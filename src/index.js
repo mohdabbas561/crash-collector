@@ -1,0 +1,18 @@
+const { initDB } = require('./db');
+const { startCollector } = require('./collector');
+const { startAPI } = require('./api');
+
+async function main() {
+  console.log('🚀 Crash Collector starting...');
+  await initDB();
+  console.log('✅ Database ready');
+  startCollector();
+  console.log('✅ Collector started');
+  startAPI();
+  console.log('✅ API started');
+}
+
+main().catch(err => {
+  console.error('Fatal error:', err);
+  process.exit(1);
+});
