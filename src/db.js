@@ -20,7 +20,7 @@ async function initDB() {
       id            SERIAL PRIMARY KEY,
       target        VARCHAR(10)  NOT NULL,
       min_mult      NUMERIC(12,4) NOT NULL,
-      outcome       VARCHAR(10)  NOT NULL,
+      outcome       VARCHAR(15)  NOT NULL,
       window_lo     BIGINT       NOT NULL,
       window_hi     BIGINT       NOT NULL,
       hit_round     BIGINT,
@@ -168,4 +168,8 @@ async function getStats() {
   };
 }
 
-module.exports = { initDB, saveRounds, getRounds, getStorageStats, getStats, savePrediction, getPredictions };
+async function clearPredictions() {
+  await pool.query(`DELETE FROM predictions`);
+}
+
+module.exports = { initDB, saveRounds, getRounds, getStorageStats, getStats, savePrediction, getPredictions, clearPredictions };

@@ -1,6 +1,6 @@
 const express = require('express');
 const cors    = require('cors');
-const { getRounds, getStats, getStorageStats, savePrediction, getPredictions } = require('./db');
+const { getRounds, getStats, getStorageStats, savePrediction, getPredictions, clearPredictions } = require('./db');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -65,6 +65,15 @@ app.post('/predictions', async (req, res) => {
     }
     await savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation });
     res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.delete('/predictions', async (req, res) => {
+  try {
+    await clearPredictions();
+    res.json({ ok: true, message: 'All prediction history cleared' });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
