@@ -15,7 +15,57 @@ async function initDB() {
     );
     CREATE INDEX IF NOT EXISTS idx_rounds_created_at ON rounds(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_rounds_multiplier ON rounds(multiplier);
+
+    CREATE TABLE IF NOT EXISTS predictions (
+      id            SERIAL PRIMARY KEY,
+      target        VARCHAR(10)  NOT NULL,
+      min_mult      NUMERIC(12,4) NOT NULL,
+      outcome       VARCHAR(10)  NOT NULL,
+      window_lo     BIGINT       NOT NULL,
+      window_hi     BIGINT       NOT NULL,
+      hit_round     BIGINT,
+      generation    INT          NOT NULL DEFAULT 1,
+      created_at    TIMESTAMPTZ  DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_predictions_target     ON predictions(target);
+    CREATE INDEX IF NOT EXISTS idx_predictions_outcome    ON predictions(outcome);
+    CREATE INDEX IF NOT EXISTS idx_predictions_created_at ON predictions(created_at DESC);
   `);
+}
+
+async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation }) {
+  await pool.query(
+    `INSERT INTO predictions (target, min_mult, outcome, window_lo, window_hi, hit_round, generation)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [target, minMult, outcome, lo, hi, hitRound ?? null, generation]
+  );
+}
+
+async function getPredictions({ limit = 200, target = null } = {}) {
+  const conditions = [];
+  const params     = [];
+  let idx = 1;
+  if (target) { conditions.push(`target = $${idx++}`); params.push(target); }
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  params.push(limit);
+  const res = await pool.query(
+    `SELECT id, target, min_mult, outcome, window_lo, window_hi, hit_round, generation, created_at
+     FROM predictions ${where}
+     ORDER BY created_at DESC
+     LIMIT $${idx}`,
+    params
+  );
+  return res.rows.map(r => ({
+    id:         r.id,
+    target:     r.target,
+    minMult:    parseFloat(r.min_mult),
+    outcome:    r.outcome,
+    lo:         Number(r.window_lo),
+    hi:         Number(r.window_hi),
+    hitRound:   r.hit_round ? Number(r.hit_round) : null,
+    generation: r.generation,
+    ts:         new Date(r.created_at).getTime(),
+  }));
 }
 
 async function saveRounds(rounds) {
@@ -118,4 +168,4 @@ async function getStats() {
   };
 }
 
-module.exports = { initDB, saveRounds, getRounds, getStorageStats, getStats };
+module.exports = { initDB, saveRounds, getRounds, getStorageStats, getStats, savePrediction, getPredictions };

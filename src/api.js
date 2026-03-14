@@ -1,6 +1,6 @@
 const express = require('express');
 const cors    = require('cors');
-const { getRounds, getStats, getStorageStats } = require('./db');
+const { getRounds, getStats, getStorageStats, savePrediction, getPredictions } = require('./db');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -43,6 +43,31 @@ app.get('/storage-stats', async (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
+});
+
+// ── Predictions history ────────────────────────────────────────────────────
+app.get('/predictions', async (req, res) => {
+  try {
+    const limit  = Math.min(parseInt(req.query.limit || '200'), 1000);
+    const target = req.query.target || null;
+    const rows   = await getPredictions({ limit, target });
+    res.json({ ok: true, count: rows.length, predictions: rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/predictions', async (req, res) => {
+  try {
+    const { target, minMult, outcome, lo, hi, hitRound, generation } = req.body;
+    if (!target || !outcome || lo == null || hi == null) {
+      return res.status(400).json({ ok: false, error: 'Missing required fields: target, outcome, lo, hi' });
+    }
+    await savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 function startAPI() {
