@@ -5,6 +5,7 @@ const {
   savePrediction, getPredictions, clearPredictions,
   initAccessCodes, createAccessCode, getAccessCode,
   updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,
+  saveLockedPreds, getLockedPreds,
 } = require('./db');
 
 const app  = express();
@@ -148,6 +149,32 @@ app.get('/access/list', requireAdmin, async (req, res) => {
 app.delete('/access/:id', requireAdmin, async (req, res) => {
   try {
     await deleteAccessCode(req.params.id);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── LOCKED PREDICTIONS ───────────────────────────────────────────────────────
+
+// GET /locked — load persisted locked windows on app mount
+app.get('/locked', async (req, res) => {
+  try {
+    const preds = await getLockedPreds();
+    res.json({ ok: true, preds });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /locked — save all locked windows (called on every state machine update)
+app.post('/locked', async (req, res) => {
+  try {
+    const { preds } = req.body;
+    if (!preds || typeof preds !== 'object') {
+      return res.status(400).json({ ok: false, error: 'preds object required' });
+    }
+    await saveLockedPreds(preds);
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });

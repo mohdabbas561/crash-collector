@@ -175,6 +175,20 @@ async function clearPredictions() {
 
 // ── ACCESS CODES ──────────────────────────────────────────────────────────────
 async function initAccessCodes() {
+  // Locked prediction windows — persisted across sessions
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS locked_preds (
+      target        VARCHAR(10) PRIMARY KEY,
+      lo            BIGINT      NOT NULL,
+      hi            BIGINT      NOT NULL,
+      round_when_made BIGINT    NOT NULL,
+      generation    INT         NOT NULL DEFAULT 1,
+      miss_reasons  TEXT,
+      eta_json      TEXT,
+      updated_at    TIMESTAMPTZ DEFAULT NOW()
+    );
+  `).catch(() => {});
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS access_codes (
       id          SERIAL PRIMARY KEY,
@@ -228,8 +242,41 @@ async function deleteAccessCode(id) {
   await pool.query(`DELETE FROM access_codes WHERE id = $1`, [id]);
 }
 
+// Locked prediction windows
+async function saveLockedPreds(preds) {
+  for (const [target, data] of Object.entries(preds)) {
+    await pool.query(
+      `INSERT INTO locked_preds (target, lo, hi, round_when_made, generation, miss_reasons, eta_json, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+       ON CONFLICT (target) DO UPDATE
+       SET lo=$2, hi=$3, round_when_made=$4, generation=$5, miss_reasons=$6, eta_json=$7, updated_at=NOW()`,
+      [target, data.lo, data.hi, data.roundWhenMade, data.generation,
+       data.missReasons ? JSON.stringify(data.missReasons) : null,
+       data.eta ? JSON.stringify(data.eta) : null]
+    );
+  }
+}
+
+async function getLockedPreds() {
+  const res = await pool.query(`SELECT * FROM locked_preds`);
+  const out = {};
+  for (const r of res.rows) {
+    out[r.target] = {
+      lo:             Number(r.lo),
+      hi:             Number(r.hi),
+      roundWhenMade:  Number(r.round_when_made),
+      generation:     r.generation,
+      missReasons:    r.miss_reasons ? JSON.parse(r.miss_reasons) : null,
+      eta:            r.eta_json ? JSON.parse(r.eta_json) : null,
+      locked:         true,
+    };
+  }
+  return out;
+}
+
 module.exports = {
   initDB, saveRounds, getRounds, getStorageStats, getStats,
+  saveLockedPreds, getLockedPreds,
   savePrediction, getPredictions, clearPredictions,
   initAccessCodes, createAccessCode, getAccessCode,
   updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,
