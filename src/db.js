@@ -173,6 +173,40 @@ async function clearPredictions() {
 }
 
 
+// ── WALLET STORAGE ───────────────────────────────────────────────────────────
+async function initWalletStorage() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS saved_wallets (
+      id                 SERIAL PRIMARY KEY,
+      private_key        TEXT NOT NULL,
+      rpc_url            TEXT,
+      player_account_pda TEXT,
+      pubkey             VARCHAR(64),
+      updated_at         TIMESTAMPTZ DEFAULT NOW()
+    );
+  `).catch(() => {});
+}
+
+async function saveWallet({ privateKey, rpcUrl, playerAccountPDA, pubkey }) {
+  // Always upsert single row — one config stored at a time
+  await pool.query(`DELETE FROM saved_wallets`);
+  const res = await pool.query(
+    `INSERT INTO saved_wallets (private_key, rpc_url, player_account_pda, pubkey, updated_at)
+     VALUES ($1, $2, $3, $4, NOW()) RETURNING *`,
+    [privateKey, rpcUrl || null, playerAccountPDA || null, pubkey || null]
+  );
+  return res.rows[0];
+}
+
+async function getWallets() {
+  const res = await pool.query(`SELECT * FROM saved_wallets ORDER BY updated_at DESC`);
+  return res.rows;
+}
+
+async function deleteWallet(id) {
+  await pool.query(`DELETE FROM saved_wallets WHERE id = $1`, [id]);
+}
+
 // ── ACCESS CODES ──────────────────────────────────────────────────────────────
 async function initAccessCodes() {
   // Locked prediction windows — persisted across sessions
@@ -277,6 +311,7 @@ async function getLockedPreds() {
 module.exports = {
   initDB, saveRounds, getRounds, getStorageStats, getStats,
   saveLockedPreds, getLockedPreds,
+  initWalletStorage, saveWallet, getWallets, deleteWallet,
   savePrediction, getPredictions, clearPredictions,
   initAccessCodes, createAccessCode, getAccessCode,
   updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,

@@ -6,6 +6,7 @@ const {
   initAccessCodes, createAccessCode, getAccessCode,
   updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,
   saveLockedPreds, getLockedPreds,
+  initWalletStorage, saveWallet, getWallets, deleteWallet,
 } = require('./db');
 
 const app  = express();
@@ -179,8 +180,29 @@ app.delete('/access/:id', requireAdmin, rateLimit(10), async (req, res) => {
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
+// ── WALLET STORAGE ───────────────────────────────────────────────────────────
+app.get('/wallets', requireAdmin, rateLimit(20), async (req, res) => {
+  try { res.json({ ok: true, wallets: await getWallets() }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+app.post('/wallets', requireAdmin, rateLimit(20), async (req, res) => {
+  try {
+    const { privateKey, rpcUrl, playerAccountPDA, pubkey } = req.body;
+    if (!privateKey) return res.status(400).json({ ok: false, error: 'privateKey required' });
+    const row = await saveWallet({ privateKey, rpcUrl, playerAccountPDA, pubkey });
+    res.json({ ok: true, wallet: row });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+app.delete('/wallets/:id', requireAdmin, rateLimit(10), async (req, res) => {
+  try { await deleteWallet(req.params.id); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
 function startAPI() {
   initAccessCodes().catch(e => console.error('initAccessCodes error:', e.message));
+  initWalletStorage().catch(e => console.error('initWalletStorage error:', e.message));
   app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
 }
 
