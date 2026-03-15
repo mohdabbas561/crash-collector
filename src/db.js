@@ -182,20 +182,27 @@ async function initAccessCodes() {
       created_at  TIMESTAMPTZ DEFAULT NOW(),
       expires_at  TIMESTAMPTZ NOT NULL,
       ip          VARCHAR(64),
-      note        VARCHAR(200)
+      note        VARCHAR(200),
+      max_uses    INT NOT NULL DEFAULT 1,
+      use_count   INT NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_access_codes_code    ON access_codes(code);
     CREATE INDEX IF NOT EXISTS idx_access_codes_expires ON access_codes(expires_at);
   `);
+  // Add columns if they don't exist (for existing deployments)
+  await pool.query(`
+    ALTER TABLE access_codes ADD COLUMN IF NOT EXISTS max_uses  INT NOT NULL DEFAULT 1;
+    ALTER TABLE access_codes ADD COLUMN IF NOT EXISTS use_count INT NOT NULL DEFAULT 0;
+  `).catch(() => {});
 }
 
-async function createAccessCode({ code, expiresAt, note }) {
+async function createAccessCode({ code, expiresAt, note, maxUses }) {
   const res = await pool.query(
-    `INSERT INTO access_codes (code, expires_at, note)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (code) DO UPDATE SET expires_at = $2, note = $3
+    `INSERT INTO access_codes (code, expires_at, note, max_uses, use_count)
+     VALUES ($1, $2, $3, $4, 0)
+     ON CONFLICT (code) DO UPDATE SET expires_at = $2, note = $3, max_uses = $4, use_count = 0
      RETURNING *`,
-    [code, new Date(expiresAt), note || '']
+    [code, new Date(expiresAt), note || '', maxUses || 1]
   );
   return res.rows[0];
 }
@@ -206,7 +213,10 @@ async function getAccessCode(code) {
 }
 
 async function updateAccessCodeIP(code, ip) {
-  await pool.query(`UPDATE access_codes SET ip = $2 WHERE code = $1`, [code, ip]);
+  await pool.query(
+    `UPDATE access_codes SET ip = $2, use_count = use_count + 1 WHERE code = $1`,
+    [code, ip]
+  );
 }
 
 async function getAllAccessCodes() {
