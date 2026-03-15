@@ -1,6 +1,9 @@
 const express = require('express');
 const cors    = require('cors');
-const { getRounds, getStats, getStorageStats, savePrediction, getPredictions, clearPredictions } = require('./db');
+const {
+  getRounds, getStats, getStorageStats,
+  savePrediction, getPredictions, clearPredictions, getAccuracyStats,
+} = require('./db');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -10,7 +13,7 @@ app.use(express.json());
 
 app.get('/rounds', async (req, res) => {
   try {
-    const limit  = Math.min(parseInt(req.query.limit  || '1000'), 10000);
+    const limit  = Math.min(parseInt(req.query.limit  || '2000'), 10000);
     const offset = parseInt(req.query.offset || '0');
     const from   = req.query.from || null;
     const to     = req.query.to   || null;
@@ -45,10 +48,10 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
 
-// ── Predictions history ────────────────────────────────────────────────────
+// ── Predictions history ───────────────────────────────────────────────────────
 app.get('/predictions', async (req, res) => {
   try {
-    const limit  = Math.min(parseInt(req.query.limit || '200'), 1000);
+    const limit  = Math.min(parseInt(req.query.limit || '500'), 2000);
     const target = req.query.target || null;
     const rows   = await getPredictions({ limit, target });
     res.json({ ok: true, count: rows.length, predictions: rows });
@@ -63,6 +66,11 @@ app.post('/predictions', async (req, res) => {
     if (!target || !outcome || lo == null || hi == null) {
       return res.status(400).json({ ok: false, error: 'Missing required fields: target, outcome, lo, hi' });
     }
+    // Validate outcome
+    const VALID = ['win', 'retry-win', 'loss', 'retry-loss', 'early'];
+    if (!VALID.includes(outcome)) {
+      return res.status(400).json({ ok: false, error: `Invalid outcome: ${outcome}. Must be one of: ${VALID.join(', ')}` });
+    }
     await savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation });
     res.json({ ok: true });
   } catch (e) {
@@ -70,10 +78,21 @@ app.post('/predictions', async (req, res) => {
   }
 });
 
+// DELETE is kept for admin use only (no UI button exposes this)
 app.delete('/predictions', async (req, res) => {
   try {
     await clearPredictions();
     res.json({ ok: true, message: 'All prediction history cleared' });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Accuracy stats endpoint (cross-device, from DB)
+app.get('/predictions/accuracy', async (req, res) => {
+  try {
+    const stats = await getAccuracyStats();
+    res.json({ ok: true, accuracy: stats });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
