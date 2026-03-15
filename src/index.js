@@ -1,10 +1,11 @@
-const { initDB } = require('./db');
+const { initDB, initAccessCodes } = require('./db');
 const { startCollector } = require('./collector');
 const { startAPI } = require('./api');
 
 async function main() {
   console.log('🚀 Crash Collector starting...');
   await initDB();
+  await initAccessCodes();
   console.log('✅ Database ready');
   startCollector();
   console.log('✅ Collector started');

@@ -2,7 +2,9 @@ const express = require('express');
 const cors    = require('cors');
 const {
   getRounds, getStats, getStorageStats,
-  savePrediction, getPredictions, clearPredictions, getAccuracyStats,
+  savePrediction, getPredictions, clearPredictions,
+  initAccessCodes, createAccessCode, getAccessCode,
+  updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,
 } = require('./db');
 
 const app  = express();
@@ -11,9 +13,20 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
+// Helper: get real IP behind proxy
+function getIP(req) {
+  return (
+    req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
+    req.headers['x-real-ip'] ||
+    req.socket?.remoteAddress ||
+    'unknown'
+  );
+}
+
+// ── ROUNDS ────────────────────────────────────────────────────────────────────
 app.get('/rounds', async (req, res) => {
   try {
-    const limit  = Math.min(parseInt(req.query.limit  || '2000'), 10000);
+    const limit  = Math.min(parseInt(req.query.limit  || '1000'), 10000);
     const offset = parseInt(req.query.offset || '0');
     const from   = req.query.from || null;
     const to     = req.query.to   || null;
@@ -48,10 +61,10 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
 
-// ── Predictions history ───────────────────────────────────────────────────────
+// ── PREDICTIONS ───────────────────────────────────────────────────────────────
 app.get('/predictions', async (req, res) => {
   try {
-    const limit  = Math.min(parseInt(req.query.limit || '500'), 2000);
+    const limit  = Math.min(parseInt(req.query.limit || '200'), 1000);
     const target = req.query.target || null;
     const rows   = await getPredictions({ limit, target });
     res.json({ ok: true, count: rows.length, predictions: rows });
@@ -64,12 +77,7 @@ app.post('/predictions', async (req, res) => {
   try {
     const { target, minMult, outcome, lo, hi, hitRound, generation } = req.body;
     if (!target || !outcome || lo == null || hi == null) {
-      return res.status(400).json({ ok: false, error: 'Missing required fields: target, outcome, lo, hi' });
-    }
-    // Validate outcome
-    const VALID = ['win', 'retry-win', 'loss', 'retry-loss', 'early'];
-    if (!VALID.includes(outcome)) {
-      return res.status(400).json({ ok: false, error: `Invalid outcome: ${outcome}. Must be one of: ${VALID.join(', ')}` });
+      return res.status(400).json({ ok: false, error: 'Missing required fields' });
     }
     await savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation });
     res.json({ ok: true });
@@ -78,7 +86,6 @@ app.post('/predictions', async (req, res) => {
   }
 });
 
-// DELETE is kept for admin use only (no UI button exposes this)
 app.delete('/predictions', async (req, res) => {
   try {
     await clearPredictions();
@@ -88,17 +95,74 @@ app.delete('/predictions', async (req, res) => {
   }
 });
 
-// Accuracy stats endpoint (cross-device, from DB)
-app.get('/predictions/accuracy', async (req, res) => {
+// ── ACCESS CODES ──────────────────────────────────────────────────────────────
+
+// Verify a code (called by frontend on load)
+app.post('/access/verify', async (req, res) => {
   try {
-    const stats = await getAccuracyStats();
-    res.json({ ok: true, accuracy: stats });
+    const { code } = req.body;
+    if (!code) return res.json({ ok: false, reason: 'no_code' });
+    const row = await getAccessCode(code);
+    if (!row) return res.json({ ok: false, reason: 'invalid' });
+    if (new Date(row.expires_at) < new Date()) return res.json({ ok: false, reason: 'expired' });
+    // Record IP on first use
+    const ip = getIP(req);
+    if (!row.ip || row.ip === 'unknown') await updateAccessCodeIP(code, ip);
+    res.json({ ok: true, expiresAt: row.expires_at });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Create / update a code (admin only — protected by admin_secret header)
+app.post('/access/create', async (req, res) => {
+  try {
+    const secret = req.headers['x-admin-secret'];
+    if (secret !== process.env.ADMIN_SECRET) {
+      return res.status(403).json({ ok: false, error: 'Forbidden' });
+    }
+    const { code, expiresAt, note } = req.body;
+    if (!code || !expiresAt) {
+      return res.status(400).json({ ok: false, error: 'code and expiresAt required' });
+    }
+    const row = await createAccessCode({ code, expiresAt, note });
+    res.json({ ok: true, row });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// List all codes (admin)
+app.get('/access/list', async (req, res) => {
+  try {
+    const secret = req.headers['x-admin-secret'];
+    if (secret !== process.env.ADMIN_SECRET) {
+      return res.status(403).json({ ok: false, error: 'Forbidden' });
+    }
+    const rows = await getAllAccessCodes();
+    res.json({ ok: true, codes: rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Delete a code (admin)
+app.delete('/access/:id', async (req, res) => {
+  try {
+    const secret = req.headers['x-admin-secret'];
+    if (secret !== process.env.ADMIN_SECRET) {
+      return res.status(403).json({ ok: false, error: 'Forbidden' });
+    }
+    await deleteAccessCode(req.params.id);
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
 function startAPI() {
+  // Init access codes table on startup
+  initAccessCodes().catch(e => console.error('initAccessCodes failed:', e.message));
   app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
 }
 

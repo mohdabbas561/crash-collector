@@ -18,14 +18,14 @@ async function initDB() {
 
     CREATE TABLE IF NOT EXISTS predictions (
       id            SERIAL PRIMARY KEY,
-      target        VARCHAR(10)   NOT NULL,
+      target        VARCHAR(10)  NOT NULL,
       min_mult      NUMERIC(12,4) NOT NULL,
-      outcome       VARCHAR(15)   NOT NULL,
-      window_lo     BIGINT        NOT NULL,
-      window_hi     BIGINT        NOT NULL,
+      outcome       VARCHAR(15)  NOT NULL,
+      window_lo     BIGINT       NOT NULL,
+      window_hi     BIGINT       NOT NULL,
       hit_round     BIGINT,
-      generation    INT           NOT NULL DEFAULT 1,
-      created_at    TIMESTAMPTZ   DEFAULT NOW()
+      generation    INT          NOT NULL DEFAULT 1,
+      created_at    TIMESTAMPTZ  DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_predictions_target     ON predictions(target);
     CREATE INDEX IF NOT EXISTS idx_predictions_outcome    ON predictions(outcome);
@@ -34,9 +34,6 @@ async function initDB() {
 }
 
 async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation }) {
-  // Validate outcome is one of known values
-  const VALID = ['win', 'retry-win', 'loss', 'retry-loss', 'early'];
-  if (!VALID.includes(outcome)) throw new Error(`Invalid outcome: ${outcome}`);
   await pool.query(
     `INSERT INTO predictions (target, min_mult, outcome, window_lo, window_hi, hit_round, generation)
      VALUES ($1, $2, $3, $4, $5, $6, $7)`,
@@ -68,33 +65,6 @@ async function getPredictions({ limit = 200, target = null } = {}) {
     hitRound:   r.hit_round ? Number(r.hit_round) : null,
     generation: r.generation,
     ts:         new Date(r.created_at).getTime(),
-  }));
-}
-
-// Get accuracy stats per target (excludes 'early' from win/loss calc)
-async function getAccuracyStats() {
-  const res = await pool.query(`
-    SELECT
-      target,
-      COUNT(*) FILTER (WHERE outcome IN ('win','retry-win'))                                AS wins,
-      COUNT(*) FILTER (WHERE outcome IN ('loss','retry-loss'))                              AS losses,
-      COUNT(*) FILTER (WHERE outcome = 'early')                                             AS early,
-      COUNT(*) FILTER (WHERE outcome IN ('win','retry-win','loss','retry-loss'))            AS decisive,
-      ROUND(
-        COUNT(*) FILTER (WHERE outcome IN ('win','retry-win'))::NUMERIC /
-        NULLIF(COUNT(*) FILTER (WHERE outcome IN ('win','retry-win','loss','retry-loss')), 0) * 100
-      , 1) AS win_rate
-    FROM predictions
-    GROUP BY target
-    ORDER BY target
-  `);
-  return res.rows.map(r => ({
-    target:   r.target,
-    wins:     Number(r.wins),
-    losses:   Number(r.losses),
-    early:    Number(r.early),
-    decisive: Number(r.decisive),
-    winRate:  r.win_rate ? parseFloat(r.win_rate) : null,
   }));
 }
 
@@ -202,7 +172,55 @@ async function clearPredictions() {
   await pool.query(`DELETE FROM predictions`);
 }
 
+
+// ── ACCESS CODES ──────────────────────────────────────────────────────────────
+async function initAccessCodes() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS access_codes (
+      id          SERIAL PRIMARY KEY,
+      code        VARCHAR(64) UNIQUE NOT NULL,
+      created_at  TIMESTAMPTZ DEFAULT NOW(),
+      expires_at  TIMESTAMPTZ NOT NULL,
+      ip          VARCHAR(64),
+      note        VARCHAR(200)
+    );
+    CREATE INDEX IF NOT EXISTS idx_access_codes_code    ON access_codes(code);
+    CREATE INDEX IF NOT EXISTS idx_access_codes_expires ON access_codes(expires_at);
+  `);
+}
+
+async function createAccessCode({ code, expiresAt, note }) {
+  const res = await pool.query(
+    `INSERT INTO access_codes (code, expires_at, note)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (code) DO UPDATE SET expires_at = $2, note = $3
+     RETURNING *`,
+    [code, new Date(expiresAt), note || '']
+  );
+  return res.rows[0];
+}
+
+async function getAccessCode(code) {
+  const res = await pool.query(`SELECT * FROM access_codes WHERE code = $1`, [code]);
+  return res.rows[0] ?? null;
+}
+
+async function updateAccessCodeIP(code, ip) {
+  await pool.query(`UPDATE access_codes SET ip = $2 WHERE code = $1`, [code, ip]);
+}
+
+async function getAllAccessCodes() {
+  const res = await pool.query(`SELECT * FROM access_codes ORDER BY created_at DESC`);
+  return res.rows;
+}
+
+async function deleteAccessCode(id) {
+  await pool.query(`DELETE FROM access_codes WHERE id = $1`, [id]);
+}
+
 module.exports = {
   initDB, saveRounds, getRounds, getStorageStats, getStats,
-  savePrediction, getPredictions, clearPredictions, getAccuracyStats,
+  savePrediction, getPredictions, clearPredictions,
+  initAccessCodes, createAccessCode, getAccessCode,
+  updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,
 };
