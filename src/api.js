@@ -18,16 +18,15 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
 
 app.use(cors({
   origin: (origin, cb) => {
-    // Allow Railway internal calls (no origin) and configured origins
     if (!origin) return cb(null, true);
-    if (ALLOWED_ORIGINS.length === 0) return cb(null, true); // dev fallback
+    if (ALLOWED_ORIGINS.length === 0) return cb(null, true);
     if (ALLOWED_ORIGINS.some(o => origin.startsWith(o))) return cb(null, true);
     cb(new Error('Not allowed by CORS'));
   },
   credentials: true,
 }));
 
-app.use(express.json({ limit: '50kb' })); // raised from 10kb — locked_preds slim payload ~2kb
+app.use(express.json({ limit: '50kb' }));
 
 // ── SECURITY: Simple in-memory rate limiter ───────────────────────────────
 const rateLimits = new Map();
@@ -46,7 +45,6 @@ function rateLimit(maxPerMin) {
     next();
   };
 }
-// Clean up old rate limit entries every 5 minutes
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of rateLimits) if (now > v.reset) rateLimits.delete(k);
@@ -90,27 +88,36 @@ app.get('/storage-stats', rateLimit(20), async (req, res) => { try { res.json({ 
 app.get('/health', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
 // ── PREDICTIONS ───────────────────────────────────────────────────────────
+// GET /predictions?limit=200&target=5x&source=engine|pattern
+// source=engine  → stat-model history only
+// source=pattern → pattern-model history only
+// source omitted → all records (both engines)
 app.get('/predictions', rateLimit(30), async (req, res) => {
   try {
     const limit  = Math.min(parseInt(req.query.limit || '200'), 1000);
     const target = req.query.target || null;
-    const rows   = await getPredictions({ limit, target });
+    // Validate source param — only allow known values
+    const rawSource = req.query.source || null;
+    const source = (rawSource === 'engine' || rawSource === 'pattern') ? rawSource : null;
+    const rows   = await getPredictions({ limit, target, source });
     res.json({ ok: true, count: rows.length, predictions: rows });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
+// POST /predictions — accepts source: 'engine' | 'pattern' in body
 app.post('/predictions', rateLimit(120), async (req, res) => {
   try {
-    const { target, minMult, outcome, lo, hi, hitRound, generation } = req.body;
+    const { target, minMult, outcome, lo, hi, hitRound, generation, source } = req.body;
     if (!target || !outcome || lo == null || hi == null)
       return res.status(400).json({ ok: false, error: 'Missing required fields' });
-    // Input validation
     const validOutcomes = ['win','loss','early','retry-win','retry-loss'];
     if (!validOutcomes.includes(outcome))
       return res.status(400).json({ ok: false, error: 'Invalid outcome' });
     if (typeof lo !== 'number' || typeof hi !== 'number' || hi < lo)
       return res.status(400).json({ ok: false, error: 'Invalid window' });
-    await savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation });
+    // Validate source — default to 'engine' if missing or unrecognised
+    const validSource = (source === 'pattern') ? 'pattern' : 'engine';
+    await savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation, source: validSource });
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
@@ -127,7 +134,6 @@ app.get('/locked', rateLimit(60), async (req, res) => {
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-// PROTECTED — only the app itself should write locks (use a shared app secret)
 const APP_SECRET = process.env.APP_SECRET || process.env.ADMIN_SECRET;
 app.post('/locked', rateLimit(120), async (req, res) => {
   const token = req.headers['x-app-secret'];

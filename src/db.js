@@ -25,31 +25,42 @@ async function initDB() {
       window_hi     BIGINT       NOT NULL,
       hit_round     BIGINT,
       generation    INT          NOT NULL DEFAULT 1,
+      source        VARCHAR(20)  NOT NULL DEFAULT 'engine',
       created_at    TIMESTAMPTZ  DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_predictions_target     ON predictions(target);
     CREATE INDEX IF NOT EXISTS idx_predictions_outcome    ON predictions(outcome);
+    CREATE INDEX IF NOT EXISTS idx_predictions_source     ON predictions(source);
     CREATE INDEX IF NOT EXISTS idx_predictions_created_at ON predictions(created_at DESC);
   `);
+
+  // Add source column to existing deployments that predate this change
+  await pool.query(`
+    ALTER TABLE predictions ADD COLUMN IF NOT EXISTS source VARCHAR(20) NOT NULL DEFAULT 'engine';
+    CREATE INDEX IF NOT EXISTS idx_predictions_source ON predictions(source);
+  `).catch(() => {}); // ignore if already exists
 }
 
-async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation }) {
+// source: 'engine' (stat-model) | 'pattern' (pattern-model)
+async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation, source = 'engine' }) {
   await pool.query(
-    `INSERT INTO predictions (target, min_mult, outcome, window_lo, window_hi, hit_round, generation)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-    [target, minMult, outcome, lo, hi, hitRound ?? null, generation]
+    `INSERT INTO predictions (target, min_mult, outcome, window_lo, window_hi, hit_round, generation, source)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [target, minMult, outcome, lo, hi, hitRound ?? null, generation, source]
   );
 }
 
-async function getPredictions({ limit = 200, target = null } = {}) {
+// source filter: 'engine' | 'pattern' | null (all)
+async function getPredictions({ limit = 200, target = null, source = null } = {}) {
   const conditions = [];
   const params     = [];
   let idx = 1;
   if (target) { conditions.push(`target = $${idx++}`); params.push(target); }
+  if (source) { conditions.push(`source = $${idx++}`); params.push(source); }
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   params.push(limit);
   const res = await pool.query(
-    `SELECT id, target, min_mult, outcome, window_lo, window_hi, hit_round, generation, created_at
+    `SELECT id, target, min_mult, outcome, window_lo, window_hi, hit_round, generation, source, created_at
      FROM predictions ${where}
      ORDER BY created_at DESC
      LIMIT $${idx}`,
@@ -64,6 +75,7 @@ async function getPredictions({ limit = 200, target = null } = {}) {
     hi:         Number(r.window_hi),
     hitRound:   r.hit_round ? Number(r.hit_round) : null,
     generation: r.generation,
+    source:     r.source || 'engine',
     ts:         new Date(r.created_at).getTime(),
   }));
 }
@@ -188,7 +200,6 @@ async function initWalletStorage() {
 }
 
 async function saveWallet({ privateKey, rpcUrl, playerAccountPDA, pubkey }) {
-  // Always upsert single row — one config stored at a time
   await pool.query(`DELETE FROM saved_wallets`);
   const res = await pool.query(
     `INSERT INTO saved_wallets (private_key, rpc_url, player_account_pda, pubkey, updated_at)
@@ -209,7 +220,6 @@ async function deleteWallet(id) {
 
 // ── ACCESS CODES ──────────────────────────────────────────────────────────────
 async function initAccessCodes() {
-  // Locked prediction windows — persisted across sessions
   await pool.query(`
     CREATE TABLE IF NOT EXISTS locked_preds (
       target        VARCHAR(10) PRIMARY KEY,
@@ -237,7 +247,6 @@ async function initAccessCodes() {
     CREATE INDEX IF NOT EXISTS idx_access_codes_code    ON access_codes(code);
     CREATE INDEX IF NOT EXISTS idx_access_codes_expires ON access_codes(expires_at);
   `);
-  // Add columns if they don't exist (for existing deployments)
   await pool.query(`
     ALTER TABLE access_codes ADD COLUMN IF NOT EXISTS max_uses  INT NOT NULL DEFAULT 1;
     ALTER TABLE access_codes ADD COLUMN IF NOT EXISTS use_count INT NOT NULL DEFAULT 0;
@@ -276,7 +285,6 @@ async function deleteAccessCode(id) {
   await pool.query(`DELETE FROM access_codes WHERE id = $1`, [id]);
 }
 
-// Locked prediction windows
 async function saveLockedPreds(preds) {
   for (const [target, data] of Object.entries(preds)) {
     await pool.query(
