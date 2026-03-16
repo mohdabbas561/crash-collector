@@ -27,7 +27,7 @@ app.use(cors({
   credentials: true,
 }));
 
-app.use(express.json({ limit: '10kb' })); // limit request body size
+app.use(express.json({ limit: '50kb' })); // raised from 10kb — locked_preds slim payload ~2kb
 
 // ── SECURITY: Simple in-memory rate limiter ───────────────────────────────
 const rateLimits = new Map();
@@ -138,8 +138,12 @@ app.post('/locked', rateLimit(120), async (req, res) => {
     if (!preds || typeof preds !== 'object')
       return res.status(400).json({ ok: false, error: 'preds object required' });
     await saveLockedPreds(preds);
+    console.log(`[locked] saved ${Object.keys(preds).length} windows`);
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+  } catch (e) {
+    console.error('[locked] save failed:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 // ── ACCESS CODES ──────────────────────────────────────────────────────────
