@@ -6,6 +6,7 @@ const pool = new Pool({
 });
 
 async function initDB() {
+  // Step 1 — base tables and safe indexes (no source column yet)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS rounds (
       round_id    BIGINT PRIMARY KEY,
@@ -25,20 +26,24 @@ async function initDB() {
       window_hi     BIGINT       NOT NULL,
       hit_round     BIGINT,
       generation    INT          NOT NULL DEFAULT 1,
-      source        VARCHAR(20)  NOT NULL DEFAULT 'engine',
       created_at    TIMESTAMPTZ  DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_predictions_target     ON predictions(target);
     CREATE INDEX IF NOT EXISTS idx_predictions_outcome    ON predictions(outcome);
-    CREATE INDEX IF NOT EXISTS idx_predictions_source     ON predictions(source);
     CREATE INDEX IF NOT EXISTS idx_predictions_created_at ON predictions(created_at DESC);
   `);
 
-  // Add source column to existing deployments that predate this change
+  // Step 2 — migrate: add source column if it doesn't exist (safe on both
+  //           fresh deployments and existing ones that predate this change)
   await pool.query(`
-    ALTER TABLE predictions ADD COLUMN IF NOT EXISTS source VARCHAR(20) NOT NULL DEFAULT 'engine';
+    ALTER TABLE predictions
+      ADD COLUMN IF NOT EXISTS source VARCHAR(20) NOT NULL DEFAULT 'engine';
+  `);
+
+  // Step 3 — now that the column is guaranteed to exist, create its index
+  await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_predictions_source ON predictions(source);
-  `).catch(() => {}); // ignore if already exists
+  `);
 }
 
 // source: 'engine' (stat-model) | 'pattern' (pattern-model)
