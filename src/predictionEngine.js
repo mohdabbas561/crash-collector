@@ -387,7 +387,7 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
       if (!isNonsense && !isTooOld) {
         const status = getStatus(sortedRounds, existing, lastRoundId);
         if (['hit','miss','early'].includes(status.status)) {
-          const outcome = (status.status==='hit' || status.status==='early') ? 'win' : 'loss';
+          const outcome = status.status==='hit' ? 'win' : status.status==='early' ? 'early' : 'loss';
           // Key: window identity only (no outcome/hitRound) — prevents dupes
           const key = makeKey(engineId, target.label, absLow, absHigh);
           if (!state.savedSet.has(key)) {
@@ -427,7 +427,7 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
     // Window still active/waiting — check if it just resolved NOW
     const status = getStatus(sortedRounds, existing, lastRoundId);
     if (['hit','miss','early'].includes(status.status)) {
-      const outcome = (status.status==='hit' || status.status==='early') ? 'win' : 'loss';
+      const outcome = status.status==='hit' ? 'win' : status.status==='early' ? 'early' : 'loss';
       const key = makeKey(engineId, target.label, absLow, absHigh);
       if (!state.savedSet.has(key)) {
         state.savedSet.add(key);
