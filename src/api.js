@@ -85,13 +85,13 @@ app.get('/storage-stats', rateLimit(20), async (req, res) => { try { res.json({ 
 app.get('/health', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
 // ── PREDICTIONS HISTORY ───────────────────────────────────────────────────
-// No login required — all history is public
 app.get('/predictions', rateLimit(60), async (req, res) => {
   try {
-    const limit  = Math.min(parseInt(req.query.limit || '500'), 5000);
-    const target = req.query.target || null;
+    const limit     = Math.min(parseInt(req.query.limit || '500'), 5000);
+    const target    = req.query.target || null;
     const rawSource = req.query.source || null;
-    const source = (rawSource === 'engine' || rawSource === 'pattern') ? rawSource : null;
+    const validSources = ['engine', 'pattern', 'ens', 'geo', 'bay', 'km'];
+    const source = validSources.includes(rawSource) ? rawSource : null;
     const rows   = await getPredictions({ limit, target, source });
     res.json({ ok: true, count: rows.length, predictions: rows });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
@@ -107,19 +107,24 @@ app.post('/predictions', rateLimit(120), async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Invalid outcome' });
     if (typeof lo !== 'number' || typeof hi !== 'number' || hi < lo || !isFinite(lo) || !isFinite(hi))
       return res.status(400).json({ ok: false, error: 'Invalid window' });
-    const validSource = (source === 'pattern') ? 'pattern' : 'engine';
+    const validSources = ['engine', 'pattern', 'ens', 'geo', 'bay', 'km'];
+    const validSource = validSources.includes(source) ? source : 'engine';
     await savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation, source: validSource });
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
+// DELETE /predictions — clears history + resets in-memory engine state
 app.delete('/predictions', requireAdmin, async (req, res) => {
-  try { await clearPredictions(); res.json({ ok: true }); }
-  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+  try {
+    await clearPredictions();
+    require('./predictionEngine').resetEngineState();
+    console.log('[api] /predictions deleted + engine state reset');
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 // ── ENGINE LOCKED PREDS ───────────────────────────────────────────────────
-// Public read — anyone opening the site gets the latest engine windows
 app.get('/locked', rateLimit(120), async (req, res) => {
   try { res.json({ ok: true, preds: await getLockedPreds() }); }
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
@@ -135,14 +140,23 @@ app.post('/locked', rateLimit(120), async (req, res) => {
       return res.status(400).json({ ok: false, error: 'preds object required' });
     await saveLockedPreds(preds);
     res.json({ ok: true });
-  } catch (e) {
-    console.error('[locked] save failed:', e.message);
-    res.status(500).json({ ok: false, error: e.message });
-  }
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// DELETE /locked — clears engine locked windows + resets state
+app.delete('/locked', requireAdmin, async (req, res) => {
+  try {
+    const { Pool } = require('pg');
+    const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+    await pool.query('DELETE FROM locked_preds');
+    await pool.end();
+    require('./predictionEngine').resetEngineState();
+    console.log('[api] /locked deleted + engine state reset');
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 // ── PATTERN LOCKED PREDS ──────────────────────────────────────────────────
-// Public read — same as engine, anyone gets latest pattern windows
 app.get('/locked-pattern', rateLimit(120), async (req, res) => {
   try { res.json({ ok: true, preds: await getLockedPatternPreds() }); }
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
@@ -158,10 +172,36 @@ app.post('/locked-pattern', rateLimit(120), async (req, res) => {
       return res.status(400).json({ ok: false, error: 'preds object required' });
     await saveLockedPatternPreds(preds);
     res.json({ ok: true });
-  } catch (e) {
-    console.error('[locked-pattern] save failed:', e.message);
-    res.status(500).json({ ok: false, error: e.message });
-  }
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// DELETE /locked-pattern — clears pattern locked windows + resets state
+app.delete('/locked-pattern', requireAdmin, async (req, res) => {
+  try {
+    const { Pool } = require('pg');
+    const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+    await pool.query('DELETE FROM locked_preds_pattern');
+    await pool.end();
+    require('./predictionEngine').resetEngineState();
+    console.log('[api] /locked-pattern deleted + engine state reset');
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── FULL RESET ────────────────────────────────────────────────────────────
+// DELETE /reset — clears ALL prediction tables + resets engine in one shot
+app.delete('/reset', requireAdmin, async (req, res) => {
+  try {
+    const { Pool } = require('pg');
+    const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+    await pool.query('DELETE FROM predictions');
+    await pool.query('DELETE FROM locked_preds');
+    await pool.query('DELETE FROM locked_preds_pattern');
+    await pool.end();
+    require('./predictionEngine').resetEngineState();
+    console.log('[api] /reset — all prediction tables cleared + engine state reset');
+    res.json({ ok: true, message: 'All prediction data cleared and engine reset' });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 // ── ACCESS CODES ──────────────────────────────────────────────────────────

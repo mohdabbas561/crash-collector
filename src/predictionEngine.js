@@ -1,24 +1,5 @@
 'use strict';
 // predictionEngine.js  v4
-// ============================================================================
-// FIXES vs v3:
-//
-//   FIX A — POST-DB-CLEAR RECOVERY:
-//     After DELETE on predictions/locked tables, in-memory state was stale.
-//     Added resetEngineState() — call this from the API after any DELETE.
-//     It nulls lockedPreds/lockedPatterns, clears savedKeys, resets
-//     initialised=false so the next poll does a full re-init from (empty) DB.
-//
-//   FIX B — savedKeys/patSavedKeys survived DB clear:
-//     These Sets were never cleared so after a DB wipe the engine would
-//     silently skip re-saving outcomes it thought were already saved.
-//     resetEngineState() clears both.
-//
-//   FIX C — lockedPreds/lockedPatterns in-memory survived DB clear:
-//     Old stale windows with ancient anchorRounds stayed in memory → RESOLVING.
-//     resetEngineState() nulls both maps so next poll starts clean.
-//
-// ============================================================================
 
 const {
   getRounds, savePrediction, getPredictions,
@@ -46,9 +27,7 @@ let patSavedKeys   = new Set();
 let lastRoundCount = 0;
 let initialised    = false;
 
-// ============================================================================
-// FIX A+B+C: Reset all in-memory state — call from API after any DB clear
-// ============================================================================
+// ── Reset all in-memory state (call after any DB clear) ───────────────────────
 function resetEngineState() {
   console.log('[engine] resetEngineState() — clearing all in-memory prediction state');
   lockedPreds    = null;
@@ -56,12 +35,10 @@ function resetEngineState() {
   savedKeys      = new Set();
   patSavedKeys   = new Set();
   lastRoundCount = 0;
-  initialised    = false; // forces full re-init on next runPredictionEngine() call
+  initialised    = false;
 }
 
-// ============================================================================
-// MATH HELPERS
-// ============================================================================
+// ── Math helpers ──────────────────────────────────────────────────────────────
 
 function bayesLambda(hits, n) { return (hits + 1) / (n + 2); }
 
@@ -142,7 +119,7 @@ function detectRegime(rounds) {
   for (const r of rounds) gLogSum += Math.log(Math.max(1.01,r.multiplier));
   const logRatio = (gLogSum/n) > 0 ? (rLogSum/W)/(gLogSum/n) : 1;
   let coldScore=0, hotScore=0;
-  if (logRatio < 0.78) coldScore+=3; else if(logRatio<0.90) coldScore+=1;
+  if (logRatio<0.78) coldScore+=3; else if(logRatio<0.90) coldScore+=1;
   if (streakPct>=0.85) coldScore+=3; else if(streakPct>=0.70) coldScore+=1;
   if (currentStreak>12) coldScore+=2;
   if (lowCount/W>0.65) coldScore+=2;
@@ -256,9 +233,7 @@ function buildPatternWindow(patternResult, maxWidth) {
 function histKey(r)    { return `${r.target}-${Number(r.lo)||0}-${Number(r.hi)||0}-${r.outcome}-${r.hitRound??'x'}`; }
 function patHistKey(r) { return `pat-${r.target}-${Number(r.lo)||0}-${Number(r.hi)||0}-${r.outcome}-${r.hitRound??'x'}`; }
 
-// ============================================================================
-// INITIALISE
-// ============================================================================
+// ── Initialise ────────────────────────────────────────────────────────────────
 
 async function initialise() {
   if (initialised) return;
@@ -305,32 +280,7 @@ async function initialise() {
   lastRoundCount = 0;
 }
 
-// ============================================================================
-// SHARED RESOLVE HELPER — reduces duplication between engine + pattern
-// ============================================================================
-
-async function resolveWindow(existing, target, sortedRounds, lastRoundId, buildNext, saveKey, savedSet, source) {
-  const absLow  = existing.anchorRound + existing.low;
-  const absHigh = existing.anchorRound + existing.high;
-  const status  = getStatus(sortedRounds, existing, lastRoundId);
-
-  if (['hit', 'miss', 'early'].includes(status.status)) {
-    const outcome = status.status === 'hit' ? 'win' : status.status === 'early' ? 'early' : 'loss';
-    const record  = { target: target.label, minMult: target.min, outcome, lo: absLow, hi: absHigh, anchorRound: existing.anchorRound, hitRound: status.hitRound||null, generation: existing.generation, source, ts: Date.now() };
-    const key = saveKey(record);
-    if (!savedSet.has(key) && Number.isFinite(absLow) && Number.isFinite(absHigh) && absLow <= absHigh) {
-      savedSet.add(key);
-      try { await savePrediction(record); console.log(`[${source}] ${target.label} ${outcome.toUpperCase()} #${absLow}–#${absHigh}${record.hitRound?` @#${record.hitRound}`:''}`); }
-      catch(e) { console.error(`[${source}] save fail:`, e.message); }
-    }
-    return { resolved: true, nextPred: buildNext() };
-  }
-  return { resolved: false, nextPred: null };
-}
-
-// ============================================================================
-// PROCESS ENGINE
-// ============================================================================
+// ── Process Engine ────────────────────────────────────────────────────────────
 
 async function processEngine(sortedRounds, lastRoundId, regime) {
   buildPrediction._statsCache = computeGlobalStats(sortedRounds);
@@ -342,15 +292,15 @@ async function processEngine(sortedRounds, lastRoundId, regime) {
 
     if (!existing) {
       const pred = buildNext(target);
-      if (pred) { lockedPreds[target.label] = { ...pred, targetMin: target.min, anchorRound: lastRoundId, generation: 1 }; anyChange = true; console.log(`[engine] NEW ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}%`); }
+      if (pred) { lockedPreds[target.label] = { ...pred, targetMin:target.min, anchorRound:lastRoundId, generation:1 }; anyChange = true; console.log(`[engine] NEW ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}%`); }
       continue;
     }
 
     const absHigh = existing.anchorRound + existing.high;
-    // Stale or past window — resolve and rebuild
+    const absLow  = existing.anchorRound + existing.low;
+
     if (existing.stale || lastRoundId > absHigh) {
       if (existing.stale) existing.stale = false;
-      const absLow = existing.anchorRound + existing.low;
       const status = getStatus(sortedRounds, existing, lastRoundId);
       if (['hit','miss','early'].includes(status.status)) {
         const outcome = status.status==='hit'?'win':status.status==='early'?'early':'loss';
@@ -366,15 +316,12 @@ async function processEngine(sortedRounds, lastRoundId, regime) {
         else delete lockedPreds[target.label];
         anyChange = true;
       }
-      // If status is still active/waiting after clearing stale, leave it
       continue;
     }
 
-    // Normal active: check status
     const status = getStatus(sortedRounds, existing, lastRoundId);
     if (['hit','miss','early'].includes(status.status)) {
       const outcome = status.status==='hit'?'win':status.status==='early'?'early':'loss';
-      const absLow  = existing.anchorRound + existing.low;
       const record  = { target:target.label, minMult:target.min, outcome, lo:absLow, hi:absHigh, anchorRound:existing.anchorRound, hitRound:status.hitRound||null, generation:existing.generation, source:'engine', ts:Date.now() };
       const key = histKey(record);
       if (!savedKeys.has(key)) {
@@ -397,15 +344,13 @@ async function processEngine(sortedRounds, lastRoundId, regime) {
     const toSave = {};
     for (const [label, pred] of Object.entries(lockedPreds)) {
       if (pred.stale || !Number.isFinite(pred.anchorRound)) continue;
-      toSave[label] = { lo: pred.anchorRound+pred.low, hi: pred.anchorRound+pred.high, roundWhenMade: pred.anchorRound, generation: pred.generation, eta: { low:pred.low, high:pred.high, conf:pred.confidence } };
+      toSave[label] = { lo:pred.anchorRound+pred.low, hi:pred.anchorRound+pred.high, roundWhenMade:pred.anchorRound, generation:pred.generation, eta:{low:pred.low,high:pred.high,conf:pred.confidence} };
     }
     if (Object.keys(toSave).length > 0) { try { await saveLockedPreds(toSave); } catch(e) { console.error('[engine] saveLockedPreds fail:', e.message); } }
   }
 }
 
-// ============================================================================
-// PROCESS PATTERN
-// ============================================================================
+// ── Process Pattern ───────────────────────────────────────────────────────────
 
 async function processPattern(sortedRounds, lastRoundId, regime) {
   let anyChange = false;
@@ -421,9 +366,10 @@ async function processPattern(sortedRounds, lastRoundId, regime) {
     }
 
     const absHigh = existing.anchorRound + existing.high;
+    const absLow  = existing.anchorRound + existing.low;
+
     if (existing.stale || lastRoundId > absHigh) {
       if (existing.stale) existing.stale = false;
-      const absLow = existing.anchorRound + existing.low;
       const status = getStatus(sortedRounds, existing, lastRoundId);
       if (['hit','miss','early'].includes(status.status)) {
         const outcome = status.status==='hit'?'win':status.status==='early'?'early':'loss';
@@ -444,7 +390,6 @@ async function processPattern(sortedRounds, lastRoundId, regime) {
     const status = getStatus(sortedRounds, existing, lastRoundId);
     if (['hit','miss','early'].includes(status.status)) {
       const outcome = status.status==='hit'?'win':status.status==='early'?'early':'loss';
-      const absLow  = existing.anchorRound + existing.low;
       const record  = { target:target.label, minMult:target.min, outcome, lo:absLow, hi:absHigh, anchorRound:existing.anchorRound, hitRound:status.hitRound||null, generation:existing.generation, source:'pattern', ts:Date.now() };
       const key = patHistKey(record);
       if (!patSavedKeys.has(key)) {
@@ -464,15 +409,13 @@ async function processPattern(sortedRounds, lastRoundId, regime) {
     const toSave = {};
     for (const [label, pred] of Object.entries(lockedPatterns)) {
       if (pred.stale || !Number.isFinite(pred.anchorRound)) continue;
-      toSave[label] = { lo: pred.anchorRound+pred.low, hi: pred.anchorRound+pred.high, roundWhenMade: pred.anchorRound, generation: pred.generation, eta: { low:pred.low, high:pred.high, conf:pred.confidence } };
+      toSave[label] = { lo:pred.anchorRound+pred.low, hi:pred.anchorRound+pred.high, roundWhenMade:pred.anchorRound, generation:pred.generation, eta:{low:pred.low,high:pred.high,conf:pred.confidence} };
     }
     if (Object.keys(toSave).length > 0) { try { await saveLockedPatternPreds(toSave); } catch(e) { console.error('[pattern] saveLockedPatternPreds fail:', e.message); } }
   }
 }
 
-// ============================================================================
-// MAIN
-// ============================================================================
+// ── Main ──────────────────────────────────────────────────────────────────────
 
 async function runPredictionEngine() {
   try {
