@@ -359,6 +359,36 @@ async function getLockedPatternPreds() {
   return out;
 }
 
+async function saveLockedStatPreds(modelId, preds) {
+  for (const [target, data] of Object.entries(preds)) {
+    await pool.query(
+      `INSERT INTO locked_preds_stat (model, target, lo, hi, round_when_made, generation, eta_json, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+       ON CONFLICT (model, target) DO UPDATE
+       SET lo=$3, hi=$4, round_when_made=$5, generation=$6, eta_json=$7, updated_at=NOW()`,
+      [modelId, target, data.lo, data.hi, data.roundWhenMade, data.generation,
+       data.eta ? JSON.stringify(data.eta) : null]
+    );
+  }
+}
+ 
+async function getLockedStatPreds() {
+  const res = await pool.query(`SELECT * FROM locked_preds_stat`);
+  const out = { ens:{}, geo:{}, bay:{}, km:{} };
+  for (const r of res.rows) {
+    if (!out[r.model]) out[r.model] = {};
+    out[r.model][r.target] = {
+      lo:            Number(r.lo),
+      hi:            Number(r.hi),
+      roundWhenMade: Number(r.round_when_made),
+      generation:    r.generation,
+      eta:           r.eta_json ? JSON.parse(r.eta_json) : null,
+      locked:        true,
+    };
+  }
+  return out;
+}
+
 module.exports = {
   initDB, saveRounds, getRounds, getStorageStats, getStats,
   saveLockedPreds, getLockedPreds,
@@ -367,4 +397,5 @@ module.exports = {
   savePrediction, getPredictions, clearPredictions,
   initAccessCodes, createAccessCode, getAccessCode,
   updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,
+  saveLockedStatPreds, getLockedStatPreds,
 };
