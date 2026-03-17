@@ -26,7 +26,11 @@
 //
 // ============================================================================
 
-const { getRounds, savePrediction, getPredictions, saveLockedPreds, getLockedPreds } = require('./db');
+const {
+  getRounds, savePrediction, getPredictions,
+  saveLockedPreds, getLockedPreds,
+  saveLockedPatternPreds, getLockedPatternPreds,
+} = require('./db');
 
 const TARGETS = [
   { label: '5x',    min: 5,    maxWidth: 3  },
@@ -543,6 +547,29 @@ async function initialise() {
     console.log(`[engine] Loaded ${savedKeys.size} engine keys, ${patSavedKeys.size} pattern keys`);
   } catch(e) { console.error('[engine] history load error:', e.message); }
 
+  // Load pattern locked preds from DB
+  try {
+    const dbPatPreds = await getLockedPatternPreds();
+    for (const [label, pred] of Object.entries(dbPatPreds)) {
+      const target = TARGETS.find(t => t.label === label);
+      if (!target) continue;
+      const eta    = pred.eta || {};
+      const anchor = Number(pred.roundWhenMade ?? pred.lo) || 0;
+      lockedPatterns[label] = {
+        low:         eta.low  != null ? eta.low  : Math.max(0, Number(pred.lo) - anchor),
+        high:        eta.high != null ? eta.high : Math.max(0, Number(pred.hi) - anchor),
+        confidence:  eta.conf ?? 50,
+        targetMin:   target.min,
+        anchorRound: anchor,
+        generation:  pred.generation ?? 1,
+        stale:       true,
+      };
+    }
+    console.log(`[engine] Loaded ${Object.keys(lockedPatterns).length} pattern locked preds from DB`);
+  } catch(e) {
+    console.error('[engine] pattern locked preds load error:', e.message);
+  }
+
   // Always reset round count after init so first poll always processes
   lastRoundCount = 0;
 }
@@ -690,6 +717,25 @@ async function processPattern(sortedRounds, lastRoundId, regime) {
         lockedPatterns[target.label] = { ...win, targetMin:target.min, anchorRound:lastRoundId, generation:existing.generation+1 };
         anyChange = true;
       }
+    }
+  }
+
+  // Persist pattern locked preds to DB so they survive server restarts
+  if (anyChange) {
+    const toSavePat = {};
+    for (const [label, pred] of Object.entries(lockedPatterns)) {
+      if (pred.stale) continue;
+      toSavePat[label] = {
+        lo:            pred.anchorRound + pred.low,
+        hi:            pred.anchorRound + pred.high,
+        roundWhenMade: pred.anchorRound,
+        generation:    pred.generation,
+        eta:           { low: pred.low, high: pred.high, conf: pred.confidence },
+      };
+    }
+    if (Object.keys(toSavePat).length > 0) {
+      try { await saveLockedPatternPreds(toSavePat); }
+      catch(e) { console.error('[pattern] saveLockedPatternPreds fail:', e.message); }
     }
   }
 }

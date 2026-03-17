@@ -6,13 +6,13 @@ const {
   initAccessCodes, createAccessCode, getAccessCode,
   updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,
   saveLockedPreds, getLockedPreds,
+  saveLockedPatternPreds, getLockedPatternPreds,
   initWalletStorage, saveWallet, getWallets, deleteWallet,
 } = require('./db');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
-// ── SECURITY: Allowed frontend origins only ───────────────────────────────
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
@@ -28,7 +28,6 @@ app.use(cors({
 
 app.use(express.json({ limit: '50kb' }));
 
-// ── SECURITY: Simple in-memory rate limiter ───────────────────────────────
 const rateLimits = new Map();
 function rateLimit(maxPerMin) {
   return (req, res, next) => {
@@ -39,9 +38,7 @@ function rateLimit(maxPerMin) {
     if (now > win.reset) { win.count = 0; win.reset = now + 60000; }
     win.count++;
     rateLimits.set(key, win);
-    if (win.count > maxPerMin) {
-      return res.status(429).json({ ok: false, error: 'Too many requests' });
-    }
+    if (win.count > maxPerMin) return res.status(429).json({ ok: false, error: 'Too many requests' });
     next();
   };
 }
@@ -50,15 +47,13 @@ setInterval(() => {
   for (const [k, v] of rateLimits) if (now > v.reset) rateLimits.delete(k);
 }, 300000);
 
-// ── SECURITY: Admin middleware ────────────────────────────────────────────
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
-if (!ADMIN_SECRET) console.warn('⚠️  ADMIN_SECRET not set — admin endpoints unprotected!');
+if (!ADMIN_SECRET) console.warn('⚠️  ADMIN_SECRET not set');
 
 function requireAdmin(req, res, next) {
   const secret = req.headers['x-admin-secret'];
-  if (!ADMIN_SECRET || !secret || secret !== ADMIN_SECRET) {
+  if (!ADMIN_SECRET || !secret || secret !== ADMIN_SECRET)
     return res.status(403).json({ ok: false, error: 'Forbidden' });
-  }
   next();
 }
 
@@ -68,6 +63,8 @@ function getIP(req) {
     || req.socket?.remoteAddress
     || 'unknown';
 }
+
+const APP_SECRET = process.env.APP_SECRET || process.env.ADMIN_SECRET;
 
 // ── ROUNDS ────────────────────────────────────────────────────────────────
 app.get('/rounds', rateLimit(60), async (req, res) => {
@@ -87,16 +84,12 @@ app.get('/stats',         rateLimit(30), async (req, res) => { try { res.json({ 
 app.get('/storage-stats', rateLimit(20), async (req, res) => { try { res.json({ ok: true, ...(await getStorageStats()) }); } catch (e) { res.status(500).json({ ok: false, error: e.message }); } });
 app.get('/health', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
-// ── PREDICTIONS ───────────────────────────────────────────────────────────
-// GET /predictions?limit=200&target=5x&source=engine|pattern
-// source=engine  → stat-model history only
-// source=pattern → pattern-model history only
-// source omitted → all records (both engines)
-app.get('/predictions', rateLimit(30), async (req, res) => {
+// ── PREDICTIONS HISTORY ───────────────────────────────────────────────────
+// No login required — all history is public
+app.get('/predictions', rateLimit(60), async (req, res) => {
   try {
-    const limit  = Math.min(parseInt(req.query.limit || '200'), 1000);
+    const limit  = Math.min(parseInt(req.query.limit || '500'), 5000);
     const target = req.query.target || null;
-    // Validate source param — only allow known values
     const rawSource = req.query.source || null;
     const source = (rawSource === 'engine' || rawSource === 'pattern') ? rawSource : null;
     const rows   = await getPredictions({ limit, target, source });
@@ -104,7 +97,6 @@ app.get('/predictions', rateLimit(30), async (req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-// POST /predictions — accepts source: 'engine' | 'pattern' in body
 app.post('/predictions', rateLimit(120), async (req, res) => {
   try {
     const { target, minMult, outcome, lo, hi, hitRound, generation, source } = req.body;
@@ -113,28 +105,26 @@ app.post('/predictions', rateLimit(120), async (req, res) => {
     const validOutcomes = ['win','loss','early','retry-win','retry-loss'];
     if (!validOutcomes.includes(outcome))
       return res.status(400).json({ ok: false, error: 'Invalid outcome' });
-    if (typeof lo !== 'number' || typeof hi !== 'number' || hi < lo)
+    if (typeof lo !== 'number' || typeof hi !== 'number' || hi < lo || !isFinite(lo) || !isFinite(hi))
       return res.status(400).json({ ok: false, error: 'Invalid window' });
-    // Validate source — default to 'engine' if missing or unrecognised
     const validSource = (source === 'pattern') ? 'pattern' : 'engine';
     await savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation, source: validSource });
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-// PROTECTED — require admin to delete all history
 app.delete('/predictions', requireAdmin, async (req, res) => {
   try { await clearPredictions(); res.json({ ok: true }); }
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-// ── LOCKED PREDICTIONS ────────────────────────────────────────────────────
-app.get('/locked', rateLimit(60), async (req, res) => {
+// ── ENGINE LOCKED PREDS ───────────────────────────────────────────────────
+// Public read — anyone opening the site gets the latest engine windows
+app.get('/locked', rateLimit(120), async (req, res) => {
   try { res.json({ ok: true, preds: await getLockedPreds() }); }
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-const APP_SECRET = process.env.APP_SECRET || process.env.ADMIN_SECRET;
 app.post('/locked', rateLimit(120), async (req, res) => {
   const token = req.headers['x-app-secret'];
   if (APP_SECRET && token !== APP_SECRET)
@@ -144,10 +134,32 @@ app.post('/locked', rateLimit(120), async (req, res) => {
     if (!preds || typeof preds !== 'object')
       return res.status(400).json({ ok: false, error: 'preds object required' });
     await saveLockedPreds(preds);
-    console.log(`[locked] saved ${Object.keys(preds).length} windows`);
     res.json({ ok: true });
   } catch (e) {
     console.error('[locked] save failed:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── PATTERN LOCKED PREDS ──────────────────────────────────────────────────
+// Public read — same as engine, anyone gets latest pattern windows
+app.get('/locked-pattern', rateLimit(120), async (req, res) => {
+  try { res.json({ ok: true, preds: await getLockedPatternPreds() }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+app.post('/locked-pattern', rateLimit(120), async (req, res) => {
+  const token = req.headers['x-app-secret'];
+  if (APP_SECRET && token !== APP_SECRET)
+    return res.status(403).json({ ok: false, error: 'Forbidden' });
+  try {
+    const { preds } = req.body;
+    if (!preds || typeof preds !== 'object')
+      return res.status(400).json({ ok: false, error: 'preds object required' });
+    await saveLockedPatternPreds(preds);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[locked-pattern] save failed:', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
@@ -160,8 +172,8 @@ app.post('/access/verify', rateLimit(20), async (req, res) => {
     const row = await getAccessCode(code.trim());
     if (!row) return res.json({ ok: false, reason: 'invalid' });
     if (new Date(row.expires_at) < new Date()) return res.json({ ok: false, reason: 'expired' });
-    const ip      = getIP(req);
-    const sameIP  = row.ip && row.ip === ip;
+    const ip     = getIP(req);
+    const sameIP = row.ip && row.ip === ip;
     if (row.use_count >= row.max_uses && !sameIP)
       return res.json({ ok: false, reason: 'used_up' });
     if (!row.ip || (!sameIP && row.use_count < row.max_uses))
@@ -190,7 +202,7 @@ app.delete('/access/:id', requireAdmin, rateLimit(10), async (req, res) => {
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-// ── WALLET STORAGE ───────────────────────────────────────────────────────────
+// ── WALLET STORAGE ────────────────────────────────────────────────────────
 app.get('/wallets', requireAdmin, rateLimit(20), async (req, res) => {
   try { res.json({ ok: true, wallets: await getWallets() }); }
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }

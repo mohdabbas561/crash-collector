@@ -6,7 +6,6 @@ const pool = new Pool({
 });
 
 async function initDB() {
-  // Step 1 — base tables and safe indexes (no source column yet)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS rounds (
       round_id    BIGINT PRIMARY KEY,
@@ -33,20 +32,16 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_predictions_created_at ON predictions(created_at DESC);
   `);
 
-  // Step 2 — migrate: add source column if it doesn't exist (safe on both
-  //           fresh deployments and existing ones that predate this change)
   await pool.query(`
     ALTER TABLE predictions
       ADD COLUMN IF NOT EXISTS source VARCHAR(20) NOT NULL DEFAULT 'engine';
   `);
 
-  // Step 3 — now that the column is guaranteed to exist, create its index
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_predictions_source ON predictions(source);
   `);
 }
 
-// source: 'engine' (stat-model) | 'pattern' (pattern-model)
 async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation, source = 'engine' }) {
   await pool.query(
     `INSERT INTO predictions (target, min_mult, outcome, window_lo, window_hi, hit_round, generation, source)
@@ -55,8 +50,7 @@ async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, gene
   );
 }
 
-// source filter: 'engine' | 'pattern' | null (all)
-async function getPredictions({ limit = 200, target = null, source = null } = {}) {
+async function getPredictions({ limit = 500, target = null, source = null } = {}) {
   const conditions = [];
   const params     = [];
   let idx = 1;
@@ -189,8 +183,7 @@ async function clearPredictions() {
   await pool.query(`DELETE FROM predictions`);
 }
 
-
-// ── WALLET STORAGE ───────────────────────────────────────────────────────────
+// ── WALLET STORAGE ────────────────────────────────────────────────────────────
 async function initWalletStorage() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS saved_wallets (
@@ -225,16 +218,30 @@ async function deleteWallet(id) {
 
 // ── ACCESS CODES ──────────────────────────────────────────────────────────────
 async function initAccessCodes() {
+  // ── Engine locked preds ───────────────────────────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS locked_preds (
-      target        VARCHAR(10) PRIMARY KEY,
-      lo            BIGINT      NOT NULL,
-      hi            BIGINT      NOT NULL,
-      round_when_made BIGINT    NOT NULL,
-      generation    INT         NOT NULL DEFAULT 1,
-      miss_reasons  TEXT,
-      eta_json      TEXT,
-      updated_at    TIMESTAMPTZ DEFAULT NOW()
+      target          VARCHAR(10) PRIMARY KEY,
+      lo              BIGINT      NOT NULL,
+      hi              BIGINT      NOT NULL,
+      round_when_made BIGINT      NOT NULL,
+      generation      INT         NOT NULL DEFAULT 1,
+      miss_reasons    TEXT,
+      eta_json        TEXT,
+      updated_at      TIMESTAMPTZ DEFAULT NOW()
+    );
+  `).catch(() => {});
+
+  // ── Pattern locked preds (new — mirrors locked_preds for pattern engine) ──
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS locked_preds_pattern (
+      target          VARCHAR(10) PRIMARY KEY,
+      lo              BIGINT      NOT NULL,
+      hi              BIGINT      NOT NULL,
+      round_when_made BIGINT      NOT NULL,
+      generation      INT         NOT NULL DEFAULT 1,
+      eta_json        TEXT,
+      updated_at      TIMESTAMPTZ DEFAULT NOW()
     );
   `).catch(() => {});
 
@@ -290,6 +297,7 @@ async function deleteAccessCode(id) {
   await pool.query(`DELETE FROM access_codes WHERE id = $1`, [id]);
 }
 
+// ── Engine locked preds ───────────────────────────────────────────────────────
 async function saveLockedPreds(preds) {
   for (const [target, data] of Object.entries(preds)) {
     await pool.query(
@@ -309,13 +317,43 @@ async function getLockedPreds() {
   const out = {};
   for (const r of res.rows) {
     out[r.target] = {
-      lo:             Number(r.lo),
-      hi:             Number(r.hi),
-      roundWhenMade:  Number(r.round_when_made),
-      generation:     r.generation,
-      missReasons:    r.miss_reasons ? JSON.parse(r.miss_reasons) : null,
-      eta:            r.eta_json ? JSON.parse(r.eta_json) : null,
-      locked:         true,
+      lo:            Number(r.lo),
+      hi:            Number(r.hi),
+      roundWhenMade: Number(r.round_when_made),
+      generation:    r.generation,
+      missReasons:   r.miss_reasons ? JSON.parse(r.miss_reasons) : null,
+      eta:           r.eta_json ? JSON.parse(r.eta_json) : null,
+      locked:        true,
+    };
+  }
+  return out;
+}
+
+// ── Pattern locked preds ──────────────────────────────────────────────────────
+async function saveLockedPatternPreds(preds) {
+  for (const [target, data] of Object.entries(preds)) {
+    await pool.query(
+      `INSERT INTO locked_preds_pattern (target, lo, hi, round_when_made, generation, eta_json, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,NOW())
+       ON CONFLICT (target) DO UPDATE
+       SET lo=$2, hi=$3, round_when_made=$4, generation=$5, eta_json=$6, updated_at=NOW()`,
+      [target, data.lo, data.hi, data.roundWhenMade, data.generation,
+       data.eta ? JSON.stringify(data.eta) : null]
+    );
+  }
+}
+
+async function getLockedPatternPreds() {
+  const res = await pool.query(`SELECT * FROM locked_preds_pattern`);
+  const out = {};
+  for (const r of res.rows) {
+    out[r.target] = {
+      lo:            Number(r.lo),
+      hi:            Number(r.hi),
+      roundWhenMade: Number(r.round_when_made),
+      generation:    r.generation,
+      eta:           r.eta_json ? JSON.parse(r.eta_json) : null,
+      locked:        true,
     };
   }
   return out;
@@ -324,6 +362,7 @@ async function getLockedPreds() {
 module.exports = {
   initDB, saveRounds, getRounds, getStorageStats, getStats,
   saveLockedPreds, getLockedPreds,
+  saveLockedPatternPreds, getLockedPatternPreds,
   initWalletStorage, saveWallet, getWallets, deleteWallet,
   savePrediction, getPredictions, clearPredictions,
   initAccessCodes, createAccessCode, getAccessCode,
