@@ -1,5 +1,7 @@
+// collector.js
 const fetch = require('node-fetch');
 const { saveRounds } = require('./db');
+const { runPredictionEngine } = require('./predictionEngine');
 
 const API_URL     = 'https://api.dealer.degencoinflip.com/v1/game/2/room/1/rounds?limit=100';
 const POLL_MS     = 15000;
@@ -35,9 +37,16 @@ async function poll() {
     if (!newRounds.length) return;
     const saved = await saveRounds(newRounds);
     const maxId = Math.max(...newRounds.map(r => r.roundId));
-    if (saved > 0) console.log(`[${new Date().toISOString()}] Saved ${saved} new rounds. Latest: #${maxId}`);
+    if (saved > 0) {
+      console.log(`[${new Date().toISOString()}] Saved ${saved} new rounds. Latest: #${maxId}`);
+    }
     lastSeenRoundId   = maxId;
     consecutiveErrors = 0;
+
+    // ── Run prediction engine after every successful poll ─────────────────
+    // This runs even when the frontend is offline, keeping DB history current.
+    await runPredictionEngine();
+
   } catch (err) {
     consecutiveErrors++;
     console.error(`[${new Date().toISOString()}] Poll error (${consecutiveErrors}): ${err.message}`);
@@ -56,6 +65,10 @@ async function startCollector() {
   } catch (e) {
     console.error('Collector: initial fetch failed:', e.message);
   }
+
+  // Run engine once immediately after bootstrap
+  await runPredictionEngine();
+
   const tick = async () => {
     await poll();
     const delay = consecutiveErrors >= MAX_RETRIES ? 60000 : POLL_MS;
