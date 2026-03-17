@@ -511,13 +511,14 @@ async function initialise() {
     for (const [label, pred] of Object.entries(dbPreds)) {
       const target = TARGETS.find(t => t.label === label);
       if (!target) continue;
-      const eta = pred.eta || {};
+      const eta    = pred.eta || {};
+      const anchor = Number(pred.roundWhenMade ?? pred.lo) || 0;
       lockedPreds[label] = {
-        low:         eta.low  ?? 0,
-        high:        eta.high ?? (target.maxWidth - 1),
+        low:         eta.low  != null ? eta.low  : Math.max(0, Number(pred.lo) - anchor),
+        high:        eta.high != null ? eta.high : Math.max(0, Number(pred.hi) - anchor),
         confidence:  eta.conf ?? 50,
         targetMin:   target.min,
-        anchorRound: pred.roundWhenMade ?? pred.lo,
+        anchorRound: anchor,
         generation:  pred.generation ?? 1,
         stale:       true,
       };
@@ -541,6 +542,9 @@ async function initialise() {
     }
     console.log(`[engine] Loaded ${savedKeys.size} engine keys, ${patSavedKeys.size} pattern keys`);
   } catch(e) { console.error('[engine] history load error:', e.message); }
+
+  // Always reset round count after init so first poll always processes
+  lastRoundCount = 0;
 }
 
 // ============================================================================
@@ -593,10 +597,15 @@ async function processEngine(sortedRounds, lastRoundId, regime) {
       if (!savedKeys.has(key)) {
         savedKeys.add(key);
         savedKeys.add(`${record.target}-${record.anchorRound}-${record.outcome}-${record.hitRound??'x'}`);
-        try {
-          await savePrediction(record);
-          console.log(`[engine] ${target.label} ${outcome.toUpperCase()} #${record.lo}–#${record.hi}${record.hitRound?` @#${record.hitRound}`:''} regime=${regime.regime}`);
-        } catch(e) { console.error(`[engine] save fail ${target.label}:`, e.message); }
+        // Guard: only save valid windows (anchorRound undefined = NaN lo/hi)
+        if (Number.isFinite(record.lo) && Number.isFinite(record.hi) && record.lo <= record.hi) {
+          try {
+            await savePrediction(record);
+            console.log(`[engine] ${target.label} ${outcome.toUpperCase()} #${record.lo}–#${record.hi}${record.hitRound?` @#${record.hitRound}`:''} regime=${regime.regime}`);
+          } catch(e) { console.error(`[engine] save fail ${target.label}:`, e.message); }
+        } else {
+          console.warn(`[engine] skipped save ${target.label} — invalid lo/hi: ${record.lo}/${record.hi} (anchorRound=${record.anchorRound})`);
+        }
       }
       const pred = buildPrediction(sortedRounds, target.min, target.maxWidth, regime);
       if (pred) {
@@ -668,10 +677,14 @@ async function processPattern(sortedRounds, lastRoundId, regime) {
       if (!patSavedKeys.has(key)) {
         patSavedKeys.add(key);
         patSavedKeys.add(`pat-${record.target}-${record.anchorRound}-${record.outcome}-${record.hitRound??'x'}`);
-        try {
-          await savePrediction(record);
-          console.log(`[pattern] ${target.label} ${outcome.toUpperCase()} #${record.lo}–#${record.hi} regime=${regime.regime}`);
-        } catch(e) { console.error(`[pattern] save fail ${target.label}:`, e.message); }
+        if (Number.isFinite(record.lo) && Number.isFinite(record.hi) && record.lo <= record.hi) {
+          try {
+            await savePrediction(record);
+            console.log(`[pattern] ${target.label} ${outcome.toUpperCase()} #${record.lo}–#${record.hi} regime=${regime.regime}`);
+          } catch(e) { console.error(`[pattern] save fail ${target.label}:`, e.message); }
+        } else {
+          console.warn(`[pattern] skipped save ${target.label} — invalid lo/hi: ${record.lo}/${record.hi}`);
+        }
       }
       if (win) {
         lockedPatterns[target.label] = { ...win, targetMin:target.min, anchorRound:lastRoundId, generation:existing.generation+1 };
