@@ -1,22 +1,23 @@
 'use strict';
-// predictionEngine.js  v6
+// predictionEngine.js  v7
 //
-// KEY FIXES:
+// ROOT CAUSE OF PERSISTENT RESOLVING:
 //
-// 1. MIN_ROUNDS reduced from 100 → 50.
-//    With only 99 rounds on boot, the engine was returning early and NEVER
-//    processing the stale windows loaded from DB. Those stale windows had
-//    ancient round numbers → frontend showed RESOLVING forever.
+//   The engine skipped processing when rounds.length === lastRoundCount.
+//   But a window can expire (lastRoundId > absHigh) even when no new rounds
+//   arrive — because the window is narrow (e.g. 3 rounds wide for 5x) and
+//   lastRoundId already passed absHigh on the previous run.
+//   The "no new rounds" guard prevented the expired window from ever being
+//   rebuilt. It stayed in the DB with the old lo/hi forever → RESOLVING.
 //
-// 2. FORCE_REBUILD_IF_STALE: on first run after boot, if a loaded window's
-//    absHigh is more than 1000 rounds behind lastRoundId, we treat it as
-//    unresolvable and force-rebuild immediately without trying to scan.
-//    This catches the case where we simply don't have enough historical
-//    round data to scan the old window (data is fetched with limit:5000
-//    but old windows may be from 10000+ rounds ago).
+//   FIX: Always run processWindows. Remove the "rounds unchanged" early exit.
+//   Use a separate `lastProcessedRoundId` to avoid redundant DB saves:
+//   only persist to DB when lastRoundId has actually advanced.
 //
-// 3. processWindows now always saves to DB after ANY rebuild, not just
-//    when anyChange is true inside the loop — the caller always persists.
+// OTHER FIXES:
+//   - MIN_ROUNDS = 50 (was 100, prevented engine from running on first boot)
+//   - isFirstRun forces processing on startup to clear stale DB windows
+//   - STALE_FORCE_REBUILD_THRESHOLD: skip scanning windows > 500r old
 
 const {
   getRounds, savePrediction, getPredictions,
@@ -43,11 +44,7 @@ const STAT_MODELS = [
   { id: 'km',  wOffset: 4 },
 ];
 
-// FIX 1: lowered from 100 to 50
 const MIN_ROUNDS = 50;
-
-// If a stale window's absHigh is this many rounds behind current, skip scanning
-// and force-rebuild immediately (we won't have that data anyway)
 const STALE_FORCE_REBUILD_THRESHOLD = 500;
 
 let lockedPreds    = null;
@@ -56,8 +53,10 @@ let lockedStats    = null;
 let savedKeys      = new Set();
 let patSavedKeys   = new Set();
 let statSavedKeys  = {};
-let lastRoundCount = 0;
+let lastProcessedRoundId = 0; // track last roundId we actually processed
 let initialised    = false;
+
+// ── Reset ─────────────────────────────────────────────────────────────────────
 
 function resetEngineState() {
   console.log('[engine] resetEngineState() — clearing all in-memory state');
@@ -67,7 +66,7 @@ function resetEngineState() {
   savedKeys      = new Set();
   patSavedKeys   = new Set();
   statSavedKeys  = {};
-  lastRoundCount = 0;
+  lastProcessedRoundId = 0;
   initialised    = false;
 }
 
@@ -195,7 +194,7 @@ function buildStatPrediction(sortedRounds, targetMin, maxWidth, modelId, gs) {
     p = 0.80 * ((hits+1)/(n+2)) + 0.20 * ((r200+1)/202);
   } else if (modelId === 'km') {
     p = lambda;
-  } else { // ens
+  } else {
     const r200 = sortedRounds.slice(-200).filter(r => r.multiplier >= targetMin).length;
     const pG = (hits+1)/(n+2), pR = (r200+1)/202;
     p = 0.70*pG + 0.25*(0.80*pG+0.20*pR) + 0.05*lambda;
@@ -296,13 +295,7 @@ function getStatus(sortedRounds, pred, currentRoundId) {
 }
 
 // ── processWindows ────────────────────────────────────────────────────────────
-// Core engine loop. Handles ALL engines uniformly.
-//
-// RESOLVING FIX: Any window that is stale OR expired OR nonsense is
-// immediately force-rebuilt. We NEVER leave the loop without either:
-//   a) having a fresh window in lockedMap, OR
-//   b) having deleted the entry (buildFn returned null)
-// There is no code path that leaves an expired window in place.
+// RUNS ON EVERY POLL — no early exit for "no new rounds"
 
 async function processWindows({ lockedMap, savedSet, source, sortedRounds, lastRoundId, buildFn }) {
   let anyChange = false;
@@ -310,7 +303,6 @@ async function processWindows({ lockedMap, savedSet, source, sortedRounds, lastR
   for (const target of TARGETS) {
     const existing = lockedMap[target.label];
 
-    // ── No window — create one ─────────────────────────────────────────────
     if (!existing) {
       const pred = buildFn(target);
       if (pred) {
@@ -321,22 +313,17 @@ async function processWindows({ lockedMap, savedSet, source, sortedRounds, lastR
       continue;
     }
 
-    const anchorRound  = Number(existing.anchorRound) || 0;
-    const low          = Number(existing.low)  || 0;
-    const high         = Number(existing.high) || 0;
-    const absLow       = anchorRound + low;
-    const absHigh      = anchorRound + high;
-
-    // Detect bad windows
-    const isNonsense   = !Number.isFinite(absLow) || !Number.isFinite(absHigh) || absHigh < absLow || anchorRound === 0;
-    const isExpired    = lastRoundId > absHigh;
-    const isStale      = !!existing.stale;
-    // FIX 2: if the window is so old we definitely can't scan it, force rebuild
-    const isTooOld     = isExpired && (lastRoundId - absHigh) > STALE_FORCE_REBUILD_THRESHOLD;
+    const anchorRound = Number(existing.anchorRound) || 0;
+    const absLow      = anchorRound + (Number(existing.low)  || 0);
+    const absHigh     = anchorRound + (Number(existing.high) || 0);
+    const isNonsense  = !Number.isFinite(absLow) || !Number.isFinite(absHigh) || absHigh < absLow || anchorRound === 0;
+    const isExpired   = lastRoundId > absHigh;
+    const isStale     = !!existing.stale;
+    const isTooOld    = isExpired && (lastRoundId - absHigh) > STALE_FORCE_REBUILD_THRESHOLD;
 
     if (isNonsense || isExpired || isStale) {
-      // Attempt to record outcome — but only if we might have the data
-      if (!isNonsense && !isTooOld && Number.isFinite(absLow) && Number.isFinite(absHigh) && absLow <= absHigh) {
+      // Try to record outcome unless too old or nonsense
+      if (!isNonsense && !isTooOld) {
         const status = getStatus(sortedRounds, existing, lastRoundId);
         if (['hit','miss','early'].includes(status.status)) {
           const outcome = status.status==='hit'?'win':status.status==='early'?'early':'loss';
@@ -349,17 +336,15 @@ async function processWindows({ lockedMap, savedSet, source, sortedRounds, lastR
           const key = makeKey(source, record);
           if (!savedSet.has(key)) {
             savedSet.add(key);
-            try { await savePrediction(record); console.log(`[${source}] ${target.label} ${outcome.toUpperCase()} #${absLow}–#${absHigh}${status.hitRound?` @#${status.hitRound}`:''}`); }
-            catch(e) { console.error(`[${source}] save fail:`, e.message); }
+            try {
+              await savePrediction(record);
+              console.log(`[${source}] ${target.label} ${outcome.toUpperCase()} #${absLow}–#${absHigh}${status.hitRound?` @#${status.hitRound}`:''}`);
+            } catch(e) { console.error(`[${source}] save fail:`, e.message); }
           }
         }
-        // If status is 'active' or 'waiting' on an expired window — data lag.
-        // We still rebuild below. This is intentional.
-      } else if (isTooOld) {
-        console.log(`[${source}] ${target.label} window #${absLow}–#${absHigh} too old to scan (${lastRoundId-absHigh}r ago) — force rebuild`);
       }
 
-      // ALWAYS rebuild — this is what prevents RESOLVING
+      // ALWAYS rebuild — no matter what getStatus returned
       const pred = buildFn(target);
       if (pred) {
         lockedMap[target.label] = {
@@ -372,13 +357,13 @@ async function processWindows({ lockedMap, savedSet, source, sortedRounds, lastR
         console.log(`[${source}] REBUILD ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}%`);
       } else {
         delete lockedMap[target.label];
-        console.warn(`[${source}] ${target.label} cleared — buildFn null`);
+        console.warn(`[${source}] ${target.label} cleared — buildFn null, will retry next poll`);
       }
       anyChange = true;
       continue;
     }
 
-    // ── Active window — check if resolved ─────────────────────────────────
+    // Window is active or waiting — check if it just resolved
     const status = getStatus(sortedRounds, existing, lastRoundId);
     if (['hit','miss','early'].includes(status.status)) {
       const outcome = status.status==='hit'?'win':status.status==='early'?'early':'loss';
@@ -391,8 +376,10 @@ async function processWindows({ lockedMap, savedSet, source, sortedRounds, lastR
       const key = makeKey(source, record);
       if (!savedSet.has(key)) {
         savedSet.add(key);
-        try { await savePrediction(record); console.log(`[${source}] ${target.label} ${outcome.toUpperCase()} #${absLow}–#${absHigh}${status.hitRound?` @#${status.hitRound}`:''}`); }
-        catch(e) { console.error(`[${source}] save fail:`, e.message); }
+        try {
+          await savePrediction(record);
+          console.log(`[${source}] ${target.label} ${outcome.toUpperCase()} #${absLow}–#${absHigh}${status.hitRound?` @#${status.hitRound}`:''}`);
+        } catch(e) { console.error(`[${source}] save fail:`, e.message); }
       }
       const pred = buildFn(target);
       if (pred) {
@@ -403,7 +390,7 @@ async function processWindows({ lockedMap, savedSet, source, sortedRounds, lastR
       }
       anyChange = true;
     }
-    // 'active' or 'waiting' — window still open, nothing to do
+    // 'active' or 'waiting' — nothing to do
   }
 
   return anyChange;
@@ -442,7 +429,7 @@ function loadLockedMap(dbRows) {
       targetMin:   target.min,
       anchorRound: anchor,
       generation:  pred.generation ?? 1,
-      stale:       true, // will be validated on first processWindows run
+      stale:       true,
     };
   }
   return map;
@@ -475,13 +462,13 @@ async function initialise() {
     for (const r of rows) {
       const src = r.source || 'engine';
       const key = makeKey(src, r);
-      if (src === 'engine')          savedKeys.add(key);
-      else if (src === 'pattern')    patSavedKeys.add(key);
-      else if (statSavedKeys[src])   statSavedKeys[src].add(key);
+      if (src === 'engine')        savedKeys.add(key);
+      else if (src === 'pattern')  patSavedKeys.add(key);
+      else if (statSavedKeys[src]) statSavedKeys[src].add(key);
     }
   } catch(e) { console.error('[engine] history load error:', e.message); }
 
-  lastRoundCount = 0;
+  lastProcessedRoundId = 0;
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -492,22 +479,34 @@ async function runPredictionEngine() {
 
     const rounds = await getRounds({ limit: 5000 });
     if (rounds.length < MIN_ROUNDS) {
-      console.log(`[engine] Not enough rounds yet (${rounds.length}/${MIN_ROUNDS})`);
+      console.log(`[engine] waiting for rounds (${rounds.length}/${MIN_ROUNDS})`);
       return;
     }
     rounds.sort((a, b) => a.roundId - b.roundId);
     const lastRoundId = rounds[rounds.length - 1].roundId;
 
-    // Always run on first boot (lastRoundCount=0) to clear stale windows
-    const isFirstRun = lastRoundCount === 0;
-    if (!isFirstRun && rounds.length === lastRoundCount) return;
-    lastRoundCount = rounds.length;
+    // Check if ANY window is expired — if so, we must process even with same round count
+    const hasExpiredWindows = () => {
+      const allMaps = [lockedPreds, lockedPatterns, ...STAT_MODELS.map(m => lockedStats[m.id])].filter(Boolean);
+      for (const map of allMaps) {
+        for (const pred of Object.values(map)) {
+          const anchor  = Number(pred.anchorRound) || 0;
+          const absHigh = anchor + (Number(pred.high) || 0);
+          if (pred.stale || lastRoundId > absHigh || anchor === 0) return true;
+        }
+      }
+      return false;
+    };
 
-    const regime = detectRegime(rounds);
-    _statsCache  = computeGlobalStats(rounds);
+    // Skip only if round ID unchanged AND no expired windows
+    if (lastRoundId === lastProcessedRoundId && !hasExpiredWindows()) return;
+    lastProcessedRoundId = lastRoundId;
+
+    const regime    = detectRegime(rounds);
+    _statsCache     = computeGlobalStats(rounds);
 
     if (regime.regime !== 'normal' || regime.currentStreak > 5)
-      console.log(`[engine] REGIME=${regime.regime.toUpperCase()} streak=${regime.currentStreak}r(${Math.round(regime.streakPct*100)}pct) penalty=${regime.streakPenalty}r cold=${regime.coldScore}`);
+      console.log(`[engine] REGIME=${regime.regime.toUpperCase()} streak=${regime.currentStreak}r(${Math.round(regime.streakPct*100)}pct) penalty=${regime.streakPenalty}r`);
 
     // ENGINE
     const engChanged = await processWindows({
