@@ -7,7 +7,7 @@ async function main() {
   await initDB();
   await initAccessCodes();
   console.log('✅ Database ready');
-  startCollector(); // collector calls runPredictionEngine after every poll
+  startCollector();
   console.log('✅ Collector started');
   startAPI();
   console.log('✅ API started');

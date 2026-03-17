@@ -41,12 +41,11 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_predictions_source ON predictions(source);
   `);
 
-  // Unique constraint: prevents duplicate history rows on server restart
   await pool.query(`
     ALTER TABLE predictions
       ADD CONSTRAINT IF NOT EXISTS uq_predictions_source_target_window
       UNIQUE (source, target, window_lo, window_hi);
-  `).catch(() => {}); // ignore if already exists
+  `).catch(() => {});
 }
 
 async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation, source = 'engine' }) {
@@ -105,7 +104,7 @@ async function saveRounds(rounds) {
   return res.rowCount;
 }
 
-async function getRounds({ limit = 1000, offset = 0, from = null, to = null } = {}) {
+async function getRounds({ limit = 1000, offset = 0, from = null, to = null, order = 'ASC' } = {}) {
   const conditions = [];
   const params = [];
   let idx = 1;
@@ -113,18 +112,21 @@ async function getRounds({ limit = 1000, offset = 0, from = null, to = null } = 
   if (to)   { conditions.push(`created_at <= $${idx++}`); params.push(new Date(to)); }
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   params.push(limit, offset);
+  const sortDir = order === 'DESC' ? 'DESC' : 'ASC';
   const res = await pool.query(
     `SELECT round_id, multiplier, timestamp, created_at
      FROM rounds ${where}
-     ORDER BY round_id ASC
+     ORDER BY round_id ${sortDir}
      LIMIT $${idx++} OFFSET $${idx++}`,
     params
   );
-  return res.rows.map(row => ({
+  const rows = res.rows.map(row => ({
     roundId   : Number(row.round_id),
     multiplier: parseFloat(row.multiplier),
     timestamp : row.timestamp ? Number(row.timestamp) : Number(new Date(row.created_at)),
   }));
+  if (order === 'DESC') rows.sort((a, b) => a.roundId - b.roundId);
+  return rows;
 }
 
 async function getStorageStats() {
