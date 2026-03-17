@@ -570,9 +570,14 @@ async function processEngine(sortedRounds, lastRoundId, regime) {
       const pred = buildPrediction(sortedRounds, target.min, target.maxWidth, regime);
       if (pred) {
         lockedPreds[target.label] = { ...pred, targetMin:target.min, anchorRound:lastRoundId, generation:existing.generation+1 };
-        anyChange = true;
         console.log(`[engine] NEXT ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}% regime=${regime.regime}`);
+      } else {
+        // buildPrediction returned null (insufficient data) — clear the stale pred
+        // so we don't loop forever on RESOLVING. Will retry next poll.
+        delete lockedPreds[target.label];
+        console.warn(`[engine] ${target.label} cleared after ${outcome} — buildPrediction returned null, will retry`);
       }
+      anyChange = true;
     }
   }
 
@@ -648,8 +653,13 @@ async function processPattern(sortedRounds, lastRoundId, regime) {
       }
       if (win) {
         lockedPatterns[target.label] = { ...win, targetMin:target.min, anchorRound:lastRoundId, generation:existing.generation+1 };
-        anyChange = true;
+        console.log(`[pattern] NEXT ${target.label}: +${win.low}–+${win.high} conf=${win.confidence}%`);
+      } else {
+        // buildPatternPrediction returned null — clear stale pred to prevent infinite RESOLVING
+        delete lockedPatterns[target.label];
+        console.warn(`[pattern] ${target.label} cleared after ${outcome} — buildPatternPrediction returned null, will retry`);
       }
+      anyChange = true;
     }
   }
 
