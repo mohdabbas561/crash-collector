@@ -40,12 +40,20 @@ async function initDB() {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_predictions_source ON predictions(source);
   `);
+
+  // Unique constraint: prevents duplicate history rows on server restart
+  await pool.query(`
+    ALTER TABLE predictions
+      ADD CONSTRAINT IF NOT EXISTS uq_predictions_source_target_window
+      UNIQUE (source, target, window_lo, window_hi);
+  `).catch(() => {}); // ignore if already exists
 }
 
 async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation, source = 'engine' }) {
   await pool.query(
     `INSERT INTO predictions (target, min_mult, outcome, window_lo, window_hi, hit_round, generation, source)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     ON CONFLICT (source, target, window_lo, window_hi) DO NOTHING`,
     [target, minMult, outcome, lo, hi, hitRound ?? null, generation, source]
   );
 }
@@ -97,7 +105,7 @@ async function saveRounds(rounds) {
   return res.rowCount;
 }
 
-async function getRounds({ limit = 1000, offset = 0, from = null, to = null, order = 'ASC' } = {}) {
+async function getRounds({ limit = 1000, offset = 0, from = null, to = null } = {}) {
   const conditions = [];
   const params = [];
   let idx = 1;
@@ -105,23 +113,18 @@ async function getRounds({ limit = 1000, offset = 0, from = null, to = null, ord
   if (to)   { conditions.push(`created_at <= $${idx++}`); params.push(new Date(to)); }
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   params.push(limit, offset);
-  // When order='DESC' we fetch newest N rows then re-sort ASC for the caller
-  const sortDir = order === 'DESC' ? 'DESC' : 'ASC';
   const res = await pool.query(
     `SELECT round_id, multiplier, timestamp, created_at
      FROM rounds ${where}
-     ORDER BY round_id ${sortDir}
+     ORDER BY round_id ASC
      LIMIT $${idx++} OFFSET $${idx++}`,
     params
   );
-  const rows = res.rows.map(row => ({
+  return res.rows.map(row => ({
     roundId   : Number(row.round_id),
     multiplier: parseFloat(row.multiplier),
     timestamp : row.timestamp ? Number(row.timestamp) : Number(new Date(row.created_at)),
   }));
-  // Always return in ASC order regardless of fetch direction
-  if (order === 'DESC') rows.sort((a, b) => a.roundId - b.roundId);
-  return rows;
 }
 
 async function getStorageStats() {

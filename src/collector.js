@@ -4,7 +4,7 @@ const { saveRounds } = require('./db');
 const { runPredictionEngine } = require('./predictionEngine');
 
 const API_URL     = 'https://api.dealer.degencoinflip.com/v1/game/2/room/1/rounds?limit=100';
-const POLL_MS     = 15000;
+const POLL_MS     = 5000;  // 5s — fast enough to catch resolves quickly
 const MAX_RETRIES = 5;
 
 let lastSeenRoundId   = 0;
