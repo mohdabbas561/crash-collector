@@ -52,113 +52,6 @@ let patSavedKeys   = new Set();
 let lastRoundCount = 0;
 let initialised    = false;
 
-// ============================================================================
-// REGIME DETECTOR  — runs once per tick, gates everything else
-// ============================================================================
-
-function detectRegime(rounds) {
-  const n = rounds.length;
-  if (n < 50) return { regime: 'normal', streakPenalty: 0, streakPct: 0, coldScore: 0, currentStreak: 0 };
-
-  // ── 1. White streak analysis ──────────────────────────────────────────
-  const STREAK_THRESH = 5;
-  const streaks = [];
-  let cur = 0;
-  for (let i = 0; i < n; i++) {
-    if (rounds[i].multiplier < STREAK_THRESH) {
-      cur++;
-    } else {
-      if (cur > 0) streaks.push(cur);
-      cur = 0;
-    }
-  }
-  const currentStreak = cur;
-
-  let streakPct = 0, streakMedian = 0;
-  if (streaks.length >= 3) {
-    streaks.sort((a, b) => a - b);
-    const below  = streaks.filter(s => s <= currentStreak).length;
-    streakPct    = below / streaks.length;
-    const mid    = Math.floor(streaks.length / 2);
-    streakMedian = streaks.length % 2 === 1 ? streaks[mid] : (streaks[mid-1]+streaks[mid])/2;
-  }
-
-  // Streak penalty: extra rounds added to every window
-  let streakPenalty = 0;
-  if      (streakPct >= 0.95) streakPenalty = Math.round(currentStreak * 1.2);
-  else if (streakPct >= 0.85) streakPenalty = Math.round(currentStreak * 0.8);
-  else if (streakPct >= 0.70) streakPenalty = Math.round(currentStreak * 0.4);
-  else if (streakPct >= 0.60) streakPenalty = Math.round(currentStreak * 0.15);
-
-  // ── 2. Recent multiplier distribution (last 100 rounds) ──────────────
-  const W = Math.min(100, n);
-  const recent = rounds.slice(n - W);
-  let lowCount = 0, highCount = 0, recentLogSum = 0;
-  for (let i = 0; i < recent.length; i++) {
-    const m = recent[i].multiplier;
-    recentLogSum += Math.log(Math.max(1.01, m));
-    if (m < 2) lowCount++;
-    if (m >= 20) highCount++;
-  }
-  const recentMeanLog = recentLogSum / W;
-
-  let globalLogSum = 0;
-  for (let i = 0; i < n; i++) globalLogSum += Math.log(Math.max(1.01, rounds[i].multiplier));
-  const globalMeanLog = globalLogSum / n;
-  const logRatio      = globalMeanLog > 0 ? recentMeanLog / globalMeanLog : 1;
-
-  // ── 3. Cold score ─────────────────────────────────────────────────────
-  let coldScore = 0;
-  if (logRatio < 0.75)      coldScore += 3;
-  else if (logRatio < 0.88) coldScore += 1;
-  if (streakPct >= 0.85)    coldScore += 3;
-  else if (streakPct >= 0.70) coldScore += 1;
-  if (currentStreak > 10)   coldScore += 2;
-  if (lowCount / W > 0.60)  coldScore += 2;
-
-  // ── 4. Hot score ──────────────────────────────────────────────────────
-  let hotScore = 0;
-  if (logRatio > 1.20)         hotScore += 3;
-  else if (logRatio > 1.10)    hotScore += 1;
-  if (highCount / W > 0.30)    hotScore += 2;
-
-  // ── 5. Variance (volatile) ────────────────────────────────────────────
-  let rVarSum = 0;
-  for (let i = 0; i < recent.length; i++)
-    rVarSum += (Math.log(Math.max(1.01, recent[i].multiplier)) - recentMeanLog) ** 2;
-  const recentVar = rVarSum / W;
-
-  let gVarSum = 0;
-  for (let i = 0; i < n; i++)
-    gVarSum += (Math.log(Math.max(1.01, rounds[i].multiplier)) - globalMeanLog) ** 2;
-  const globalVar  = gVarSum / n;
-  const varRatio   = globalVar > 0 ? recentVar / globalVar : 1;
-  const isVolatile = varRatio > 1.5;
-
-  // ── 6. Classify ───────────────────────────────────────────────────────
-  let regime;
-  if      (coldScore >= 4)  regime = 'cold';
-  else if (hotScore  >= 3)  regime = 'hot';
-  else if (isVolatile)      regime = 'volatile';
-  else                      regime = 'normal';
-
-  return {
-    regime,
-    coldScore,
-    hotScore,
-    streakPct:      +streakPct.toFixed(3),
-    streakPenalty,
-    currentStreak,
-    streakMedian,
-    logRatio:       +logRatio.toFixed(3),
-    varRatio:       +varRatio.toFixed(3),
-    isVolatile,
-  };
-}
-
-// ============================================================================
-// STAT ENGINE  v9  — regime-aware
-// ============================================================================
 
 function bayesLambda(hits, n) {
   return (hits + 1) / (n + 2);
@@ -261,8 +154,6 @@ function computeGlobalStats(rounds) {
   return { regimeAdj, driftAdj, coldTailAdj };
 }
 
-// ── Regime detector ───────────────────────────────────────────────────────
-// Runs first. Output gates timing and confidence of both engines.
 function detectRegime(rounds) {
   const n = rounds.length;
   if (n < 50) return { regime:'normal', streakPenalty:0, streakPct:0, coldScore:0, currentStreak:0, hotScore:0 };
@@ -404,73 +295,6 @@ function getStatus(sortedRounds, pred, currentRoundId) {
   return { status:'waiting' };
 }
 
-
-// ── Regime detector ───────────────────────────────────────────────────────
-// Runs first. Output gates timing and confidence of both engines.
-function detectRegime(rounds) {
-  const n = rounds.length;
-  if (n < 50) return { regime:'normal', streakPenalty:0, streakPct:0, coldScore:0, currentStreak:0, hotScore:0 };
-
-  // White streak
-  const THRESH = 5;
-  const streaks = [];
-  let cur = 0;
-  for (let i = 0; i < n; i++) {
-    if (rounds[i].multiplier < THRESH) { cur++; }
-    else { if (cur > 0) streaks.push(cur); cur = 0; }
-  }
-  const currentStreak = cur;
-  let streakPct = 0;
-  if (streaks.length >= 5) {
-    streaks.sort((a, b) => a - b);
-    streakPct = streaks.filter(s => s <= currentStreak).length / streaks.length;
-  }
-
-  // Streak penalty — only kicks in above 70th pct
-  let streakPenalty = 0;
-  if      (streakPct >= 0.95) streakPenalty = Math.round(currentStreak * 1.0);
-  else if (streakPct >= 0.85) streakPenalty = Math.round(currentStreak * 0.6);
-  else if (streakPct >= 0.70) streakPenalty = Math.round(currentStreak * 0.3);
-
-  // Recent 100r multiplier ratio vs all-time
-  const W = Math.min(100, n);
-  const recent = rounds.slice(n - W);
-  let rLogSum = 0, gLogSum = 0, lowCount = 0, highCount = 0;
-  for (const r of recent) {
-    rLogSum += Math.log(Math.max(1.01, r.multiplier));
-    if (r.multiplier < 2)  lowCount++;
-    if (r.multiplier >= 20) highCount++;
-  }
-  for (const r of rounds) gLogSum += Math.log(Math.max(1.01, r.multiplier));
-  const logRatio = (gLogSum / n) > 0 ? (rLogSum / W) / (gLogSum / n) : 1;
-
-  // Cold / hot scores
-  let coldScore = 0, hotScore = 0;
-  if (logRatio < 0.78)        coldScore += 3; else if (logRatio < 0.90) coldScore += 1;
-  if (streakPct >= 0.85)      coldScore += 3; else if (streakPct >= 0.70) coldScore += 1;
-  if (currentStreak > 12)     coldScore += 2;
-  if (lowCount / W > 0.65)    coldScore += 2;
-  if (logRatio > 1.22)        hotScore  += 3; else if (logRatio > 1.12) hotScore  += 1;
-  if (highCount / W > 0.30)   hotScore  += 2;
-
-  // Variance
-  let rVarSum = 0;
-  const rMean = rLogSum / W;
-  for (const r of recent) rVarSum += (Math.log(Math.max(1.01, r.multiplier)) - rMean) ** 2;
-  const gMean = gLogSum / n;
-  let gVarSum = 0;
-  for (const r of rounds) gVarSum += (Math.log(Math.max(1.01, r.multiplier)) - gMean) ** 2;
-  const isVolatile = (gVarSum / n) > 0 && (rVarSum / W) / (gVarSum / n) > 1.6;
-
-  const regime = coldScore >= 4 ? 'cold' : hotScore >= 3 ? 'hot' : isVolatile ? 'volatile' : 'normal';
-  return { regime, coldScore, hotScore, streakPct: +streakPct.toFixed(3), streakPenalty, currentStreak, logRatio: +logRatio.toFixed(3), isVolatile };
-}
-
-
-buildPrediction._statsCache = null;
-
-fu
-
 function buildPatternPrediction(sortedRounds, targetMin) {
   const n = sortedRounds.length;
   if (n < MIN_ROUNDS) return null;
@@ -595,7 +419,6 @@ function buildPatternWindow(patternResult, maxWidth) {
 
   return { low, high, confidence };
 }
-
 
 
 // ============================================================================
