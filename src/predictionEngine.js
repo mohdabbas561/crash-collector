@@ -328,7 +328,7 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
     if (!existing) {
       const pred = buildFn(target);
       if (pred) {
-        state.lockedMap[target.label] = { ...pred, targetMin:target.min, anchorRound:lastRoundId, generation:1, stale:false };
+        state.lockedMap[target.label] = { ...pred, targetMin:target.min, anchorRound:lastRoundId + 1, generation:1, stale:false };
         anyChange = true;
         console.log(`[${engineId}] NEW ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}% probW=${pred.probW??'—'}`);
       }
@@ -367,11 +367,11 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
         }
       }
 
-      // Rebuild window
+      // Rebuild window — anchor to lastRoundId+1 so new window never overlaps the just-resolved hit
       const pred = buildFn(target);
       if (pred) {
         state.lockedMap[target.label] = {
-          ...pred, targetMin: target.min, anchorRound: lastRoundId,
+          ...pred, targetMin: target.min, anchorRound: lastRoundId + 1,
           generation: (existing.generation||1) + (isNonsense ? 0 : 1),
           stale: false,
         };
@@ -403,11 +403,11 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
           console.log(`[${engineId}] ${target.label} ${outcome.toUpperCase()}${status.status==='early'?' (early)':''} #${absLow}–#${absHigh}${status.hitRound?` @#${status.hitRound}`:''}`);
         } catch(e) { console.error(`[${engineId}] save fail:`, e.message); }
       }
-      // Immediately build next window
+      // Immediately build next window — anchor to lastRoundId+1 so it starts AFTER the hit
       const pred = buildFn(target);
       if (pred) {
         state.lockedMap[target.label] = {
-          ...pred, targetMin: target.min, anchorRound: lastRoundId,
+          ...pred, targetMin: target.min, anchorRound: lastRoundId + 1,
           generation: (existing.generation||1) + 1, stale: false,
         };
         console.log(`[${engineId}] NEXT ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}%`);
