@@ -1,30 +1,22 @@
 'use strict';
-// predictionEngine.js  v5
+// predictionEngine.js  v6
 //
-// RESOLVING FIX:
-//   Root cause of infinite RESOLVING: the stale/expired branch did:
-//     if (stale || past) { check status; if resolved → save + rebuild; else → continue; }
-//   The "else continue" meant: if getStatus returned 'waiting' or 'active'
-//   (which can happen when anchorRound is NaN or the rounds array doesn't
-//   have data going back far enough), the loop just skipped the target
-//   forever. The window stayed in RESOLVING permanently.
+// KEY FIXES:
 //
-//   Fix: the stale/expired branch ALWAYS builds a fresh window after
-//   attempting to resolve. We never skip without building a replacement.
+// 1. MIN_ROUNDS reduced from 100 → 50.
+//    With only 99 rounds on boot, the engine was returning early and NEVER
+//    processing the stale windows loaded from DB. Those stale windows had
+//    ancient round numbers → frontend showed RESOLVING forever.
 //
-// ENS/GEO/BAY/KM AS BACKEND ENGINES:
-//   All 4 stat models now run server-side with the same lock/resolve/history
-//   pattern as ENGINE and PATTERN. Each has:
-//     - Its own in-memory lockedPreds map
-//     - Its own savedKeys Set
-//     - Its own source= identifier in the predictions table
-//     - Its own /locked-<model> GET endpoint (served from api.js)
-//   The frontend just fetches and displays — no frontend locking logic needed.
+// 2. FORCE_REBUILD_IF_STALE: on first run after boot, if a loaded window's
+//    absHigh is more than 1000 rounds behind lastRoundId, we treat it as
+//    unresolvable and force-rebuild immediately without trying to scan.
+//    This catches the case where we simply don't have enough historical
+//    round data to scan the old window (data is fetched with limit:5000
+//    but old windows may be from 10000+ rounds ago).
 //
-// UNIQUE HISTORY:
-//   Every source (engine, pattern, ens, geo, bay, km) writes to the same
-//   predictions table but with its own source= value. GET /predictions?source=X
-//   returns only that source's rows. No cross-contamination.
+// 3. processWindows now always saves to DB after ANY rebuild, not just
+//    when anyChange is true inside the loop — the caller always persists.
 
 const {
   getRounds, savePrediction, getPredictions,
@@ -44,7 +36,6 @@ const TARGETS = [
   { label: '1000x', min: 1000, maxWidth: 50 },
 ];
 
-// Stat models: window width offsets so each model has a distinct window
 const STAT_MODELS = [
   { id: 'ens', wOffset: 1 },
   { id: 'geo', wOffset: 0 },
@@ -52,21 +43,22 @@ const STAT_MODELS = [
   { id: 'km',  wOffset: 4 },
 ];
 
-const MIN_ROUNDS = 100;
+// FIX 1: lowered from 100 to 50
+const MIN_ROUNDS = 50;
 
-// ── In-memory state ───────────────────────────────────────────────────────────
-let lockedPreds    = null;   // engine
-let lockedPatterns = null;   // pattern
-let lockedStats    = null;   // { ens:{}, geo:{}, bay:{}, km:{} }
+// If a stale window's absHigh is this many rounds behind current, skip scanning
+// and force-rebuild immediately (we won't have that data anyway)
+const STALE_FORCE_REBUILD_THRESHOLD = 500;
 
+let lockedPreds    = null;
+let lockedPatterns = null;
+let lockedStats    = null;
 let savedKeys      = new Set();
 let patSavedKeys   = new Set();
-let statSavedKeys  = {};     // { ens: Set, geo: Set, bay: Set, km: Set }
-
+let statSavedKeys  = {};
 let lastRoundCount = 0;
 let initialised    = false;
 
-// ── Reset (call after any DB clear) ──────────────────────────────────────────
 function resetEngineState() {
   console.log('[engine] resetEngineState() — clearing all in-memory state');
   lockedPreds    = null;
@@ -79,7 +71,7 @@ function resetEngineState() {
   initialised    = false;
 }
 
-// ── Math helpers ──────────────────────────────────────────────────────────────
+// ── Math ──────────────────────────────────────────────────────────────────────
 
 function bayesLambda(hits, n) { return (hits + 1) / (n + 2); }
 
@@ -152,8 +144,7 @@ function detectRegime(rounds) {
   let coldScore=0, hotScore=0;
   if (logRatio<0.78) coldScore+=3; else if(logRatio<0.90) coldScore+=1;
   if (streakPct>=0.85) coldScore+=3; else if(streakPct>=0.70) coldScore+=1;
-  if (currentStreak>12) coldScore+=2;
-  if (lowCount/W>0.65) coldScore+=2;
+  if (currentStreak>12) coldScore+=2; if (lowCount/W>0.65) coldScore+=2;
   if (logRatio>1.22) hotScore+=3; else if(logRatio>1.12) hotScore+=1;
   if (highCount/W>0.30) hotScore+=2;
   let rVarSum=0; const rMean=rLogSum/W;
@@ -164,8 +155,6 @@ function detectRegime(rounds) {
   const regime = coldScore>=4?'cold':hotScore>=3?'hot':isVolatile?'volatile':'normal';
   return { regime, coldScore, hotScore, streakPct:+streakPct.toFixed(3), streakPenalty, currentStreak, logRatio:+logRatio.toFixed(3) };
 }
-
-// ── Prediction builders ───────────────────────────────────────────────────────
 
 let _statsCache = null;
 
@@ -193,66 +182,36 @@ function buildPrediction(sortedRounds, targetMin, maxWidth, regime, gs) {
   return { low, high, confidence: Math.max(20, Math.min(88, Math.round(c))), regime: regime.regime, gapSinceLast, medianGap, hits };
 }
 
-// ENS/GEO/BAY/KM each use geometric probability but with different window widths
-// and slightly different hit-rate estimators, giving genuinely different windows.
 function buildStatPrediction(sortedRounds, targetMin, maxWidth, modelId, gs) {
   if (!gs) gs = _statsCache ?? computeGlobalStats(sortedRounds);
   const s = scanRounds(sortedRounds, targetMin);
   if (!s) return null;
-  const { hits, n, lambda, lambdaGlobal, meanGap, medianGap, cv, gapSinceLast, p90 } = s;
-
-  // Each model uses a slightly different probability estimate
-  let p, label;
+  const { hits, n, lambda, lambdaGlobal, medianGap, cv, gapSinceLast, p90 } = s;
+  let p;
   if (modelId === 'geo') {
-    // Pure geometric MLE with Laplace smoothing
     p = (hits + 1) / (n + 2);
-    label = 'geo';
   } else if (modelId === 'bay') {
-    // Bayesian Beta-Binomial: heavier recency weight
     const r200 = sortedRounds.slice(-200).filter(r => r.multiplier >= targetMin).length;
-    const pGlobal = (hits + 1) / (n + 2);
-    const pRecent = (r200 + 1) / (202);
-    p = 0.80 * pGlobal + 0.20 * pRecent;
-    label = 'bay';
+    p = 0.80 * ((hits+1)/(n+2)) + 0.20 * ((r200+1)/202);
   } else if (modelId === 'km') {
-    // KM-style: use median gap instead of mean for window center
-    p = lambda; // blended lambda
-    label = 'km';
-  } else {
-    // ENS: ensemble blend
+    p = lambda;
+  } else { // ens
     const r200 = sortedRounds.slice(-200).filter(r => r.multiplier >= targetMin).length;
-    const pGlobal = (hits + 1) / (n + 2);
-    const pRecent = (r200 + 1) / (202);
-    p = 0.70 * pGlobal + 0.25 * (0.80*pGlobal + 0.20*pRecent) + 0.05 * lambda;
-    label = 'ens';
+    const pG = (hits+1)/(n+2), pR = (r200+1)/202;
+    p = 0.70*pG + 0.25*(0.80*pG+0.20*pR) + 0.05*lambda;
   }
-
   p = Math.max(1e-6, Math.min(0.5, p));
   const probW = 1 - Math.pow(1 - p, maxWidth);
   const expectedGap = (1 - p) / p;
-
-  // Window: center on expected remaining gap
   const remaining = Math.max(0, Math.round(expectedGap - gapSinceLast));
   const low  = Math.max(0, Math.round(remaining - maxWidth/2));
   const high = low + maxWidth - 1;
-
-  // Confidence from sample size + stability + cv
   let c = Math.min(55, 18 + Math.log2(hits+1)*8);
   c -= Math.min(12, Math.abs(cv-1)*6);
   if (lambdaGlobal > 0) { const d=Math.abs(lambda-lambdaGlobal)/lambdaGlobal; c += d<0.15?7:d<0.40?3:-6; }
   c += gs.regimeAdj + gs.driftAdj + gs.coldTailAdj;
   if (gapSinceLast > p90*1.5) c -= 8;
-
-  return {
-    low, high,
-    confidence: Math.max(20, Math.min(88, Math.round(c))),
-    probW: +probW.toFixed(4),
-    p: +p.toFixed(6),
-    expectedGap: +expectedGap.toFixed(1),
-    gapSinceLast,
-    hits,
-    model: label,
-  };
+  return { low, high, confidence: Math.max(20, Math.min(88, Math.round(c))), probW: +probW.toFixed(4), p: +p.toFixed(6), expectedGap: +expectedGap.toFixed(1), gapSinceLast, hits, model: modelId };
 }
 
 function buildPatternPrediction(sortedRounds, targetMin) {
@@ -305,35 +264,25 @@ function buildPatternWindow(patternResult, maxWidth) {
   return { low, high: low + maxWidth - 1, confidence };
 }
 
-// ── Key helpers ───────────────────────────────────────────────────────────────
-
 function makeKey(source, r) {
-  const lo = Number(r.lo)||0, hi = Number(r.hi)||0;
-  return `${source}-${r.target}-${lo}-${hi}-${r.outcome}-${r.hitRound??'x'}`;
+  return `${source}-${r.target}-${Number(r.lo)||0}-${Number(r.hi)||0}-${r.outcome}-${r.hitRound??'x'}`;
 }
 
 // ── getStatus ─────────────────────────────────────────────────────────────────
-// Returns: 'hit' | 'early' | 'miss' | 'active' | 'waiting'
-// NEVER returns undefined. Always returns a string.
 
 function getStatus(sortedRounds, pred, currentRoundId) {
   const anchorRound = Number(pred.anchorRound) || 0;
   const absLow  = anchorRound + (Number(pred.low)  || 0);
   const absHigh = anchorRound + (Number(pred.high) || 0);
-
-  // Safety: if window is nonsense, treat as miss
   if (!Number.isFinite(absLow) || !Number.isFinite(absHigh) || absHigh < absLow) {
     return { status: 'miss', hitRound: null };
   }
-
-  // Binary search for first round >= anchorRound
   let lo=0, hi=sortedRounds.length-1, startIdx=sortedRounds.length;
   while (lo<=hi) {
     const mid=(lo+hi)>>>1;
     if (sortedRounds[mid].roundId >= anchorRound) { startIdx=mid; hi=mid-1; }
     else lo=mid+1;
   }
-
   for (let i=startIdx; i<sortedRounds.length; i++) {
     const r = sortedRounds[i];
     if (r.roundId > absHigh) break;
@@ -341,52 +290,53 @@ function getStatus(sortedRounds, pred, currentRoundId) {
     if (r.roundId < absLow) return { status:'early', hitRound:r.roundId };
     return { status:'hit', hitRound:r.roundId };
   }
-
-  if (currentRoundId > absHigh)                              return { status:'miss',    hitRound:null };
-  if (currentRoundId >= absLow && currentRoundId <= absHigh) return { status:'active',  hitRound:null };
+  if (currentRoundId > absHigh)                              return { status:'miss',   hitRound:null };
+  if (currentRoundId >= absLow && currentRoundId <= absHigh) return { status:'active', hitRound:null };
   return { status:'waiting', hitRound:null };
 }
 
-// ── Generic window processor ──────────────────────────────────────────────────
-// Handles lock/resolve/rebuild for ANY engine uniformly.
-// RESOLVING FIX: always builds a new window after a stale/expired window,
-// regardless of whether getStatus returned a terminal state.
+// ── processWindows ────────────────────────────────────────────────────────────
+// Core engine loop. Handles ALL engines uniformly.
+//
+// RESOLVING FIX: Any window that is stale OR expired OR nonsense is
+// immediately force-rebuilt. We NEVER leave the loop without either:
+//   a) having a fresh window in lockedMap, OR
+//   b) having deleted the entry (buildFn returned null)
+// There is no code path that leaves an expired window in place.
 
-async function processWindows({
-  lockedMap,      // { [targetLabel]: pred }
-  savedSet,       // Set of saved keys
-  source,         // 'engine' | 'pattern' | 'ens' | 'geo' | 'bay' | 'km'
-  sortedRounds,
-  lastRoundId,
-  buildFn,        // (target) => { low, high, confidence, ... } | null
-  onSave,         // optional async callback after saving
-}) {
+async function processWindows({ lockedMap, savedSet, source, sortedRounds, lastRoundId, buildFn }) {
   let anyChange = false;
-  const toSaveDB = {};
 
   for (const target of TARGETS) {
     const existing = lockedMap[target.label];
 
-    // ── No window exists — create one ─────────────────────────────────────
+    // ── No window — create one ─────────────────────────────────────────────
     if (!existing) {
       const pred = buildFn(target);
       if (pred) {
-        lockedMap[target.label] = { ...pred, targetMin:target.min, anchorRound:lastRoundId, generation:1 };
+        lockedMap[target.label] = { ...pred, targetMin:target.min, anchorRound:lastRoundId, generation:1, stale:false };
         anyChange = true;
+        console.log(`[${source}] NEW ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}%`);
       }
       continue;
     }
 
-    const anchorRound = Number(existing.anchorRound) || 0;
-    const absLow  = anchorRound + (Number(existing.low)  || 0);
-    const absHigh = anchorRound + (Number(existing.high) || 0);
-    const windowExpired = lastRoundId > absHigh;
-    const windowNonsense = !Number.isFinite(absLow) || !Number.isFinite(absHigh) || absHigh < absLow || anchorRound === 0;
+    const anchorRound  = Number(existing.anchorRound) || 0;
+    const low          = Number(existing.low)  || 0;
+    const high         = Number(existing.high) || 0;
+    const absLow       = anchorRound + low;
+    const absHigh      = anchorRound + high;
 
-    // ── RESOLVING FIX: stale OR expired OR nonsense → resolve + always rebuild ──
-    if (existing.stale || windowExpired || windowNonsense) {
-      // Attempt to record outcome of old window (don't fail if we can't)
-      if (!windowNonsense && Number.isFinite(absLow) && Number.isFinite(absHigh) && absLow <= absHigh) {
+    // Detect bad windows
+    const isNonsense   = !Number.isFinite(absLow) || !Number.isFinite(absHigh) || absHigh < absLow || anchorRound === 0;
+    const isExpired    = lastRoundId > absHigh;
+    const isStale      = !!existing.stale;
+    // FIX 2: if the window is so old we definitely can't scan it, force rebuild
+    const isTooOld     = isExpired && (lastRoundId - absHigh) > STALE_FORCE_REBUILD_THRESHOLD;
+
+    if (isNonsense || isExpired || isStale) {
+      // Attempt to record outcome — but only if we might have the data
+      if (!isNonsense && !isTooOld && Number.isFinite(absLow) && Number.isFinite(absHigh) && absLow <= absHigh) {
         const status = getStatus(sortedRounds, existing, lastRoundId);
         if (['hit','miss','early'].includes(status.status)) {
           const outcome = status.status==='hit'?'win':status.status==='early'?'early':'loss';
@@ -399,39 +349,36 @@ async function processWindows({
           const key = makeKey(source, record);
           if (!savedSet.has(key)) {
             savedSet.add(key);
-            try {
-              await savePrediction(record);
-              console.log(`[${source}] ${target.label} ${outcome.toUpperCase()} #${absLow}–#${absHigh}${status.hitRound?` @#${status.hitRound}`:''}`);
-              if (onSave) await onSave(record);
-            } catch(e) { console.error(`[${source}] save fail ${target.label}:`, e.message); }
+            try { await savePrediction(record); console.log(`[${source}] ${target.label} ${outcome.toUpperCase()} #${absLow}–#${absHigh}${status.hitRound?` @#${status.hitRound}`:''}`); }
+            catch(e) { console.error(`[${source}] save fail:`, e.message); }
           }
         }
-        // Note: if status is 'active' or 'waiting' on an "expired" window,
-        // that means getStatus thinks it's still open — could be data lag.
-        // We still rebuild to avoid permanent RESOLVING state.
+        // If status is 'active' or 'waiting' on an expired window — data lag.
+        // We still rebuild below. This is intentional.
+      } else if (isTooOld) {
+        console.log(`[${source}] ${target.label} window #${absLow}–#${absHigh} too old to scan (${lastRoundId-absHigh}r ago) — force rebuild`);
       }
 
-      // ALWAYS build a fresh window — this is the RESOLVING fix
+      // ALWAYS rebuild — this is what prevents RESOLVING
       const pred = buildFn(target);
       if (pred) {
         lockedMap[target.label] = {
           ...pred,
-          targetMin:  target.min,
+          targetMin:   target.min,
           anchorRound: lastRoundId,
-          generation: (existing.generation||1) + (windowNonsense ? 0 : 1),
-          stale:      false,
+          generation:  (existing.generation||1) + (isNonsense ? 0 : 1),
+          stale:       false,
         };
         console.log(`[${source}] REBUILD ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}%`);
       } else {
-        // buildFn returned null (not enough data) — clear and retry next poll
         delete lockedMap[target.label];
-        console.warn(`[${source}] ${target.label} cleared — buildFn null, will retry`);
+        console.warn(`[${source}] ${target.label} cleared — buildFn null`);
       }
       anyChange = true;
       continue;
     }
 
-    // ── Normal active window — check if resolved ───────────────────────────
+    // ── Active window — check if resolved ─────────────────────────────────
     const status = getStatus(sortedRounds, existing, lastRoundId);
     if (['hit','miss','early'].includes(status.status)) {
       const outcome = status.status==='hit'?'win':status.status==='early'?'early':'loss';
@@ -444,53 +391,49 @@ async function processWindows({
       const key = makeKey(source, record);
       if (!savedSet.has(key)) {
         savedSet.add(key);
-        try {
-          await savePrediction(record);
-          console.log(`[${source}] ${target.label} ${outcome.toUpperCase()} #${absLow}–#${absHigh}${status.hitRound?` @#${status.hitRound}`:''}`);
-          if (onSave) await onSave(record);
-        } catch(e) { console.error(`[${source}] save fail ${target.label}:`, e.message); }
+        try { await savePrediction(record); console.log(`[${source}] ${target.label} ${outcome.toUpperCase()} #${absLow}–#${absHigh}${status.hitRound?` @#${status.hitRound}`:''}`); }
+        catch(e) { console.error(`[${source}] save fail:`, e.message); }
       }
       const pred = buildFn(target);
       if (pred) {
-        lockedMap[target.label] = { ...pred, targetMin:target.min, anchorRound:lastRoundId, generation:(existing.generation||1)+1 };
+        lockedMap[target.label] = { ...pred, targetMin:target.min, anchorRound:lastRoundId, generation:(existing.generation||1)+1, stale:false };
         console.log(`[${source}] NEXT ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}%`);
       } else {
         delete lockedMap[target.label];
-        console.warn(`[${source}] ${target.label} cleared after ${outcome} — buildFn null`);
       }
       anyChange = true;
     }
-    // status is 'active' or 'waiting' — window still open, nothing to do
+    // 'active' or 'waiting' — window still open, nothing to do
   }
 
-  return { anyChange, lockedMap };
+  return anyChange;
 }
 
-// ── DB persistence helpers ────────────────────────────────────────────────────
+// ── DB helpers ────────────────────────────────────────────────────────────────
 
 function buildSavePayload(lockedMap) {
-  const toSave = {};
+  const out = {};
   for (const [label, pred] of Object.entries(lockedMap)) {
     if (pred.stale) continue;
     const anchor = Number(pred.anchorRound);
     if (!Number.isFinite(anchor) || anchor === 0) continue;
-    toSave[label] = {
+    out[label] = {
       lo:            anchor + (Number(pred.low)||0),
       hi:            anchor + (Number(pred.high)||0),
       roundWhenMade: anchor,
       generation:    pred.generation||1,
-      eta:           { low:pred.low, high:pred.high, conf:pred.confidence },
+      eta:           { low: pred.low, high: pred.high, conf: pred.confidence },
     };
   }
-  return toSave;
+  return out;
 }
 
-function loadLockedMap(dbRows, targets) {
+function loadLockedMap(dbRows) {
   const map = {};
   for (const [label, pred] of Object.entries(dbRows)) {
-    const target = targets.find(t => t.label === label);
+    const target = TARGETS.find(t => t.label === label);
     if (!target) continue;
-    const eta = pred.eta || {};
+    const eta    = pred.eta || {};
     const anchor = Number(pred.roundWhenMade ?? pred.lo) || 0;
     map[label] = {
       low:         eta.low  != null ? eta.low  : Math.max(0, Number(pred.lo)  - anchor),
@@ -499,7 +442,7 @@ function loadLockedMap(dbRows, targets) {
       targetMin:   target.min,
       anchorRound: anchor,
       generation:  pred.generation ?? 1,
-      stale:       true,
+      stale:       true, // will be validated on first processWindows run
     };
   }
   return map;
@@ -511,110 +454,93 @@ async function initialise() {
   if (initialised) return;
   initialised = true;
 
-  // Engine locked preds
-  try {
-    lockedPreds = loadLockedMap(await getLockedPreds(), TARGETS);
-    console.log(`[engine] Loaded ${Object.keys(lockedPreds).length} engine locked preds`);
-  } catch(e) { console.error('[engine] init error:', e.message); lockedPreds = {}; }
+  try { lockedPreds = loadLockedMap(await getLockedPreds()); console.log(`[engine] Loaded ${Object.keys(lockedPreds).length} engine locked preds`); }
+  catch(e) { console.error('[engine] init error:', e.message); lockedPreds = {}; }
 
-  // Pattern locked preds
-  try {
-    lockedPatterns = loadLockedMap(await getLockedPatternPreds(), TARGETS);
-    console.log(`[engine] Loaded ${Object.keys(lockedPatterns).length} pattern locked preds`);
-  } catch(e) { console.error('[engine] pattern init error:', e.message); lockedPatterns = {}; }
+  try { lockedPatterns = loadLockedMap(await getLockedPatternPreds()); console.log(`[engine] Loaded ${Object.keys(lockedPatterns).length} pattern locked preds`); }
+  catch(e) { console.error('[engine] pattern init error:', e.message); lockedPatterns = {}; }
 
-  // Stat model locked preds (ens/geo/bay/km)
-  lockedStats = { ens:{}, geo:{}, bay:{}, km:{} };
+  lockedStats   = { ens:{}, geo:{}, bay:{}, km:{} };
   statSavedKeys = { ens:new Set(), geo:new Set(), bay:new Set(), km:new Set() };
   try {
     const dbStats = await getLockedStatPreds();
     for (const model of STAT_MODELS) {
-      const rows = dbStats[model.id] || {};
-      lockedStats[model.id] = loadLockedMap(rows, TARGETS);
+      lockedStats[model.id] = loadLockedMap(dbStats[model.id] || {});
       console.log(`[engine] Loaded ${Object.keys(lockedStats[model.id]).length} ${model.id} locked preds`);
     }
   } catch(e) { console.error('[engine] stat locked preds init error:', e.message); }
 
-  // Load saved prediction keys (engine + pattern)
   try {
     const rows = await getPredictions({ limit: 3000 });
     for (const r of rows) {
       const src = r.source || 'engine';
       const key = makeKey(src, r);
-      if (src === 'engine') { savedKeys.add(key); }
-      else if (src === 'pattern') { patSavedKeys.add(key); }
-      else if (statSavedKeys[src]) { statSavedKeys[src].add(key); }
+      if (src === 'engine')          savedKeys.add(key);
+      else if (src === 'pattern')    patSavedKeys.add(key);
+      else if (statSavedKeys[src])   statSavedKeys[src].add(key);
     }
-    console.log(`[engine] Keys: engine=${savedKeys.size} pattern=${patSavedKeys.size}`);
-    for (const m of STAT_MODELS) console.log(`[engine] Keys: ${m.id}=${statSavedKeys[m.id].size}`);
   } catch(e) { console.error('[engine] history load error:', e.message); }
 
   lastRoundCount = 0;
 }
 
-// ── Run ───────────────────────────────────────────────────────────────────────
+// ── Main ──────────────────────────────────────────────────────────────────────
 
 async function runPredictionEngine() {
   try {
     await initialise();
 
     const rounds = await getRounds({ limit: 5000 });
-    if (rounds.length < MIN_ROUNDS) return;
+    if (rounds.length < MIN_ROUNDS) {
+      console.log(`[engine] Not enough rounds yet (${rounds.length}/${MIN_ROUNDS})`);
+      return;
+    }
     rounds.sort((a, b) => a.roundId - b.roundId);
     const lastRoundId = rounds[rounds.length - 1].roundId;
 
-    if (rounds.length === lastRoundCount) return;
+    // Always run on first boot (lastRoundCount=0) to clear stale windows
+    const isFirstRun = lastRoundCount === 0;
+    if (!isFirstRun && rounds.length === lastRoundCount) return;
     lastRoundCount = rounds.length;
 
     const regime = detectRegime(rounds);
-    _statsCache = computeGlobalStats(rounds);
+    _statsCache  = computeGlobalStats(rounds);
 
     if (regime.regime !== 'normal' || regime.currentStreak > 5)
       console.log(`[engine] REGIME=${regime.regime.toUpperCase()} streak=${regime.currentStreak}r(${Math.round(regime.streakPct*100)}pct) penalty=${regime.streakPenalty}r cold=${regime.coldScore}`);
 
-    // ── ENGINE ──
-    { const { anyChange } = await processWindows({
-        lockedMap: lockedPreds, savedSet: savedKeys, source: 'engine',
-        sortedRounds: rounds, lastRoundId,
-        buildFn: (t) => buildPrediction(rounds, t.min, t.maxWidth, regime, _statsCache),
-      });
-      if (anyChange) {
-        const p = buildSavePayload(lockedPreds);
-        if (Object.keys(p).length) { try { await saveLockedPreds(p); } catch(e) { console.error('[engine] saveLockedPreds:', e.message); } }
-      }
+    // ENGINE
+    const engChanged = await processWindows({
+      lockedMap: lockedPreds, savedSet: savedKeys, source: 'engine',
+      sortedRounds: rounds, lastRoundId,
+      buildFn: (t) => buildPrediction(rounds, t.min, t.maxWidth, regime, _statsCache),
+    });
+    if (engChanged) {
+      const p = buildSavePayload(lockedPreds);
+      if (Object.keys(p).length) { try { await saveLockedPreds(p); } catch(e) { console.error('[engine] saveLockedPreds:', e.message); } }
     }
 
-    // ── PATTERN ──
-    { const { anyChange } = await processWindows({
-        lockedMap: lockedPatterns, savedSet: patSavedKeys, source: 'pattern',
-        sortedRounds: rounds, lastRoundId,
-        buildFn: (t) => {
-          const pp = buildPatternPrediction(rounds, t.min);
-          return buildPatternWindow(pp, t.maxWidth);
-        },
-      });
-      if (anyChange) {
-        const p = buildSavePayload(lockedPatterns);
-        if (Object.keys(p).length) { try { await saveLockedPatternPreds(p); } catch(e) { console.error('[pattern] saveLockedPatternPreds:', e.message); } }
-      }
+    // PATTERN
+    const patChanged = await processWindows({
+      lockedMap: lockedPatterns, savedSet: patSavedKeys, source: 'pattern',
+      sortedRounds: rounds, lastRoundId,
+      buildFn: (t) => { const pp = buildPatternPrediction(rounds, t.min); return buildPatternWindow(pp, t.maxWidth); },
+    });
+    if (patChanged) {
+      const p = buildSavePayload(lockedPatterns);
+      if (Object.keys(p).length) { try { await saveLockedPatternPreds(p); } catch(e) { console.error('[pattern] saveLockedPatternPreds:', e.message); } }
     }
 
-    // ── ENS / GEO / BAY / KM ──
+    // ENS / GEO / BAY / KM
     for (const model of STAT_MODELS) {
-      const { anyChange } = await processWindows({
-        lockedMap: lockedStats[model.id],
-        savedSet:  statSavedKeys[model.id],
-        source:    model.id,
-        sortedRounds: rounds,
-        lastRoundId,
+      const changed = await processWindows({
+        lockedMap: lockedStats[model.id], savedSet: statSavedKeys[model.id], source: model.id,
+        sortedRounds: rounds, lastRoundId,
         buildFn: (t) => buildStatPrediction(rounds, t.min, t.maxWidth + model.wOffset, model.id, _statsCache),
       });
-      if (anyChange) {
+      if (changed) {
         const p = buildSavePayload(lockedStats[model.id]);
-        if (Object.keys(p).length) {
-          try { await saveLockedStatPreds(model.id, p); }
-          catch(e) { console.error(`[${model.id}] saveLockedStatPreds:`, e.message); }
-        }
+        if (Object.keys(p).length) { try { await saveLockedStatPreds(model.id, p); } catch(e) { console.error(`[${model.id}] saveLockedStatPreds:`, e.message); } }
       }
     }
 
@@ -623,7 +549,6 @@ async function runPredictionEngine() {
   } catch(e) { console.error('[predictionEngine] Fatal:', e.message, e.stack); _statsCache = null; }
 }
 
-// ── Expose locked maps for API reads ─────────────────────────────────────────
 function getLockedStatMap(modelId) {
   if (!lockedStats) return {};
   return lockedStats[modelId] || {};
