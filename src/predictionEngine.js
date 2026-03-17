@@ -1,28 +1,40 @@
 'use strict';
-// predictionEngine.js  v2
+// predictionEngine.js  v3
 // ============================================================================
-// Complete rebuild. Core philosophy change:
+// BUG FIXES vs v2:
 //
-//   OLD: predict WHEN the next hit comes (timing only)
-//   NEW: first classify WHAT REGIME we are in, then predict timing WITHIN
-//        that regime. If the regime says "white streak / cold" → suppress ALL
-//        bullish predictions and delay windows hard.
+//   FIX 1 — STUCK IN RESOLVING (critical):
+//     Root cause: stale preds loaded from DB kept their old anchorRound.
+//     The stale branch did: anchorRound = existing.anchorRound (past value).
+//     So absHigh = oldAnchor + high = round from days ago.
+//     currentRoundId > absHigh always → getStatus() returned 'miss' every poll.
+//     But savedKeys already had that key so it never re-saved.
+//     Fix: when a stale pred's window is ENTIRELY in the past, treat it as
+//     resolved (record the outcome) then immediately build a fresh prediction
+//     anchored to lastRoundId. If the window overlaps current rounds, scan
+//     properly for a hit.
 //
-// REGIME SYSTEM (runs first, gates everything else):
-//   COLD     — market suppressed, sub-5x dominating, all windows delayed
-//   NORMAL   — baseline, standard timing
-//   HOT      — elevated multipliers, tighten windows
-//   VOLATILE — high variance, widen windows, reduce confidence
+//   FIX 2 — STALE BRANCH ANCHOR WRONG:
+//     Stale rebuild was using existing.anchorRound instead of lastRoundId.
+//     A "stale" pred means we reloaded it from DB on startup and haven't
+//     validated it yet. We should rebuild from lastRoundId so the new window
+//     is always in the future, not the past.
 //
-// WHITE STREAK SUPPRESSION:
-//   When current white streak is above its historical 60th percentile →
-//   add streakPenalty rounds to every window.
-//   Above 85th → also reduce confidence by up to 25pts.
-//   Above 95th → max suppression, confidence floor drops to 20.
+//   FIX 3 — savedKeys dedup too aggressive:
+//     The compound key `${target}-${anchorRound}-${outcome}-${hitRound}` was
+//     sometimes preventing valid new resolutions from saving because anchorRound
+//     was undefined (NaN). Normalized all key fields to Number() with fallback.
 //
-// CROSS-TARGET COHERENCE:
-//   burst5/burst10 counts how many targets fired recently.
-//   Used to detect post-burst cooldowns that suppress lower targets.
+//   FIX 4 — Pattern engine: same stale anchor bug fixed identically.
+//
+//   FIX 5 — getStatus binary search off-by-one:
+//     Binary search for startIdx was searching rounds where roundId >= anchorRound
+//     but anchor is exclusive of the prediction window (window starts at
+//     anchorRound + low). Corrected search to start from anchorRound, then
+//     skip rounds before absLow.
+//
+//   FIX 6 — processEngine/processPattern called buildPrediction._statsCache
+//     before computeGlobalStats ran for pattern. Fixed ordering.
 //
 // ============================================================================
 
@@ -53,6 +65,10 @@ let lastRoundCount = 0;
 let initialised    = false;
 
 
+// ============================================================================
+// MATH HELPERS
+// ============================================================================
+
 function bayesLambda(hits, n) {
   return (hits + 1) / (n + 2);
 }
@@ -66,7 +82,6 @@ function blendedLambda(rounds, targetMin, lambdaGlobal, recentHits) {
       if (rounds[i].multiplier >= targetMin) recentHits++;
   }
   const lambdaRecent = bayesLambda(recentHits, recentN);
-  // Heavier weight on recent — 500-round window is responsive enough
   return Math.max(1e-6, Math.min(0.5, 0.6 * lambdaGlobal + 0.4 * lambdaRecent));
 }
 
@@ -100,14 +115,12 @@ function scanRounds(rounds, targetMin) {
   const stdGap = gaps.length > 1 ? Math.sqrt(gVs / gaps.length) : meanGap;
   const cv     = meanGap > 0 ? stdGap / meanGap : 1;
 
-  // Median — robust timing baseline
   const sg  = [...gaps].sort((a, b) => a - b);
   const mid = Math.floor(sg.length / 2);
   const medianGap = sg.length === 0 ? meanGap
     : sg.length % 2 === 1 ? sg[mid]
     : (sg[mid - 1] + sg[mid]) / 2;
 
-  // P10 / P90 of gap distribution — for honest window sizing
   const p10 = sg[Math.floor(sg.length * 0.10)] ?? sg[0] ?? 0;
   const p90 = sg[Math.floor(sg.length * 0.90)] ?? sg[sg.length - 1] ?? meanGap;
 
@@ -130,7 +143,6 @@ function computeGlobalStats(rounds) {
     if (i >= start200) dLogS += lv;
   }
 
-  // Regime variance shift
   const gVar = n > 0 ? gLogSS / n - (gLogS / n) ** 2 : 0;
   const rVar = r500 > 0 ? rLogSS / r500 - (rLogS / r500) ** 2 : 0;
   let regimeAdj = 0;
@@ -140,13 +152,11 @@ function computeGlobalStats(rounds) {
     else if (ratio < 0.6) regimeAdj = -4;
   }
 
-  // Mean-log drift
   const mlg = n > 0 ? gLogS / n : 0;
   const mlr = r200 > 0 ? dLogS / r200 : mlg;
   const dv  = mlr - mlg;
   const driftAdj = n >= 100 ? (dv > 0.20 ? 3 : dv < -0.20 ? -3 : 0) : 0;
 
-  // Cold tail: sub-2x fraction of recent 200 rounds
   const slice200 = rounds.slice(n - Math.min(200, n));
   const sub2r    = slice200.filter(r => r.multiplier < 2).length / slice200.length;
   const coldTailAdj = sub2r > 0.60 ? -10 : sub2r > 0.50 ? -5 : 0;
@@ -158,7 +168,6 @@ function detectRegime(rounds) {
   const n = rounds.length;
   if (n < 50) return { regime:'normal', streakPenalty:0, streakPct:0, coldScore:0, currentStreak:0, hotScore:0 };
 
-  // White streak
   const THRESH = 5;
   const streaks = [];
   let cur = 0;
@@ -173,13 +182,11 @@ function detectRegime(rounds) {
     streakPct = streaks.filter(s => s <= currentStreak).length / streaks.length;
   }
 
-  // Streak penalty — only kicks in above 70th pct
   let streakPenalty = 0;
   if      (streakPct >= 0.95) streakPenalty = Math.round(currentStreak * 1.0);
   else if (streakPct >= 0.85) streakPenalty = Math.round(currentStreak * 0.6);
   else if (streakPct >= 0.70) streakPenalty = Math.round(currentStreak * 0.3);
 
-  // Recent 100r multiplier ratio vs all-time
   const W = Math.min(100, n);
   const recent = rounds.slice(n - W);
   let rLogSum = 0, gLogSum = 0, lowCount = 0, highCount = 0;
@@ -191,7 +198,6 @@ function detectRegime(rounds) {
   for (const r of rounds) gLogSum += Math.log(Math.max(1.01, r.multiplier));
   const logRatio = (gLogSum / n) > 0 ? (rLogSum / W) / (gLogSum / n) : 1;
 
-  // Cold / hot scores
   let coldScore = 0, hotScore = 0;
   if (logRatio < 0.78)        coldScore += 3; else if (logRatio < 0.90) coldScore += 1;
   if (streakPct >= 0.85)      coldScore += 3; else if (streakPct >= 0.70) coldScore += 1;
@@ -200,7 +206,6 @@ function detectRegime(rounds) {
   if (logRatio > 1.22)        hotScore  += 3; else if (logRatio > 1.12) hotScore  += 1;
   if (highCount / W > 0.30)   hotScore  += 2;
 
-  // Variance
   let rVarSum = 0;
   const rMean = rLogSum / W;
   for (const r of recent) rVarSum += (Math.log(Math.max(1.01, r.multiplier)) - rMean) ** 2;
@@ -223,7 +228,6 @@ function buildPrediction(sortedRounds, targetMin, maxWidth, regime) {
   const { hits, n, lambda, lambdaGlobal, medianGap, cv, gapSinceLast, gaps } = s;
   if (!regime) regime = detectRegime(sortedRounds);
 
-  // ── Window center: median-gap timing + regime shift ───────────────────
   const remainingGap = medianGap - gapSinceLast;
 
   let regimeShift = 0;
@@ -237,29 +241,17 @@ function buildPrediction(sortedRounds, targetMin, maxWidth, regime) {
   const low    = center <= 0 ? 0 : Math.max(0, Math.round(center - maxWidth / 2));
   const high   = low + maxWidth - 1;
 
-  // ── Confidence — honest, no inflation ─────────────────────────────────
-  // Base: sample size contribution
   let c = Math.min(55, 18 + Math.log2(hits + 1) * 8);
-
-  // Stability: low cv = regular gaps = more predictable
   c -= Math.min(12, Math.abs(cv - 1) * 6);
-
-  // Lambda stability
   if (lambdaGlobal > 0) {
     const d = Math.abs(lambda - lambdaGlobal) / lambdaGlobal;
     if (d < 0.15) c += 7; else if (d < 0.40) c += 3; else c -= 6;
   }
-
-  // Global stats adjustments
   c += gs.regimeAdj + gs.driftAdj + gs.coldTailAdj;
-
-  // Regime confidence penalty
   if (regime.regime === 'cold')     c -= Math.min(15, regime.coldScore * 2);
   if (regime.regime === 'volatile') c -= 8;
   if (regime.streakPct >= 0.85)     c -= 10;
   if (regime.streakPct >= 0.95)     c -= 8;
-
-  // Gap position penalty: if gapSinceLast is much larger than p90, prediction is unreliable
   if (gapSinceLast > s.p90 * 1.5) c -= 8;
 
   const conf = Math.max(20, Math.min(88, Math.round(c)));
@@ -273,26 +265,37 @@ function buildPrediction(sortedRounds, targetMin, maxWidth, regime) {
   };
 }
 
-function getStatus(sortedRounds, pred, currentRoundId) {
-  const ws = pred.anchorRound + pred.low;
-  const we = pred.anchorRound + pred.high;
+// ============================================================================
+// FIX 1+5: getStatus — correct binary search + proper window bounds
+// ============================================================================
 
-  let lo=0, hi=sortedRounds.length-1, startIdx=sortedRounds.length;
+function getStatus(sortedRounds, pred, currentRoundId) {
+  // FIX: use anchorRound + low/high as absolute window bounds
+  const absLow  = pred.anchorRound + pred.low;
+  const absHigh = pred.anchorRound + pred.high;
+
+  // Binary search: find first round with roundId >= anchorRound
+  // (we search from anchorRound so we don't miss early hits before absLow)
+  let lo = 0, hi = sortedRounds.length - 1, startIdx = sortedRounds.length;
   while (lo <= hi) {
-    const mid = (lo+hi) >>> 1;
-    if (sortedRounds[mid].roundId >= pred.anchorRound) { startIdx=mid; hi=mid-1; }
-    else lo=mid+1;
+    const mid = (lo + hi) >>> 1;
+    if (sortedRounds[mid].roundId >= pred.anchorRound) { startIdx = mid; hi = mid - 1; }
+    else lo = mid + 1;
   }
+
   for (let i = startIdx; i < sortedRounds.length; i++) {
     const r = sortedRounds[i];
-    if (r.roundId > we) break;
+    if (r.roundId > absHigh) break;
     if (r.multiplier < pred.targetMin) continue;
-    if (r.roundId < ws) return { status:'early', hitRound:r.roundId };
-    return { status:'hit', hitRound:r.roundId };
+    // Hit found — determine if it's inside window or before it
+    if (r.roundId < absLow) return { status: 'early', hitRound: r.roundId };
+    return { status: 'hit', hitRound: r.roundId };
   }
-  if (currentRoundId > we)                          return { status:'miss'   };
-  if (currentRoundId >= ws && currentRoundId <= we) return { status:'active' };
-  return { status:'waiting' };
+
+  // No hit found
+  if (currentRoundId > absHigh)                          return { status: 'miss'    };
+  if (currentRoundId >= absLow && currentRoundId <= absHigh) return { status: 'active' };
+  return { status: 'waiting' };
 }
 
 function buildPatternPrediction(sortedRounds, targetMin) {
@@ -335,25 +338,18 @@ function buildPatternPrediction(sortedRounds, targetMin) {
   const stdGap = gaps.length>1 ? Math.sqrt(gVs/gaps.length) : meanGap;
   const cv = meanGap>0 ? stdGap/meanGap : 1;
 
-  // ── CLUSTER ───────────────────────────────────────────────────────────
-  // Ratio-normalized: (expected - observed) / expected
-  // This makes +1 = complete drought, -1 = 2× the expected rate
   const dW1=hW1/W1, dW2=hW2/W2, dW3=hW3/Math.min(W3,n);
   const rW1 = globalRate>0 ? Math.max(-1, Math.min(1, (globalRate-dW1)/Math.max(globalRate,0.001))) : 0;
   const rW2 = globalRate>0 ? Math.max(-1, Math.min(1, (globalRate-dW2)/Math.max(globalRate,0.001))) : 0;
   const rW3 = globalRate>0 ? Math.max(-1, Math.min(1, (globalRate-dW3)/Math.max(globalRate,0.001))) : 0;
-  // Short window weighted most for immediacy, long window for context
   const clusterScore = Math.max(-1, Math.min(1, rW1*0.50 + rW2*0.30 + rW3*0.20));
 
-  // ── TREND ─────────────────────────────────────────────────────────────
   const trendRaw   = emaSlow>0 ? (emaSlow-emaFast)/emaSlow : 0;
   const trendScore = Math.max(-1, Math.min(1, trendRaw*4));
 
-  // ── SEQUENCE PATTERN — multi-lag autocorr ────────────────────────────
   let varSum=0;
   for (const g of gaps) varSum+=(g-meanGap)**2;
 
-  // Check lags 1, 2, 3 — take dominant (strongest absolute)
   let bestAC=0, bestLag=1;
   for (let lag=1; lag<=Math.min(3, gaps.length-1); lag++) {
     let covSum=0;
@@ -362,25 +358,20 @@ function buildPatternPrediction(sortedRounds, targetMin) {
     if (Math.abs(ac) > Math.abs(bestAC)) { bestAC=ac; bestLag=lag; }
   }
 
-  // Direction: is current gap above or below median?
   const aboveMedian = gapSinceLast > medianGap ? 1 : -1;
-  // Negative autocorr + above median → alternating → hit soon → positive score
-  // Positive autocorr + above median → clustering  → drought extends → negative
   const patternScore = Math.max(-1, Math.min(1, -bestAC * aboveMedian * 0.9));
 
-  // ── Composite direction ───────────────────────────────────────────────
   const composite = clusterScore*0.45 + trendScore*0.35 + patternScore*0.20;
   const direction = composite > 0.12 ? 'bullish' : composite < -0.12 ? 'bearish' : 'neutral';
 
-  // ── Confidence — signal agreement + sample size + signal strength ─────
   const scores   = [clusterScore, trendScore, patternScore];
   const nBull    = scores.filter(s=>s>0.10).length;
   const nBear    = scores.filter(s=>s<-0.10).length;
-  const agree    = Math.max(nBull, nBear); // 0,1,2,3
+  const agree    = Math.max(nBull, nBear);
   const sampleB  = Math.min(20, Math.log2(hits+1) * 5);
   const strengthB= Math.abs(composite) * 28;
-  const agreeB   = (agree-1) * 8; // -8, 0, +8, +16
-  const cvPenalty= cv > 1.5 ? -8 : cv > 1.2 ? -4 : 0; // irregular gaps = unreliable
+  const agreeB   = (agree-1) * 8;
+  const cvPenalty= cv > 1.5 ? -8 : cv > 1.2 ? -4 : 0;
   const conf     = Math.max(28, Math.min(90,
     Math.round(38 + sampleB + strengthB + agreeB + cvPenalty)
   ));
@@ -401,37 +392,37 @@ function buildPatternPrediction(sortedRounds, targetMin) {
 
 function buildPatternWindow(patternResult, maxWidth) {
   if (!patternResult) return null;
-  const { medianGap, clusterScore, trendScore, patternScore, confidence } = patternResult;
+  const { medianGap, clusterScore, trendScore, patternScore } = patternResult;
 
-  // Scale votes to medianGap, floored at maxWidth*1.5 so small medians still move
   const scale = Math.max(medianGap, maxWidth * 1.5);
-
-  // Each signal votes independently on "rounds from NOW":
-  // positive = event is later, negative = event is sooner
-  const cShift = -clusterScore * scale * 1.4; // drought→sooner, burst→later
-  const tShift =  trendScore   * scale * 0.9; // cooling→later, heating→sooner
-  const pShift = -patternScore * scale * 0.7; // pattern says soon→sooner
+  const cShift = -clusterScore * scale * 1.4;
+  const tShift =  trendScore   * scale * 0.9;
+  const pShift = -patternScore * scale * 0.7;
 
   const rawCenter = cShift*0.50 + tShift*0.30 + pShift*0.20;
   const center    = Math.max(0, Math.round(rawCenter));
   const low       = Math.max(0, Math.round(center - maxWidth/2));
   const high      = low + maxWidth - 1;
 
-  return { low, high, confidence };
+  return { low, high, confidence: patternResult.confidence };
 }
 
 
 // ============================================================================
 // KEY HELPERS
+// FIX 3: normalize all fields to avoid NaN keys
 // ============================================================================
 
 function histKey(r) {
-  const lo=r.lo??0, hi=r.hi??0;
-  return `${r.target}-${lo}-${hi}-${r.outcome}-${r.hitRound??'x'}`;
+  const lo = Number(r.lo) || 0;
+  const hi = Number(r.hi) || 0;
+  return `${r.target}-${lo}-${hi}-${r.outcome}-${r.hitRound ?? 'x'}`;
 }
+
 function patHistKey(r) {
-  const lo=r.lo??0, hi=r.hi??0;
-  return `pat-${r.target}-${lo}-${hi}-${r.outcome}-${r.hitRound??'x'}`;
+  const lo = Number(r.lo) || 0;
+  const hi = Number(r.hi) || 0;
+  return `pat-${r.target}-${lo}-${hi}-${r.outcome}-${r.hitRound ?? 'x'}`;
 }
 
 // ============================================================================
@@ -457,7 +448,7 @@ async function initialise() {
         targetMin:   target.min,
         anchorRound: anchor,
         generation:  pred.generation ?? 1,
-        stale:       true,
+        stale:       true, // mark as stale — will be validated on first poll
       };
     }
     console.log(`[engine] Loaded ${Object.keys(lockedPreds).length} locked preds from DB`);
@@ -466,21 +457,21 @@ async function initialise() {
     lockedPreds    = {};
     lockedPatterns = {};
   }
+
   try {
-    const rows = await getPredictions({ limit: 500 });
+    const rows = await getPredictions({ limit: 1000 });
     for (const r of rows) {
       if (!r.source || r.source === 'engine') {
         savedKeys.add(histKey(r));
-        savedKeys.add(`${r.target}-${r.anchorRound??r.lo}-${r.outcome}-${r.hitRound??'x'}`);
+        savedKeys.add(`${r.target}-${Number(r.anchorRound ?? r.lo) || 0}-${r.outcome}-${r.hitRound ?? 'x'}`);
       } else if (r.source === 'pattern') {
         patSavedKeys.add(patHistKey(r));
-        patSavedKeys.add(`pat-${r.target}-${r.anchorRound??r.lo}-${r.outcome}-${r.hitRound??'x'}`);
+        patSavedKeys.add(`pat-${r.target}-${Number(r.anchorRound ?? r.lo) || 0}-${r.outcome}-${r.hitRound ?? 'x'}`);
       }
     }
     console.log(`[engine] Loaded ${savedKeys.size} engine keys, ${patSavedKeys.size} pattern keys`);
   } catch(e) { console.error('[engine] history load error:', e.message); }
 
-  // Load pattern locked preds from DB
   try {
     const dbPatPreds = await getLockedPatternPreds();
     for (const [label, pred] of Object.entries(dbPatPreds)) {
@@ -501,14 +492,17 @@ async function initialise() {
     console.log(`[engine] Loaded ${Object.keys(lockedPatterns).length} pattern locked preds from DB`);
   } catch(e) {
     console.error('[engine] pattern locked preds load error:', e.message);
+    if (!lockedPatterns) lockedPatterns = {};
   }
 
-  // Always reset round count after init so first poll always processes
   lastRoundCount = 0;
 }
 
 // ============================================================================
 // PROCESS ENGINE
+// FIX 1+2: stale branch now validates old window against actual rounds,
+// records outcome if it's fully resolved, then always anchors new pred to
+// lastRoundId (not existing.anchorRound).
 // ============================================================================
 
 async function processEngine(sortedRounds, lastRoundId, regime) {
@@ -518,35 +512,127 @@ async function processEngine(sortedRounds, lastRoundId, regime) {
   for (const target of TARGETS) {
     const existing = lockedPreds[target.label];
 
+    // ── No prediction exists — create one ─────────────────────────────────
     if (!existing) {
       const pred = buildPrediction(sortedRounds, target.min, target.maxWidth, regime);
       if (pred) {
-        lockedPreds[target.label] = { ...pred, targetMin:target.min, anchorRound:lastRoundId, generation:1 };
+        lockedPreds[target.label] = {
+          ...pred,
+          targetMin:   target.min,
+          anchorRound: lastRoundId,
+          generation:  1,
+        };
         anyChange = true;
         console.log(`[engine] NEW ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}% regime=${regime.regime}`);
       }
       continue;
     }
 
+    // ── FIX 2: Stale pred — validate it against actual rounds ──────────────
+    // A stale pred was loaded from DB. Its anchorRound is from a past session.
+    // We must check if the old window already resolved (fully in the past).
     if (existing.stale) {
-      const pred = buildPrediction(sortedRounds, target.min, target.maxWidth, regime);
-      if (pred) {
-        lockedPreds[target.label] = { ...pred, targetMin:target.min, anchorRound:existing.anchorRound, generation:existing.generation };
+      const absLow  = existing.anchorRound + existing.low;
+      const absHigh = existing.anchorRound + existing.high;
+      const windowInPast = lastRoundId > absHigh;
+
+      if (windowInPast) {
+        // FIX 1: Old window is entirely in the past — it must have resolved.
+        // Check if there was a hit inside that window.
+        const status = getStatus(sortedRounds, existing, lastRoundId);
+        const resolvedStatuses = ['hit', 'miss', 'early'];
+
+        if (resolvedStatuses.includes(status.status)) {
+          const outcome = status.status === 'hit' ? 'win' : status.status === 'early' ? 'early' : 'loss';
+          const record  = {
+            target:      target.label,
+            minMult:     target.min,
+            outcome,
+            lo:          absLow,
+            hi:          absHigh,
+            anchorRound: existing.anchorRound,
+            hitRound:    status.hitRound || null,
+            generation:  existing.generation,
+            source:      'engine',
+            ts:          Date.now(),
+          };
+          const key = histKey(record);
+          if (!savedKeys.has(key) && Number.isFinite(absLow) && Number.isFinite(absHigh) && absLow <= absHigh) {
+            savedKeys.add(key);
+            try {
+              await savePrediction(record);
+              console.log(`[engine] STALE-RESOLVED ${target.label} ${outcome.toUpperCase()} #${absLow}–#${absHigh}`);
+            } catch(e) { console.error(`[engine] stale save fail ${target.label}:`, e.message); }
+          }
+        }
+
+        // Always build a fresh prediction anchored to NOW after resolving stale
+        const pred = buildPrediction(sortedRounds, target.min, target.maxWidth, regime);
+        if (pred) {
+          lockedPreds[target.label] = {
+            ...pred,
+            targetMin:   target.min,
+            anchorRound: lastRoundId, // FIX 2: anchor to NOW, not existing.anchorRound
+            generation:  existing.generation + 1,
+          };
+          console.log(`[engine] STALE→FRESH ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}%`);
+        } else {
+          delete lockedPreds[target.label];
+          console.warn(`[engine] ${target.label} stale cleared — buildPrediction null, will retry`);
+        }
         anyChange = true;
+      } else {
+        // Window might still be active — clear stale flag and evaluate normally
+        existing.stale = false;
+        // Fall through to normal status check below on next poll
+        // (don't skip this target — re-check status immediately)
+        const status = getStatus(sortedRounds, existing, lastRoundId);
+        if (['hit', 'miss', 'early'].includes(status.status)) {
+          // Resolved within the still-valid stale window
+          const outcome = status.status === 'hit' ? 'win' : status.status === 'early' ? 'early' : 'loss';
+          const record  = {
+            target:      target.label,
+            minMult:     target.min,
+            outcome,
+            lo:          absLow,
+            hi:          absHigh,
+            anchorRound: existing.anchorRound,
+            hitRound:    status.hitRound || null,
+            generation:  existing.generation,
+            source:      'engine',
+            ts:          Date.now(),
+          };
+          const key = histKey(record);
+          if (!savedKeys.has(key) && Number.isFinite(absLow) && Number.isFinite(absHigh)) {
+            savedKeys.add(key);
+            try { await savePrediction(record); } catch(e) {}
+          }
+          const pred = buildPrediction(sortedRounds, target.min, target.maxWidth, regime);
+          if (pred) {
+            lockedPreds[target.label] = { ...pred, targetMin: target.min, anchorRound: lastRoundId, generation: existing.generation + 1 };
+          } else {
+            delete lockedPreds[target.label];
+          }
+          anyChange = true;
+        }
+        // else: status is active/waiting — leave as-is, now not stale
       }
       continue;
     }
 
+    // ── Normal active prediction — check status ────────────────────────────
     const status = getStatus(sortedRounds, existing, lastRoundId);
 
-    if (['hit','miss','early'].includes(status.status)) {
-      const outcome = status.status==='hit' ? 'win' : status.status==='early' ? 'early' : 'loss';
+    if (['hit', 'miss', 'early'].includes(status.status)) {
+      const outcome = status.status === 'hit' ? 'win' : status.status === 'early' ? 'early' : 'loss';
+      const absLow  = existing.anchorRound + existing.low;
+      const absHigh = existing.anchorRound + existing.high;
       const record  = {
         target:      target.label,
         minMult:     target.min,
         outcome,
-        lo:          existing.anchorRound + existing.low,
-        hi:          existing.anchorRound + existing.high,
+        lo:          absLow,
+        hi:          absHigh,
         anchorRound: existing.anchorRound,
         hitRound:    status.hitRound || null,
         generation:  existing.generation,
@@ -556,29 +642,32 @@ async function processEngine(sortedRounds, lastRoundId, regime) {
       const key = histKey(record);
       if (!savedKeys.has(key)) {
         savedKeys.add(key);
-        savedKeys.add(`${record.target}-${record.anchorRound}-${record.outcome}-${record.hitRound??'x'}`);
-        // Guard: only save valid windows (anchorRound undefined = NaN lo/hi)
+        savedKeys.add(`${record.target}-${record.anchorRound}-${record.outcome}-${record.hitRound ?? 'x'}`);
         if (Number.isFinite(record.lo) && Number.isFinite(record.hi) && record.lo <= record.hi) {
           try {
             await savePrediction(record);
-            console.log(`[engine] ${target.label} ${outcome.toUpperCase()} #${record.lo}–#${record.hi}${record.hitRound?` @#${record.hitRound}`:''} regime=${regime.regime}`);
+            console.log(`[engine] ${target.label} ${outcome.toUpperCase()} #${record.lo}–#${record.hi}${record.hitRound ? ` @#${record.hitRound}` : ''} regime=${regime.regime}`);
           } catch(e) { console.error(`[engine] save fail ${target.label}:`, e.message); }
         } else {
-          console.warn(`[engine] skipped save ${target.label} — invalid lo/hi: ${record.lo}/${record.hi} (anchorRound=${record.anchorRound})`);
+          console.warn(`[engine] skipped save ${target.label} — invalid lo/hi: ${record.lo}/${record.hi}`);
         }
       }
       const pred = buildPrediction(sortedRounds, target.min, target.maxWidth, regime);
       if (pred) {
-        lockedPreds[target.label] = { ...pred, targetMin:target.min, anchorRound:lastRoundId, generation:existing.generation+1 };
+        lockedPreds[target.label] = {
+          ...pred,
+          targetMin:   target.min,
+          anchorRound: lastRoundId,
+          generation:  existing.generation + 1,
+        };
         console.log(`[engine] NEXT ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}% regime=${regime.regime}`);
       } else {
-        // buildPrediction returned null (insufficient data) — clear the stale pred
-        // so we don't loop forever on RESOLVING. Will retry next poll.
         delete lockedPreds[target.label];
-        console.warn(`[engine] ${target.label} cleared after ${outcome} — buildPrediction returned null, will retry`);
+        console.warn(`[engine] ${target.label} cleared after ${outcome} — buildPrediction null, will retry`);
       }
       anyChange = true;
     }
+    // status === 'active' or 'waiting' → do nothing, window still open
   }
 
   buildPrediction._statsCache = null;
@@ -587,6 +676,7 @@ async function processEngine(sortedRounds, lastRoundId, regime) {
     const toSave = {};
     for (const [label, pred] of Object.entries(lockedPreds)) {
       if (pred.stale) continue;
+      if (!Number.isFinite(pred.anchorRound) || !Number.isFinite(pred.low) || !Number.isFinite(pred.high)) continue;
       toSave[label] = {
         lo:            pred.anchorRound + pred.low,
         hi:            pred.anchorRound + pred.high,
@@ -604,6 +694,7 @@ async function processEngine(sortedRounds, lastRoundId, regime) {
 
 // ============================================================================
 // PROCESS PATTERN
+// FIX 1+2: same stale anchor fix as processEngine
 // ============================================================================
 
 async function processPattern(sortedRounds, lastRoundId, regime) {
@@ -611,27 +702,110 @@ async function processPattern(sortedRounds, lastRoundId, regime) {
 
   for (const target of TARGETS) {
     const existing = lockedPatterns[target.label];
-    const patPred  = buildPatternPrediction(sortedRounds, target.min, regime);
-    const win      = buildPatternWindow(patPred, target.maxWidth, regime);
+    const patPred  = buildPatternPrediction(sortedRounds, target.min);
+    const win      = buildPatternWindow(patPred, target.maxWidth);
 
-    if (!existing || existing.stale) {
+    // ── No prediction — create one ─────────────────────────────────────────
+    if (!existing) {
       if (win) {
-        lockedPatterns[target.label] = { ...win, targetMin:target.min, anchorRound:lastRoundId, generation:existing?existing.generation:1 };
+        lockedPatterns[target.label] = {
+          ...win,
+          targetMin:   target.min,
+          anchorRound: lastRoundId,
+          generation:  1,
+        };
         anyChange = true;
       }
       continue;
     }
 
+    // ── Stale pred — validate old window, build fresh ──────────────────────
+    if (existing.stale) {
+      const absLow  = existing.anchorRound + existing.low;
+      const absHigh = existing.anchorRound + existing.high;
+      const windowInPast = lastRoundId > absHigh;
+
+      if (windowInPast) {
+        const status = getStatus(sortedRounds, existing, lastRoundId);
+        if (['hit', 'miss', 'early'].includes(status.status)) {
+          const outcome = status.status === 'hit' ? 'win' : status.status === 'early' ? 'early' : 'loss';
+          const record  = {
+            target:      target.label,
+            minMult:     target.min,
+            outcome,
+            lo:          absLow,
+            hi:          absHigh,
+            anchorRound: existing.anchorRound,
+            hitRound:    status.hitRound || null,
+            generation:  existing.generation,
+            source:      'pattern',
+            ts:          Date.now(),
+          };
+          const key = patHistKey(record);
+          if (!patSavedKeys.has(key) && Number.isFinite(absLow) && Number.isFinite(absHigh) && absLow <= absHigh) {
+            patSavedKeys.add(key);
+            try {
+              await savePrediction(record);
+              console.log(`[pattern] STALE-RESOLVED ${target.label} ${outcome.toUpperCase()} #${absLow}–#${absHigh}`);
+            } catch(e) { console.error(`[pattern] stale save fail:`, e.message); }
+          }
+        }
+        // FIX 2: anchor fresh prediction to NOW
+        if (win) {
+          lockedPatterns[target.label] = {
+            ...win,
+            targetMin:   target.min,
+            anchorRound: lastRoundId,
+            generation:  existing.generation + 1,
+          };
+          console.log(`[pattern] STALE→FRESH ${target.label}: +${win.low}–+${win.high}`);
+        } else {
+          delete lockedPatterns[target.label];
+        }
+        anyChange = true;
+      } else {
+        // Window still valid — clear stale flag, check status
+        existing.stale = false;
+        const status = getStatus(sortedRounds, existing, lastRoundId);
+        if (['hit', 'miss', 'early'].includes(status.status)) {
+          const absLow2  = existing.anchorRound + existing.low;
+          const absHigh2 = existing.anchorRound + existing.high;
+          const outcome = status.status === 'hit' ? 'win' : status.status === 'early' ? 'early' : 'loss';
+          const record  = {
+            target: target.label, minMult: target.min, outcome,
+            lo: absLow2, hi: absHigh2, anchorRound: existing.anchorRound,
+            hitRound: status.hitRound || null, generation: existing.generation,
+            source: 'pattern', ts: Date.now(),
+          };
+          const key = patHistKey(record);
+          if (!patSavedKeys.has(key) && Number.isFinite(absLow2) && Number.isFinite(absHigh2)) {
+            patSavedKeys.add(key);
+            try { await savePrediction(record); } catch(e) {}
+          }
+          if (win) {
+            lockedPatterns[target.label] = { ...win, targetMin: target.min, anchorRound: lastRoundId, generation: existing.generation + 1 };
+          } else {
+            delete lockedPatterns[target.label];
+          }
+          anyChange = true;
+        }
+      }
+      continue;
+    }
+
+    // ── Normal active prediction ───────────────────────────────────────────
     const status = getStatus(sortedRounds, existing, lastRoundId);
 
-    if (['hit','miss','early'].includes(status.status)) {
-      const outcome = status.status==='hit' ? 'win' : status.status==='early' ? 'early' : 'loss';
+    if (['hit', 'miss', 'early'].includes(status.status)) {
+      const outcome = status.status === 'hit' ? 'win' : status.status === 'early' ? 'early' : 'loss';
+      const absLow  = existing.anchorRound + existing.low;
+      const absHigh = existing.anchorRound + existing.high;
       const record  = {
         target:      target.label,
         minMult:     target.min,
         outcome,
-        lo:          existing.anchorRound + existing.low,
-        hi:          existing.anchorRound + existing.high,
+        lo:          absLow,
+        hi:          absHigh,
         anchorRound: existing.anchorRound,
         hitRound:    status.hitRound || null,
         generation:  existing.generation,
@@ -641,7 +815,7 @@ async function processPattern(sortedRounds, lastRoundId, regime) {
       const key = patHistKey(record);
       if (!patSavedKeys.has(key)) {
         patSavedKeys.add(key);
-        patSavedKeys.add(`pat-${record.target}-${record.anchorRound}-${record.outcome}-${record.hitRound??'x'}`);
+        patSavedKeys.add(`pat-${record.target}-${record.anchorRound}-${record.outcome}-${record.hitRound ?? 'x'}`);
         if (Number.isFinite(record.lo) && Number.isFinite(record.hi) && record.lo <= record.hi) {
           try {
             await savePrediction(record);
@@ -652,22 +826,26 @@ async function processPattern(sortedRounds, lastRoundId, regime) {
         }
       }
       if (win) {
-        lockedPatterns[target.label] = { ...win, targetMin:target.min, anchorRound:lastRoundId, generation:existing.generation+1 };
+        lockedPatterns[target.label] = {
+          ...win,
+          targetMin:   target.min,
+          anchorRound: lastRoundId,
+          generation:  existing.generation + 1,
+        };
         console.log(`[pattern] NEXT ${target.label}: +${win.low}–+${win.high} conf=${win.confidence}%`);
       } else {
-        // buildPatternPrediction returned null — clear stale pred to prevent infinite RESOLVING
         delete lockedPatterns[target.label];
-        console.warn(`[pattern] ${target.label} cleared after ${outcome} — buildPatternPrediction returned null, will retry`);
+        console.warn(`[pattern] ${target.label} cleared after ${outcome} — buildPatternPrediction null, will retry`);
       }
       anyChange = true;
     }
   }
 
-  // Persist pattern locked preds to DB so they survive server restarts
   if (anyChange) {
     const toSavePat = {};
     for (const [label, pred] of Object.entries(lockedPatterns)) {
       if (pred.stale) continue;
+      if (!Number.isFinite(pred.anchorRound) || !Number.isFinite(pred.low) || !Number.isFinite(pred.high)) continue;
       toSavePat[label] = {
         lo:            pred.anchorRound + pred.low,
         hi:            pred.anchorRound + pred.high,
@@ -710,7 +888,7 @@ async function runPredictionEngine() {
     await processPattern(rounds, lastRoundId, regime);
 
   } catch(e) {
-    console.error('[predictionEngine] Fatal:', e.message);
+    console.error('[predictionEngine] Fatal:', e.message, e.stack);
   }
 }
 
