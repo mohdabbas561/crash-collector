@@ -273,6 +273,15 @@ function startAPI() {
   initAccessCodes().catch(e => console.error('initAccessCodes error:', e.message));
   initWalletStorage().catch(e => console.error('initWalletStorage error:', e.message));
   app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
+
+  const { runPredictionEngine } = require('./predictionEngine');
+
+// Start the prediction engine
+runPredictionEngine();
+setInterval(runPredictionEngine, 10000);
+
+// Start the API server
+startAPI();
 }
 
 module.exports = { startAPI };
