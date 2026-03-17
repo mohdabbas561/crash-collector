@@ -97,7 +97,7 @@ async function saveRounds(rounds) {
   return res.rowCount;
 }
 
-async function getRounds({ limit = 1000, offset = 0, from = null, to = null } = {}) {
+async function getRounds({ limit = 1000, offset = 0, from = null, to = null, order = 'ASC' } = {}) {
   const conditions = [];
   const params = [];
   let idx = 1;
@@ -105,18 +105,23 @@ async function getRounds({ limit = 1000, offset = 0, from = null, to = null } = 
   if (to)   { conditions.push(`created_at <= $${idx++}`); params.push(new Date(to)); }
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   params.push(limit, offset);
+  // When order='DESC' we fetch newest N rows then re-sort ASC for the caller
+  const sortDir = order === 'DESC' ? 'DESC' : 'ASC';
   const res = await pool.query(
     `SELECT round_id, multiplier, timestamp, created_at
      FROM rounds ${where}
-     ORDER BY round_id ASC
+     ORDER BY round_id ${sortDir}
      LIMIT $${idx++} OFFSET $${idx++}`,
     params
   );
-  return res.rows.map(row => ({
+  const rows = res.rows.map(row => ({
     roundId   : Number(row.round_id),
     multiplier: parseFloat(row.multiplier),
     timestamp : row.timestamp ? Number(row.timestamp) : Number(new Date(row.created_at)),
   }));
+  // Always return in ASC order regardless of fetch direction
+  if (order === 'DESC') rows.sort((a, b) => a.roundId - b.roundId);
+  return rows;
 }
 
 async function getStorageStats() {

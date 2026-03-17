@@ -499,7 +499,7 @@ async function runPredictionEngine() {
   try {
     await initialise();
 
-    const rounds = await getRounds({ limit: 5000 });
+    const rounds = await getRounds({ limit: 5000, order: 'DESC' }); // fetch NEWEST 5000, sorted ASC
     if (rounds.length < MIN_ROUNDS) {
       console.log(`[engine] waiting for rounds (${rounds.length}/${MIN_ROUNDS})`);
       return;
