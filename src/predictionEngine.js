@@ -157,11 +157,26 @@ function detectRegime(rounds) {
 function buildPrediction(sortedRounds, targetMin, maxWidth) {
   const s = scanRounds(sortedRounds, targetMin);
   if (!s) return null;
-  const { hits, p, gapSinceLast, rateShifted, cusumNorm } = s;
+  const { hits, p, pGlobal, gapSinceLast, medianGap, p90, rateShifted, cusumNorm } = s;
   const probW = 1 - Math.pow(1 - p, maxWidth);
   const regime = detectRegime(sortedRounds);
+
+  // Expected gap = median of historical gaps (more robust than mean for skewed distributions)
+  // Weight toward p90 slightly when rate-shifted (conservative)
+  const expectedGap = rateShifted
+    ? Math.round(medianGap * 0.7 + p90 * 0.3)
+    : Math.round(medianGap);
+
+  // Window opens in the last W rounds of the expected gap
+  // low = max(0, expectedGap - W), high = low + W - 1
+  // This means: "we expect the hit around round expectedGap, and we open a W-round window for it"
+  const low  = Math.max(0, expectedGap - maxWidth);
+  const high = low + maxWidth - 1;
+
   return {
-    low: 0, high: maxWidth - 1,
+    low, high,
+    expectedGap,
+    opensIn: low, // rounds from anchor until window opens
     confidence: computeConf(probW, hits),
     probW: +probW.toFixed(4),
     p: +p.toFixed(6),
@@ -207,12 +222,26 @@ function buildStatPrediction(sortedRounds, targetMin, maxWidth, modelId) {
   // KM pModel is already P(gap ≤ W), others need geometric transform
   const probW = modelId === 'km' ? pModel : 1 - Math.pow(1 - pModel, maxWidth);
 
+  // Expected gap from pGlobal (unblended, pure base rate)
+  const rawExpectedGap = (1 - pGlobal) / pGlobal;
+  // Use median gap for window placement — more robust
+  const { medianGap, p90 } = s;
+  const expectedGap = rateShifted
+    ? Math.round(medianGap * 0.7 + p90 * 0.3)
+    : Math.round(medianGap);
+
+  // Window: last W rounds of the expected gap
+  const low  = Math.max(0, expectedGap - maxWidth);
+  const high = low + maxWidth - 1;
+
   return {
-    low: 0, high: maxWidth - 1,
+    low, high,
+    expectedGap,
+    opensIn: low,
     confidence: computeConf(probW, hits),
     probW: +probW.toFixed(4),
     p: +pModel.toFixed(6),
-    expectedGap: +((1 - pGlobal) / pGlobal).toFixed(1),
+    rawExpectedGap: +rawExpectedGap.toFixed(1),
     gapSinceLast, hits, rateShifted, model: modelId,
   };
 }
@@ -277,9 +306,19 @@ function buildPatternPrediction(sortedRounds, targetMin) {
   return { direction, confidence: conf, hits, meanGap: Math.round(meanGap), medianGap: Math.round(medianGap), composite:+composite.toFixed(3) };
 }
 
-function buildPatternWindow(patternResult, maxWidth) {
+function buildPatternWindow(patternResult, maxWidth, sortedRounds, targetMin) {
   if (!patternResult) return null;
-  return { low: 0, high: maxWidth - 1, confidence: patternResult.confidence, direction: patternResult.direction };
+  // Pattern uses its own meanGap as expected gap
+  const expectedGap = patternResult.medianGap || patternResult.meanGap || maxWidth;
+  const low  = Math.max(0, expectedGap - maxWidth);
+  const high = low + maxWidth - 1;
+  return {
+    low, high,
+    expectedGap,
+    opensIn: low,
+    confidence: patternResult.confidence,
+    direction: patternResult.direction,
+  };
 }
 
 // ── makeKey — window identity only (no outcome/hitRound to prevent dupes) ─────
@@ -434,7 +473,7 @@ function buildSavePayload(lockedMap) {
       hi:            anchor + (Number(pred.high)||0),
       roundWhenMade: anchor,
       generation:    pred.generation||1,
-      eta:           { low: pred.low, high: pred.high, conf: pred.confidence, probW: pred.probW },
+      eta:           { low: pred.low, high: pred.high, conf: pred.confidence, probW: pred.probW, expectedGap: pred.expectedGap, opensIn: pred.opensIn },
     };
   }
   return out;
@@ -452,6 +491,8 @@ function loadLockedMap(dbRows) {
       high:        eta.high != null ? eta.high : Math.max(0, Number(pred.hi) - anchor),
       confidence:  eta.conf ?? 50,
       probW:       eta.probW ?? null,
+      expectedGap: eta.expectedGap ?? null,
+      opensIn:     eta.opensIn ?? null,
       targetMin:   target.min,
       anchorRound: anchor,
       generation:  pred.generation ?? 1,
@@ -534,7 +575,7 @@ async function runPredictionEngine() {
       {
         id: 'pattern',
         state: STATE.pattern,
-        buildFn: (t) => { const pp = buildPatternPrediction(rounds, t.min); return buildPatternWindow(pp, t.maxWidth); },
+        buildFn: (t) => { const pp = buildPatternPrediction(rounds, t.min); return buildPatternWindow(pp, t.maxWidth, rounds, t.min); },
         saveFn:  async (p) => { if (Object.keys(p).length) await saveLockedPatternPreds(p); },
       },
       ...STAT_MODELS.map(model => ({
