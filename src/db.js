@@ -41,10 +41,20 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_predictions_source ON predictions(source);
   `);
 
+  // Unique constraint — safe idempotent creation
   await pool.query(`
-    ALTER TABLE predictions
-      ADD CONSTRAINT IF NOT EXISTS uq_predictions_source_target_window
-      UNIQUE (source, target, window_lo, window_hi);
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'uq_predictions_source_target_window'
+      ) THEN
+        ALTER TABLE predictions
+          ADD CONSTRAINT uq_predictions_source_target_window
+          UNIQUE (source, target, window_lo, window_hi);
+      END IF;
+    END
+    $$;
   `).catch(() => {});
 }
 

@@ -41,14 +41,14 @@ const {
 } = require('./db');
 
 const TARGETS = [
-  { label: '5x',    min: 5,    maxWidth: 4  },
-  { label: '10x',   min: 10,   maxWidth: 6  },
-  { label: '20x',   min: 20,   maxWidth: 10 },
-  { label: '50x',   min: 50,   maxWidth: 14 },
-  { label: '100x',  min: 100,  maxWidth: 20 },
-  { label: '250x',  min: 250,  maxWidth: 28 },
-  { label: '500x',  min: 500,  maxWidth: 35 },
-  { label: '1000x', min: 1000, maxWidth: 55 },
+  { label: '5x',    min: 5,    maxWidth: 3  },
+  { label: '10x',   min: 10,   maxWidth: 5  },
+  { label: '20x',   min: 20,   maxWidth: 8  },
+  { label: '50x',   min: 50,   maxWidth: 12 },
+  { label: '100x',  min: 100,  maxWidth: 18 },
+  { label: '250x',  min: 250,  maxWidth: 25 },
+  { label: '500x',  min: 500,  maxWidth: 30 },
+  { label: '1000x', min: 1000, maxWidth: 50 },
 ];
 
 const STAT_MODELS = [
