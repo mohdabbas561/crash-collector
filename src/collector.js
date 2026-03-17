@@ -31,22 +31,22 @@ async function fetchRounds() {
 
 async function poll() {
   try {
-    const rounds    = await fetchRounds();
-    if (!rounds.length) return;
-    const newRounds = rounds.filter(r => r.roundId > lastSeenRoundId);
-    if (!newRounds.length) return;
-    const saved = await saveRounds(newRounds);
-    const maxId = Math.max(...newRounds.map(r => r.roundId));
-    if (saved > 0) {
-      console.log(`[${new Date().toISOString()}] Saved ${saved} new rounds. Latest: #${maxId}`);
+    const rounds = await fetchRounds();
+    if (rounds.length) {
+      const newRounds = rounds.filter(r => r.roundId > lastSeenRoundId);
+      if (newRounds.length) {
+        const saved = await saveRounds(newRounds);
+        const maxId = Math.max(...newRounds.map(r => r.roundId));
+        if (saved > 0) {
+          console.log(`[${new Date().toISOString()}] Saved ${saved} new rounds. Latest: #${maxId}`);
+        }
+        lastSeenRoundId = maxId;
+      }
     }
-    lastSeenRoundId   = maxId;
     consecutiveErrors = 0;
-
-    // ── Run prediction engine after every successful poll ─────────────────
-    // This runs even when the frontend is offline, keeping DB history current.
+    // Always run engine every tick — engines check their own dirty flags
+    // and rebuild immediately when a window resolves, no round needed
     await runPredictionEngine();
-
   } catch (err) {
     consecutiveErrors++;
     console.error(`[${new Date().toISOString()}] Poll error (${consecutiveErrors}): ${err.message}`);
