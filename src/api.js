@@ -28,6 +28,12 @@ app.use(cors({
 }));
 
 app.use(express.json({ limit: '50kb' }));
+app.use((req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  next();
+});
 
 const rateLimits = new Map();
 function rateLimit(maxPerMin) {
