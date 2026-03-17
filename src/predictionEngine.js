@@ -512,7 +512,7 @@ async function initialise() {
 // ============================================================================
 
 async function processEngine(sortedRounds, lastRoundId, regime) {
-  _statsCache = computeGlobalStats(sortedRounds);
+  buildPrediction._statsCache = computeGlobalStats(sortedRounds);
   let anyChange = false;
 
   for (const target of TARGETS) {
@@ -576,7 +576,7 @@ async function processEngine(sortedRounds, lastRoundId, regime) {
     }
   }
 
-  _statsCache = null;
+  buildPrediction._statsCache = null;
 
   if (anyChange) {
     const toSave = {};
