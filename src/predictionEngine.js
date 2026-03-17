@@ -1,23 +1,22 @@
 'use strict';
-// predictionEngine.js  v7
+// predictionEngine.js  v8
 //
-// ROOT CAUSE OF PERSISTENT RESOLVING:
+// FIXES in v8:
 //
-//   The engine skipped processing when rounds.length === lastRoundCount.
-//   But a window can expire (lastRoundId > absHigh) even when no new rounds
-//   arrive — because the window is narrow (e.g. 3 rounds wide for 5x) and
-//   lastRoundId already passed absHigh on the previous run.
-//   The "no new rounds" guard prevented the expired window from ever being
-//   rebuilt. It stayed in the DB with the old lo/hi forever → RESOLVING.
+//   1. lastProcessedRoundId is now set AFTER processing (not before).
+//      Previously: set at top → crash mid-run → next boot sees same roundId
+//      → skips processing → stale RESOLVING windows stay forever.
 //
-//   FIX: Always run processWindows. Remove the "rounds unchanged" early exit.
-//   Use a separate `lastProcessedRoundId` to avoid redundant DB saves:
-//   only persist to DB when lastRoundId has actually advanced.
+//   2. isFirstRun flag: on the very first runPredictionEngine() call after
+//      startup, ALWAYS run processWindows regardless of lastProcessedRoundId.
+//      This clears stale DB windows that survived a server restart.
 //
-// OTHER FIXES:
-//   - MIN_ROUNDS = 50 (was 100, prevented engine from running on first boot)
-//   - isFirstRun forces processing on startup to clear stale DB windows
-//   - STALE_FORCE_REBUILD_THRESHOLD: skip scanning windows > 500r old
+//   3. hasExpiredWindows() now correctly detects windows where the DB-loaded
+//      stale:true entries have anchor=0 (would never expire by absHigh check
+//      alone) — they are always treated as expired.
+//
+//   4. STALE_FORCE_REBUILD_THRESHOLD lowered to 200 (was 500) so very old
+//      windows don't block outcome recording.
 
 const {
   getRounds, savePrediction, getPredictions,
@@ -45,7 +44,7 @@ const STAT_MODELS = [
 ];
 
 const MIN_ROUNDS = 50;
-const STALE_FORCE_REBUILD_THRESHOLD = 500;
+const STALE_FORCE_REBUILD_THRESHOLD = 200;
 
 let lockedPreds    = null;
 let lockedPatterns = null;
@@ -53,8 +52,9 @@ let lockedStats    = null;
 let savedKeys      = new Set();
 let patSavedKeys   = new Set();
 let statSavedKeys  = {};
-let lastProcessedRoundId = 0; // track last roundId we actually processed
+let lastProcessedRoundId = 0;
 let initialised    = false;
+let isFirstRun     = true; // FIX: force processing on first call after boot
 
 // ── Reset ─────────────────────────────────────────────────────────────────────
 
@@ -68,6 +68,7 @@ function resetEngineState() {
   statSavedKeys  = {};
   lastProcessedRoundId = 0;
   initialised    = false;
+  isFirstRun     = true;
 }
 
 // ── Math ──────────────────────────────────────────────────────────────────────
@@ -295,7 +296,6 @@ function getStatus(sortedRounds, pred, currentRoundId) {
 }
 
 // ── processWindows ────────────────────────────────────────────────────────────
-// RUNS ON EVERY POLL — no early exit for "no new rounds"
 
 async function processWindows({ lockedMap, savedSet, source, sortedRounds, lastRoundId, buildFn }) {
   let anyChange = false;
@@ -344,7 +344,7 @@ async function processWindows({ lockedMap, savedSet, source, sortedRounds, lastR
         }
       }
 
-      // ALWAYS rebuild — no matter what getStatus returned
+      // ALWAYS rebuild
       const pred = buildFn(target);
       if (pred) {
         lockedMap[target.label] = {
@@ -429,7 +429,7 @@ function loadLockedMap(dbRows) {
       targetMin:   target.min,
       anchorRound: anchor,
       generation:  pred.generation ?? 1,
-      stale:       true,
+      stale:       true, // always mark DB-loaded as stale so they get re-evaluated on first run
     };
   }
   return map;
@@ -468,7 +468,29 @@ async function initialise() {
     }
   } catch(e) { console.error('[engine] history load error:', e.message); }
 
+  // FIX: reset lastProcessedRoundId so first run always processes
   lastProcessedRoundId = 0;
+  isFirstRun = true;
+}
+
+// ── hasExpiredWindows — checks in-memory maps ─────────────────────────────────
+
+function hasExpiredWindows(lastRoundId) {
+  const allMaps = [
+    lockedPreds,
+    lockedPatterns,
+    ...STAT_MODELS.map(m => lockedStats?.[m.id]),
+  ].filter(Boolean);
+
+  for (const map of allMaps) {
+    for (const pred of Object.values(map)) {
+      const anchor  = Number(pred.anchorRound) || 0;
+      const absHigh = anchor + (Number(pred.high) || 0);
+      // stale, anchor=0, or past absHigh all count as "needs processing"
+      if (pred.stale || anchor === 0 || lastRoundId > absHigh) return true;
+    }
+  }
+  return false;
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -485,22 +507,16 @@ async function runPredictionEngine() {
     rounds.sort((a, b) => a.roundId - b.roundId);
     const lastRoundId = rounds[rounds.length - 1].roundId;
 
-    // Check if ANY window is expired — if so, we must process even with same round count
-    const hasExpiredWindows = () => {
-      const allMaps = [lockedPreds, lockedPatterns, ...STAT_MODELS.map(m => lockedStats[m.id])].filter(Boolean);
-      for (const map of allMaps) {
-        for (const pred of Object.values(map)) {
-          const anchor  = Number(pred.anchorRound) || 0;
-          const absHigh = anchor + (Number(pred.high) || 0);
-          if (pred.stale || lastRoundId > absHigh || anchor === 0) return true;
-        }
-      }
-      return false;
-    };
+    // FIX: Skip only if round unchanged AND no expired windows AND not first run
+    const shouldSkip = !isFirstRun
+      && lastRoundId === lastProcessedRoundId
+      && !hasExpiredWindows(lastRoundId);
 
-    // Skip only if round ID unchanged AND no expired windows
-    if (lastRoundId === lastProcessedRoundId && !hasExpiredWindows()) return;
-    lastProcessedRoundId = lastRoundId;
+    if (shouldSkip) return;
+
+    // FIX: Mark first run done BEFORE processing (so we don't re-enter)
+    // but set lastProcessedRoundId AFTER so a crash mid-run forces retry
+    isFirstRun = false;
 
     const regime    = detectRegime(rounds);
     _statsCache     = computeGlobalStats(rounds);
@@ -543,9 +559,15 @@ async function runPredictionEngine() {
       }
     }
 
+    // FIX: Only update lastProcessedRoundId AFTER all processing succeeds
+    lastProcessedRoundId = lastRoundId;
     _statsCache = null;
 
-  } catch(e) { console.error('[predictionEngine] Fatal:', e.message, e.stack); _statsCache = null; }
+  } catch(e) {
+    console.error('[predictionEngine] Fatal:', e.message, e.stack);
+    _statsCache = null;
+    // FIX: Do NOT update lastProcessedRoundId on error — force retry next poll
+  }
 }
 
 function getLockedStatMap(modelId) {
