@@ -216,8 +216,9 @@ async function deleteWallet(id) {
   await pool.query(`DELETE FROM saved_wallets WHERE id = $1`, [id]);
 }
 
-// ── ACCESS CODES ──────────────────────────────────────────────────────────────
+// ── ACCESS CODES + ALL LOCKED PRED TABLES ────────────────────────────────────
 async function initAccessCodes() {
+
   // ── Engine locked preds ───────────────────────────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS locked_preds (
@@ -232,7 +233,7 @@ async function initAccessCodes() {
     );
   `).catch(() => {});
 
-  // ── Pattern locked preds (new — mirrors locked_preds for pattern engine) ──
+  // ── Pattern locked preds ──────────────────────────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS locked_preds_pattern (
       target          VARCHAR(10) PRIMARY KEY,
@@ -245,6 +246,22 @@ async function initAccessCodes() {
     );
   `).catch(() => {});
 
+  // ── Stat model locked preds (ens / geo / bay / km) ────────────────────────
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS locked_preds_stat (
+      model           VARCHAR(10) NOT NULL,
+      target          VARCHAR(10) NOT NULL,
+      lo              BIGINT      NOT NULL,
+      hi              BIGINT      NOT NULL,
+      round_when_made BIGINT      NOT NULL,
+      generation      INT         NOT NULL DEFAULT 1,
+      eta_json        TEXT,
+      updated_at      TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (model, target)
+    );
+  `).catch(() => {});
+
+  // ── Access codes ──────────────────────────────────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS access_codes (
       id          SERIAL PRIMARY KEY,
@@ -359,6 +376,7 @@ async function getLockedPatternPreds() {
   return out;
 }
 
+// ── Stat model locked preds (ens / geo / bay / km) ────────────────────────────
 async function saveLockedStatPreds(modelId, preds) {
   for (const [target, data] of Object.entries(preds)) {
     await pool.query(
@@ -371,7 +389,7 @@ async function saveLockedStatPreds(modelId, preds) {
     );
   }
 }
- 
+
 async function getLockedStatPreds() {
   const res = await pool.query(`SELECT * FROM locked_preds_stat`);
   const out = { ens:{}, geo:{}, bay:{}, km:{} };
@@ -393,9 +411,9 @@ module.exports = {
   initDB, saveRounds, getRounds, getStorageStats, getStats,
   saveLockedPreds, getLockedPreds,
   saveLockedPatternPreds, getLockedPatternPreds,
+  saveLockedStatPreds, getLockedStatPreds,
   initWalletStorage, saveWallet, getWallets, deleteWallet,
   savePrediction, getPredictions, clearPredictions,
   initAccessCodes, createAccessCode, getAccessCode,
   updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,
-  saveLockedStatPreds, getLockedStatPreds,
 };
