@@ -412,7 +412,7 @@ async function saveLockedStatPreds(modelId, preds) {
 
 async function getLockedStatPreds() {
   const res = await pool.query(`SELECT * FROM locked_preds_stat`);
-  const out = { ens:{}, geo:{}, bay:{}, km:{}, rf:{}, gbt:{}, lr:{}, nb:{}, lstm:{} };
+  const out = { ens:{}, geo:{}, bay:{}, km:{}, rf:{}, gbt:{}, lr:{}, nb:{}, lstm:{}, lgbm:{}, prp:{}, gru:{}, ifor:{} };
   for (const r of res.rows) {
     if (!out[r.model]) out[r.model] = {};
     out[r.model][r.target] = {

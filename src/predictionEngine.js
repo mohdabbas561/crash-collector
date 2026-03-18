@@ -88,6 +88,10 @@ const STAT_MODELS = [
   { id: 'lr'   },   // Logistic Regression   — simple-statistics
   { id: 'nb'   },   // Naive Bayes (Gaussian) — ml-naivebayes
   { id: 'lstm' },   // LSTM                  — pure JS, zero deps
+  { id: 'lgbm' },   // LightGBM              — pure JS leaf-wise boosting
+  { id: 'prp'  },   // Prophet               — pure JS seasonality/cycle
+  { id: 'gru'  },   // GRU Neural Net        — pure JS gated recurrent
+  { id: 'ifor' },   // Isolation Forest      — pure JS anomaly detection
 ];
 
 // ── Lazy-load ML libraries (installed via npm, optional) ─────────────────────
@@ -209,7 +213,7 @@ for (const t of TARGETS) {
 
 // ── Per-engine independent CUSUM / regime state ───────────────────────────────
 const engineCusumState = {};
-for (const id of ['engine', 'ens', 'geo', 'bay', 'km', 'rf', 'gbt', 'lr', 'nb', 'lstm']) {
+for (const id of ['engine', 'ens', 'geo', 'bay', 'km', 'rf', 'gbt', 'lr', 'nb', 'lstm', 'lgbm', 'prp', 'gru', 'ifor']) {
   engineCusumState[id] = {};
   for (const t of TARGETS) {
     engineCusumState[id][t.label] = {
@@ -238,6 +242,10 @@ const STATE = {
   lr:      { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
   nb:      { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
   lstm:    { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
+  lgbm:    { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
+  prp:     { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
+  gru:     { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
+  ifor:    { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
 };
 
 // ── Per-engine last-hit tracker ────────────────────────────────────────────────
@@ -245,7 +253,7 @@ const STATE = {
 // per target. This drives independent gapSinceLast so windows diverge.
 // Initialised to -1 (unknown — falls back to shared gapStats on first run).
 const engineLastHit = {};
-for (const id of ['engine', 'ens', 'geo', 'bay', 'km', 'rf', 'gbt', 'lr', 'nb', 'lstm']) {
+for (const id of ['engine', 'ens', 'geo', 'bay', 'km', 'rf', 'gbt', 'lr', 'nb', 'lstm', 'lgbm', 'prp', 'gru', 'ifor']) {
   engineLastHit[id] = {};
   for (const t of TARGETS) engineLastHit[id][t.label] = -1;
 }
@@ -1584,6 +1592,10 @@ function buildStatPrediction(rounds, targetMin, maxWidth, modelId, lastRoundId) 
     case 'lr':   return buildLR(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
     case 'nb':   return buildNB(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
     case 'lstm': return buildLSTM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
+    case 'lgbm': return buildServerLGBM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
+    case 'prp':  return buildServerPRP(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
+    case 'gru':  return buildServerGRU(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
+    case 'ifor': return buildServerIFOR(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
     default:     return null;
   }
 }
@@ -2106,6 +2118,187 @@ function buildLSTM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineG
 }
 
 // ── BUILD: PATTERN ────────────────────────────────────────────────────────────
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ── SERVER-SIDE PURE-JS ENGINES: LGBM / PROPHET / GRU / ISOLATION FOREST ─────
+// ══════════════════════════════════════════════════════════════════════════════
+
+function srvExtractFeatures(gs, rounds, targetMin) {
+  if (!gs || gs.hits < 3) return null;
+  const { hits, n, pGlobal, pRecent, gapSinceLast, meanGap, cv, kmExpectedGap, currentStreak, cusumNorm } = gs;
+  const recent = rounds.slice(-50);
+  const recentHits = recent.filter(r => r.multiplier >= targetMin).length;
+  const recentRate = recentHits / Math.max(1, recent.length);
+  const last10 = rounds.slice(-10).map(r => r.multiplier >= targetMin ? 1 : 0);
+  const streak3 = last10.slice(-3).reduce((a, b) => a + b, 0);
+  const overdueRatio = meanGap > 0 ? gapSinceLast / meanGap : 0;
+  const kmGapRatio = kmExpectedGap > 0 ? gapSinceLast / kmExpectedGap : 0;
+  const streakFactor = currentStreak / Math.max(1, meanGap);
+  return [
+    pGlobal, pRecent, recentRate,
+    Math.min(3, overdueRatio), Math.min(3, kmGapRatio), Math.min(1, cv),
+    Math.min(1, (cusumNorm||0) / 3), streak3 / 3,
+    last10.reduce((a, b) => a + b, 0) / 10, Math.min(1, streakFactor),
+    Math.min(1, hits / 500), Math.min(1, gapSinceLast / 200),
+  ];
+}
+
+function srvBuildDataset(rounds, targetMin, maxWidth) {
+  const X = [], y = [];
+  const trainRounds = rounds.slice(-800);
+  if (trainRounds.length < 80 + maxWidth) return { X, y };
+  for (let i = 40; i < trainRounds.length - maxWidth; i++) {
+    const slice = trainRounds.slice(0, i);
+    let hits = 0, lastIdx = -1; const gaps = [];
+    for (let j = 0; j < slice.length; j++) {
+      if (slice[j].multiplier >= targetMin) { if (lastIdx !== -1) gaps.push(j - lastIdx - 1); lastIdx = j; hits++; }
+    }
+    if (hits < 3) continue;
+    const nn = slice.length;
+    const gapSinceLast = lastIdx === -1 ? nn : nn - lastIdx - 1;
+    const meanGap = gaps.length > 0 ? gaps.reduce((a,b)=>a+b,0)/gaps.length : 1/Math.max(1e-6,hits/nn);
+    const variance = gaps.length > 1 ? gaps.reduce((a,b)=>a+(b-meanGap)**2,0)/gaps.length : meanGap**2;
+    const cv = meanGap > 0 ? Math.sqrt(variance)/meanGap : 1;
+    const pGlobal = (hits+1)/(nn+2);
+    const r200 = slice.slice(-200).filter(r=>r.multiplier>=targetMin).length;
+    const pRecent = (r200+1)/202;
+    const r50 = slice.slice(-50).filter(r=>r.multiplier>=targetMin).length;
+    const last10 = slice.slice(-10).map(r=>r.multiplier>=targetMin?1:0);
+    let streak=0; for(let k=nn-1;k>=0;k--){if(slice[k].multiplier<targetMin)streak++;else break;}
+    let cusum=0,maxC=0,p0=hits/nn;
+    for(const r of slice.slice(-150)){cusum+=(r.multiplier>=targetMin?1:0)-p0;if(Math.abs(cusum)>maxC)maxC=Math.abs(cusum);}
+    const sigma0=Math.sqrt(Math.max(1e-9,p0*(1-p0)));
+    const cusumNorm=maxC/(sigma0*Math.sqrt(Math.min(150,slice.length)));
+    const kmEG=Math.max(1,Math.round(meanGap));
+    const feat=[pGlobal,pRecent,r50/Math.min(50,slice.length),Math.min(3,gapSinceLast/meanGap),Math.min(3,gapSinceLast/kmEG),Math.min(1,cv),Math.min(1,cusumNorm/3),last10.slice(-3).reduce((a,b)=>a+b,0)/3,last10.reduce((a,b)=>a+b,0)/10,Math.min(1,streak/Math.max(1,meanGap)),Math.min(1,hits/500),Math.min(1,gapSinceLast/200)];
+    const label=trainRounds.slice(i,i+maxWidth).some(r=>r.multiplier>=targetMin)?1:0;
+    X.push(feat); y.push(label);
+  }
+  return { X, y };
+}
+
+const srvModelCache = {};
+const SRV_RETRAIN_INTERVAL = 1000;
+function srvNeedsRetrain(key, n) {
+  if (!mlTrainingEnabled) return false;
+  const c = srvModelCache[key];
+  if (!c) return true;
+  return (n - c.trainedAt) >= SRV_RETRAIN_INTERVAL;
+}
+
+// LGBM helpers
+function srvLGBMTree(XY,depth=0,maxDepth=4){
+  if(!XY.length||depth>=maxDepth)return{leaf:true,value:XY.reduce((s,[,y])=>s+y,0)/Math.max(1,XY.length)};
+  const nFeat=XY[0][0].length;let bestGain=-Infinity,bestF=0,bestT=0,bestL=[],bestR=[];
+  for(let f=0;f<nFeat;f++){const vals=[...new Set(XY.map(([x])=>x[f]))].sort((a,b)=>a-b);for(let t=0;t<vals.length-1;t++){const th=(vals[t]+vals[t+1])/2;const L=XY.filter(([x])=>x[f]<=th),R=XY.filter(([x])=>x[f]>th);if(!L.length||!R.length)continue;const mL=L.reduce((s,[,y])=>s+y,0)/L.length,mR=R.reduce((s,[,y])=>s+y,0)/R.length,mT=XY.reduce((s,[,y])=>s+y,0)/XY.length;const gain=XY.length*(mT**2)-L.length*(mL**2)-R.length*(mR**2);if(gain>bestGain){bestGain=gain;bestF=f;bestT=th;bestL=L;bestR=R;}}}
+  if(!bestL.length||bestGain<=0)return{leaf:true,value:XY.reduce((s,[,y])=>s+y,0)/Math.max(1,XY.length)};
+  return{leaf:false,feat:bestF,thresh:bestT,left:srvLGBMTree(bestL,depth+1,maxDepth),right:srvLGBMTree(bestR,depth+1,maxDepth)};
+}
+function srvLGBMPred1(tree,x){if(tree.leaf)return tree.value;return x[tree.feat]<=tree.thresh?srvLGBMPred1(tree.left,x):srvLGBMPred1(tree.right,x);}
+
+function buildServerLGBM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) {
+  const key=`lgbm_${targetMin}`; let prob=0.5;
+  try {
+    if(srvNeedsRetrain(key,rounds.length)){
+      const{X,y}=srvBuildDataset(rounds,targetMin,maxWidth);
+      if(X.length<20)return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
+      const trees=[],lr=0.12,nT=20;
+      let F=new Array(X.length).fill(y.filter(v=>v===1).length/y.length);
+      for(let t=0;t<nT;t++){const sub=X.map((x,i)=>[x,y[i]-F[i]]).filter(()=>Math.random()<0.7);if(sub.length<5)continue;const tree=srvLGBMTree(sub);trees.push(tree);F=F.map((fi,i)=>Math.max(0.001,Math.min(0.999,fi+lr*srvLGBMPred1(tree,X[i]))));}
+      srvModelCache[key]={model:trees,baseRate:y.filter(v=>v===1).length/y.length,trainedAt:rounds.length};
+    }
+    if(!srvModelCache[key])return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
+    const feat=srvExtractFeatures(gs,rounds,targetMin);
+    if(!feat)return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
+    const{model:trees,baseRate}=srvModelCache[key];
+    prob=baseRate;
+    for(const tree of trees)prob=Math.max(0.001,Math.min(0.999,prob+0.12*srvLGBMPred1(tree,feat)));
+  }catch(e){console.warn('[lgbm]',e.message);return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);}
+  return buildMLWindow(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast,Math.max(0.05,Math.min(0.95,prob)),'lgbm');
+}
+
+function buildServerPRP(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) {
+  const key=`prp_${targetMin}`; let prob=0.5;
+  try {
+    if(srvNeedsRetrain(key,rounds.length)){
+      if(rounds.length<100)return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
+      const signal=rounds.map(r=>r.multiplier>=targetMin?1:0);
+      const N=Math.min(signal.length,512),seg=signal.slice(-N);
+      let topMag=0,topK=1;
+      for(let k=1;k<N/2;k++){let re=0,im=0;for(let n=0;n<N;n++){const a=(2*Math.PI*k*n)/N;re+=seg[n]*Math.cos(a);im-=seg[n]*Math.sin(a);}const mag=Math.sqrt(re*re+im*im);if(mag>topMag){topMag=mag;topK=k;}}
+      const dominantPeriod=Math.round(N/topK);
+      const baseRate=signal.filter(Boolean).length/signal.length;
+      const lastHitIdx=signal.reduceRight((acc,v,i)=>acc===-1&&v?i:acc,-1);
+      const phase=lastHitIdx>=0?(signal.length-1-lastHitIdx)%dominantPeriod:dominantPeriod/2;
+      const winSz=20,windows=[];
+      for(let i=0;i+winSz<=signal.length;i++)windows.push(signal.slice(i,i+winSz).filter(Boolean).length/winSz);
+      const wMean=windows.reduce((a,b)=>a+b,0)/Math.max(1,windows.length);
+      const wStd=Math.sqrt(windows.reduce((a,b)=>a+(b-wMean)**2,0)/Math.max(1,windows.length));
+      const clusterScore=((windows.slice(-1)[0]||0)-wMean)/Math.max(0.001,wStd);
+      srvModelCache[key]={baseRate,dominantPeriod,phase,clusterScore,trainedAt:rounds.length};
+    }
+    if(!srvModelCache[key])return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
+    const{baseRate,dominantPeriod,phase,clusterScore}=srvModelCache[key];
+    const seasonality=0.5*(1+Math.sin((2*Math.PI*phase)/Math.max(1,dominantPeriod)));
+    const clusterAdj=Math.min(0.2,Math.max(-0.2,clusterScore*0.08));
+    const overdueBoost=Math.min(0.25,(gs.gapSinceLast/Math.max(1,gs.meanGap))*0.12);
+    prob=baseRate+0.12*(seasonality-0.5)+clusterAdj+overdueBoost;
+  }catch(e){console.warn('[prp]',e.message);return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);}
+  return buildMLWindow(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast,Math.max(0.05,Math.min(0.95,prob)),'prp');
+}
+
+const SRV_GRU_H=12,SRV_GRU_SEQ=20;
+function srvGSig(x){return 1/(1+Math.exp(-Math.max(-15,Math.min(15,x))));}
+function srvGTanh(x){const e=Math.exp(2*Math.max(-15,Math.min(15,x)));return(e-1)/(e+1);}
+function srvInitGRU(){const r=()=>(Math.random()-0.5)*0.1,mat=(R,C)=>Array.from({length:R},()=>Array.from({length:C},r)),vec=n=>Array.from({length:n},r),H=SRV_GRU_H;return{Wr:mat(H,1),Ur:mat(H,H),br:vec(H),Wz:mat(H,1),Uz:mat(H,H),bz:vec(H),Wn:mat(H,1),Un:mat(H,H),bn:vec(H),Wo:[Array.from({length:H},r)],bo:[0]};}
+function srvGRUFwd(w,seq){const{Wr,Ur,br,Wz,Uz,bz,Wn,Un,bn,Wo,bo}=w,H=SRV_GRU_H;let h=new Array(H).fill(0);const mv=(M,v)=>M.map(row=>row.reduce((s,w,k)=>s+w*v[k],0)),add=(a,b)=>a.map((x,i)=>x+b[i]);for(const x of seq){const xv=[x];const rg=add(add(mv(Wr,xv),mv(Ur,h)),br).map(srvGSig);const zg=add(add(mv(Wz,xv),mv(Uz,h)),bz).map(srvGSig);const ng=add(add(mv(Wn,xv),mv(Un,h.map((hi,i)=>rg[i]*hi))),bn).map(srvGTanh);h=h.map((hi,i)=>(1-zg[i])*ng[i]+zg[i]*hi);}return srvGSig(mv(Wo,h)[0]+bo[0]);}
+
+function buildServerGRU(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) {
+  const key=`gru_${targetMin}`; let prob=0.5;
+  try {
+    if(srvNeedsRetrain(key,rounds.length)){
+      if(rounds.length<80)return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
+      const seqs=[],labels=[],logMax=Math.log(Math.max(2,targetMin*2));
+      for(let i=SRV_GRU_SEQ;i<rounds.length-maxWidth;i++){const seq=rounds.slice(i-SRV_GRU_SEQ,i).map(r=>Math.min(1,Math.log(Math.max(1,r.multiplier))/logMax));const label=rounds.slice(i,i+maxWidth).some(r=>r.multiplier>=targetMin)?1:0;seqs.push(seq);labels.push(label);}
+      if(seqs.length<20)return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
+      let w=srvModelCache[key]?.model??srvInitGRU();
+      for(let e=0;e<3;e++){let dwO=w.Wo.map(r=>r.map(()=>0)),dbO=[0];for(let i=0;i<seqs.length;i++){const p=srvGRUFwd(w,seqs[i]),err=p-labels[i];dwO=dwO.map(row=>row.map(ww=>ww+err*0.1));dbO=[dbO[0]+err];}const N=seqs.length;w.Wo=w.Wo.map(row=>row.map((ww,j)=>ww-0.01*dwO[0][j]/N));w.bo=[w.bo[0]-0.01*dbO[0]/N];}
+      srvModelCache[key]={model:w,trainedAt:rounds.length};
+    }
+    if(!srvModelCache[key])return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
+    const logMax=Math.log(Math.max(2,targetMin*2));
+    const seq=rounds.slice(-SRV_GRU_SEQ).map(r=>Math.min(1,Math.log(Math.max(1,r.multiplier))/logMax));
+    if(seq.length<SRV_GRU_SEQ)return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
+    prob=srvGRUFwd(srvModelCache[key].model,seq);
+  }catch(e){console.warn('[gru]',e.message);return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);}
+  return buildMLWindow(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast,Math.max(0.05,Math.min(0.95,prob)),'gru');
+}
+
+function srvITree(X,depth=0,maxDepth=8){if(X.length<=1||depth>=maxDepth)return{leaf:true,size:X.length};const nF=X[0].length,f=Math.floor(Math.random()*nF),col=X.map(x=>x[f]),mn=Math.min(...col),mx=Math.max(...col);if(mn===mx)return{leaf:true,size:X.length};const th=mn+Math.random()*(mx-mn);return{leaf:false,feat:f,thresh:th,left:srvITree(X.filter(x=>x[f]<th),depth+1,maxDepth),right:srvITree(X.filter(x=>x[f]>=th),depth+1,maxDepth)};}
+function srvPathLen(tree,x,d=0){if(tree.leaf){const n=tree.size;if(n<=1)return d;return d+2*(Math.log(n-1)+0.5772)-(2*(n-1)/n);}return x[tree.feat]<tree.thresh?srvPathLen(tree.left,x,d+1):srvPathLen(tree.right,x,d+1);}
+
+function buildServerIFOR(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) {
+  const key=`ifor_${targetMin}`; let prob=0.5;
+  try {
+    if(srvNeedsRetrain(key,rounds.length)){
+      const{X}=srvBuildDataset(rounds,targetMin,maxWidth);
+      if(X.length<20)return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
+      const nT=60,subSz=32,trees=[];
+      for(let t=0;t<nT;t++){const sub=Array.from({length:subSz},()=>X[Math.floor(Math.random()*X.length)]);trees.push(srvITree(sub));}
+      srvModelCache[key]={model:{trees,subSz},trainedAt:rounds.length};
+    }
+    if(!srvModelCache[key])return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
+    const feat=srvExtractFeatures(gs,rounds,targetMin);
+    if(!feat)return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
+    const{trees,subSz}=srvModelCache[key].model;
+    const avgLen=trees.reduce((s,t)=>s+srvPathLen(t,feat),0)/trees.length;
+    const c=subSz>1?2*(Math.log(subSz-1)+0.5772)-(2*(subSz-1)/subSz):1;
+    const anomaly=Math.pow(2,-avgLen/Math.max(1,c));
+    prob=anomaly*0.7+Math.min(0.25,(gs.gapSinceLast/Math.max(1,gs.meanGap))*0.12);
+  }catch(e){console.warn('[ifor]',e.message);return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);}
+  return buildMLWindow(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast,Math.max(0.05,Math.min(0.95,prob)),'ifor');
+}
+
 function buildPatternPrediction(sortedRounds, targetMin) {
   const n = sortedRounds.length;
   if (n < MIN_ROUNDS) return null;
@@ -2427,7 +2620,7 @@ function getEngineStats() {
   const out = {};
   for (const t of TARGETS) {
     out[t.label] = {};
-    for (const id of ['engine', 'ens', 'geo', 'bay', 'km', 'rf', 'gbt', 'lr', 'nb', 'lstm']) {
+    for (const id of ['engine', 'ens', 'geo', 'bay', 'km', 'rf', 'gbt', 'lr', 'nb', 'lstm', 'lgbm', 'prp', 'gru', 'ifor']) {
       const cs = engineCusumState[id]?.[t.label];
       if (!cs) continue;
       const ece = STAT_MODELS.some(m => m.id === id) ? getECE(t.label, id) : null;
