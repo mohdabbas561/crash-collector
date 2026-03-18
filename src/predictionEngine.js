@@ -92,10 +92,10 @@ const STAT_MODELS = [
 
 // ── Lazy-load ML libraries (installed via npm, optional) ─────────────────────
 let _rf = null, _cart = null, _ss = null, _nb = null;
-function getRF()   { if (_rf   === null) { try { _rf   = require('ml-random-forest'); } catch(e) { _rf   = false; console.warn('[ml] ml-random-forest not available:', e.message); } } return _rf   || null; }
-function getCART() { if (_cart === null) { try { _cart = require('ml-cart');          } catch(e) { _cart = false; console.warn('[ml] ml-cart not available:',          e.message); } } return _cart || null; }
+function getRF()   { if (_rf   === null) { try { const _m = require('ml-random-forest'); _rf = _m.RandomForestClassifier ? _m : (_m.default || _m); } catch(e) { _rf = false; console.warn('[ml] ml-random-forest not available:', e.message); } } return _rf || null; }
+function getCART() { if (_cart === null) { try { const _m = require('ml-cart'); _cart = _m.DecisionTreeClassifier ? _m : (_m.default || _m); } catch(e) { _cart = false; console.warn('[ml] ml-cart not available:', e.message); } } return _cart || null; }
 function getSS()   { if (_ss   === null) { try { _ss   = require('simple-statistics'); } catch(e) { _ss  = false; console.warn('[ml] simple-statistics not available:',  e.message); } } return _ss   || null; }
-function getNB()   { if (_nb   === null) { try { _nb   = require('ml-naivebayes');    } catch(e) { _nb   = false; console.warn('[ml] ml-naivebayes not available:',    e.message); } } return _nb   || null; }
+function getNB()   { if (_nb   === null) { try { const _m = require('ml-naivebayes'); _nb = _m.GaussianNB || _m.default?.GaussianNB || _m; } catch(e) { _nb = false; console.warn('[ml] ml-naivebayes not available:', e.message); } } return _nb || null; }
 
 // ── In-memory ML model cache (retrain when rounds grow by ML_RETRAIN_INTERVAL) ─
 const mlModelCache    = {};   // { rf_5x: {model, trainedAt}, ... }
@@ -1744,7 +1744,8 @@ function buildRF(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap
         // Not enough data — fall back
         return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
       }
-      const rf = new RF.RandomForestClassifier({ nEstimators: 100, maxDepth: 6, seed: 42 });
+      const RFClass = RF.RandomForestClassifier || RF;
+      const rf = new RFClass({ nEstimators: 100, maxDepth: 6, seed: 42 });
       rf.train(X, y);
       mlModelCache[key] = { model: rf, trainedAt: rounds.length };
     }
@@ -1798,7 +1799,8 @@ function buildGBT(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGa
       for (let t = 0; t < nTrees; t++) {
         // Pseudo-residuals (gradient of log-loss)
         const residuals = y.map((yi, i) => yi - F[i]);
-        const tree = new CART.DecisionTreeClassifier({ gainFunction: 'gini', maxDepth: 3 });
+        const CartClass = CART.DecisionTreeClassifier || CART;
+        const tree = new CartClass({ gainFunction: 'gini', maxDepth: 3 });
         tree.train(X, residuals.map(r => r >= 0 ? 1 : 0));
         trees.push(tree);
         // Update F
@@ -1911,7 +1913,7 @@ function buildNB(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap
       }
 
       // ml-naivebayes: GaussianNB
-      const nb = new NB.GaussianNB();
+      const nb = new NB();  // getNB() returns GaussianNB class directly
       nb.train(X, y);
       mlModelCache[key] = { model: nb, trainedAt: rounds.length };
     }
