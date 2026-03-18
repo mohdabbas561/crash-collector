@@ -1653,12 +1653,12 @@ function extractMLFeatures(gs, rounds, targetMin) {
 // Converts feature vector to labelled training rows from historical gaps
 // Returns { X: number[][], y: number[] } for binary classification (hit in next W rounds)
 function buildMLDataset(rounds, targetMin, maxWidth) {
-  // O(n) sliding window — uses ALL available rounds for richer training signal
-  // Each sample uses a fixed CONTEXT window so complexity stays O(n), not O(n²)
+  // O(n) sliding window — caps training at last 1000 rounds for speed
+  // Full 5000 rounds are used only for predictions (gap stats, window placement)
   const X = [], y = [];
   const CONTEXT = 100; // fixed context window per sample — keeps O(n)
-  // Use all rounds passed in (up to 5000 from DB fetch)
-  const trainRounds = rounds;
+  const TRAIN_CAP = 1000; // cap training data — 1000 rounds ~= 14 min of game history
+  const trainRounds = rounds.slice(-Math.min(rounds.length, TRAIN_CAP + maxWidth));
   if (trainRounds.length < CONTEXT + maxWidth + 10) return { X, y };
 
   for (let i = CONTEXT; i < trainRounds.length - maxWidth; i++) {
@@ -2077,14 +2077,15 @@ function buildLSTM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineG
         return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
       }
 
-      // Build training sequences — all available rounds for richer pattern learning
+      // Build training sequences — last 1000 rounds for speed
       const sequences = [], labels = [];
-      for (let i = LSTM_SEQ_LEN; i < rounds.length - maxWidth; i++) {
-        const seq = rounds.slice(i-LSTM_SEQ_LEN, i).map(r => {
+      const lstmTrain = rounds.slice(-Math.min(rounds.length, 1000 + maxWidth));
+      for (let i = LSTM_SEQ_LEN; i < lstmTrain.length - maxWidth; i++) {
+        const seq = lstmTrain.slice(i-LSTM_SEQ_LEN, i).map(r => {
           const v = r.multiplier;
           return Math.min(1, Math.log(Math.max(1, v)) / Math.log(Math.max(2, targetMin*2)));
         });
-        const label = rounds.slice(i, i+maxWidth).some(r=>r.multiplier>=targetMin) ? 1 : 0;
+        const label = lstmTrain.slice(i, i+maxWidth).some(r=>r.multiplier>=targetMin) ? 1 : 0;
         sequences.push(seq);
         labels.push(label);
       }
@@ -2147,10 +2148,11 @@ function srvExtractFeatures(gs, rounds, targetMin) {
 }
 
 function srvBuildDataset(rounds, targetMin, maxWidth) {
-  // O(n) sliding window — uses ALL available rounds for richer training signal
+  // O(n) sliding window — caps training at last 1000 rounds for speed
   const X = [], y = [];
   const CONTEXT = 100; // fixed context window per sample — keeps O(n)
-  const trainRounds = rounds;
+  const TRAIN_CAP = 1000;
+  const trainRounds = rounds.slice(-Math.min(rounds.length, TRAIN_CAP + maxWidth));
   if (trainRounds.length < CONTEXT + maxWidth + 10) return { X, y };
   for (let i = CONTEXT; i < trainRounds.length - maxWidth; i++) {
     const ctx = trainRounds.slice(i - CONTEXT, i);
@@ -2257,7 +2259,8 @@ function buildServerGRU(gs, maxWidth, targetLabel, isRare, rounds, targetMin, en
     if(srvNeedsRetrain(key,rounds.length)){
       if(rounds.length<80)return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
       const seqs=[],labels=[],logMax=Math.log(Math.max(2,targetMin*2));
-      for(let i=SRV_GRU_SEQ;i<rounds.length-maxWidth;i++){const seq=rounds.slice(i-SRV_GRU_SEQ,i).map(r=>Math.min(1,Math.log(Math.max(1,r.multiplier))/logMax));const label=rounds.slice(i,i+maxWidth).some(r=>r.multiplier>=targetMin)?1:0;seqs.push(seq);labels.push(label);}
+      const gruTrain=rounds.slice(-Math.min(rounds.length,1000+maxWidth));
+      for(let i=SRV_GRU_SEQ;i<gruTrain.length-maxWidth;i++){const seq=gruTrain.slice(i-SRV_GRU_SEQ,i).map(r=>Math.min(1,Math.log(Math.max(1,r.multiplier))/logMax));const label=gruTrain.slice(i,i+maxWidth).some(r=>r.multiplier>=targetMin)?1:0;seqs.push(seq);labels.push(label);}
       if(seqs.length<15)return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
       let w=srvModelCache[key]?.model??srvInitGRU();
       for(let e=0;e<3;e++){let dwO=w.Wo.map(r=>r.map(()=>0)),dbO=[0];for(let i=0;i<seqs.length;i++){const p=srvGRUFwd(w,seqs[i]),err=p-labels[i];dwO=dwO.map(row=>row.map(ww=>ww+err*0.1));dbO=[dbO[0]+err];}const N=seqs.length;w.Wo=w.Wo.map(row=>row.map((ww,j)=>ww-0.01*dwO[0][j]/N));w.bo=[w.bo[0]-0.01*dbO[0]/N];}
@@ -2795,6 +2798,7 @@ const ML_ENGINE_IDS = new Set(['rf','gbt','lr','nb','lstm','lgbm','prp','gru','i
 function runEngineDeferred(eng, rounds, lastRoundId) {
   return new Promise((resolve) => {
     setImmediate(async () => {
+      const tStart = Date.now();
       try {
         if (!(lastRoundId > eng.state.lastRoundId || eng.state.needsRebuild)) {
           resolve(); return;
@@ -2806,7 +2810,11 @@ function runEngineDeferred(eng, rounds, lastRoundId) {
           const p = buildSavePayload(eng.state.lockedMap);
           try { await eng.saveFn(p); } catch(e) { console.error(`[${eng.id}] save:`, e.message); }
         }
-      } catch(e) { console.error(`[${eng.id}] error:`, e.message); }
+        const ms = Date.now() - tStart;
+        if (ms > 1000) console.log(`[${eng.id}] took ${ms}ms`);
+      } catch(e) {
+        console.error(`[${eng.id}] error in deferred:`, e.message, e.stack?.split('\n')[1] || '');
+      }
       resolve();
     });
   });
@@ -2824,7 +2832,9 @@ async function runTier2Background(allEngines, rounds, lastRoundId) {
     const mlEngines  = allEngines.filter(e => ML_ENGINE_IDS.has(e.id) && e.id !== 'meta');
     const metaEngine = allEngines.find(e => e.id === 'meta');
     for (const eng of mlEngines) {
+      console.log(`[tier2] starting ${eng.id}`);
       await runEngineDeferred(eng, rounds, lastRoundId);
+      console.log(`[tier2] done ${eng.id}`);
     }
     // Meta runs last — reads already-trained caches from sub-engines
     if (metaEngine) await runEngineDeferred(metaEngine, rounds, lastRoundId);
