@@ -70,11 +70,11 @@ console.log('[v19-FINAL] Loaded — 4-zone decision, timing intact');
 const TARGETS = [
   { label: '5x',    min: 5,    maxWidth: 3,  rare: false },
   { label: '10x',   min: 10,   maxWidth: 5,  rare: false },
-  { label: '20x',   min: 20,   maxWidth: 8,  rare: false },
+  { label: '20x',   min: 20,   maxWidth: 7,  rare: false },
   { label: '50x',   min: 50,   maxWidth: 12, rare: false },
   { label: '100x',  min: 100,  maxWidth: 18, rare: true  },
   { label: '250x',  min: 250,  maxWidth: 25, rare: true  },
-  { label: '500x',  min: 500,  maxWidth: 30, rare: true  },
+  { label: '500x',  min: 500,  maxWidth: 35, rare: true  },
   { label: '1000x', min: 1000, maxWidth: 50, rare: true  },
 ];
 
@@ -169,7 +169,6 @@ const TIMING_RECENT_SPIKE_THRESH  = 0.30;
 const TIMING_RECENT_SPIKE_SHIFT   = 0.10;
 const TIMING_WIDTH_BOOST_THRESH   = 0.20;
 const TIMING_WIDTH_BOOST_FRAC     = 0.12;
-const TIMING_WIDTH_HARD_CAP       = 1.50;
 
 // ── Per-target timing feedback state ─────────────────────────────────────────
 const timingState = {};
@@ -321,14 +320,8 @@ function getTimingParams(targetLabel) {
 function applyTimingCorrection(expectedGap, effectiveWidth, targetLabel, maxWidth) {
   const { earlyRate, recentEarlyRate, timingShiftFactor, hasData } = getTimingParams(targetLabel);
 
+  // Width is fixed to maxWidth — timing boost disabled per window-gap spec.
   let correctedWidth = effectiveWidth;
-  if (hasData && earlyRate > TIMING_WIDTH_BOOST_THRESH) {
-    const boost = Math.round(effectiveWidth * TIMING_WIDTH_BOOST_FRAC);
-    correctedWidth = Math.min(
-      Math.round(maxWidth * TIMING_WIDTH_HARD_CAP),
-      effectiveWidth + boost
-    );
-  }
 
   if (!hasData) {
     const low  = Math.max(0, expectedGap - correctedWidth);
@@ -639,10 +632,7 @@ function hybridWindowPlacement(kmCDF, expectedGap, effectiveWidth, gapSinceLast,
   const blendedLow  = Math.round(0.70 * parametric.low  + 0.30 * km.low);
   const blendedHigh = Math.round(0.70 * parametric.high + 0.30 * km.high);
 
-  const inPrimeZone = gapSinceLast >= expectedGap * 0.5 && gapSinceLast <= expectedGap * 1.6;
-  const anchoredWidth = inPrimeZone
-    ? Math.round(effectiveWidth * 1.22)
-    : (blendedHigh - blendedLow + 1);
+  const anchoredWidth = blendedHigh - blendedLow + 1;
 
   const mw = maxWidth ?? effectiveWidth;
   const { low, high, effectiveWidth: correctedWidth } =
@@ -1082,11 +1072,8 @@ function getStreakInfo(gs, maxWidth, isRare) {
   else if (gapSinceLast >= p90) streakStatus = 'severe';
 
   let effectiveWidth = maxWidth;
-  if (isRare && cv > 1.1) {
-    effectiveWidth = Math.round(maxWidth * Math.min(1.25, 1.0 + (cv - 1.0) * 0.30));
-  }
-  if (z > 2) effectiveWidth = Math.min(Math.round(maxWidth * 1.35), Math.round(effectiveWidth * 1.15));
-  effectiveWidth = Math.min(effectiveWidth, Math.round(maxWidth * 1.35));
+  // Window width is fixed to maxWidth — streak and CV expansions disabled.
+  // Width is controlled exclusively by the TARGETS table.
 
   return { z: +z.toFixed(2), confPenalty, streakStatus, effectiveWidth };
 }
@@ -1452,11 +1439,9 @@ function buildRare(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
   const extremeGap = gapSinceLast > (p95 ?? meanGap * 2.5);
   const extremeGapScore = extremeGap ? +z.toFixed(2) : 0;
   let tailProbability = calibProbW;
-  let effectiveWidth  = Math.round(maxWidth * (extremeGap ? RARE_EXTREME_WIDTH_BOOST : 1.0));
-  if (extremeGap) {
-    tailProbability = Math.min(0.95, tailProbability + RARE_EXTREME_GAP_BOOST);
-  }
-  effectiveWidth = Math.min(effectiveWidth, Math.round(maxWidth * 1.50));
+  // effectiveWidth fixed to maxWidth — no extreme-gap or CV expansion.
+  let effectiveWidth = maxWidth;
+  if (extremeGap) tailProbability = Math.min(0.95, tailProbability + RARE_EXTREME_GAP_BOOST);
   const earlyEnd  = Math.max(1, Math.round(kmExpectedGap * RARE_EARLY_WINDOW_FRAC));
   const lateEnd   = Math.max(earlyEnd + 1, Math.round(kmExpectedGap * RARE_LATE_WINDOW_FRAC));
   const earlyWindow = { low: 0, high: earlyEnd };
