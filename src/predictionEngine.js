@@ -126,7 +126,21 @@ function scanRounds(rounds, targetMin) {
   const p90 = sg[Math.floor(sg.length * 0.90)] ?? sg[sg.length - 1] ?? meanGap;
   const p95 = sg[Math.floor(sg.length * 0.95)] ?? sg[sg.length - 1] ?? meanGap;
 
-  return { hits, n, p, pGlobal, pRecent, rateShifted, cusumNorm: +cusumNorm.toFixed(3), gapSinceLast, meanGap, medianGap, cv, p90, p95, gaps };
+  // Current white streak (consecutive rounds below targetMin)
+  let currentStreak = 0;
+  for (let i = n - 1; i >= 0; i--) {
+    if (rounds[i].multiplier < targetMin) currentStreak++;
+    else break;
+  }
+  // Historical streak distribution — build from gaps (gap = streak length between hits)
+  // p90/p95 of gap distribution tells us when a streak becomes statistically unusual
+  const streakPercentile = sg.length > 0
+    ? sg.filter(g => g <= currentStreak).length / sg.length
+    : 0;
+
+  return { hits, n, p, pGlobal, pRecent, rateShifted, cusumNorm: +cusumNorm.toFixed(3),
+    gapSinceLast, meanGap, medianGap, cv, p90, p95, gaps,
+    currentStreak, streakPercentile: +streakPercentile.toFixed(3) };
 }
 
 function computeConf(probW, hits) {
@@ -135,6 +149,58 @@ function computeConf(probW, hits) {
   else if (hits < 20) c -= 8;
   else if (hits < 40) c -= 3;
   return Math.max(20, Math.min(88, Math.round(c)));
+}
+
+/**
+ * streakAwareWindow — adjusts window placement based on live gap data.
+ *
+ * Normal: window = [expectedGap - W, expectedGap - 1]
+ *
+ * When gapSinceLast is ALREADY past expectedGap (overdue):
+ *   → Open window immediately (low=0), keep width W
+ *   → We are already in the zone — don't delay further
+ *
+ * When gapSinceLast is past P90 (historically rare streak):
+ *   → Open window immediately AND tag as streak alert
+ *   → Confidence reduced — rare territory, harder to predict exact round
+ *
+ * When gapSinceLast is past P95 (extreme streak):
+ *   → Open window immediately, heavy confidence penalty
+ *   → Signal: extreme_streak — tells UI to show warning
+ *
+ * We do NOT inflate probW (that would be gambler's fallacy).
+ * We only adjust WHERE the window sits, not HOW LIKELY the hit is.
+ */
+function streakAwareWindow(expectedGap, maxWidth, gapSinceLast, p90, p95, streakPercentile) {
+  let low, high, streakStatus, confPenalty;
+
+  if (gapSinceLast >= p95) {
+    // Extreme — open immediately, heavy penalty
+    low         = 0;
+    high        = maxWidth - 1;
+    streakStatus = 'extreme';
+    confPenalty  = 18;
+  } else if (gapSinceLast >= p90) {
+    // Severe — open immediately, moderate penalty
+    low         = 0;
+    high        = maxWidth - 1;
+    streakStatus = 'severe';
+    confPenalty  = 10;
+  } else if (gapSinceLast >= expectedGap) {
+    // Overdue — open immediately, small penalty
+    low         = 0;
+    high        = maxWidth - 1;
+    streakStatus = 'overdue';
+    confPenalty  = 4;
+  } else {
+    // Normal — window opens at expectedGap - W
+    low         = Math.max(0, expectedGap - maxWidth);
+    high        = low + maxWidth - 1;
+    streakStatus = 'normal';
+    confPenalty  = 0;
+  }
+
+  return { low, high, streakStatus, confPenalty };
 }
 
 function detectRegime(rounds) {
@@ -157,31 +223,28 @@ function detectRegime(rounds) {
 function buildPrediction(sortedRounds, targetMin, maxWidth) {
   const s = scanRounds(sortedRounds, targetMin);
   if (!s) return null;
-  const { hits, p, pGlobal, gapSinceLast, medianGap, p90, rateShifted, cusumNorm } = s;
+  const { hits, p, pGlobal, gapSinceLast, medianGap, p90, p95, rateShifted, cusumNorm, currentStreak, streakPercentile } = s;
   const probW = 1 - Math.pow(1 - p, maxWidth);
   const regime = detectRegime(sortedRounds);
 
-  // Expected gap = median of historical gaps (more robust than mean for skewed distributions)
-  // Weight toward p90 slightly when rate-shifted (conservative)
   const expectedGap = rateShifted
     ? Math.round(medianGap * 0.7 + p90 * 0.3)
     : Math.round(medianGap);
 
-  // Window opens in the last W rounds of the expected gap
-  // low = max(0, expectedGap - W), high = low + W - 1
-  // This means: "we expect the hit around round expectedGap, and we open a W-round window for it"
-  const low  = Math.max(0, expectedGap - maxWidth);
-  const high = low + maxWidth - 1;
+  const { low, high, streakStatus, confPenalty } = streakAwareWindow(
+    expectedGap, maxWidth, gapSinceLast, p90, p95, streakPercentile
+  );
 
   return {
     low, high,
     expectedGap,
-    opensIn: low, // rounds from anchor until window opens
-    confidence: computeConf(probW, hits),
+    opensIn: low,
+    confidence: Math.max(20, computeConf(probW, hits) - confPenalty),
     probW: +probW.toFixed(4),
     p: +p.toFixed(6),
     rateShifted, cusumNorm,
     regime: regime.regime,
+    streakStatus, currentStreak, streakPercentile,
     gapSinceLast, hits,
   };
 }
@@ -231,23 +294,23 @@ function buildStatPrediction(sortedRounds, targetMin, maxWidth, modelId) {
 
   // Expected gap from pGlobal (unblended, pure base rate)
   const rawExpectedGap = (1 - pGlobal) / pGlobal;
-  // Use median gap for window placement — more robust
-  const { medianGap, p90 } = s;
+  const { medianGap, p90, p95, gapSinceLast: gsl, currentStreak, streakPercentile } = s;
   const expectedGap = rateShifted
     ? Math.round(medianGap * 0.7 + p90 * 0.3)
     : Math.round(medianGap);
 
-  // Window: last W rounds of the expected gap
-  const low  = Math.max(0, expectedGap - maxWidth);
-  const high = low + maxWidth - 1;
+  const { low, high, streakStatus, confPenalty } = streakAwareWindow(
+    expectedGap, maxWidth, gsl, p90, p95, streakPercentile
+  );
 
   return {
     low, high,
     expectedGap,
     opensIn: low,
-    confidence: computeConf(probW, hits),
+    confidence: Math.max(20, computeConf(probW, hits) - confPenalty),
     probW: +probW.toFixed(4),
     p: +pModel.toFixed(6),
+    streakStatus, currentStreak, streakPercentile,
     rawExpectedGap: +rawExpectedGap.toFixed(1),
     gapSinceLast, hits, rateShifted, model: modelId,
   };
@@ -480,7 +543,7 @@ function buildSavePayload(lockedMap) {
       hi:            anchor + (Number(pred.high)||0),
       roundWhenMade: anchor,
       generation:    pred.generation||1,
-      eta:           { low: pred.low, high: pred.high, conf: pred.confidence, probW: pred.probW, expectedGap: pred.expectedGap, opensIn: pred.opensIn },
+      eta:           { low: pred.low, high: pred.high, conf: pred.confidence, probW: pred.probW, expectedGap: pred.expectedGap, opensIn: pred.opensIn, streakStatus: pred.streakStatus, currentStreak: pred.currentStreak },
     };
   }
   return out;
@@ -500,6 +563,8 @@ function loadLockedMap(dbRows) {
       probW:       eta.probW ?? null,
       expectedGap: eta.expectedGap ?? null,
       opensIn:     eta.opensIn ?? null,
+      streakStatus:  eta.streakStatus ?? 'normal',
+      currentStreak: eta.currentStreak ?? 0,
       targetMin:   target.min,
       anchorRound: anchor,
       generation:  pred.generation ?? 1,
