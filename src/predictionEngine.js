@@ -98,9 +98,18 @@ function getSS()   { if (_ss   === null) { try { _ss   = require('simple-statist
 function getNB()   { if (_nb   === null) { try { const _m = require('ml-naivebayes'); _nb = _m.GaussianNB || _m.default?.GaussianNB || _m; } catch(e) { _nb = false; console.warn('[ml] ml-naivebayes not available:', e.message); } } return _nb || null; }
 
 // ── In-memory ML model cache (retrain when rounds grow by ML_RETRAIN_INTERVAL) ─
-const mlModelCache    = {};   // { rf_5x: {model, trainedAt}, ... }
-const ML_RETRAIN_INTERVAL = 500;
-let   mlLastTrainRound = 0;
+const mlModelCache       = {};   // { rf_5x: {model, trainedAt}, ... }
+const ML_RETRAIN_INTERVAL = 1000; // retrain every 1000 new rounds
+let   mlTrainingEnabled  = false; // stays false until after first full engine cycle
+let   mlLastTrainRound   = 0;
+
+// Called after first successful runPredictionEngine() tick — enables ML training
+function enableMLTraining() {
+  if (!mlTrainingEnabled) {
+    mlTrainingEnabled = true;
+    console.log('[ml] Training enabled — ML engines will train on next tick');
+  }
+}
 
 const MIN_ROUNDS                    = 50;
 const STALE_FORCE_REBUILD_THRESHOLD = 200;
@@ -1628,7 +1637,7 @@ function extractMLFeatures(gs, rounds, targetMin) {
 
 // Converts feature vector to labelled training rows from historical gaps
 // Returns { X: number[][], y: number[] } for binary classification (hit in next W rounds)
-function buildMLDataset(rounds, targetMin, maxWidth, windowSize = 60) {
+function buildMLDataset(rounds, targetMin, maxWidth, windowSize = 40) {
   const X = [], y = [];
   const MIN_TRAIN = 100;
   if (rounds.length < MIN_TRAIN + windowSize) return { X, y };
@@ -1688,6 +1697,7 @@ function mlKey(modelId, targetMin) { return `${modelId}_${targetMin}`; }
 
 // Check if model needs retraining
 function needsRetrain(key, currentRoundCount) {
+  if (!mlTrainingEnabled) return false; // never train during startup
   const cached = mlModelCache[key];
   if (!cached) return true;
   return (currentRoundCount - cached.trainedAt) >= ML_RETRAIN_INTERVAL;
@@ -1745,7 +1755,7 @@ function buildRF(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap
         return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
       }
       const RFClass = RF.RandomForestClassifier || RF;
-      const rf = new RFClass({ nEstimators: 100, maxDepth: 6, seed: 42 });
+      const rf = new RFClass({ nEstimators: 30, maxDepth: 5, seed: 42 });
       rf.train(X, y);
       mlModelCache[key] = { model: rf, trainedAt: rounds.length };
     }
@@ -1791,7 +1801,7 @@ function buildGBT(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGa
       }
 
       // Build GBT: 40 shallow CART trees fitting pseudo-residuals
-      const nTrees = 40;
+      const nTrees = 20;
       const lr     = 0.15;
       const trees  = [];
       let   F      = new Array(X.length).fill(y.filter(v=>v===1).length / y.length); // init to base rate
@@ -1863,7 +1873,7 @@ function buildLR(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap
       // Gradient descent
       const sig = v => 1 / (1 + Math.exp(-Math.max(-20, Math.min(20, v))));
       let w = new Array(nFeat).fill(0), b = 0;
-      const lrRate = 0.05, epochs = 200, lambda = 0.001;
+      const lrRate = 0.05, epochs = 80, lambda = 0.001;
       for (let e = 0; e < epochs; e++) {
         let dw = new Array(nFeat).fill(0), db = 0;
         for (let i = 0; i < Xn.length; i++) {
@@ -1947,7 +1957,7 @@ function buildNB(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap
 const LSTM_SEQ_LEN   = 20;
 const LSTM_HIDDEN    = 12;
 const LSTM_LR        = 0.01;
-const LSTM_EPOCHS    = 5;
+const LSTM_EPOCHS    = 3;
 
 function lstmSig(x) { return 1/(1+Math.exp(-Math.max(-15,Math.min(15,x)))); }
 function lstmTanh(x){ const e=Math.exp(2*Math.max(-15,Math.min(15,x))); return (e-1)/(e+1); }
@@ -2492,6 +2502,8 @@ async function runPredictionEngine() {
       eng.state.lastRoundId = lastRoundId;
       if (changed) { const p=buildSavePayload(eng.state.lockedMap); try{await eng.saveFn(p);}catch(e){console.error(`[${eng.id}] save:`,e.message);} }
     }
+    // Enable ML training after first successful cycle — they train on next tick
+    enableMLTraining();
   } catch(e) { console.error('[predictionEngine] Fatal:', e.message, e.stack); }
 }
 
