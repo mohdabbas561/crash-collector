@@ -1,53 +1,50 @@
 'use strict';
-// predictionEngine.js  v14-regime
+// predictionEngine.js  v15-fixes
 //
-// WHAT'S NEW vs v13-final:
+// CHANGES vs v14-regime:
 //
-// ── Per-Engine Independent Regime Detection ───────────────────────────────────
+// FIX 1 — Gambler's Fallacy removed (all 5 engines)
+//   The 'overdue' streak status override has been removed from ENGINE, GEO, BAY, KM, ENS.
+//   Previously: when gapSinceLast >= expectedGap, window opened immediately and status
+//   was set to 'overdue' — implying the game "owes" a hit. This is mathematically wrong
+//   for any memoryless or near-memoryless process. Window placement math now decides
+//   position on its own without any fallacy-driven override.
 //
-// Every engine (GEO, BAY, KM, ENS, ENGINE) now runs its OWN persistent CUSUM
-// and adaptive window sizing. No shared state. Each engine independently:
+// FIX 2 — Calibration threshold raised from 8 → 25 samples per bin
+//   With only 8 samples, calibration corrections were noise-driven and could make
+//   probabilities less accurate. 25 samples per bin required before any correction applies.
 //
-//   1. Maintains a persistent CUSUM accumulator (not recomputed from scratch each call).
-//   2. Detects hot streaks  → recent hit rate rising  → tighten window, shift earlier.
-//   3. Detects cold streaks → recent hit rate falling → widen window, shift later.
-//   4. Uses a short adaptive window (30 rounds) for fast regime detection, separate
-//      from the 200-round pRecent already in the shared cache.
-//   5. Computes a regimeFactor in [-1, +1]:
-//        +1 = strong hot streak  (hits coming faster than expected)
-//        -1 = strong cold streak (white streak, hits drying up)
-//        0  = neutral / normal
-//   6. Applies regimeFactor to:
-//        - effectiveWidth   (wider on cold, narrower on hot)
-//        - window placement (open sooner on hot, push later on cold)
-//        - per-engine p     (blend more recent rate on hot or cold)
+// FIX 3 — CUSUM accumulation tightened (reduces false regime signals)
+//   REGIME_CUSUM_CLIP lowered from 2.0 → 1.0 (tighter saturation)
+//   REGIME_CUSUM_THRESHOLD raised from 1.20 → 1.80 (stronger signal required)
+//   REGIME_MIN_FACTOR raised from 0.05 → 0.20 (minimum regime factor before window affected)
+//   Combined effect: random dry patches no longer trigger confident cold-regime shifts.
 //
-// INDEPENDENCE GUARANTEE:
-//   - Each engine has its own engineCusumState[engineId] object.
-//   - No engine reads another engine's CUSUM state.
-//   - Shared gapStatsCache still contains only RAW DATA (hits, gaps, meanGap…).
-//   - The regime math is applied inside each buildXxx() function separately.
+// FIX 4 — Randomness check added to computeGapStats
+//   Autocorrelation tested at lags 1–5 on gap history (requires 50+ gaps).
+//   isRandom = true when max |AC| < 0.10 — honest signal that no structure is detected.
+//   maxAC exposed on every engine output. Does NOT disable predictions — informational only.
 //
-// EXISTING LOGIC PRESERVED:
-//   - All existing p calculations, calibration, KM CDF, Pareto blend, HSM,
-//     ensemble logit combiner, betaConf, streak status, confPenalty are UNCHANGED.
-//   - Regime adjustment is an ADDITIVE layer on top of existing window placement.
+// FIX 5 — ENS weights exposed (adjWeights for geo/bay/km)
+//   ensWeights: { geo, bay, km } now included in ENS output and persisted to DB.
+//   Lets callers see which sub-model ENS is currently trusting most.
 //
-// REGIME WINDOW ADJUSTMENT FORMULA (per engine):
-//   regimeFactor ∈ [-1, +1]
-//   widthMult    = 1 + clamp(−regimeFactor × REGIME_WIDTH_SCALE, -0.25, +0.35)
-//     hot streak  (rf>0): widthMult < 1  → narrower window (high confidence zone)
-//     cold streak (rf<0): widthMult > 1  → wider  window (uncertainty expanded)
-//   offsetShift  = round(regimeFactor × expectedGap × REGIME_OFFSET_SCALE)
-//     hot streak  (rf>0): offsetShift > 0 → open window sooner
-//     cold streak (rf<0): offsetShift < 0 → push window later (more rounds away)
+// FIX 6 — isRandom, maxAC, ensWeights now persisted in buildSavePayload
+//   and restored in loadLockedMap so they survive server restarts.
+//
+// ── Per-Engine Independent Regime Detection (from v14) ────────────────────────
+//
+// Every engine (GEO, BAY, KM, ENS, ENGINE) runs its OWN persistent CUSUM.
+// Each engine independently detects hot/cold streaks and adapts window placement.
+// engineCusumState[engineId][targetLabel] — zero cross-engine state sharing.
+// Shared gapStatsCache contains only RAW DATA (hits, gaps, meanGap…).
 //
 // ENGINE-SPECIFIC REGIME p BLEND:
-//   GEO:    pure Laplace MLE + regime blend of short-window rate
-//   BAY:    existing recency blend enhanced by regime strength
-//   KM:     no p change (empirical), but window placement shifted
-//   ENS:    regime affects pEns blend weights
-//   ENGINE: existing CUSUM blend enhanced by regime strength
+//   GEO:    Laplace MLE + regime blend of short-window rate (max 25%)
+//   BAY:    recency blend enhanced by regime strength (max 45%)
+//   KM:     no p change (empirical), window placement shifted only
+//   ENS:    regime affects pEns + window; exposes adjWeights
+//   ENGINE: CUSUM blend enhanced by regime strength
 
 const {
   getRounds, savePrediction, getPredictions,
@@ -82,8 +79,10 @@ const WINDOW_LAMBDA            = 0.01;
 const REGIME_SHORT_WINDOW      = 30;   // rounds for fast regime detection
 const REGIME_WIDTH_SCALE       = 0.30; // max ±30% width change from regime
 const REGIME_OFFSET_SCALE      = 0.20; // max ±20% of expectedGap offset shift
-const REGIME_CUSUM_THRESHOLD   = 1.20; // CUSUM norm threshold for regime trigger
+const REGIME_CUSUM_THRESHOLD   = 1.80; // raised from 1.20 — needs stronger signal before triggering
 const REGIME_DECAY             = 0.10; // EWMA decay for persistent regime state
+const REGIME_CUSUM_CLIP        = 1.0;  // clip CUSUM at ±1 sigma×sqrt(W) — tighter than ±2, reduces false alarms
+const REGIME_MIN_FACTOR        = 0.20; // regime factor must exceed this before affecting window placement
 
 // ── Per-engine independent CUSUM / regime state ───────────────────────────────
 // Each engine tracks its OWN persistent regime per target.
@@ -237,8 +236,9 @@ function updateEngineRegime(rounds, targetMin, targetLabel, engineId, gs) {
   const sigma = Math.sqrt(Math.max(1e-9, shortBaseline * (1 - shortBaseline)));
   const cusumNorm = cs.cusum / Math.max(sigma * Math.sqrt(REGIME_SHORT_WINDOW), 1e-6);
 
-  // Soft clip to [-2, +2] range so extreme events don't dominate permanently
-  cs.cusum = clamp(cs.cusum, -2 * sigma * Math.sqrt(REGIME_SHORT_WINDOW), 2 * sigma * Math.sqrt(REGIME_SHORT_WINDOW));
+  // Clip at ±REGIME_CUSUM_CLIP sigma×sqrt(W) — tighter clip reduces false cold/hot alarms
+  // during random dry patches (the main source of Gambler's Fallacy in regime detection)
+  cs.cusum = clamp(cs.cusum, -REGIME_CUSUM_CLIP * sigma * Math.sqrt(REGIME_SHORT_WINDOW), REGIME_CUSUM_CLIP * sigma * Math.sqrt(REGIME_SHORT_WINDOW));
 
   // regimeFactor: smooth mapping of cusumNorm → [-1, +1]
   // tanh gives smooth saturation: small deviations → small factor, large → saturates at ±1
@@ -271,7 +271,8 @@ function updateEngineRegime(rounds, targetMin, targetLabel, engineId, gs) {
 // just nudges it proportionally to regime strength.
 
 function applyRegimeToWindow(low, high, expectedGap, effectiveWidth, regimeFactor) {
-  if (Math.abs(regimeFactor) < 0.05) return { low, high }; // negligible regime
+  // Must exceed minimum threshold — prevents random noise from shifting windows
+  if (Math.abs(regimeFactor) < REGIME_MIN_FACTOR) return { low, high };
 
   // Width adjustment: hot → narrower, cold → wider
   const widthDelta  = clamp(-regimeFactor * REGIME_WIDTH_SCALE, -0.25, 0.35);
@@ -294,7 +295,7 @@ function applyRegimeToWindow(low, high, expectedGap, effectiveWidth, regimeFacto
 // blendStrength controls how much the short rate pulls the engine's p.
 
 function applyRegimeToP(baseP, shortRate, regimeFactor, blendStrength) {
-  if (Math.abs(regimeFactor) < 0.05) return baseP;
+  if (Math.abs(regimeFactor) < REGIME_MIN_FACTOR) return baseP;
   const regimeBlend = Math.abs(regimeFactor) * blendStrength;
   const blended = (1 - regimeBlend) * baseP + regimeBlend * shortRate;
   return Math.max(1e-6, Math.min(0.5, blended));
@@ -381,6 +382,30 @@ function computeGapStats(rounds, targetMin) {
     else break;
   }
 
+  // ── Randomness check: autocorrelation on gaps ─────────────────────────────
+  // If gaps are pure random (geometric RNG), autocorrelation at all lags ≈ 0.
+  // We test lags 1–5. If the max |AC| < threshold AND we have enough data,
+  // flag isRandom = true so callers can reduce confidence or warn the user.
+  // Threshold: |AC| > 0.10 with 50+ gaps suggests real structure.
+  // isRandom does NOT disable predictions — it is an honest signal only.
+  let maxAC = 0;
+  if (gaps.length >= 50) {
+    let gVarSum = 0;
+    for (const g of gaps) gVarSum += (g - meanGap) ** 2;
+    if (gVarSum > 0) {
+      for (let lag = 1; lag <= Math.min(5, gaps.length - 1); lag++) {
+        let cov = 0;
+        for (let i = lag; i < gaps.length; i++) {
+          cov += (gaps[i] - meanGap) * (gaps[i - lag] - meanGap);
+        }
+        const ac = cov / gVarSum;
+        if (Math.abs(ac) > Math.abs(maxAC)) maxAC = ac;
+      }
+    }
+  }
+  // isRandom: true when we have enough data AND no meaningful autocorrelation found
+  const isRandom = gaps.length >= 50 && Math.abs(maxAC) < 0.10;
+
   return {
     hits, n, pGlobal, pRecent, rateShifted,
     cusumNorm: +cusumNorm.toFixed(3),
@@ -388,6 +413,8 @@ function computeGapStats(rounds, targetMin) {
     p75, p90, p95, sg, kmCDF,
     hsm, kmExpectedGap,
     currentStreak,
+    maxAC: +maxAC.toFixed(4),
+    isRandom,
   };
 }
 
@@ -508,7 +535,7 @@ function applyCalibration(probW, targetLabel, modelId) {
   const bins = calibState[targetLabel]?.[modelId];
   if (!bins) return probW;
   const bin = bins[getCalBinIdx(probW)];
-  if (bin.count < 8) return probW;
+  if (bin.count < 25) return probW; // need 25 samples minimum to avoid noisy corrections
   const empirical = bin.ewmaAct, predicted = bin.ewmaPred;
   if (predicted < 1e-6) return probW;
   const ratio = empirical / predicted;
@@ -666,8 +693,9 @@ function buildPrediction(rounds, targetMin, maxWidth, isRare, lastRoundId) {
     expectedGap, baseWidth, regime.regimeFactor
   );
 
-  let finalStreakStatus = streakStatus;
-  if (streakStatus === 'normal' && gapSinceLast >= expectedGap) finalStreakStatus = 'overdue';
+  // No overdue override — letting gapSinceLast >= expectedGap open window immediately
+  // is Gambler's Fallacy. Window placement math handles position on its own.
+  const finalStreakStatus = streakStatus;
 
   return {
     low, high, expectedGap, opensIn: low,
@@ -679,6 +707,7 @@ function buildPrediction(rounds, targetMin, maxWidth, isRare, lastRoundId) {
     gapSinceLast, hits,
     regime: regime.regimeLabel,
     regimeFactor: regime.regimeFactor,
+    isRandom: gs.isRandom, maxAC: gs.maxAC,
   };
 }
 
@@ -714,8 +743,7 @@ function buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
     expectedGap, baseWidth, regime.regimeFactor
   );
 
-  let finalStreakStatus = streakStatus;
-  if (streakStatus === 'normal' && gapSinceLast >= expectedGap) finalStreakStatus = 'overdue';
+  const finalStreakStatus = streakStatus; // no overdue override — Gambler's Fallacy removed
 
   return {
     low, high, expectedGap, opensIn: low,
@@ -727,6 +755,7 @@ function buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
     rateShifted: gs.rateShifted, model: 'geo',
     regime: regime.regimeLabel,
     regimeFactor: regime.regimeFactor,
+    isRandom: gs.isRandom, maxAC: gs.maxAC,
   };
 }
 
@@ -767,8 +796,7 @@ function buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
     expectedGap, baseWidth, regime.regimeFactor
   );
 
-  let finalStreakStatus = streakStatus;
-  if (streakStatus === 'normal' && gapSinceLast >= expectedGap) finalStreakStatus = 'overdue';
+  const finalStreakStatus = streakStatus; // no overdue override — Gambler's Fallacy removed
 
   return {
     low, high, expectedGap, opensIn: low,
@@ -780,6 +808,7 @@ function buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
     rateShifted, model: 'bay',
     regime: regime.regimeLabel,
     regimeFactor: regime.regimeFactor,
+    isRandom: gs.isRandom, maxAC: gs.maxAC,
   };
 }
 
@@ -818,8 +847,7 @@ function buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
     regimeExpGap, baseWidth, regime.regimeFactor
   );
 
-  let finalStreakStatus = streakStatus;
-  if (streakStatus === 'normal' && gapSinceLast >= kmExpectedGap) finalStreakStatus = 'overdue';
+  const finalStreakStatus = streakStatus; // no overdue override — Gambler's Fallacy removed
 
   return {
     low, high, expectedGap: kmExpectedGap, opensIn: low,
@@ -831,6 +859,7 @@ function buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
     rateShifted: gs.rateShifted, model: 'km',
     regime: regime.regimeLabel,
     regimeFactor: regime.regimeFactor,
+    isRandom: gs.isRandom, maxAC: gs.maxAC,
   };
 }
 
@@ -901,8 +930,7 @@ function buildEns(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
     regimeEnsExpGap, baseWidth, regime.regimeFactor
   );
 
-  let finalStreakStatus = streakStatus;
-  if (streakStatus === 'normal' && gapSinceLast >= ensExpectedGap) finalStreakStatus = 'overdue';
+  const finalStreakStatus = streakStatus; // no overdue override — Gambler's Fallacy removed
 
   return {
     low, high, expectedGap: ensExpectedGap, opensIn: low,
@@ -914,6 +942,12 @@ function buildEns(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
     rateShifted, model: 'ens', spread: +spread.toFixed(3),
     regime: regime.regimeLabel,
     regimeFactor: regime.regimeFactor,
+    ensWeights: {
+      geo: +adjWeights[0].toFixed(3),
+      bay: +adjWeights[1].toFixed(3),
+      km:  +adjWeights[2].toFixed(3),
+    },
+    isRandom: gs.isRandom, maxAC: gs.maxAC,
   };
 }
 
@@ -1126,7 +1160,7 @@ function buildSavePayload(lockedMap) {
     out[label] = {
       lo: anchor+(Number(pred.low)||0), hi: anchor+(Number(pred.high)||0),
       roundWhenMade: anchor, generation: pred.generation||1,
-      eta: { low:pred.low, high:pred.high, conf:pred.confidence, probW:pred.probW, rawProbW:pred.rawProbW??pred.probW, expectedGap:pred.expectedGap, opensIn:pred.opensIn, streakStatus:pred.streakStatus, currentStreak:pred.currentStreak, spread:pred.spread??null, regime:pred.regime??null, regimeFactor:pred.regimeFactor??null },
+      eta: { low:pred.low, high:pred.high, conf:pred.confidence, probW:pred.probW, rawProbW:pred.rawProbW??pred.probW, expectedGap:pred.expectedGap, opensIn:pred.opensIn, streakStatus:pred.streakStatus, currentStreak:pred.currentStreak, spread:pred.spread??null, regime:pred.regime??null, regimeFactor:pred.regimeFactor??null, ensWeights:pred.ensWeights??null, isRandom:pred.isRandom??null, maxAC:pred.maxAC??null },
     };
   }
   return out;
@@ -1147,6 +1181,8 @@ function loadLockedMap(dbRows) {
       streakStatus: eta.streakStatus??'normal', currentStreak: eta.currentStreak??0,
       spread: eta.spread??null,
       regime: eta.regime??null, regimeFactor: eta.regimeFactor??null,
+      ensWeights: eta.ensWeights??null,
+      isRandom: eta.isRandom??null, maxAC: eta.maxAC??null,
       targetMin: target.min, anchorRound: anchor,
       generation: pred.generation??1, stale: true,
     };
