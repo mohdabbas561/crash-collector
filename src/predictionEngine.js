@@ -1460,7 +1460,8 @@ function buildRare(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
     kmExpectedGap, baseWidth, targetLabel, maxWidth
   );
   let primaryLow  = Math.max(0, tcLow  - regimeOffset);
-  let primaryHigh = Math.max(primaryLow, tcHigh - regimeOffset);
+  // Hard-cap width to maxWidth — rare dual-window logic can exceed spec otherwise
+  let primaryHigh = Math.min(primaryLow + maxWidth - 1, Math.max(primaryLow, tcHigh - regimeOffset));
   const decision = computeRareDecision(tailProbability, extremeGapScore, targetLabel, hits);
   const streakStatus = extremeGapScore > 0
     ? (z > 3 ? 'extreme' : 'severe')
