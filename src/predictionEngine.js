@@ -1,57 +1,71 @@
 'use strict';
-// predictionEngine.js  v15-fixes
+// predictionEngine.js  v19-FINAL
 //
-// CHANGES vs v14-regime:
+// ═══════════════════════════════════════════════════════════════════════════════
+// CHANGELOG vs v18-PRECISION
+// ═══════════════════════════════════════════════════════════════════════════════
 //
-// FIX 1 — Gambler's Fallacy removed (all 5 engines)
-//   The 'overdue' streak status override has been removed from ENGINE, GEO, BAY, KM, ENS.
-//   Previously: when gapSinceLast >= expectedGap, window opened immediately and status
-//   was set to 'overdue' — implying the game "owes" a hit. This is mathematically wrong
-//   for any memoryless or near-memoryless process. Window placement math now decides
-//   position on its own without any fallacy-driven override.
+// PROBLEM: v18 floor at 0.46 still admitted some low-quality signals.
+// The 0.42–0.46 zone is salvageable ONLY with very tight model agreement.
+// Decision reasons were verbose; output fields unnecessary for production.
 //
-// FIX 2 — Calibration threshold raised from 8 → 25 samples per bin
-//   With only 8 samples, calibration corrections were noise-driven and could make
-//   probabilities less accurate. 25 samples per bin required before any correction applies.
+// FINAL DECISION SYSTEM (4 zones, no exceptions):
 //
-// FIX 3 — CUSUM accumulation tightened (reduces false regime signals)
-//   REGIME_CUSUM_CLIP lowered from 2.0 → 1.0 (tighter saturation)
-//   REGIME_CUSUM_THRESHOLD raised from 1.20 → 1.80 (stronger signal required)
-//   REGIME_MIN_FACTOR raised from 0.05 → 0.20 (minimum regime factor before window affected)
-//   Combined effect: random dry patches no longer trigger confident cold-regime shifts.
+//   ZONE 0 — Hard floor
+//     prob < 0.42                               → SKIP  (FILTERED)
 //
-// FIX 4 — Randomness check added to computeGapStats
-//   Autocorrelation tested at lags 1–5 on gap history (requires 50+ gaps).
-//   isRandom = true when max |AC| < 0.10 — honest signal that no structure is detected.
-//   maxAC exposed on every engine output. Does NOT disable predictions — informational only.
+//   ZONE 1 — Low zone (0.42–0.46): mostly noise
+//     spread < 0.08 AND confidence > 55         → TAKE  (MODERATE_SIGNAL)
+//     else                                      → SKIP  (FILTERED)
 //
-// FIX 5 — ENS weights exposed (adjWeights for geo/bay/km)
-//   ensWeights: { geo, bay, km } now included in ENS output and persisted to DB.
-//   Lets callers see which sub-model ENS is currently trusting most.
+//   ZONE 2 — Core moderate (0.46–0.52)
+//     spread < 0.12 AND confidence > 50         → TAKE  (MODERATE_SIGNAL)
+//     else                                      → SKIP  (FILTERED)
 //
-// FIX 6 — isRandom, maxAC, ensWeights now persisted in buildSavePayload
-//   and restored in loadLockedMap so they survive server restarts.
+//   ZONE 3 — Strong (≥ 0.52)                   → TAKE  (STRONG_SIGNAL)
 //
-// ── Per-Engine Independent Regime Detection (from v14) ────────────────────────
+// AMPLIFICATION (unchanged from v18):
+//   Only when rawProbW ≥ 0.50 AND spread < 0.10
 //
-// Every engine (GEO, BAY, KM, ENS, ENGINE) runs its OWN persistent CUSUM.
-// Each engine independently detects hot/cold streaks and adapts window placement.
-// engineCusumState[engineId][targetLabel] — zero cross-engine state sharing.
-// Shared gapStatsCache contains only RAW DATA (hits, gaps, meanGap…).
+// ENSEMBLE (unchanged from v18):
+//   Best model direct if leads all others by ≥ 0.06; else ensemble.
 //
-// ENGINE-SPECIFIC REGIME p BLEND:
-//   GEO:    Laplace MLE + regime blend of short-window rate (max 25%)
-//   BAY:    recency blend enhanced by regime strength (max 45%)
-//   KM:     no p change (empirical), window placement shifted only
-//   ENS:    regime affects pEns + window; exposes adjWeights
-//   ENGINE: CUSUM blend enhanced by regime strength
+// TIMING: zero changes — identical to v16/v17/v18.
+//
+// OUTPUT (simplified — only what matters):
+//   prob, confidence, spread, recommendation (TAKE/SKIP), reason
+//   Diagnostic fields (rawProbW, amplifiedProbW, finalProbUsed,
+//   signalStrength, aggressiveMode) retained for observability.
+//
+// METRIC: winRate = wins / total trades (takenWins / takenTotal). Only this.
+//
+// NOTE: If accuracy does not improve past ~50% after this change, the system
+//   has reached the ceiling imposed by IID randomness in the underlying game.
+//   No further decision-logic changes will help. The probability math is correct.
+//
+// ALL timing / regime / calibration / window / rare-engine math UNCHANGED.
+// DB format UNCHANGED. processEngine, runPredictionEngine UNCHANGED.
+//
+// ── HOW TO DEPLOY ────────────────────────────────────────────────────────────
+//   1. Replace predictionEngine.js with this file.
+//   2. Restart — no DB migration needed.
+//   3. Console: "[v19-FINAL] Loaded — 4-zone decision, timing intact"
+//   4. Fewer trades, cleaner signals. winRate target 50–60%.
+//   5. decisionReason: STRONG_SIGNAL / MODERATE_SIGNAL / FILTERED
+//
+// ═══════════════════════════════════════════════════════════════════════════════
 
+const ENGINE_VERSION = 'v19-FINAL';
 const {
   getRounds, savePrediction, getPredictions,
   saveLockedPreds, getLockedPreds,
   saveLockedPatternPreds, getLockedPatternPreds,
   saveLockedStatPreds, getLockedStatPreds,
 } = require('./db');
+
+console.log('[v19-FINAL] Loaded — 4-zone decision, timing intact');
+
+// ── Targets ───────────────────────────────────────────────────────────────────
 
 const TARGETS = [
   { label: '5x',    min: 5,    maxWidth: 3,  rare: false },
@@ -71,40 +85,122 @@ const STAT_MODELS = [
   { id: 'km'  },
 ];
 
-const MIN_ROUNDS               = 50;
+const MIN_ROUNDS                    = 50;
 const STALE_FORCE_REBUILD_THRESHOLD = 200;
-const WINDOW_LAMBDA            = 0.01;
+const WINDOW_LAMBDA                 = 0.008;
 
-// Regime tuning constants
-const REGIME_SHORT_WINDOW      = 30;   // rounds for fast regime detection
-const REGIME_WIDTH_SCALE       = 0.30; // max ±30% width change from regime
-const REGIME_OFFSET_SCALE      = 0.20; // max ±20% of expectedGap offset shift
-const REGIME_CUSUM_THRESHOLD   = 1.80; // raised from 1.20 — needs stronger signal before triggering
-const REGIME_DECAY             = 0.10; // EWMA decay for persistent regime state
-const REGIME_CUSUM_CLIP        = 1.0;  // clip CUSUM at ±1 sigma×sqrt(W) — tighter than ±2, reduces false alarms
-const REGIME_MIN_FACTOR        = 0.20; // regime factor must exceed this before affecting window placement
+// ── Regime constants ──────────────────────────────────────────────────────────
+const REGIME_SHORT_WINDOW           = 30;
+const REGIME_WIDTH_SCALE            = 0.25;
+const REGIME_OFFSET_SCALE           = 0.18;
+const REGIME_DECAY                  = 0.10;
+const REGIME_CUSUM_CLIP_HOT         = 1.2;
+const REGIME_CUSUM_CLIP_COLD        = 0.8;
+const REGIME_HYSTERESIS_REQUIRED    = 2;
+const REGIME_ACTIVATION_OUTCOMES    = 50;
+const REGIME_EARLY_HINT_SIGMA       = 1.8;
+const REGIME_EARLY_HINT_MAX_FACTOR  = 0.25;
+
+// ── Calibration constants ─────────────────────────────────────────────────────
+const CAL_BINS  = [0, 0.30, 0.45, 0.60, 0.75, 1.01];
+const CAL_DECAY = { normal: 0.08, rare: 0.03 };
+const CAL_MIN_SAMPLES = 12;
+const CAL_WARMUP_OUTCOMES = 80;
+const CAL_WARMUP_RAW_WEIGHT = 0.65;
+
+// ── Decision engine constants ─────────────────────────────────────────────────
+// TEMP_SCALE_AGREEMENT kept for applyTemperatureScaling (ENS builder).
+const TEMP_SCALE_AGREEMENT  = 0.15;
+
+// ── Decision constants — 4-zone system ───────────────────────────────────────
+// Zone 0: hard floor — no trade below this
+const SIG_HARD_FLOOR          = 0.42;   // below → SKIP always
+// Zone 1: low zone (0.42–0.46) — admit only on very tight agreement
+const SIG_LOW_ZONE_TOP        = 0.46;   // top of low zone
+const SIG_LOW_ZONE_SPREAD     = 0.08;   // spread must be < this in low zone
+const SIG_LOW_ZONE_CONF       = 55;     // confidence must be > this in low zone
+// Zone 2: core moderate (0.46–0.52)
+const SIG_MODERATE_TOP        = 0.52;   // top of moderate zone (= bottom of strong)
+const SIG_MODERATE_SPREAD     = 0.12;   // spread must be < this in moderate zone
+const SIG_MODERATE_CONF       = 50;     // confidence must be > this in moderate zone
+// Zone 3: strong — TAKE unconditionally
+const SIG_STRONG_PROB         = 0.52;   // ≥ this → STRONG_SIGNAL
+
+// Amplification — restricted to high-confidence zone only (unchanged from v18)
+const SIG_AMP_FACTOR          = 1.45;
+const SIG_AMP_MIN_PROB        = 0.50;   // raw prob must be ≥ this to amplify
+const SIG_AMP_MAX_SPREAD      = 0.10;   // spread must be < this to amplify
+const SIG_AMP_MAX_ECE         = 0.04;
+
+// Ensemble best-model direct use (unchanged from v18)
+const SIG_BEST_MODEL_MIN_N    = 20;
+const SIG_BEST_MODEL_GAP      = 0.06;   // best must lead ALL others by ≥ this
+
+// Calibration relaxation (unchanged)
+const SIG_CAL_RELAX_MAX_HITS  = 200;
+const SIG_CAL_RELAX_MAX_ECE   = 0.02;
+
+// High-conviction window boost (unchanged — only affects window width, not decision)
+const SIG_CONVICTION_SPREAD   = 0.08;
+const SIG_CONVICTION_REGIME   = 0.30;
+const SIG_CONVICTION_BOOST    = 0.05;
+
+// ── Rare engine constants ──────────────────────────────────────────────────────
+const RARE_MIN_MULTIPLIER      = 100;
+const RARE_TAIL_GEO_BLEND      = 0.40;
+const RARE_TAIL_GEO_BLEND_SPARSE = 0.70;
+const RARE_SPARSE_HITS         = 30;
+const RARE_EV_THRESHOLD        = 0.80;
+const RARE_TAIL_MIN            = 0.12;
+const RARE_EXTREME_GAP_BOOST   = 0.15;
+const RARE_EXTREME_WIDTH_BOOST = 1.25;
+const RARE_EARLY_WINDOW_FRAC   = 0.60;
+const RARE_LATE_WINDOW_FRAC    = 2.50;
+const RARE_CAL_IMPACT_HITS     = 150;
+const RARE_CAL_REDUCED_WEIGHT  = 0.30;
+const RARE_PAYOUT = { '100x':0.95, '250x':0.92, '500x':0.90, '1000x':0.88 };
+
+// ── Timing feedback constants ─────────────────────────────────────────────────
+const TIMING_MAX_SHIFT_FACTOR     = 0.35;
+const TIMING_GAP_CORRECTION_SCALE = 0.20;
+const TIMING_CENTER_PULL_SCALE    = 0.25;
+const TIMING_RECENT_WINDOW        = 20;
+const TIMING_RECENT_SPIKE_THRESH  = 0.30;
+const TIMING_RECENT_SPIKE_SHIFT   = 0.10;
+const TIMING_WIDTH_BOOST_THRESH   = 0.20;
+const TIMING_WIDTH_BOOST_FRAC     = 0.12;
+const TIMING_WIDTH_HARD_CAP       = 1.50;
+
+// ── Per-target timing feedback state ─────────────────────────────────────────
+const timingState = {};
+for (const t of TARGETS) {
+  timingState[t.label] = {
+    earlyCount:       0,
+    totalCount:       0,
+    earlyQueue:       [],
+    recentEarlyCount: 0,
+  };
+}
 
 // ── Per-engine independent CUSUM / regime state ───────────────────────────────
-// Each engine tracks its OWN persistent regime per target.
-// NOTE: 'pattern' is intentionally excluded — buildPatternPrediction is a
-// fully isolated UI-only signal that computes its own trend via EMA internally.
-// Structure: engineCusumState[engineId][targetLabel] = { cusum, regimeFactor, ewmaRate, count }
-
 const engineCusumState = {};
 for (const id of ['engine', 'ens', 'geo', 'bay', 'km']) {
   engineCusumState[id] = {};
   for (const t of TARGETS) {
     engineCusumState[id][t.label] = {
-      cusum:        0,
-      regimeFactor: 0,   // [-1, +1]
-      ewmaRate:     -1,  // EWMA of short-window hit rate (uninitialised = -1)
-      count:        0,
+      cusum:             0,
+      regimeFactor:      0,
+      ewmaRate:          -1,
+      count:             0,
+      regimeLabel:       'neutral',
+      hysteresisCount:   0,
+      pendingLabel:      'neutral',
+      confirmedFactor:   0,
     };
   }
 }
 
-// ── Per-engine state (fully independent) ──────────────────────────────────────
-
+// ── Per-engine state ──────────────────────────────────────────────────────────
 const STATE = {
   engine:  { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
   pattern: { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
@@ -114,14 +210,11 @@ const STATE = {
   km:      { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
 };
 
-// ── Gap stats cache — SHARED RAW DATA only, not model outputs ─────────────────
+// ── Gap stats cache ───────────────────────────────────────────────────────────
 const gapStatsCache = new Map();
 let   cacheRoundId  = -1;
 
-// ── 5-bin calibration — per model per target ──────────────────────────────────
-const CAL_BINS  = [0, 0.30, 0.45, 0.60, 0.75, 1.01];
-const CAL_DECAY = { normal: 0.08, rare: 0.03 };
-
+// ── Calibration state ─────────────────────────────────────────────────────────
 const calibState = {};
 for (const t of TARGETS) {
   calibState[t.label] = {};
@@ -133,7 +226,7 @@ for (const t of TARGETS) {
   }
 }
 
-// ── Adaptive ensemble weights — log-loss EWMA per model per target ────────────
+// ── Adaptive ensemble weights ─────────────────────────────────────────────────
 const modelScores = {};
 for (const t of TARGETS) {
   modelScores[t.label] = {};
@@ -145,14 +238,26 @@ const valMetrics = {};
 for (const t of TARGETS) {
   valMetrics[t.label] = {};
   for (const m of STAT_MODELS) {
-    valMetrics[t.label][m.id] = { brierSum: 0, logLossSum: 0, count: 0, wins: 0, losses: 0, earlyCount: 0 };
+    valMetrics[t.label][m.id] = {
+      brierSum: 0, logLossSum: 0, count: 0,
+      wins: 0, losses: 0, earlyCount: 0,
+      takenWins: 0, takenTotal: 0,
+      // F8: trade metrics — TAKE only
+      tradeCount: 0,    // TAKE decisions taken
+      totalWins:  0,    // wins on taken trades
+    };
   }
+}
+
+// ── F8: Per-target taken-trades tracking ─────────────────────────────────────
+const takenTradesMetrics = {};
+for (const t of TARGETS) {
+  takenTradesMetrics[t.label] = { wins: 0, losses: 0, early: 0, total: 0 };
 }
 
 let initialised = false;
 
 // ── Reset ─────────────────────────────────────────────────────────────────────
-
 function resetEngineState() {
   console.log('[engine] resetEngineState()');
   for (const id of Object.keys(STATE)) {
@@ -161,148 +266,214 @@ function resetEngineState() {
     STATE[id].needsRebuild = true;
     STATE[id].lastRoundId  = 0;
   }
-  // Reset all per-engine CUSUM states (pattern excluded — it has no regime state)
   for (const id of Object.keys(engineCusumState)) {
     for (const t of TARGETS) {
-      engineCusumState[id][t.label] = { cusum: 0, regimeFactor: 0, ewmaRate: -1, count: 0 };
+      engineCusumState[id][t.label] = {
+        cusum: 0, regimeFactor: 0, ewmaRate: -1, count: 0,
+        regimeLabel: 'neutral', hysteresisCount: 0,
+        pendingLabel: 'neutral', confirmedFactor: 0,
+      };
     }
   }
   gapStatsCache.clear();
   cacheRoundId = -1;
   initialised  = false;
+  for (const t of TARGETS) {
+    timingState[t.label] = { earlyCount: 0, totalCount: 0, earlyQueue: [], recentEarlyCount: 0 };
+    takenTradesMetrics[t.label] = { wins: 0, losses: 0, early: 0, total: 0 };
+  }
 }
 
 // ── Math helpers ──────────────────────────────────────────────────────────────
-
-function sigmoid(x)   { return 1 / (1 + Math.exp(-x)); }
-function logit(p)     { const q = Math.max(1e-7, Math.min(1 - 1e-7, p)); return Math.log(q / (1 - q)); }
-function fromLogit(l) { return sigmoid(l); }
+function sigmoid(x)       { return 1 / (1 + Math.exp(-x)); }
+function logit(p)         { const q = Math.max(1e-7, Math.min(1 - 1e-7, p)); return Math.log(q / (1 - q)); }
+function fromLogit(l)     { return sigmoid(l); }
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
-// ── Per-Engine Regime Detection ───────────────────────────────────────────────
-//
-// Called independently by each engine with its own engineId.
-// Updates engineCusumState[engineId][targetLabel] in-place.
-//
-// Parameters:
-//   rounds      — full sorted rounds array
-//   targetMin   — target multiplier threshold
-//   targetLabel — string label e.g. '10x'
-//   engineId    — which engine's state bucket to update ('geo','bay','km','ens','engine')
-//   gs          — shared gap stats (read-only: gs.hits, gs.n used as global baseline,
-//                 avoids re-scanning all rounds for totalHits)
-//
-// Returns: { regimeFactor, regimeLabel, shortRate, shortBaseline, cusumNorm }
-//   regimeFactor ∈ [-1, +1]:
-//     > 0 → hot streak (hits accelerating)
-//     < 0 → cold / white streak (hits drying up)
-//
-// Uses the last REGIME_SHORT_WINDOW rounds for fast detection.
-// Persistent CUSUM accumulates across calls (stateful per engine per target).
-// Each engineId reads/writes ONLY its own bucket — zero cross-engine state sharing.
+// ── Timing feedback: record outcome ───────────────────────────────────────────
+function recordTimingOutcome(targetLabel, isEarly) {
+  const ts = timingState[targetLabel];
+  if (!ts) return;
+  ts.totalCount++;
+  if (isEarly) ts.earlyCount++;
+  const val = isEarly ? 1 : 0;
+  ts.earlyQueue.push(val);
+  ts.recentEarlyCount += val;
+  if (ts.earlyQueue.length > TIMING_RECENT_WINDOW) {
+    ts.recentEarlyCount -= ts.earlyQueue.shift();
+  }
+}
 
-function updateEngineRegime(rounds, targetMin, targetLabel, engineId, gs) {
+// ── Timing feedback: compute shift params ────────────────────────────────────
+function getTimingParams(targetLabel) {
+  const ts = timingState[targetLabel];
+  if (!ts || ts.totalCount < 5) {
+    return { earlyRate: 0, recentEarlyRate: 0, timingShiftFactor: 0, hasData: false };
+  }
+  const earlyRate       = ts.earlyCount / ts.totalCount;
+  const recentTotal     = ts.earlyQueue.length;
+  const recentEarlyRate = recentTotal > 0 ? ts.recentEarlyCount / recentTotal : earlyRate;
+  const timingShiftFactor = clamp(earlyRate, 0, TIMING_MAX_SHIFT_FACTOR);
+  return { earlyRate, recentEarlyRate, timingShiftFactor, hasData: true };
+}
+
+// ── Timing-corrected window placement ────────────────────────────────────────
+function applyTimingCorrection(expectedGap, effectiveWidth, targetLabel, maxWidth) {
+  const { earlyRate, recentEarlyRate, timingShiftFactor, hasData } = getTimingParams(targetLabel);
+
+  let correctedWidth = effectiveWidth;
+  if (hasData && earlyRate > TIMING_WIDTH_BOOST_THRESH) {
+    const boost = Math.round(effectiveWidth * TIMING_WIDTH_BOOST_FRAC);
+    correctedWidth = Math.min(
+      Math.round(maxWidth * TIMING_WIDTH_HARD_CAP),
+      effectiveWidth + boost
+    );
+  }
+
+  if (!hasData) {
+    const low  = Math.max(0, expectedGap - correctedWidth);
+    const high = low + correctedWidth - 1;
+    return { low, high, effectiveWidth: correctedWidth, timingShiftFactor: 0 };
+  }
+
+  const expectedGapCorrected = Math.max(1, Math.round(
+    expectedGap * (1 - TIMING_GAP_CORRECTION_SCALE * earlyRate)
+  ));
+  const center = Math.max(1, Math.round(
+    expectedGapCorrected * (1 - TIMING_CENTER_PULL_SCALE * earlyRate)
+  ));
+  let low  = Math.max(0, center - Math.floor(correctedWidth / 2));
+  let high = low + correctedWidth - 1;
+
+  if (recentEarlyRate > TIMING_RECENT_SPIKE_THRESH) {
+    const spikeShift = Math.round(expectedGapCorrected * TIMING_RECENT_SPIKE_SHIFT);
+    low  = Math.max(0, low  - spikeShift);
+    high = low + correctedWidth - 1;
+  }
+
+  return { low, high, effectiveWidth: correctedWidth, timingShiftFactor, expectedGapCorrected };
+}
+
+// ── Dynamic regime thresholds ─────────────────────────────────────────────────
+function getDynamicRegimeParams(outcomeCount) {
+  if (outcomeCount < REGIME_ACTIVATION_OUTCOMES) {
+    return { threshold: 9999, minFactor: 9999, active: false };
+  }
+  const t = clamp((outcomeCount - REGIME_ACTIVATION_OUTCOMES) / (400 - REGIME_ACTIVATION_OUTCOMES), 0, 1);
+  const threshold = 2.4 - t * (2.4 - 1.65);
+  const minFactor = 0.45 - t * (0.45 - 0.18);
+  return { threshold, minFactor, active: true };
+}
+
+// ── Per-Engine Regime Detection ───────────────────────────────────────────────
+function updateEngineRegime(rounds, targetMin, targetLabel, engineId, gs, isRandomSignal) {
   const cs = engineCusumState[engineId]?.[targetLabel];
-  if (!cs) return { regimeFactor: 0, regimeLabel: 'neutral', shortRate: 0, shortBaseline: 0, cusumNorm: 0 };
+  if (!cs) return { regimeFactor: 0, regimeLabel: 'neutral', shortRate: 0, shortBaseline: 0, cusumNorm: 0, regimeConfidence: 0 };
 
   const n = rounds.length;
-  const shortStart = Math.max(0, n - REGIME_SHORT_WINDOW);
+  const shortStart  = Math.max(0, n - REGIME_SHORT_WINDOW);
   const shortWindow = rounds.slice(shortStart);
 
-  // Short-window hit rate (fast, only 30 rounds)
   let shortHits = 0;
   for (const r of shortWindow) if (r.multiplier >= targetMin) shortHits++;
-  const shortRate = shortHits / Math.max(1, shortWindow.length);
-
-  // Global baseline: reuse pre-computed gs.hits / gs.n — no re-scan of full rounds
-  // gs is shared read-only cache; each engine reads the same raw fact independently.
+  const shortRate     = shortHits / Math.max(1, shortWindow.length);
   const shortBaseline = gs.hits / Math.max(1, gs.n);
 
-  // Update persistent EWMA of short-window rate (engine-specific)
-  if (cs.ewmaRate < 0) {
-    cs.ewmaRate = shortRate; // first call: initialise
-  } else {
-    cs.ewmaRate = (1 - REGIME_DECAY) * cs.ewmaRate + REGIME_DECAY * shortRate;
-  }
+  if (cs.ewmaRate < 0) cs.ewmaRate = shortRate;
+  else cs.ewmaRate = (1 - REGIME_DECAY) * cs.ewmaRate + REGIME_DECAY * shortRate;
   cs.count++;
 
-  // Persistent CUSUM: accumulates deviations of shortRate from baseline
-  // Positive CUSUM = hot streak (hits above baseline)
-  // Negative CUSUM = cold streak / white streak (hits below baseline)
+  const regimeConfidence = clamp((cs.count - REGIME_ACTIVATION_OUTCOMES) / 200, 0, 1);
+  const { threshold, minFactor, active } = getDynamicRegimeParams(cs.count);
+
+  if (!active) {
+    const sigma        = Math.sqrt(Math.max(1e-9, shortBaseline * (1 - shortBaseline)));
+    const deviationSig = sigma > 0 ? (shortRate - shortBaseline) / sigma : 0;
+    let hintFactor = 0;
+    if (Math.abs(deviationSig) >= REGIME_EARLY_HINT_SIGMA) {
+      const rawHint = Math.sign(deviationSig) * REGIME_EARLY_HINT_MAX_FACTOR
+        * clamp((Math.abs(deviationSig) - REGIME_EARLY_HINT_SIGMA) / REGIME_EARLY_HINT_SIGMA, 0, 1);
+      hintFactor = rawHint * ((isRandomSignal === true) ? 0.40 : 1.0);
+    }
+    cs.regimeFactor    = hintFactor;
+    cs.confirmedFactor = hintFactor;
+    cs.regimeLabel     = hintFactor > 0.10 ? 'hot' : hintFactor < -0.10 ? 'cold' : 'neutral';
+    return {
+      regimeFactor:     +hintFactor.toFixed(4),
+      regimeLabel:      cs.regimeLabel,
+      shortRate, shortBaseline,
+      cusumNorm: 0,
+      regimeConfidence: 0,
+      earlyHint: true,
+    };
+  }
+
   const deviation = shortRate - shortBaseline;
   cs.cusum += deviation;
 
-  // Normalise CUSUM by baseline std dev
-  const sigma = Math.sqrt(Math.max(1e-9, shortBaseline * (1 - shortBaseline)));
+  const sigma    = Math.sqrt(Math.max(1e-9, shortBaseline * (1 - shortBaseline)));
   const cusumNorm = cs.cusum / Math.max(sigma * Math.sqrt(REGIME_SHORT_WINDOW), 1e-6);
 
-  // Clip at ±REGIME_CUSUM_CLIP sigma×sqrt(W) — tighter clip reduces false cold/hot alarms
-  // during random dry patches (the main source of Gambler's Fallacy in regime detection)
-  cs.cusum = clamp(cs.cusum, -REGIME_CUSUM_CLIP * sigma * Math.sqrt(REGIME_SHORT_WINDOW), REGIME_CUSUM_CLIP * sigma * Math.sqrt(REGIME_SHORT_WINDOW));
+  const clipHot  = REGIME_CUSUM_CLIP_HOT  * sigma * Math.sqrt(REGIME_SHORT_WINDOW);
+  const clipCold = REGIME_CUSUM_CLIP_COLD * sigma * Math.sqrt(REGIME_SHORT_WINDOW);
+  cs.cusum = clamp(cs.cusum, -clipCold, clipHot);
 
-  // regimeFactor: smooth mapping of cusumNorm → [-1, +1]
-  // tanh gives smooth saturation: small deviations → small factor, large → saturates at ±1
-  const rawFactor = Math.tanh(cusumNorm / (REGIME_CUSUM_THRESHOLD * 1.5));
+  const rawFactor = Math.tanh(cusumNorm / (threshold * 1.5));
+  const randomDampen = (isRandomSignal === true) ? 0.40 : 1.0;
+  cs.regimeFactor = clamp(
+    (1 - REGIME_DECAY) * cs.regimeFactor + REGIME_DECAY * rawFactor * randomDampen,
+    -1, 1
+  );
 
-  // EWMA-smooth the regime factor to avoid jitter
-  cs.regimeFactor = (1 - REGIME_DECAY) * cs.regimeFactor + REGIME_DECAY * rawFactor;
-  cs.regimeFactor = clamp(cs.regimeFactor, -1, 1);
-
-  const regimeLabel = cs.regimeFactor > 0.15 ? 'hot'
+  const rawLabel = cs.regimeFactor > 0.15 ? 'hot'
     : cs.regimeFactor < -0.15 ? 'cold'
     : 'neutral';
 
+  if (rawLabel === cs.pendingLabel) {
+    cs.hysteresisCount++;
+  } else {
+    cs.pendingLabel    = rawLabel;
+    cs.hysteresisCount = 1;
+  }
+
+  if (cs.hysteresisCount >= REGIME_HYSTERESIS_REQUIRED) {
+    cs.regimeLabel     = cs.pendingLabel;
+    cs.confirmedFactor = cs.regimeFactor;
+  }
+
+  const effectiveFactor = Math.abs(cs.confirmedFactor) >= minFactor ? cs.confirmedFactor : 0;
+
   return {
-    regimeFactor:  +cs.regimeFactor.toFixed(4),
-    regimeLabel,
-    shortRate:     +shortRate.toFixed(4),
-    shortBaseline: +shortBaseline.toFixed(4),
-    cusumNorm:     +cusumNorm.toFixed(3),
+    regimeFactor:      +effectiveFactor.toFixed(4),
+    regimeLabel:       cs.regimeLabel,
+    shortRate:         +shortRate.toFixed(4),
+    shortBaseline:     +shortBaseline.toFixed(4),
+    cusumNorm:         +cusumNorm.toFixed(3),
+    regimeConfidence:  +regimeConfidence.toFixed(3),
+    earlyHint:         false,
   };
 }
 
 // ── Apply regime to window placement ─────────────────────────────────────────
-//
-// Takes the raw {low, high} from parametric/empirical placement and adjusts:
-//   hot streak  (regimeFactor > 0): open sooner, narrower
-//   cold streak (regimeFactor < 0): open later,  wider
-//
-// This is the ADDITIVE layer — it never overrides the base placement entirely,
-// just nudges it proportionally to regime strength.
-
 function applyRegimeToWindow(low, high, expectedGap, effectiveWidth, regimeFactor) {
-  // Must exceed minimum threshold — prevents random noise from shifting windows
-  if (Math.abs(regimeFactor) < REGIME_MIN_FACTOR) return { low, high };
-
-  // Width adjustment: hot → narrower, cold → wider
-  const widthDelta  = clamp(-regimeFactor * REGIME_WIDTH_SCALE, -0.25, 0.35);
+  if (regimeFactor === 0) return { low, high };
+  const widthDelta  = clamp(-regimeFactor * REGIME_WIDTH_SCALE, -0.20, 0.30);
   const newWidth    = Math.max(1, Math.round(effectiveWidth * (1 + widthDelta)));
-
-  // Offset shift: hot → open sooner (negative shift), cold → open later (positive shift)
-  // regimeFactor > 0 (hot) → offsetShift > 0 → pull window earlier
-  // regimeFactor < 0 (cold) → offsetShift < 0 → push window later
   const offsetShift = Math.round(regimeFactor * expectedGap * REGIME_OFFSET_SCALE);
   const newLow      = Math.max(0, low - offsetShift);
   const newHigh     = newLow + newWidth - 1;
-
   return { low: newLow, high: newHigh };
 }
 
-// ── Regime-adjusted p blending (for parametric engines) ──────────────────────
-//
-// Each parametric engine can blend in a short-window rate when regime is active.
-// shortRate is from updateEngineRegime().
-// blendStrength controls how much the short rate pulls the engine's p.
-
+// ── Regime-adjusted p blending ────────────────────────────────────────────────
 function applyRegimeToP(baseP, shortRate, regimeFactor, blendStrength) {
-  if (Math.abs(regimeFactor) < REGIME_MIN_FACTOR) return baseP;
+  if (regimeFactor === 0) return baseP;
   const regimeBlend = Math.abs(regimeFactor) * blendStrength;
   const blended = (1 - regimeBlend) * baseP + regimeBlend * shortRate;
   return Math.max(1e-6, Math.min(0.5, blended));
 }
 
-// ── Gap stats cache — shared raw facts ────────────────────────────────────────
-
+// ── Gap stats cache ───────────────────────────────────────────────────────────
 function getGapStats(rounds, targetMin, lastRoundId) {
   if (lastRoundId !== cacheRoundId) {
     gapStatsCache.clear();
@@ -329,12 +500,10 @@ function computeGapStats(rounds, targetMin) {
   if (hits < 3) return null;
 
   const gapSinceLast = lastIdx === -1 ? n : n - lastIdx - 1;
-
   const pGlobal = (hits + 1) / (n + 2);
   const r200hits = rounds.slice(-200).filter(r => r.multiplier >= targetMin).length;
   const pRecent  = (r200hits + 1) / 202;
 
-  // Shared CUSUM (diagnostic only — each engine has its own in engineCusumState)
   const p0 = hits / n;
   let cusum = 0, maxCusum = 0;
   const cusumWindow = rounds.slice(-150);
@@ -342,8 +511,8 @@ function computeGapStats(rounds, targetMin) {
     cusum += (r.multiplier >= targetMin ? 1 : 0) - p0;
     if (Math.abs(cusum) > maxCusum) maxCusum = Math.abs(cusum);
   }
-  const sigma0     = Math.sqrt(Math.max(1e-9, p0 * (1 - p0)));
-  const cusumNorm  = maxCusum / (sigma0 * Math.sqrt(cusumWindow.length));
+  const sigma0    = Math.sqrt(Math.max(1e-9, p0 * (1 - p0)));
+  const cusumNorm = maxCusum / (sigma0 * Math.sqrt(cusumWindow.length));
   const rateShifted = cusumNorm > 1.36;
 
   const sg = [...gaps].sort((a, b) => a - b);
@@ -353,7 +522,7 @@ function computeGapStats(rounds, targetMin) {
 
   let gSum = 0, gSS = 0;
   for (const g of gaps) { gSum += g; gSS += g * g; }
-  const meanGap = gaps.length > 0 ? gSum / gaps.length : 1 / pGlobal;
+  const meanGap  = gaps.length > 0 ? gSum / gaps.length : 1 / pGlobal;
   const variance = gaps.length > 1 ? Math.max(0, gSS / gaps.length - meanGap ** 2) : meanGap * meanGap;
   const stdGap   = Math.sqrt(variance);
   const cv       = meanGap > 0 ? stdGap / meanGap : 1;
@@ -367,7 +536,6 @@ function computeGapStats(rounds, targetMin) {
   const p95 = pctile(0.95);
 
   const hsm = halfSampleMode(sg, medianGap, cv);
-
   let modeWeight;
   if (cv < 1.0)      modeWeight = 0.50;
   else if (cv > 1.3) modeWeight = 0.10;
@@ -382,12 +550,6 @@ function computeGapStats(rounds, targetMin) {
     else break;
   }
 
-  // ── Randomness check: autocorrelation on gaps ─────────────────────────────
-  // If gaps are pure random (geometric RNG), autocorrelation at all lags ≈ 0.
-  // We test lags 1–5. If the max |AC| < threshold AND we have enough data,
-  // flag isRandom = true so callers can reduce confidence or warn the user.
-  // Threshold: |AC| > 0.10 with 50+ gaps suggests real structure.
-  // isRandom does NOT disable predictions — it is an honest signal only.
   let maxAC = 0;
   if (gaps.length >= 50) {
     let gVarSum = 0;
@@ -403,7 +565,6 @@ function computeGapStats(rounds, targetMin) {
       }
     }
   }
-  // isRandom: true when we have enough data AND no meaningful autocorrelation found
   const isRandom = gaps.length >= 50 && Math.abs(maxAC) < 0.10;
 
   return {
@@ -413,13 +574,12 @@ function computeGapStats(rounds, targetMin) {
     p75, p90, p95, sg, kmCDF,
     hsm, kmExpectedGap,
     currentStreak,
-    maxAC: +maxAC.toFixed(4),
+    maxAC:    +maxAC.toFixed(4),
     isRandom,
   };
 }
 
 // ── Half-sample mode ──────────────────────────────────────────────────────────
-
 function halfSampleMode(sg, medianGap, cv) {
   const n = sg.length;
   if (n < 8)    return medianGap;
@@ -433,8 +593,7 @@ function halfSampleMode(sg, medianGap, cv) {
   return (sg[bestStart] + sg[bestStart + h - 1]) / 2;
 }
 
-// ── KM: precomputed CDF ───────────────────────────────────────────────────────
-
+// ── KM CDF ────────────────────────────────────────────────────────────────────
 function buildKmCDF(sg) {
   if (sg.length < 5) return null;
   const m = sg.length;
@@ -464,12 +623,33 @@ function kmCDFQuery(kmCDF, W) {
 }
 
 function kmWindowProb(kmCDF, lo, hi) {
-  const cdfHi = kmCDFQuery(kmCDF, hi) ?? 0;
+  const cdfHi = kmCDFQuery(kmCDF, hi)           ?? 0;
   const cdfLo = lo > 0 ? (kmCDFQuery(kmCDF, lo - 1) ?? 0) : 0;
   return Math.max(0, cdfHi - cdfLo);
 }
 
-// ── Window placement ──────────────────────────────────────────────────────────
+// ── HYBRID window placement ───────────────────────────────────────────────────
+function hybridWindowPlacement(kmCDF, expectedGap, effectiveWidth, gapSinceLast, cv, targetLabel, maxWidth) {
+  const parametric = parametricWindowPlacement(expectedGap, effectiveWidth, gapSinceLast);
+  let km = parametric;
+  if (kmCDF) {
+    km = empiricalWindowPlacement(kmCDF, expectedGap, effectiveWidth, gapSinceLast);
+  }
+
+  const blendedLow  = Math.round(0.70 * parametric.low  + 0.30 * km.low);
+  const blendedHigh = Math.round(0.70 * parametric.high + 0.30 * km.high);
+
+  const inPrimeZone = gapSinceLast >= expectedGap * 0.5 && gapSinceLast <= expectedGap * 1.6;
+  const anchoredWidth = inPrimeZone
+    ? Math.round(effectiveWidth * 1.22)
+    : (blendedHigh - blendedLow + 1);
+
+  const mw = maxWidth ?? effectiveWidth;
+  const { low, high, effectiveWidth: correctedWidth } =
+    applyTimingCorrection(expectedGap, anchoredWidth, targetLabel ?? '', mw);
+
+  return { low, high, effectiveWidth: correctedWidth };
+}
 
 function parametricWindowPlacement(expectedGap, effectiveWidth, gapSinceLast) {
   if (gapSinceLast >= expectedGap) {
@@ -488,8 +668,8 @@ function empiricalWindowPlacement(kmCDF, expectedGap, effectiveWidth, gapSinceLa
   const maxLow = Math.max(0, 3 * expectedGap - gapSinceLast - effectiveWidth);
   let bestScore = -Infinity, bestLow = 0;
   for (let low = 0; low <= maxLow; low++) {
-    const absLo  = gapSinceLast + low;
-    const absHi  = gapSinceLast + low + effectiveWidth - 1;
+    const absLo   = gapSinceLast + low;
+    const absHi   = gapSinceLast + low + effectiveWidth - 1;
     const probHit = kmWindowProb(kmCDF, absLo, absHi);
     const score   = probHit - WINDOW_LAMBDA * effectiveWidth;
     if (score > bestScore) { bestScore = score; bestLow = low; }
@@ -498,19 +678,22 @@ function empiricalWindowPlacement(kmCDF, expectedGap, effectiveWidth, gapSinceLa
   return { low: bestLow, high: bestLow + effectiveWidth - 1 };
 }
 
-// ── Pareto blend for KM on rare targets ───────────────────────────────────────
-
-function applyParetoCorrectedProbW(rawProbW, cv, expectedGap, maxWidth, isRare) {
+// ── Pareto + exponential tail smoothing for rare targets ──────────────────────
+function applyParetoCorrectedProbW(rawProbW, cv, expectedGap, maxWidth, isRare, hits) {
   if (!isRare || cv <= 1.1) return rawProbW;
-  const alpha   = 1 / Math.max(0.1, cv * cv);
+  const aggressiveMode = hits >= 120;
+  const alpha  = 1 / Math.max(0.1, cv * cv);
   const paretoP = 1 - Math.pow(1 / (1 + maxWidth / Math.max(1, expectedGap)), alpha);
-  const blendW  = Math.min(0.30, (cv - 1.0) * 0.60);
-  const blended = (1 - blendW) * rawProbW + blendW * paretoP;
+  const expP = 1 - Math.exp(-maxWidth / Math.max(1, expectedGap));
+  const tailP = paretoP * 0.60 + expP * 0.40;
+  const blendW = aggressiveMode
+    ? Math.min(0.45, (cv - 1.0) * 0.70)
+    : Math.min(0.30, (cv - 1.0) * 0.60);
+  const blended = (1 - blendW) * rawProbW + blendW * tailP;
   return Math.max(1e-6, Math.min(1 - 1e-6, blended));
 }
 
 // ── Calibration ───────────────────────────────────────────────────────────────
-
 function getCalBinIdx(probW) {
   for (let i = 0; i < CAL_BINS.length - 1; i++) {
     if (probW < CAL_BINS[i + 1]) return i;
@@ -519,43 +702,56 @@ function getCalBinIdx(probW) {
 }
 
 function updateCalibration(targetLabel, modelId, predictedProbW, outcome) {
-  if (outcome === 'early') return;
   const bins = calibState[targetLabel]?.[modelId];
   if (!bins) return;
-  const target = TARGETS.find(t => t.label === targetLabel);
-  const decay  = target?.rare ? CAL_DECAY.rare : CAL_DECAY.normal;
-  const actual = outcome === 'win' ? 1 : 0;
-  const bin    = bins[getCalBinIdx(predictedProbW)];
-  bin.ewmaAct  = (1 - decay) * bin.ewmaAct  + decay * actual;
-  bin.ewmaPred = (1 - decay) * bin.ewmaPred + decay * predictedProbW;
-  bin.count    = Math.min(bin.count + 1, 500);
+  const target  = TARGETS.find(t => t.label === targetLabel);
+  const decay   = target?.rare ? CAL_DECAY.rare : CAL_DECAY.normal;
+  const actual  = outcome === 'win' ? 1 : outcome === 'early' ? 0.5 : 0;
+  const bin     = bins[getCalBinIdx(predictedProbW)];
+  bin.ewmaAct   = (1 - decay) * bin.ewmaAct  + decay * actual;
+  bin.ewmaPred  = (1 - decay) * bin.ewmaPred + decay * predictedProbW;
+  bin.count     = Math.min(bin.count + 1, 500);
 }
 
-function applyCalibration(probW, targetLabel, modelId) {
+function applyCalibration(probW, targetLabel, modelId, totalCount) {
   const bins = calibState[targetLabel]?.[modelId];
   if (!bins) return probW;
   const bin = bins[getCalBinIdx(probW)];
-  if (bin.count < 25) return probW; // need 25 samples minimum to avoid noisy corrections
-  const empirical = bin.ewmaAct, predicted = bin.ewmaPred;
+  if (bin.count < CAL_MIN_SAMPLES) return probW;
+  const warmupT = clamp((totalCount ?? bin.count) / CAL_WARMUP_OUTCOMES, 0, 1);
+  const empirical  = bin.ewmaAct;
+  const predicted  = bin.ewmaPred;
   if (predicted < 1e-6) return probW;
   const ratio = empirical / predicted;
   if (Math.abs(ratio - 1) < 0.12) return probW;
-  const calibrated = Math.max(1e-6, Math.min(1 - 1e-6, probW * Math.max(0.80, Math.min(1.20, ratio))));
-  return Math.min(calibrated, probW + 0.05);
+  const corrected = Math.max(1e-6, Math.min(1 - 1e-6, probW * Math.max(0.80, Math.min(1.20, ratio))));
+  const capped    = Math.min(corrected, probW + 0.05);
+  const rawWeight = CAL_WARMUP_RAW_WEIGHT * (1 - warmupT);
+  return probW * rawWeight + capped * (1 - rawWeight);
 }
 
 // ── Validation metrics ────────────────────────────────────────────────────────
-
-function updateValidationMetrics(targetLabel, modelId, predictedProbW, outcome) {
+// F8: primary KPI is winRate = takenWins / takenTotal (wins on TAKE calls only)
+function updateValidationMetrics(targetLabel, modelId, predictedProbW, outcome, recommendation) {
   const v = valMetrics[targetLabel]?.[modelId];
   if (!v) return;
-  if (outcome === 'early') { v.earlyCount++; return; }
-  const actual = outcome === 'win' ? 1 : 0;
+  const actual = outcome === 'win' ? 1 : outcome === 'early' ? 0.5 : 0;
   const p = Math.max(1e-7, Math.min(1 - 1e-7, predictedProbW));
   v.brierSum   += (actual - p) ** 2;
   v.logLossSum += -(actual * Math.log(p) + (1 - actual) * Math.log(1 - p));
   v.count++;
-  if (outcome === 'win') v.wins++; else v.losses++;
+  if (outcome === 'win')        v.wins++;
+  else if (outcome === 'early') v.earlyCount++;
+  else                          v.losses++;
+  // F8: track taken-trade win rate (TAKE only — WEAK_TAKE removed)
+  if (recommendation === 'TAKE') {
+    v.takenTotal++;
+    v.tradeCount++;
+    if (outcome === 'win') {
+      v.takenWins++;
+      v.totalWins++;
+    }
+  }
 }
 
 function getECE(targetLabel, modelId) {
@@ -570,7 +766,9 @@ function getECE(targetLabel, modelId) {
   return total > 0 ? ece / total : null;
 }
 
-// ── Adaptive ensemble weights ─────────────────────────────────────────────────
+// ── BMA Ensemble weights ──────────────────────────────────────────────────────
+const BMA_WARMUP_COUNT = 60;
+const BMA_WARMUP_PRIORS = [0.45, 0.35, 0.20];
 
 function logLossVal(actual, probW) {
   const p = Math.max(1e-7, Math.min(1 - 1e-7, probW));
@@ -578,28 +776,48 @@ function logLossVal(actual, probW) {
 }
 
 function updateModelScore(targetLabel, modelId, predictedProbW, outcome) {
-  if (outcome === 'early') return;
-  const actual = outcome === 'win' ? 1 : 0;
   const s = modelScores[targetLabel]?.[modelId];
   if (!s) return;
-  const loss   = logLossVal(actual, predictedProbW);
-  const target = TARGETS.find(t => t.label === targetLabel);
-  const decay  = target?.rare ? 0.02 : 0.05;
+  const actual  = outcome === 'win' ? 1 : outcome === 'early' ? 0.5 : 0;
+  const loss    = logLossVal(actual, predictedProbW);
+  const target  = TARGETS.find(t => t.label === targetLabel);
+  const decay   = target?.rare ? 0.02 : 0.05;
   s.ewma  = s.count === 0 ? loss : (1 - decay) * s.ewma + decay * loss;
   s.count = Math.min(s.count + 1, 500);
 }
 
-function buildEnsemble(targetLabel, probGeo, probBay, probKm) {
-  const scores  = modelScores[targetLabel];
+function buildEnsemble(targetLabel, probGeo, probBay, probKm, cv) {
+  const scores   = modelScores[targetLabel];
   const modelIds = ['geo', 'bay', 'km'];
-  const probs   = [probGeo, probBay, probKm];
+  const probs    = [probGeo, probBay, probKm];
 
-  const weights = modelIds.map(id => {
-    const avgLoss = scores[id]?.count > 2 ? scores[id].ewma : 0.693;
-    return Math.exp(-avgLoss * 2);
-  });
+  const minCount = Math.min(...modelIds.map(id => scores[id]?.count ?? 0));
+
+  let weights;
+  if (minCount < BMA_WARMUP_COUNT) {
+    const warmupT = clamp(minCount / BMA_WARMUP_COUNT, 0, 1);
+    let cvPriors;
+    if (cv > 1.5)      cvPriors = [0.25, 0.30, 0.45];
+    else if (cv < 1.0) cvPriors = [0.55, 0.30, 0.15];
+    else               cvPriors = [...BMA_WARMUP_PRIORS];
+
+    const adaptiveWeights = modelIds.map(id => {
+      const avgLoss = scores[id]?.count > 2 ? scores[id].ewma : 0.693;
+      return Math.exp(-avgLoss * 2);
+    });
+    const awSum = adaptiveWeights.reduce((a, b) => a + b, 0);
+    for (let i = 0; i < adaptiveWeights.length; i++) adaptiveWeights[i] /= awSum;
+
+    weights = cvPriors.map((p, i) => (1 - warmupT) * p + warmupT * adaptiveWeights[i]);
+  } else {
+    weights = modelIds.map(id => {
+      const avgLoss = scores[id]?.count > 2 ? scores[id].ewma : 0.693;
+      return Math.exp(-avgLoss * 2);
+    });
+  }
+
   const wSum = weights.reduce((a, b) => a + b, 0);
-  if (wSum < 1e-9) return { ensProb: (probGeo + probBay + probKm) / 3, spread: 0, adjWeights: [1/3, 1/3, 1/3] };
+  if (wSum < 1e-9) return { ensProb: (probGeo + probBay + probKm) / 3, spread: 0, adjWeights: [1/3, 1/3, 1/3], modelDisagreementScore: 0 };
   for (let i = 0; i < weights.length; i++) weights[i] /= wSum;
 
   const logits = probs.map(logit);
@@ -617,12 +835,27 @@ function buildEnsemble(targetLabel, probGeo, probBay, probKm) {
   const ensLogit = logits.reduce((s, l, i) => s + adjWeights[i] * l, 0);
   const ensProb  = fromLogit(ensLogit);
 
-  return { ensProb, spread, adjWeights };
+  const modelDisagreementScore = +Math.max(
+    Math.abs(logits[0] - logits[1]),
+    Math.abs(logits[1] - logits[2]),
+    Math.abs(logits[0] - logits[2])
+  ).toFixed(3);
+
+  return { ensProb, spread, adjWeights, modelDisagreementScore };
+}
+
+// ── Temperature scaling ───────────────────────────────────────────────────────
+function applyTemperatureScaling(probW, spread, targetLabel, modelId) {
+  if (spread > TEMP_SCALE_AGREEMENT) return probW;
+  const ece = getECE(targetLabel, modelId);
+  if (ece == null || ece > 0.03) return probW;
+  const T = 0.85;
+  const sharpened = fromLogit(logit(probW) / T);
+  return Math.max(1e-6, Math.min(1 - 1e-6, sharpened));
 }
 
 // ── Beta confidence ───────────────────────────────────────────────────────────
-
-function betaConf(probW, hits, spread) {
+function betaConf(probW, hits, spread, regimeConfidence, z) {
   const effectiveN = Math.min(hits, 300);
   const alpha = probW * effectiveN + 1;
   const beta  = (1 - probW) * effectiveN + 1;
@@ -636,10 +869,208 @@ function betaConf(probW, hits, spread) {
 
   if (spread != null) c -= Math.min(15, Math.round(15 * spread / 0.5));
 
+  const streakPenalty = (z != null && z > 2.8 && regimeConfidence > 0.5) ? 8 : 0;
+  c -= streakPenalty * (regimeConfidence ?? 0);
+
   return Math.max(20, Math.min(88, Math.round(c)));
 }
 
-// ── Streak placement helper ───────────────────────────────────────────────────
+// ── F4: Signal amplification — restricted to high-confidence zone ─────────────
+// Apply ONLY when rawProbW ≥ 0.50 AND spread < 0.10.
+// Mid-zone amplification (prev: spread < 0.18) is disabled.
+// This prevents low-quality signals being pushed above the 0.46 floor.
+
+function amplifySignal(probW, spread, targetLabel, modelId) {
+  // F4: raw prob must already be ≥ 0.50 and spread very tight
+  if (probW < SIG_AMP_MIN_PROB) return { amplified: probW, wasAmplified: false };
+  if ((spread ?? 1) > SIG_AMP_MAX_SPREAD) return { amplified: probW, wasAmplified: false };
+  const ece = getECE(targetLabel, modelId);
+  if (ece != null && ece > SIG_AMP_MAX_ECE) return { amplified: probW, wasAmplified: false };
+  const amplified = fromLogit(logit(probW) * SIG_AMP_FACTOR);
+  return {
+    amplified: Math.max(1e-6, Math.min(1 - 1e-6, amplified)),
+    wasAmplified: true,
+  };
+}
+
+// ── F5: Best-model direct use ─────────────────────────────────────────────────
+// If the best-performing sub-model's probability exceeds all others by ≥ 0.06
+// (in linear probability space), use it directly instead of the ensemble.
+// No blending — either the best model leads clearly or we use the ensemble.
+// Returns { prob, modelUsed, wasOverridden }.
+
+function selectBestModelDirect(targetLabel, probs, modelIds) {
+  const scores = modelScores[targetLabel];
+  let bestIdx = -1, bestLoss = Infinity;
+  for (let i = 0; i < modelIds.length; i++) {
+    const s = scores[modelIds[i]];
+    if (!s || s.count < SIG_BEST_MODEL_MIN_N) continue;
+    if (s.ewma < bestLoss) { bestLoss = s.ewma; bestIdx = i; }
+  }
+  if (bestIdx < 0) return { prob: null, wasOverridden: false };
+
+  const bestProb = probs[bestIdx];
+  // Check that best model leads ALL others by at least SIG_BEST_MODEL_GAP
+  const leadsAll = probs.every((p, i) => i === bestIdx || (bestProb - p) >= SIG_BEST_MODEL_GAP);
+  if (!leadsAll) return { prob: null, wasOverridden: false };
+
+  return {
+    prob:         bestProb,
+    modelUsed:    modelIds[bestIdx],
+    wasOverridden: true,
+  };
+}
+
+// ── S4: Calibration relaxation ────────────────────────────────────────────────
+function applyCalibrationRelaxed(probW, targetLabel, modelId, hits) {
+  const bins = calibState[targetLabel]?.[modelId];
+  if (!bins) return probW;
+  const bin = bins[getCalBinIdx(probW)];
+  if (bin.count < CAL_MIN_SAMPLES) return probW;
+
+  const ece = getECE(targetLabel, modelId);
+  const sparse = (hits ?? 0) < SIG_CAL_RELAX_MAX_HITS;
+  const tight  = ece != null && ece < SIG_CAL_RELAX_MAX_ECE;
+  const correctionWeight = (sparse || tight) ? 0.50 : 1.0;
+
+  const empirical = bin.ewmaAct;
+  const predicted = bin.ewmaPred;
+  if (predicted < 1e-6) return probW;
+  const ratio = empirical / predicted;
+  if (Math.abs(ratio - 1) < 0.12) return probW;
+
+  const corrected = Math.max(1e-6, Math.min(1 - 1e-6, probW * Math.max(0.80, Math.min(1.20, ratio))));
+  const capped    = Math.min(corrected, probW + 0.05);
+  const warmupT   = clamp((bin.count) / CAL_WARMUP_OUTCOMES, 0, 1);
+  const rawWeight = CAL_WARMUP_RAW_WEIGHT * (1 - warmupT);
+  const fullyCalibrated = probW * rawWeight + capped * (1 - rawWeight);
+  return probW * (1 - correctionWeight) + fullyCalibrated * correctionWeight;
+}
+
+// ── 4-zone signal decision ────────────────────────────────────────────────────
+// Zone 0: prob < 0.42              → SKIP  (FILTERED)
+// Zone 1: prob 0.42–0.46           → TAKE only if spread < 0.08 AND conf > 55
+// Zone 2: prob 0.46–0.52           → TAKE only if spread < 0.12 AND conf > 50
+// Zone 3: prob ≥ 0.52              → TAKE  (STRONG_SIGNAL)
+// Probability math untouched — only decision boundaries change.
+
+function computeSignalDecision(
+  probW, confidence, spread, regimeFactor, regimeConfidence,
+  isRandom, targetLabel, modelId, hits
+) {
+  const spreadVal = spread ?? 0;
+
+  // Amplification — restricted to prob ≥ 0.50 AND spread < 0.10
+  const { amplified: amplifiedProbW, wasAmplified } = amplifySignal(probW, spreadVal, targetLabel, modelId);
+
+  // High-conviction window boost (does not affect decision, only window width)
+  const highConviction = spreadVal < SIG_CONVICTION_SPREAD
+    && Math.abs(regimeFactor ?? 0) > SIG_CONVICTION_REGIME;
+  const finalProbUsed = highConviction
+    ? Math.min(0.90, amplifiedProbW + SIG_CONVICTION_BOOST)
+    : amplifiedProbW;
+
+  // signalStrength — informational only, not used in any decision branch
+  const signalStrength = clamp(Math.round(
+    clamp((finalProbUsed - 0.35) / 0.30 * 100, 0, 100) * 0.40
+    + clamp((1 - spreadVal / 0.30) * 100, 0, 100)       * 0.25
+    + clamp((confidence - 30) / 55 * 100, 0, 100)        * 0.25
+    + clamp(Math.abs(regimeFactor ?? 0) * 100, 0, 100)   * 0.10
+  ), 0, 100);
+
+  // aggressiveMode — only used by applyAggressiveModeWidth for window sizing
+  const ev = finalProbUsed - (1 - finalProbUsed);
+  const aggressiveMode = Math.abs(regimeFactor ?? 0) > 0.35
+    && spreadVal < 0.10 && ev > 0;
+
+  // ── Zone 0: hard floor ───────────────────────────────────────────────────
+  if (finalProbUsed < SIG_HARD_FLOOR) {
+    return buildSignalResult(amplifiedProbW, finalProbUsed, signalStrength,
+      aggressiveMode, 'SKIP', 'FILTERED');
+  }
+
+  // ── Zone 3: strong — TAKE unconditionally ───────────────────────────────
+  if (finalProbUsed >= SIG_STRONG_PROB) {
+    return buildSignalResult(amplifiedProbW, finalProbUsed, signalStrength,
+      aggressiveMode, 'TAKE', 'STRONG_SIGNAL');
+  }
+
+  // ── Zone 1: low zone (0.42–0.46) — very tight gate ──────────────────────
+  if (finalProbUsed < SIG_LOW_ZONE_TOP) {
+    if (spreadVal < SIG_LOW_ZONE_SPREAD && confidence > SIG_LOW_ZONE_CONF) {
+      return buildSignalResult(amplifiedProbW, finalProbUsed, signalStrength,
+        aggressiveMode, 'TAKE', 'MODERATE_SIGNAL');
+    }
+    return buildSignalResult(amplifiedProbW, finalProbUsed, signalStrength,
+      aggressiveMode, 'SKIP', 'FILTERED');
+  }
+
+  // ── Zone 2: moderate (0.46–0.52) ────────────────────────────────────────
+  if (spreadVal < SIG_MODERATE_SPREAD && confidence > SIG_MODERATE_CONF) {
+    return buildSignalResult(amplifiedProbW, finalProbUsed, signalStrength,
+      aggressiveMode, 'TAKE', 'MODERATE_SIGNAL');
+  }
+  return buildSignalResult(amplifiedProbW, finalProbUsed, signalStrength,
+    aggressiveMode, 'SKIP', 'FILTERED');
+}
+
+// Output builder — minimal, clean fields only
+function buildSignalResult(amplifiedProbW, finalProbUsed, signalStrength,
+  aggressiveMode, recommendation, decisionReason) {
+  return {
+    recommendation,
+    decisionReason,
+    finalProbUsed:  +finalProbUsed.toFixed(4),
+    amplifiedProbW: +amplifiedProbW.toFixed(4),
+    signalStrength: clamp(signalStrength, 0, 100),
+    aggressiveMode,
+    // kept for DB / API backward compatibility
+    ev:             +(finalProbUsed - (1 - finalProbUsed)).toFixed(4),
+    signalQuality:  clamp(Math.round(finalProbUsed * 60 + signalStrength * 0.40), 0, 100),
+    risk:           signalStrength >= 65 ? 'low' : signalStrength >= 45 ? 'medium' : 'high',
+    rawProbW:       +amplifiedProbW.toFixed(4),   // alias for consumers expecting rawProbW
+  };
+}
+
+// computeDecision — mirrors 4-zone logic for non-ENS builders (GEO/BAY/KM/ENGINE)
+function computeDecision(probW, confidence, spread, regimeFactor, regimeConfidence, isRandom) {
+  const spreadVal = spread ?? 0;
+  const ev = probW - (1 - probW);
+  const aggressiveMode = Math.abs(regimeFactor ?? 0) > 0.35 && spreadVal < 0.10 && ev > 0;
+
+  if (probW < SIG_HARD_FLOOR)
+    return { ev: +ev.toFixed(4), signalQuality: 0,  risk: 'high',   recommendation: 'SKIP', aggressiveMode, decisionReason: 'FILTERED' };
+  if (probW >= SIG_STRONG_PROB)
+    return { ev: +ev.toFixed(4), signalQuality: 70, risk: 'low',    recommendation: 'TAKE', aggressiveMode, decisionReason: 'STRONG_SIGNAL' };
+  if (probW < SIG_LOW_ZONE_TOP) {
+    if (spreadVal < SIG_LOW_ZONE_SPREAD && confidence > SIG_LOW_ZONE_CONF)
+      return { ev: +ev.toFixed(4), signalQuality: 50, risk: 'medium', recommendation: 'TAKE', aggressiveMode, decisionReason: 'MODERATE_SIGNAL' };
+    return { ev: +ev.toFixed(4), signalQuality: 0,  risk: 'high',   recommendation: 'SKIP', aggressiveMode, decisionReason: 'FILTERED' };
+  }
+  // Zone 2: 0.46–0.52
+  if (spreadVal < SIG_MODERATE_SPREAD && confidence > SIG_MODERATE_CONF)
+    return { ev: +ev.toFixed(4), signalQuality: 55, risk: 'medium', recommendation: 'TAKE', aggressiveMode, decisionReason: 'MODERATE_SIGNAL' };
+  return { ev: +ev.toFixed(4), signalQuality: 0, risk: 'high', recommendation: 'SKIP', aggressiveMode, decisionReason: 'FILTERED' };
+}
+
+// ── Aggressive mode window widening ──────────────────────────────────────────
+function applyAggressiveModeWidth(low, high, aggressiveMode, spread, ev) {
+  if (!aggressiveMode) return { low, high };
+  const spreadVal = spread ?? 0;
+  const boostFrac =
+    (spreadVal < 0.10 && ev > 0) ? 0.10 :
+    (spreadVal > 0.20)            ? 0.00 :
+                                    0.05;
+  if (boostFrac === 0) return { low, high };
+  const currentWidth = high - low + 1;
+  const extraWidth   = Math.round(currentWidth * boostFrac);
+  if (extraWidth < 1) return { low, high };
+  const halfExtra    = Math.floor(extraWidth / 2);
+  return {
+    low:  Math.max(0, low - halfExtra),
+    high: high + (extraWidth - halfExtra),
+  };
+}
 
 function getStreakInfo(gs, maxWidth, isRare) {
   const { gapSinceLast, meanGap, stdGap, cv, p90, p95 } = gs;
@@ -652,7 +1083,7 @@ function getStreakInfo(gs, maxWidth, isRare) {
 
   let effectiveWidth = maxWidth;
   if (isRare && cv > 1.1) {
-    effectiveWidth = Math.round(maxWidth * Math.min(1.20, 1.0 + (cv - 1.0) * 0.25));
+    effectiveWidth = Math.round(maxWidth * Math.min(1.25, 1.0 + (cv - 1.0) * 0.30));
   }
   if (z > 2) effectiveWidth = Math.min(Math.round(maxWidth * 1.35), Math.round(effectiveWidth * 1.15));
   effectiveWidth = Math.min(effectiveWidth, Math.round(maxWidth * 1.35));
@@ -661,22 +1092,24 @@ function getStreakInfo(gs, maxWidth, isRare) {
 }
 
 // ── BUILD: ENGINE ─────────────────────────────────────────────────────────────
-// v14: ENGINE now runs its own regime detection independently.
-// Regime adjusts: p blend strength, effectiveWidth, window placement offset.
-
 function buildPrediction(rounds, targetMin, maxWidth, isRare, lastRoundId) {
+  if (isRare && targetMin >= RARE_MIN_MULTIPLIER) {
+    const gs = getGapStats(rounds, targetMin, lastRoundId);
+    if (!gs) return null;
+    const target      = TARGETS.find(t => t.min === targetMin);
+    const targetLabel = target?.label ?? '?';
+    return buildRare(gs, maxWidth, targetLabel, true, rounds, targetMin);
+  }
+
   const gs = getGapStats(rounds, targetMin, lastRoundId);
   if (!gs) return null;
-  const { hits, pGlobal, pRecent, rateShifted, gapSinceLast, currentStreak } = gs;
+  const { hits, pGlobal, pRecent, rateShifted, gapSinceLast, currentStreak, kmCDF, kmExpectedGap, cv } = gs;
 
-  // ENGINE's own regime detection (independent)
   const target      = TARGETS.find(t => t.min === targetMin);
   const targetLabel = target?.label ?? '?';
-  const regime = updateEngineRegime(rounds, targetMin, targetLabel, 'engine', gs);
+  const regime = updateEngineRegime(rounds, targetMin, targetLabel, 'engine', gs, gs.isRandom);
 
-  // ENGINE's own blended p — regime modulates blend strength on top of CUSUM shift
   let baseBlend = rateShifted ? 0.25 : 0;
-  // On cold/hot regime, increase recency blend proportionally
   const regimeBlendBoost = Math.abs(regime.regimeFactor) * 0.20;
   const totalBlend = Math.min(0.45, baseBlend + regimeBlendBoost);
   const p = Math.max(1e-6, Math.min(0.5, (1 - totalBlend) * pGlobal + totalBlend * regime.shortRate));
@@ -684,223 +1117,187 @@ function buildPrediction(rounds, targetMin, maxWidth, isRare, lastRoundId) {
   const probW       = 1 - Math.pow(1 - p, maxWidth);
   const expectedGap = Math.max(1, Math.round((1 - p) / p));
 
-  const { z, confPenalty, streakStatus, effectiveWidth: baseWidth } = getStreakInfo(gs, maxWidth, isRare ?? false);
+  const { z, confPenalty, streakStatus, effectiveWidth } = getStreakInfo(gs, maxWidth, isRare ?? false);
 
-  // Apply regime to window placement
-  const basePlacement = parametricWindowPlacement(expectedGap, baseWidth, gapSinceLast);
-  const { low, high } = applyRegimeToWindow(
-    basePlacement.low, basePlacement.high,
-    expectedGap, baseWidth, regime.regimeFactor
+  const { low, high } = hybridWindowPlacement(kmCDF, expectedGap, effectiveWidth, gapSinceLast, gs.cv, targetLabel, maxWidth);
+  const { low: rLow, high: rHigh } = applyRegimeToWindow(low, high, expectedGap, effectiveWidth, regime.regimeFactor);
+
+  const confidence = Math.max(20, betaConf(probW, hits, null, regime.regimeConfidence, z) - confPenalty);
+  const decision   = computeSignalDecision(
+    probW, confidence, null, regime.regimeFactor,
+    regime.regimeConfidence, gs.isRandom, targetLabel, 'ens', hits
   );
-
-  // No overdue override — letting gapSinceLast >= expectedGap open window immediately
-  // is Gambler's Fallacy. Window placement math handles position on its own.
-  const finalStreakStatus = streakStatus;
+  const { low: aLow, high: aHigh } = applyAggressiveModeWidth(rLow, rHigh, decision.aggressiveMode, null, decision.ev);
 
   return {
-    low, high, expectedGap, opensIn: low,
-    confidence: Math.max(20, betaConf(probW, hits, null) - confPenalty),
-    probW:       +probW.toFixed(4),
-    p:           +p.toFixed(6),
-    rateShifted, cusumNorm: gs.cusumNorm,
-    streakStatus: finalStreakStatus, currentStreak, z,
+    low: aLow, high: aHigh, expectedGap, opensIn: aLow,
+    confidence,
+    probW:        +probW.toFixed(4),
+    p:            +p.toFixed(6),
+    rateShifted,  cusumNorm: gs.cusumNorm,
+    streakStatus, currentStreak, z,
     gapSinceLast, hits,
-    regime: regime.regimeLabel,
-    regimeFactor: regime.regimeFactor,
+    regime:           regime.regimeLabel,
+    regimeFactor:     regime.regimeFactor,
+    regimeConfidence: regime.regimeConfidence,
     isRandom: gs.isRandom, maxAC: gs.maxAC,
+    ...decision,
   };
 }
 
 // ── BUILD: GEO ────────────────────────────────────────────────────────────────
-// v14: GEO now has its own regime detection.
-// Previously pure Laplace MLE with NO regime awareness.
-// Now: regime blends in short-window rate when streak detected.
-
 function buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
-  const { hits, n, pGlobal, gapSinceLast, currentStreak } = gs;
-
-  // GEO's own regime detection (independent from ENGINE/BAY/KM/ENS)
-  const regime = updateEngineRegime(rounds, targetMin, targetLabel, 'geo', gs);
-
-  // GEO base: pure Laplace MLE
+  const { hits, n, pGlobal, gapSinceLast, currentStreak, kmCDF, kmExpectedGap, cv } = gs;
+  const regime = updateEngineRegime(rounds, targetMin, targetLabel, 'geo', gs, gs.isRandom);
   const pLaplace = (hits + 1) / (n + 2);
-
-  // GEO regime blend: on hot/cold streak, blend short-window rate into pGeo
-  // Blend strength scales with regime factor magnitude
-  const geoBlendStrength = 0.25; // GEO is conservative — max 25% regime influence
-  const pGeo = applyRegimeToP(pLaplace, regime.shortRate, regime.regimeFactor, geoBlendStrength);
-
-  const rawProbW    = 1 - Math.pow(1 - pGeo, maxWidth);
-  const calibProbW  = applyCalibration(rawProbW, targetLabel, 'geo');
+  const pGeo     = applyRegimeToP(pLaplace, regime.shortRate, regime.regimeFactor, 0.25);
+  const rawProbW   = 1 - Math.pow(1 - pGeo, maxWidth);
+  const calibProbW = applyCalibrationRelaxed(rawProbW, targetLabel, 'geo', hits);
   const expectedGap = Math.max(1, Math.round((1 - pGeo) / pGeo));
-
-  const { z, confPenalty, streakStatus, effectiveWidth: baseWidth } = getStreakInfo(gs, maxWidth, isRare);
-
-  // GEO window: parametric base + regime offset
-  const basePlacement = parametricWindowPlacement(expectedGap, baseWidth, gapSinceLast);
-  const { low, high } = applyRegimeToWindow(
-    basePlacement.low, basePlacement.high,
-    expectedGap, baseWidth, regime.regimeFactor
+  const { z, confPenalty, streakStatus, effectiveWidth } = getStreakInfo(gs, maxWidth, isRare);
+  const { low, high } = hybridWindowPlacement(kmCDF, expectedGap, effectiveWidth, gapSinceLast, gs.cv, targetLabel, maxWidth);
+  const { low: rLow, high: rHigh } = applyRegimeToWindow(low, high, expectedGap, effectiveWidth, regime.regimeFactor);
+  const confidence = Math.max(20, betaConf(calibProbW, hits, null, regime.regimeConfidence, z) - confPenalty);
+  const decision   = computeSignalDecision(
+    calibProbW, confidence, null, regime.regimeFactor,
+    regime.regimeConfidence, gs.isRandom, targetLabel, 'geo', hits
   );
-
-  const finalStreakStatus = streakStatus; // no overdue override — Gambler's Fallacy removed
-
+  const { low: aLow, high: aHigh } = applyAggressiveModeWidth(rLow, rHigh, decision.aggressiveMode, null, decision.ev);
   return {
-    low, high, expectedGap, opensIn: low,
-    confidence:  Math.max(20, betaConf(calibProbW, hits, null) - confPenalty),
-    probW:       +calibProbW.toFixed(4),
-    rawProbW:    +rawProbW.toFixed(4),
-    p:           +pGeo.toFixed(6),
-    streakStatus: finalStreakStatus, currentStreak, z, gapSinceLast, hits,
+    low: aLow, high: aHigh, expectedGap, opensIn: aLow,
+    confidence,
+    probW:    +calibProbW.toFixed(4),
+    rawProbW: +rawProbW.toFixed(4),
+    p:        +pGeo.toFixed(6),
+    streakStatus, currentStreak, z, gapSinceLast, hits,
     rateShifted: gs.rateShifted, model: 'geo',
-    regime: regime.regimeLabel,
-    regimeFactor: regime.regimeFactor,
+    regime:           regime.regimeLabel,
+    regimeFactor:     regime.regimeFactor,
+    regimeConfidence: regime.regimeConfidence,
     isRandom: gs.isRandom, maxAC: gs.maxAC,
+    ...decision,
   };
 }
 
 // ── BUILD: BAY ────────────────────────────────────────────────────────────────
-// v14: BAY now has its own regime detection.
-// Previously: recency blend weight = 0.05 normal / 0.20 on CUSUM shift.
-// Now: regime factor additionally scales the recency weight beyond CUSUM trigger.
-
 function buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
-  const { hits, n, pGlobal, pRecent, rateShifted, gapSinceLast, currentStreak } = gs;
-
-  // BAY's own regime detection (independent)
-  const regime = updateEngineRegime(rounds, targetMin, targetLabel, 'bay', gs);
-
-  // BAY recency blend — existing logic + regime enhancement
+  const { hits, n, pGlobal, pRecent, rateShifted, gapSinceLast, currentStreak, kmCDF, kmExpectedGap, cv } = gs;
+  const regime = updateEngineRegime(rounds, targetMin, targetLabel, 'bay', gs, gs.isRandom);
+  const regimeActive  = Math.abs(regime.regimeFactor) > 0;
   const baseRecencyW  = rateShifted ? 0.20 : 0.05;
-  // Regime boosts recency weight: strong hot/cold → up to +0.20 additional weight
   const regimeBoost   = Math.abs(regime.regimeFactor) * 0.20;
-  const totalRecencyW = Math.min(0.45, baseRecencyW + regimeBoost);
-
-  // BAY uses pRecent (200-round) but also regime shortRate for fast signals
-  // Blend pRecent and shortRate weighted by regime strength
-  const recencyBlend  = Math.abs(regime.regimeFactor) > 0.15
+  const rawRecencyW   = Math.min(0.45, baseRecencyW + regimeBoost);
+  const totalRecencyW = Math.min(0.35, regimeActive ? rawRecencyW * 0.50 : rawRecencyW);
+  const recencyBlend = Math.abs(regime.regimeFactor) > 0.15
     ? (1 - Math.abs(regime.regimeFactor)) * pRecent + Math.abs(regime.regimeFactor) * regime.shortRate
     : pRecent;
-
   const pBay        = Math.max(1e-6, Math.min(0.5, (1 - totalRecencyW) * pGlobal + totalRecencyW * recencyBlend));
   const rawProbW    = 1 - Math.pow(1 - pBay, maxWidth);
-  const calibProbW  = applyCalibration(rawProbW, targetLabel, 'bay');
+  const calibProbW  = applyCalibrationRelaxed(rawProbW, targetLabel, 'bay', hits);
   const expectedGap = Math.max(1, Math.round((1 - pBay) / pBay));
-
-  const { z, confPenalty, streakStatus, effectiveWidth: baseWidth } = getStreakInfo(gs, maxWidth, isRare);
-
-  // BAY window: parametric base + regime offset
-  const basePlacement = parametricWindowPlacement(expectedGap, baseWidth, gapSinceLast);
-  const { low, high } = applyRegimeToWindow(
-    basePlacement.low, basePlacement.high,
-    expectedGap, baseWidth, regime.regimeFactor
+  const { z, confPenalty, streakStatus, effectiveWidth } = getStreakInfo(gs, maxWidth, isRare);
+  const { low, high } = hybridWindowPlacement(kmCDF, expectedGap, effectiveWidth, gapSinceLast, cv, targetLabel, maxWidth);
+  const { low: rLow, high: rHigh } = applyRegimeToWindow(low, high, expectedGap, effectiveWidth, regime.regimeFactor);
+  const confidence = Math.max(20, betaConf(calibProbW, hits, null, regime.regimeConfidence, z) - confPenalty);
+  const decision   = computeSignalDecision(
+    calibProbW, confidence, null, regime.regimeFactor,
+    regime.regimeConfidence, gs.isRandom, targetLabel, 'bay', hits
   );
-
-  const finalStreakStatus = streakStatus; // no overdue override — Gambler's Fallacy removed
-
+  const { low: aLow, high: aHigh } = applyAggressiveModeWidth(rLow, rHigh, decision.aggressiveMode, null, decision.ev);
   return {
-    low, high, expectedGap, opensIn: low,
-    confidence:  Math.max(20, betaConf(calibProbW, hits, null) - confPenalty),
-    probW:       +calibProbW.toFixed(4),
-    rawProbW:    +rawProbW.toFixed(4),
-    p:           +pBay.toFixed(6),
-    streakStatus: finalStreakStatus, currentStreak, z, gapSinceLast, hits,
+    low: aLow, high: aHigh, expectedGap, opensIn: aLow,
+    confidence,
+    probW:    +calibProbW.toFixed(4),
+    rawProbW: +rawProbW.toFixed(4),
+    p:        +pBay.toFixed(6),
+    streakStatus, currentStreak, z, gapSinceLast, hits,
     rateShifted, model: 'bay',
-    regime: regime.regimeLabel,
-    regimeFactor: regime.regimeFactor,
+    regime:           regime.regimeLabel,
+    regimeFactor:     regime.regimeFactor,
+    regimeConfidence: regime.regimeConfidence,
     isRandom: gs.isRandom, maxAC: gs.maxAC,
+    ...decision,
   };
 }
 
 // ── BUILD: KM ─────────────────────────────────────────────────────────────────
-// v14: KM now has its own regime detection.
-// KM never changes p (it's empirical), but regime shifts window placement.
-// Cold streak → push window later (hits are drying up, next one is further away).
-// Hot streak  → pull window earlier.
-
 function buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
   const { hits, kmCDF, kmExpectedGap, gapSinceLast, currentStreak, cv } = gs;
   if (!kmCDF) return null;
-
-  // KM's own regime detection (independent)
-  const regime = updateEngineRegime(rounds, targetMin, targetLabel, 'km', gs);
-
+  const regime = updateEngineRegime(rounds, targetMin, targetLabel, 'km', gs, gs.isRandom);
   let rawProbW = kmCDFQuery(kmCDF, maxWidth);
   if (rawProbW == null) return null;
-
-  rawProbW = applyParetoCorrectedProbW(rawProbW, cv, kmExpectedGap, maxWidth, isRare);
+  rawProbW = applyParetoCorrectedProbW(rawProbW, cv, kmExpectedGap, maxWidth, isRare, hits);
   rawProbW = Math.max(1e-6, Math.min(1 - 1e-6, rawProbW));
-
-  const calibProbW  = applyCalibration(rawProbW, targetLabel, 'km');
-
-  // KM expectedGap: regime shifts the effective expected gap for window placement
-  // Cold streak → treat gap as longer (hits rarer); hot → shorter
-  const regimeGapShift  = Math.round(-regime.regimeFactor * kmExpectedGap * 0.15);
-  const regimeExpGap    = Math.max(1, kmExpectedGap + regimeGapShift);
-
-  const { z, confPenalty, streakStatus, effectiveWidth: baseWidth } = getStreakInfo(gs, maxWidth, isRare);
-
-  // KM uses empirical placement with regime-adjusted expectedGap
-  const basePlacement = empiricalWindowPlacement(kmCDF, regimeExpGap, baseWidth, gapSinceLast);
-  const { low, high } = applyRegimeToWindow(
-    basePlacement.low, basePlacement.high,
-    regimeExpGap, baseWidth, regime.regimeFactor
+  const calibProbW  = applyCalibrationRelaxed(rawProbW, targetLabel, 'km', hits);
+  const regimeGapShift = Math.round(-regime.regimeFactor * kmExpectedGap * 0.15);
+  const regimeExpGap   = Math.max(1, kmExpectedGap + regimeGapShift);
+  const { z, confPenalty, streakStatus, effectiveWidth } = getStreakInfo(gs, maxWidth, isRare);
+  const { low, high } = hybridWindowPlacement(kmCDF, regimeExpGap, effectiveWidth, gapSinceLast, cv, targetLabel, maxWidth);
+  const { low: rLow, high: rHigh } = applyRegimeToWindow(low, high, regimeExpGap, effectiveWidth, regime.regimeFactor);
+  const confidence = Math.max(20, betaConf(calibProbW, hits, null, regime.regimeConfidence, z) - confPenalty);
+  const decision   = computeSignalDecision(
+    calibProbW, confidence, null, regime.regimeFactor,
+    regime.regimeConfidence, gs.isRandom, targetLabel, 'km', hits
   );
-
-  const finalStreakStatus = streakStatus; // no overdue override — Gambler's Fallacy removed
-
+  const { low: aLow, high: aHigh } = applyAggressiveModeWidth(rLow, rHigh, decision.aggressiveMode, null, decision.ev);
   return {
-    low, high, expectedGap: kmExpectedGap, opensIn: low,
-    confidence:  Math.max(20, betaConf(calibProbW, hits, null) - confPenalty),
-    probW:       +calibProbW.toFixed(4),
-    rawProbW:    +rawProbW.toFixed(4),
-    p:           +rawProbW.toFixed(6),
-    streakStatus: finalStreakStatus, currentStreak, z, gapSinceLast, hits,
+    low: aLow, high: aHigh, expectedGap: kmExpectedGap, opensIn: aLow,
+    confidence,
+    probW:    +calibProbW.toFixed(4),
+    rawProbW: +rawProbW.toFixed(4),
+    p:        +rawProbW.toFixed(6),
+    streakStatus, currentStreak, z, gapSinceLast, hits,
     rateShifted: gs.rateShifted, model: 'km',
-    regime: regime.regimeLabel,
-    regimeFactor: regime.regimeFactor,
+    regime:           regime.regimeLabel,
+    regimeFactor:     regime.regimeFactor,
+    regimeConfidence: regime.regimeConfidence,
     isRandom: gs.isRandom, maxAC: gs.maxAC,
+    ...decision,
   };
 }
 
 // ── BUILD: ENS ────────────────────────────────────────────────────────────────
-// v14: ENS now has its own regime detection.
-// Regime modulates pEns blend and window placement independently of sub-models.
-// Sub-models (geo/bay/km) are called via their calibrated probW only (not rebuilt).
-
 function buildEns(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
   const { hits, n, pGlobal, pRecent, rateShifted, kmCDF, kmExpectedGap,
           gapSinceLast, currentStreak, cv } = gs;
 
-  // ENS's own regime detection (independent)
-  const regime = updateEngineRegime(rounds, targetMin, targetLabel, 'ens', gs);
+  const regime = updateEngineRegime(rounds, targetMin, targetLabel, 'ens', gs, gs.isRandom);
 
-  // Base model p values — each computed independently inside ENS, no cross-engine reads.
   const pGeo = (hits + 1) / (n + 2);
-
-  // ENS computes its own pBay sub-estimate using ENS's own regime factor,
-  // NOT the shared rateShifted flag. This ensures ENS's internal pBay is
-  // independent from what BAY engine produces externally.
-  // Formula mirrors BAY's logic but driven by ENS's own regime detection.
-  const ensBaseRecencyW  = rateShifted ? 0.20 : 0.05; // structural shift baseline (shared diagnostic, read-only fact)
-  const ensRegimeBoost   = Math.abs(regime.regimeFactor) * 0.20; // ENS's own regime contribution
-  const ensRecencyW      = Math.min(0.45, ensBaseRecencyW + ensRegimeBoost);
-  const ensRecencyBlend  = Math.abs(regime.regimeFactor) > 0.15
+  const regimeActive    = Math.abs(regime.regimeFactor) > 0;
+  const ensBaseRecencyW = rateShifted ? 0.20 : 0.05;
+  const ensRegimeBoost  = Math.abs(regime.regimeFactor) * 0.20;
+  const ensRawRecencyW  = Math.min(0.45, ensBaseRecencyW + ensRegimeBoost);
+  const ensRecencyW     = Math.min(0.35, regimeActive ? ensRawRecencyW * 0.50 : ensRawRecencyW);
+  const ensRecencyBlend = Math.abs(regime.regimeFactor) > 0.15
     ? (1 - Math.abs(regime.regimeFactor)) * pRecent + Math.abs(regime.regimeFactor) * regime.shortRate
     : pRecent;
   const pBay = Math.max(1e-6, Math.min(0.5, (1 - ensRecencyW) * pGlobal + ensRecencyW * ensRecencyBlend));
 
-  const probGeo = applyCalibration(1 - Math.pow(1 - pGeo, maxWidth), targetLabel, 'geo');
-  const probBay = applyCalibration(1 - Math.pow(1 - pBay, maxWidth), targetLabel, 'bay');
+  const probGeo = applyCalibrationRelaxed(1 - Math.pow(1 - pGeo, maxWidth), targetLabel, 'geo', hits);
+  const probBay = applyCalibrationRelaxed(1 - Math.pow(1 - pBay, maxWidth), targetLabel, 'bay', hits);
 
   let rawKmProb = kmCDF ? kmCDFQuery(kmCDF, maxWidth) : null;
-  if (rawKmProb != null) rawKmProb = applyParetoCorrectedProbW(rawKmProb, cv, kmExpectedGap, maxWidth, isRare);
+  if (rawKmProb != null) rawKmProb = applyParetoCorrectedProbW(rawKmProb, cv, kmExpectedGap, maxWidth, isRare, hits);
   const probKm = rawKmProb != null
-    ? applyCalibration(Math.max(1e-6, Math.min(1 - 1e-6, rawKmProb)), targetLabel, 'km')
+    ? applyCalibrationRelaxed(Math.max(1e-6, Math.min(1 - 1e-6, rawKmProb)), targetLabel, 'km', hits)
     : probGeo;
 
-  const { ensProb, spread, adjWeights } = buildEnsemble(targetLabel, probGeo, probBay, probKm);
-  const calibrated = applyCalibration(ensProb, targetLabel, 'ens');
+  const { ensProb, spread, adjWeights, modelDisagreementScore } = buildEnsemble(targetLabel, probGeo, probBay, probKm, cv);
+
+  // F5: Best-model direct use — if best leads all others by ≥ 0.06, use directly
+  const subProbs   = [probGeo, probBay, probKm];
+  const modelIds   = ['geo', 'bay', 'km'];
+  const bestModel  = selectBestModelDirect(targetLabel, subProbs, modelIds);
+
+  // Temperature scaling when models agree + calibration stable
+  const tempScaled = applyTemperatureScaling(ensProb, spread, targetLabel, 'ens');
+
+  // F5: if best model leads clearly, use it directly; otherwise use ensemble
+  const blendedProb = bestModel.wasOverridden ? bestModel.prob : tempScaled;
+
+  const calibrated = applyCalibrationRelaxed(blendedProb, targetLabel, 'ens', hits);
 
   const egGeo = Math.max(1, Math.round((1 - pGeo) / pGeo));
   const egBay = Math.max(1, Math.round((1 - pBay) / pBay));
@@ -910,56 +1307,221 @@ function buildEns(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
   ));
 
   const pKmPerRound = Math.max(1e-6, Math.min(0.5, 1 / (Math.max(1, egKm) + 1)));
-
-  // ENS pEns — regime blends in shortRate on top of existing adaptive weights
-  const pEnsBase = Math.max(1e-6, Math.min(0.5,
+  const pEnsBase    = Math.max(1e-6, Math.min(0.5,
     adjWeights[0] * pGeo + adjWeights[1] * pBay + adjWeights[2] * pKmPerRound
   ));
-  const ensBlendStrength = 0.30; // ENS allows stronger regime influence as it has most data
-  const pEns = applyRegimeToP(pEnsBase, regime.shortRate, regime.regimeFactor, ensBlendStrength);
+  const pEns = applyRegimeToP(pEnsBase, regime.shortRate, regime.regimeFactor, 0.30);
 
-  // ENS expectedGap: regime shifts it slightly for window placement
   const regimeGapShift  = Math.round(-regime.regimeFactor * ensExpectedGap * 0.15);
   const regimeEnsExpGap = Math.max(1, ensExpectedGap + regimeGapShift);
 
-  const { z, confPenalty, streakStatus, effectiveWidth: baseWidth } = getStreakInfo(gs, maxWidth, isRare);
+  const { z, confPenalty, streakStatus, effectiveWidth } = getStreakInfo(gs, maxWidth, isRare);
 
-  const basePlacement = parametricWindowPlacement(regimeEnsExpGap, baseWidth, gapSinceLast);
-  const { low, high } = applyRegimeToWindow(
-    basePlacement.low, basePlacement.high,
-    regimeEnsExpGap, baseWidth, regime.regimeFactor
+  const { low, high } = hybridWindowPlacement(kmCDF, regimeEnsExpGap, effectiveWidth, gapSinceLast, cv, targetLabel, maxWidth);
+  const { low: rLow, high: rHigh } = applyRegimeToWindow(low, high, regimeEnsExpGap, effectiveWidth, regime.regimeFactor);
+
+  const ensembleConfidence = clamp(100 - Math.round(spread * 80) - Math.round(modelDisagreementScore * 10), 20, 95);
+  const confidence = Math.max(20, betaConf(calibrated, hits, spread, regime.regimeConfidence, z) - confPenalty);
+
+  const decision = computeSignalDecision(
+    calibrated, confidence, spread, regime.regimeFactor,
+    regime.regimeConfidence, gs.isRandom, targetLabel, 'ens', hits
   );
 
-  const finalStreakStatus = streakStatus; // no overdue override — Gambler's Fallacy removed
+  const { low: aLow, high: aHigh } = applyAggressiveModeWidth(rLow, rHigh, decision.aggressiveMode, spread, decision.ev);
+
+  const modelLabel = bestModel.wasOverridden ? `ens(best:${bestModel.modelUsed})` : 'ens';
 
   return {
-    low, high, expectedGap: ensExpectedGap, opensIn: low,
-    confidence:  Math.max(20, betaConf(calibrated, hits, spread) - confPenalty),
-    probW:       +calibrated.toFixed(4),
-    rawProbW:    +ensProb.toFixed(4),
-    p:           +pEns.toFixed(6),
-    streakStatus: finalStreakStatus, currentStreak, z, gapSinceLast, hits,
-    rateShifted, model: 'ens', spread: +spread.toFixed(3),
-    regime: regime.regimeLabel,
-    regimeFactor: regime.regimeFactor,
+    low: aLow, high: aHigh, expectedGap: ensExpectedGap, opensIn: aLow,
+    confidence,
+    probW:    +calibrated.toFixed(4),
+    rawProbW: +ensProb.toFixed(4),
+    p:        +pEns.toFixed(6),
+    streakStatus, currentStreak, z, gapSinceLast, hits,
+    rateShifted, model: modelLabel,
+    spread:               +spread.toFixed(3),
+    modelDisagreementScore,
+    ensembleConfidence,
+    bestModelOverride:    bestModel.wasOverridden ? bestModel.modelUsed : null,
+    regime:               regime.regimeLabel,
+    regimeFactor:         regime.regimeFactor,
+    regimeConfidence:     regime.regimeConfidence,
     ensWeights: {
       geo: +adjWeights[0].toFixed(3),
       bay: +adjWeights[1].toFixed(3),
       km:  +adjWeights[2].toFixed(3),
     },
     isRandom: gs.isRandom, maxAC: gs.maxAC,
+    ...decision,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ── RARE ENGINE (targets ≥ 100x) ─────────────────────────────────────────────
+
+function paretoCDF(W, alpha, expectedGap) {
+  const a     = Math.max(1.05, alpha);
+  const scale = Math.max(1, expectedGap * (a - 1));
+  return Math.max(0, Math.min(1 - 1e-9, 1 - Math.pow(1 + W / scale, -a)));
+}
+
+function paretoWindowProb(lo, hi, alpha, expectedGap) {
+  const cdfHi = paretoCDF(hi, alpha, expectedGap);
+  const cdfLo = lo > 0 ? paretoCDF(lo - 1, alpha, expectedGap) : 0;
+  return Math.max(0, cdfHi - cdfLo);
+}
+
+function kmSurvival(kmCDF, t) {
+  if (!kmCDF || kmCDF.length === 0) return 1;
+  let lo = 0, hi = kmCDF.length - 1, idx = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    if (kmCDF[mid].t <= t) { idx = mid; lo = mid + 1; }
+    else hi = mid - 1;
+  }
+  return idx >= 0 ? Math.max(0, kmCDF[idx].S) : 1.0;
+}
+
+function kmWindowProbDirect(kmCDF, lo, hi) {
+  const sLo = lo > 0 ? kmSurvival(kmCDF, lo - 1) : 1.0;
+  const sHi = kmSurvival(kmCDF, hi);
+  return Math.max(0, sLo - sHi);
+}
+
+function applyRareCalibration(probW, targetLabel, modelId, hits) {
+  const bins = calibState[targetLabel]?.[modelId];
+  if (!bins) return probW;
+  const bin = bins[getCalBinIdx(probW)];
+  if (bin.count < CAL_MIN_SAMPLES) return probW;
+  const empirical = bin.ewmaAct;
+  const predicted = bin.ewmaPred;
+  if (predicted < 1e-6) return probW;
+  const ratio = empirical / predicted;
+  if (Math.abs(ratio - 1) < 0.12) return probW;
+  const corrected = Math.max(1e-6, Math.min(1 - 1e-6, probW * Math.max(0.80, Math.min(1.20, ratio))));
+  const capped    = Math.min(corrected, probW + 0.05);
+  const calWeight = hits < RARE_CAL_IMPACT_HITS ? RARE_CAL_REDUCED_WEIGHT : 1.0;
+  return probW * (1 - calWeight) + capped * calWeight;
+}
+
+function computeRareDecision(tailProbability, extremeGapScore, targetLabel, hits) {
+  const payout    = RARE_PAYOUT[targetLabel] ?? 0.90;
+  const rareEV    = tailProbability * payout;
+  const dataConf  = clamp(hits / 80, 0, 1);
+  const tailConf  = clamp(tailProbability / 0.35, 0, 1);
+  const confidence = Math.round(20 + 60 * dataConf * 0.50 + 60 * tailConf * 0.50);
+  const rareSignal =
+    rareEV > RARE_EV_THRESHOLD ||
+    tailProbability > RARE_TAIL_MIN ||
+    extremeGapScore > 0;
+  const recommendation = rareSignal ? 'TAKE' : 'SKIP';
+  const risk = rareEV > 1.20 ? 'low' : rareEV > 0.80 ? 'medium' : 'high';
+  return {
+    rareEV:         +rareEV.toFixed(4),
+    estimatedPayout: payout,
+    rareSignal,
+    recommendation,
+    confidence:     clamp(confidence, 20, 85),
+    risk,
+    signalQuality:  Math.round(clamp(rareEV * 60 + tailProbability * 40, 0, 100)),
+    ev:             +rareEV.toFixed(4),
+  };
+}
+
+function buildRare(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
+  const { hits, n, pGlobal, gapSinceLast, currentStreak, kmCDF,
+          kmExpectedGap, cv, p95, meanGap, stdGap, sg } = gs;
+
+  const regime = updateEngineRegime(rounds, targetMin, targetLabel, 'ens', gs, gs.isRandom);
+  const alpha = 1 / Math.max(0.30, cv * cv);
+  const pGeo  = (hits + 1) / (n + 2);
+  const geoP  = 1 - Math.pow(1 - pGeo, maxWidth);
+  const tailP_full = paretoCDF(maxWidth, alpha, kmExpectedGap);
+  const kmP = kmCDF ? kmWindowProbDirect(kmCDF, 0, maxWidth) : null;
+  const sparse = hits < RARE_SPARSE_HITS;
+  const geoWeight  = sparse ? RARE_TAIL_GEO_BLEND_SPARSE : RARE_TAIL_GEO_BLEND;
+  const tailWeight = 1 - geoWeight;
+  const tailEstimate = kmP != null
+    ? tailP_full * 0.60 + kmP * 0.40
+    : tailP_full;
+  let rawProbW = geoWeight * geoP + tailWeight * tailEstimate;
+  rawProbW = Math.max(1e-6, Math.min(1 - 1e-6, rawProbW));
+  const calibProbW = applyRareCalibration(rawProbW, targetLabel, 'ens', hits);
+  const z = stdGap > 0 ? (gapSinceLast - meanGap) / stdGap : 0;
+  const extremeGap = gapSinceLast > (p95 ?? meanGap * 2.5);
+  const extremeGapScore = extremeGap ? +z.toFixed(2) : 0;
+  let tailProbability = calibProbW;
+  let effectiveWidth  = Math.round(maxWidth * (extremeGap ? RARE_EXTREME_WIDTH_BOOST : 1.0));
+  if (extremeGap) {
+    tailProbability = Math.min(0.95, tailProbability + RARE_EXTREME_GAP_BOOST);
+  }
+  effectiveWidth = Math.min(effectiveWidth, Math.round(maxWidth * 1.50));
+  const earlyEnd  = Math.max(1, Math.round(kmExpectedGap * RARE_EARLY_WINDOW_FRAC));
+  const lateEnd   = Math.max(earlyEnd + 1, Math.round(kmExpectedGap * RARE_LATE_WINDOW_FRAC));
+  const earlyWindow = { low: 0, high: earlyEnd };
+  const lateWindow  = { low: kmExpectedGap, high: lateEnd };
+  const earlyTailP = kmCDF
+    ? kmWindowProbDirect(kmCDF, earlyWindow.low, earlyWindow.high)
+    : paretoWindowProb(earlyWindow.low, earlyWindow.high, alpha, kmExpectedGap);
+  const lateTailP = kmCDF
+    ? kmWindowProbDirect(kmCDF, lateWindow.low, lateWindow.high)
+    : paretoWindowProb(lateWindow.low, lateWindow.high, alpha, kmExpectedGap);
+  const regimeOffset = Math.round(-regime.regimeFactor * kmExpectedGap * 0.12);
+  const primaryIsEarly = earlyTailP >= lateTailP;
+  const baseWin = primaryIsEarly ? earlyWindow : lateWindow;
+  const baseWidth = baseWin.high - baseWin.low + 1;
+  const { low: tcLow, high: tcHigh } = applyTimingCorrection(
+    kmExpectedGap, baseWidth, targetLabel, maxWidth
+  );
+  let primaryLow  = Math.max(0, tcLow  - regimeOffset);
+  let primaryHigh = Math.max(primaryLow, tcHigh - regimeOffset);
+  const decision = computeRareDecision(tailProbability, extremeGapScore, targetLabel, hits);
+  const streakStatus = extremeGapScore > 0
+    ? (z > 3 ? 'extreme' : 'severe')
+    : 'normal';
+  return {
+    low:          primaryLow,
+    high:         primaryHigh,
+    expectedGap:  kmExpectedGap,
+    opensIn:      primaryLow,
+    confidence:   decision.confidence,
+    probW:        +calibProbW.toFixed(4),
+    rawProbW:     +rawProbW.toFixed(4),
+    p:            +pGeo.toFixed(6),
+    streakStatus,
+    currentStreak: gs.currentStreak,
+    z:            +z.toFixed(2),
+    gapSinceLast,
+    hits,
+    rateShifted:  gs.rateShifted,
+    model:        'rare',
+    regime:       regime.regimeLabel,
+    regimeFactor: regime.regimeFactor,
+    regimeConfidence: regime.regimeConfidence,
+    isRandom:     gs.isRandom,
+    maxAC:        gs.maxAC,
+    tailProbability:  +tailProbability.toFixed(4),
+    extremeGapScore,
+    alpha:            +alpha.toFixed(3),
+    earlyWindow:      { ...earlyWindow, tailP: +earlyTailP.toFixed(4) },
+    lateWindow:       { ...lateWindow,  tailP: +lateTailP.toFixed(4)  },
+    primaryWindow:    earlyTailP >= lateTailP ? 'early' : 'late',
+    ...decision,
   };
 }
 
 // ── buildStatPrediction — dispatcher ─────────────────────────────────────────
-// v14: passes rounds + targetMin to each builder for independent regime detection
-
 function buildStatPrediction(rounds, targetMin, maxWidth, modelId, lastRoundId) {
   const gs = getGapStats(rounds, targetMin, lastRoundId);
   if (!gs) return null;
   const target      = TARGETS.find(t => t.min === targetMin);
   const targetLabel = target?.label ?? '?';
   const isRare      = target?.rare ?? false;
+
+  if (isRare && targetMin >= RARE_MIN_MULTIPLIER) {
+    return buildRare(gs, maxWidth, targetLabel, isRare, rounds, targetMin);
+  }
 
   switch (modelId) {
     case 'geo': return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin);
@@ -970,8 +1532,7 @@ function buildStatPrediction(rounds, targetMin, maxWidth, modelId, lastRoundId) 
   }
 }
 
-// ── BUILD: PATTERN (isolated, UI signal only) — UNCHANGED ─────────────────────
-
+// ── BUILD: PATTERN ────────────────────────────────────────────────────────────
 function buildPatternPrediction(sortedRounds, targetMin) {
   const n = sortedRounds.length;
   if (n < MIN_ROUNDS) return null;
@@ -999,9 +1560,9 @@ function buildPatternPrediction(sortedRounds, targetMin) {
   const sg=[...gaps].sort((a,b)=>a-b);
   const mid2=Math.floor(sg.length/2);
   const medianGap=sg.length%2===1?sg[mid2]:(sg[mid2-1]+sg[mid2])/2;
-  const cv = meanGap > 0 ? Math.sqrt(Math.max(0, gSS/gaps.length - meanGap**2)) / meanGap : 1;
+  const cv=meanGap>0?Math.sqrt(Math.max(0,gSS/gaps.length-meanGap**2))/meanGap:1;
   const dW1=hW1/W1, dW2=hW2/W2, dW3=hW3/Math.min(W3,n);
-  const safe = v => Math.max(-1, Math.min(1, v));
+  const safe=v=>Math.max(-1,Math.min(1,v));
   const rW1=globalRate>0?safe((dW1-globalRate)/Math.max(globalRate,0.001)):0;
   const rW2=globalRate>0?safe((dW2-globalRate)/Math.max(globalRate,0.001)):0;
   const rW3=globalRate>0?safe((dW3-globalRate)/Math.max(globalRate,0.001)):0;
@@ -1036,12 +1597,12 @@ function buildPatternWindow(patternResult, maxWidth) {
   return { low, high: low + maxWidth - 1, expectedGap, opensIn: low, confidence: patternResult.confidence, direction: patternResult.direction, streakStatus: 'normal', currentStreak: 0 };
 }
 
+// ── makeKey ───────────────────────────────────────────────────────────────────
 function makeKey(source, target, lo, hi) {
   return `${source}-${target}-${Number(lo)||0}-${Number(hi)||0}`;
 }
 
-// ── getStatus — UNCHANGED ─────────────────────────────────────────────────────
-
+// ── getStatus ─────────────────────────────────────────────────────────────────
 function getStatus(sortedRounds, pred, currentRoundId) {
   const anchorRound = Number(pred.anchorRound) || 0;
   const absLow  = anchorRound + (Number(pred.low)  || 0);
@@ -1066,8 +1627,7 @@ function getStatus(sortedRounds, pred, currentRoundId) {
   return { status:'waiting', hitRound:null };
 }
 
-// ── processEngine — UNCHANGED ─────────────────────────────────────────────────
-
+// ── processEngine ─────────────────────────────────────────────────────────────
 async function processEngine({ engineId, state, sortedRounds, lastRoundId, buildFn }) {
   let anyChange = false;
   for (const target of TARGETS) {
@@ -1077,7 +1637,7 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
       if (pred) {
         state.lockedMap[target.label] = { ...pred, targetMin:target.min, anchorRound:lastRoundId+1, generation:1, stale:false };
         anyChange = true;
-        console.log(`[${engineId}] NEW ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}% probW=${pred.probW??'—'} regime=${pred.regime??'—'}`);
+        console.log(`[${engineId}] NEW ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}% probW=${pred.probW??'—'} regime=${pred.regime??'—'} rec=${pred.recommendation??'—'}`);
       }
       continue;
     }
@@ -1099,12 +1659,12 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
             state.savedSet.add(key);
             try {
               await savePrediction({ target:target.label, minMult:target.min, outcome, lo:absLow, hi:absHigh, anchorRound, hitRound:status.hitRound||null, generation:existing.generation||1, source:engineId });
+              recordTimingOutcome(target.label, outcome === 'early');
               if (STAT_MODELS.some(m=>m.id===engineId) && existing.probW!=null) {
                 updateCalibration(target.label, engineId, existing.probW, outcome);
                 updateModelScore(target.label, engineId, existing.probW, outcome);
-                updateValidationMetrics(target.label, engineId, existing.probW, outcome);
+                updateValidationMetrics(target.label, engineId, existing.probW, outcome, existing.recommendation ?? null);
               }
-              console.log(`[${engineId}] ${target.label} ${outcome.toUpperCase()}${status.status==='early'?' (early)':''} #${absLow}–#${absHigh}${status.hitRound?` @#${status.hitRound}`:''}`);
             } catch(e) { console.error(`[${engineId}] save fail:`, e.message); }
           }
         }
@@ -1112,7 +1672,7 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
       const pred = buildFn(target);
       if (pred) {
         state.lockedMap[target.label] = { ...pred, targetMin:target.min, anchorRound:lastRoundId+1, generation:(existing.generation||1)+(isNonsense?0:1), stale:false };
-        console.log(`[${engineId}] REBUILD ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}% regime=${pred.regime??'—'}`);
+        console.log(`[${engineId}] REBUILD ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}% regime=${pred.regime??'—'} rec=${pred.recommendation??'—'}`);
       } else {
         delete state.lockedMap[target.label];
         console.warn(`[${engineId}] ${target.label} cleared — insufficient data`);
@@ -1130,18 +1690,20 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
         state.savedSet.add(key);
         try {
           await savePrediction({ target:target.label, minMult:target.min, outcome, lo:absLow, hi:absHigh, anchorRound, hitRound:status.hitRound||null, generation:existing.generation||1, source:engineId });
+          recordTimingOutcome(target.label, outcome === 'early');
           if (STAT_MODELS.some(m=>m.id===engineId) && existing.probW!=null) {
             updateCalibration(target.label, engineId, existing.probW, outcome);
             updateModelScore(target.label, engineId, existing.probW, outcome);
-            updateValidationMetrics(target.label, engineId, existing.probW, outcome);
+            updateValidationMetrics(target.label, engineId, existing.probW, outcome, existing.recommendation ?? null);
           }
-          console.log(`[${engineId}] ${target.label} ${outcome.toUpperCase()}${status.status==='early'?' (early)':''} #${absLow}–#${absHigh}${status.hitRound?` @#${status.hitRound}`:''}`);
+          const { earlyRate } = getTimingParams(target.label);
+          console.log(`[${engineId}] ${target.label} ${outcome.toUpperCase()}${outcome==='early'?' (early)':''} #${absLow}–#${absHigh}${status.hitRound?` @#${status.hitRound}`:''} earlyRate=${earlyRate.toFixed(2)}`);
         } catch(e) { console.error(`[${engineId}] save fail:`, e.message); }
       }
       const pred = buildFn(target);
       if (pred) {
         state.lockedMap[target.label] = { ...pred, targetMin:target.min, anchorRound:lastRoundId+1, generation:(existing.generation||1)+1, stale:false };
-        console.log(`[${engineId}] NEXT ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}% regime=${pred.regime??'—'}`);
+        console.log(`[${engineId}] NEXT ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}% regime=${pred.regime??'—'} rec=${pred.recommendation??'—'}`);
       } else { delete state.lockedMap[target.label]; }
       anyChange = true;
     }
@@ -1149,8 +1711,7 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
   return anyChange;
 }
 
-// ── DB helpers — UNCHANGED ────────────────────────────────────────────────────
-
+// ── DB helpers ────────────────────────────────────────────────────────────────
 function buildSavePayload(lockedMap) {
   const out = {};
   for (const [label, pred] of Object.entries(lockedMap)) {
@@ -1160,7 +1721,31 @@ function buildSavePayload(lockedMap) {
     out[label] = {
       lo: anchor+(Number(pred.low)||0), hi: anchor+(Number(pred.high)||0),
       roundWhenMade: anchor, generation: pred.generation||1,
-      eta: { low:pred.low, high:pred.high, conf:pred.confidence, probW:pred.probW, rawProbW:pred.rawProbW??pred.probW, expectedGap:pred.expectedGap, opensIn:pred.opensIn, streakStatus:pred.streakStatus, currentStreak:pred.currentStreak, spread:pred.spread??null, regime:pred.regime??null, regimeFactor:pred.regimeFactor??null, ensWeights:pred.ensWeights??null, isRandom:pred.isRandom??null, maxAC:pred.maxAC??null },
+      eta: {
+        low:pred.low, high:pred.high, conf:pred.confidence,
+        probW:pred.probW, rawProbW:pred.rawProbW??pred.probW,
+        expectedGap:pred.expectedGap, opensIn:pred.opensIn,
+        streakStatus:pred.streakStatus, currentStreak:pred.currentStreak,
+        spread:pred.spread??null,
+        regime:pred.regime??null, regimeFactor:pred.regimeFactor??null,
+        regimeConfidence:pred.regimeConfidence??null,
+        ensWeights:pred.ensWeights??null,
+        isRandom:pred.isRandom??null, maxAC:pred.maxAC??null,
+        ev:pred.ev??null, signalQuality:pred.signalQuality??null,
+        risk:pred.risk??null, recommendation:pred.recommendation??null,
+        decisionReason:pred.decisionReason??null,
+        signalStrength:pred.signalStrength??null,
+        finalProbUsed:pred.finalProbUsed??null,
+        amplifiedProbW:pred.amplifiedProbW??null,
+        tailProbability:pred.tailProbability??null,
+        extremeGapScore:pred.extremeGapScore??null,
+        rareEV:pred.rareEV??null,
+        earlyWindow:pred.earlyWindow??null,
+        lateWindow:pred.lateWindow??null,
+        primaryWindow:pred.primaryWindow??null,
+        alpha:pred.alpha??null,
+        rareSignal:pred.rareSignal??null,
+      },
     };
   }
   return out;
@@ -1181,8 +1766,23 @@ function loadLockedMap(dbRows) {
       streakStatus: eta.streakStatus??'normal', currentStreak: eta.currentStreak??0,
       spread: eta.spread??null,
       regime: eta.regime??null, regimeFactor: eta.regimeFactor??null,
+      regimeConfidence: eta.regimeConfidence??null,
       ensWeights: eta.ensWeights??null,
       isRandom: eta.isRandom??null, maxAC: eta.maxAC??null,
+      ev: eta.ev??null, signalQuality: eta.signalQuality??null,
+      risk: eta.risk??null, recommendation: eta.recommendation??null,
+      decisionReason: eta.decisionReason??null,
+      signalStrength: eta.signalStrength??null,
+      finalProbUsed: eta.finalProbUsed??null,
+      amplifiedProbW: eta.amplifiedProbW??null,
+      tailProbability: eta.tailProbability??null,
+      extremeGapScore: eta.extremeGapScore??null,
+      rareEV:          eta.rareEV??null,
+      earlyWindow:     eta.earlyWindow??null,
+      lateWindow:      eta.lateWindow??null,
+      primaryWindow:   eta.primaryWindow??null,
+      alpha:           eta.alpha??null,
+      rareSignal:      eta.rareSignal??null,
       targetMin: target.min, anchorRound: anchor,
       generation: pred.generation??1, stale: true,
     };
@@ -1190,22 +1790,86 @@ function loadLockedMap(dbRows) {
   return map;
 }
 
-// ── Validation export — UNCHANGED ─────────────────────────────────────────────
-
+// ── Validation export — F8: winRate = wins / trades ──────────────────────────
 function getValidationMetrics() {
   const out = {};
   for (const t of TARGETS) {
     out[t.label] = {};
     for (const m of STAT_MODELS) {
-      const v = valMetrics[t.label][m.id];
+      const v   = valMetrics[t.label][m.id];
       const ece = getECE(t.label, m.id);
-      out[t.label][m.id] = { brier: v.count>0?+(v.brierSum/v.count).toFixed(4):null, logLoss: v.count>0?+(v.logLossSum/v.count).toFixed(4):null, ece: ece!=null?+ece.toFixed(4):null, wins:v.wins, losses:v.losses, early:v.earlyCount, total:v.count, hitRate:v.count>0?+((v.wins/v.count)*100).toFixed(1):null };
+      const total = v.count;
+      const effectiveAccuracy = total > 0
+        ? +((v.wins + 0.5 * v.earlyCount) / total * 100).toFixed(1)
+        : null;
+      // F8: primary KPI — winRate = takenWins / takenTotal
+      const winRateOnTaken = v.takenTotal > 0 ? +(v.takenWins / v.takenTotal).toFixed(4) : null;
+      const balanceScore   = (v.totalWins > 0 && winRateOnTaken != null)
+        ? +(v.totalWins * winRateOnTaken).toFixed(2)
+        : null;
+      out[t.label][m.id] = {
+        brier:              total > 0 ? +(v.brierSum   / total).toFixed(4) : null,
+        logLoss:            total > 0 ? +(v.logLossSum / total).toFixed(4) : null,
+        ece:                ece != null ? +ece.toFixed(4) : null,
+        wins:               v.wins,
+        losses:             v.losses,
+        early:              v.earlyCount,
+        total,
+        hitRate:            total > 0 ? +((v.wins  / total) * 100).toFixed(1) : null,
+        effectiveAccuracy,
+        earlyRate:          total > 0 ? +((v.earlyCount / total) * 100).toFixed(1) : null,
+        // F8: trade metrics (primary KPI: winRateOnTaken = wins / trades)
+        tradeCount:         v.tradeCount,
+        totalWins:          v.totalWins,
+        winRateOnTaken,     // PRIMARY KPI: wins on TAKE calls / total TAKE calls
+        balanceScore,
+      };
     }
   }
   return out;
 }
 
-// ── Initialise — UNCHANGED ────────────────────────────────────────────────────
+// ── Engine stats ──────────────────────────────────────────────────────────────
+function getEngineStats() {
+  const out = {};
+  for (const t of TARGETS) {
+    out[t.label] = {};
+    for (const id of ['engine', 'ens', 'geo', 'bay', 'km']) {
+      const cs = engineCusumState[id]?.[t.label];
+      if (!cs) continue;
+      const ece = STAT_MODELS.some(m => m.id === id) ? getECE(t.label, id) : null;
+      out[t.label][id] = {
+        regimeConfidence: +clamp((cs.count - REGIME_ACTIVATION_OUTCOMES) / 200, 0, 1).toFixed(3),
+        warmupProgress:   +clamp(cs.count / CAL_WARMUP_OUTCOMES, 0, 1).toFixed(3),
+        regimeLabel:      cs.regimeLabel,
+        regimeFactor:     +cs.confirmedFactor.toFixed(4),
+        outcomesCount:    cs.count,
+        ece:              ece != null ? +ece.toFixed(4) : null,
+      };
+    }
+  }
+  return out;
+}
+
+// ── Timing stats export ───────────────────────────────────────────────────────
+function getTimingStats() {
+  const out = {};
+  for (const t of TARGETS) {
+    const ts = timingState[t.label];
+    if (!ts) continue;
+    const { earlyRate, recentEarlyRate, timingShiftFactor, hasData } = getTimingParams(t.label);
+    out[t.label] = {
+      earlyRate:         +earlyRate.toFixed(3),
+      recentEarlyRate:   +recentEarlyRate.toFixed(3),
+      timingShiftFactor: +timingShiftFactor.toFixed(3),
+      totalOutcomes:     ts.totalCount,
+      earlyOutcomes:     ts.earlyCount,
+      recentWindow:      ts.earlyQueue.length,
+      hasData,
+    };
+  }
+  return out;
+}
 
 async function initialise() {
   if (initialised) return;
@@ -1232,8 +1896,7 @@ async function initialise() {
   for (const id of Object.keys(STATE)) STATE[id].needsRebuild = true;
 }
 
-// ── Main — UNCHANGED ──────────────────────────────────────────────────────────
-
+// ── Main ──────────────────────────────────────────────────────────────────────
 async function runPredictionEngine() {
   try {
     await initialise();
@@ -1260,4 +1923,4 @@ async function runPredictionEngine() {
 
 function getLockedStatMap(modelId) { return STATE[modelId]?.lockedMap || {}; }
 
-module.exports = { runPredictionEngine, resetEngineState, getLockedStatMap, getValidationMetrics };
+module.exports = { runPredictionEngine, resetEngineState, getLockedStatMap, getValidationMetrics, getEngineStats, getTimingStats };
