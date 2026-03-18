@@ -1743,9 +1743,21 @@ function loadLockedMap(dbRows) {
     if (!target) continue;
     const eta = pred.eta || {};
     const anchor = Number(pred.roundWhenMade ?? pred.lo) || 0;
+
+    const low  = eta.low  != null ? eta.low  : Math.max(0, Number(pred.lo) - anchor);
+    const high = eta.high != null ? eta.high : Math.max(0, Number(pred.hi) - anchor);
+
+    // ── Window-spec guard ─────────────────────────────────────────────────────
+    // If the saved window is wider than current maxWidth, it was built before
+    // the window-gap fix. Discard it so the engine rebuilds immediately.
+    const savedWidth = high - low + 1;
+    if (savedWidth > target.maxWidth) {
+      console.log(`[engine] DISCARD stale wide window ${label}: saved ${savedWidth}r > max ${target.maxWidth}r — will rebuild`);
+      continue;
+    }
+
     map[label] = {
-      low: eta.low!=null?eta.low:Math.max(0,Number(pred.lo)-anchor),
-      high: eta.high!=null?eta.high:Math.max(0,Number(pred.hi)-anchor),
+      low, high,
       confidence: eta.conf??50, probW: eta.probW??null, rawProbW: eta.rawProbW??null,
       expectedGap: eta.expectedGap??null, opensIn: eta.opensIn??null,
       streakStatus: eta.streakStatus??'normal', currentStreak: eta.currentStreak??0,
