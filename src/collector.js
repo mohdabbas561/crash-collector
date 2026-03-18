@@ -10,13 +10,25 @@ const MAX_RETRIES = 5;
 let lastSeenRoundId   = 0;
 let consecutiveErrors = 0;
 
-async function fetchRounds() {
-  const res = await fetch(API_URL, {
-    headers: { 'Accept': 'application/json' },
-    timeout: 10000,
+async function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
   });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchRounds() {
+  const res = await withTimeout(
+    fetch(API_URL, { headers: { 'Accept': 'application/json' } }),
+    10000, 'fetchRounds'
+  );
   if (!res.ok) throw new Error(`API returned ${res.status}`);
-  const json = await res.json();
+  const json = await withTimeout(res.json(), 5000, 'fetchRounds.json');
   const arr  = json.payload || json;
   if (!Array.isArray(arr)) throw new Error('Unexpected API response shape');
   return arr
