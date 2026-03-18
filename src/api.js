@@ -85,12 +85,26 @@ app.get('/health', (req,res) => res.json({ ok:true, ts:new Date().toISOString() 
 // ── PREDICTIONS ───────────────────────────────────────────────────────────────
 const VALID_SOURCES = ['engine','pattern','ens','geo','bay','km'];
 
-app.get('/predictions', rateLimit(60), async (req, res) => {
+app.get("/predictions", rateLimit(300), async (req, res) => {
   try {
     const limit  = Math.min(parseInt(req.query.limit||'500'), 5000);
     const source = VALID_SOURCES.includes(req.query.source) ? req.query.source : null;
     const rows   = await getPredictions({ limit, target: req.query.target||null, source });
     res.json({ ok:true, count:rows.length, predictions:rows });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// u2500u2500 Batch history u2014 returns all 4 model histories in one request u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500
+app.get('/predictions-all', rateLimit(120), async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit||'300'), 1000);
+    const [ens, geo, bay, km] = await Promise.all([
+      getPredictions({ limit, source: 'ens' }),
+      getPredictions({ limit, source: 'geo' }),
+      getPredictions({ limit, source: 'bay' }),
+      getPredictions({ limit, source: 'km'  }),
+    ]);
+    res.json({ ok:true, ens, geo, bay, km });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 

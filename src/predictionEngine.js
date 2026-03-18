@@ -209,6 +209,16 @@ const STATE = {
   km:      { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
 };
 
+// ── Per-engine last-hit tracker ────────────────────────────────────────────────
+// Each engine independently tracks the roundId of the last WIN it recorded
+// per target. This drives independent gapSinceLast so windows diverge.
+// Initialised to -1 (unknown — falls back to shared gapStats on first run).
+const engineLastHit = {};
+for (const id of ['engine', 'ens', 'geo', 'bay', 'km']) {
+  engineLastHit[id] = {};
+  for (const t of TARGETS) engineLastHit[id][t.label] = -1;
+}
+
 // ── Gap stats cache ───────────────────────────────────────────────────────────
 const gapStatsCache = new Map();
 let   cacheRoundId  = -1;
@@ -281,6 +291,20 @@ function resetEngineState() {
     timingState[t.label] = { earlyCount: 0, totalCount: 0, earlyQueue: [], recentEarlyCount: 0 };
     takenTradesMetrics[t.label] = { wins: 0, losses: 0, early: 0, total: 0 };
   }
+  // Reset per-engine last-hit tracker
+  for (const id of Object.keys(engineLastHit)) {
+    for (const t of TARGETS) engineLastHit[id][t.label] = -1;
+  }
+}
+
+// ── Per-engine gapSinceLast ────────────────────────────────────────────────────
+// Returns how many rounds have elapsed since THIS engine last recorded a win
+// for this target. Falls back to shared gapStats value if unknown.
+// This is what makes each engine's window position independent.
+function getEngineGapSinceLast(engineId, targetLabel, lastRoundId, sharedGapSinceLast) {
+  const lastHit = engineLastHit[engineId]?.[targetLabel] ?? -1;
+  if (lastHit < 0) return sharedGapSinceLast; // no history yet — use shared
+  return Math.max(0, lastRoundId - lastHit);
 }
 
 // ── Math helpers ──────────────────────────────────────────────────────────────
@@ -1133,8 +1157,10 @@ function buildPrediction(rounds, targetMin, maxWidth, isRare, lastRoundId) {
 }
 
 // ── BUILD: GEO ────────────────────────────────────────────────────────────────
-function buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
-  const { hits, n, pGlobal, gapSinceLast, currentStreak, kmCDF, kmExpectedGap, cv } = gs;
+function buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) {
+  const { hits, n, pGlobal, currentStreak, kmCDF, kmExpectedGap, cv } = gs;
+  // Each engine uses its own gapSinceLast so windows diverge independently
+  const gapSinceLast = engineGapSinceLast ?? gs.gapSinceLast;
   const regime = updateEngineRegime(rounds, targetMin, targetLabel, 'geo', gs, gs.isRandom);
   const pLaplace = (hits + 1) / (n + 2);
   const pGeo     = applyRegimeToP(pLaplace, regime.shortRate, regime.regimeFactor, 0.25);
@@ -1167,8 +1193,9 @@ function buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
 }
 
 // ── BUILD: BAY ────────────────────────────────────────────────────────────────
-function buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
-  const { hits, n, pGlobal, pRecent, rateShifted, gapSinceLast, currentStreak, kmCDF, kmExpectedGap, cv } = gs;
+function buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) {
+  const { hits, n, pGlobal, pRecent, rateShifted, currentStreak, kmCDF, kmExpectedGap, cv } = gs;
+  const gapSinceLast = engineGapSinceLast ?? gs.gapSinceLast;
   const regime = updateEngineRegime(rounds, targetMin, targetLabel, 'bay', gs, gs.isRandom);
   const regimeActive  = Math.abs(regime.regimeFactor) > 0;
   const baseRecencyW  = rateShifted ? 0.20 : 0.05;
@@ -1208,8 +1235,9 @@ function buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
 }
 
 // ── BUILD: KM ─────────────────────────────────────────────────────────────────
-function buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
-  const { hits, kmCDF, kmExpectedGap, gapSinceLast, currentStreak, cv } = gs;
+function buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) {
+  const { hits, kmCDF, kmExpectedGap, currentStreak, cv } = gs;
+  const gapSinceLast = engineGapSinceLast ?? gs.gapSinceLast;
   if (!kmCDF) return null;
   const regime = updateEngineRegime(rounds, targetMin, targetLabel, 'km', gs, gs.isRandom);
   let rawProbW = kmCDFQuery(kmCDF, maxWidth);
@@ -1245,9 +1273,10 @@ function buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
 }
 
 // ── BUILD: ENS ────────────────────────────────────────────────────────────────
-function buildEns(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
+function buildEns(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) {
   const { hits, n, pGlobal, pRecent, rateShifted, kmCDF, kmExpectedGap,
-          gapSinceLast, currentStreak, cv } = gs;
+          currentStreak, cv } = gs;
+  const gapSinceLast = engineGapSinceLast ?? gs.gapSinceLast;
 
   const regime = updateEngineRegime(rounds, targetMin, targetLabel, 'ens', gs, gs.isRandom);
 
@@ -1416,9 +1445,10 @@ function computeRareDecision(tailProbability, extremeGapScore, targetLabel, hits
   };
 }
 
-function buildRare(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
-  const { hits, n, pGlobal, gapSinceLast, currentStreak, kmCDF,
+function buildRare(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) {
+  const { hits, n, pGlobal, currentStreak, kmCDF,
           kmExpectedGap, cv, p95, meanGap, stdGap, sg } = gs;
+  const gapSinceLast = engineGapSinceLast ?? gs.gapSinceLast;
 
   const regime = updateEngineRegime(rounds, targetMin, targetLabel, 'ens', gs, gs.isRandom);
   const alpha = 1 / Math.max(0.30, cv * cv);
@@ -1505,15 +1535,19 @@ function buildStatPrediction(rounds, targetMin, maxWidth, modelId, lastRoundId) 
   const targetLabel = target?.label ?? '?';
   const isRare      = target?.rare ?? false;
 
+  // Each engine uses its own independent gapSinceLast based on when it last
+  // recorded a WIN for this target. This makes window positions diverge.
+  const engineGap = getEngineGapSinceLast(modelId, targetLabel, lastRoundId, gs.gapSinceLast);
+
   if (isRare && targetMin >= RARE_MIN_MULTIPLIER) {
-    return buildRare(gs, maxWidth, targetLabel, isRare, rounds, targetMin);
+    return buildRare(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
   }
 
   switch (modelId) {
-    case 'geo': return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin);
-    case 'bay': return buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin);
-    case 'km':  return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin);
-    case 'ens': return buildEns(gs, maxWidth, targetLabel, isRare, rounds, targetMin);
+    case 'geo': return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
+    case 'bay': return buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
+    case 'km':  return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
+    case 'ens': return buildEns(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
     default:    return null;
   }
 }
@@ -1646,6 +1680,10 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
             try {
               await savePrediction({ target:target.label, minMult:target.min, outcome, lo:absLow, hi:absHigh, anchorRound, hitRound:status.hitRound||null, generation:existing.generation||1, source:engineId });
               recordTimingOutcome(target.label, outcome === 'early');
+              // Record this engine's last WIN round independently — drives per-engine gapSinceLast
+              if (outcome === 'win' && status.hitRound) {
+                if (engineLastHit[engineId]) engineLastHit[engineId][target.label] = status.hitRound;
+              }
               if (STAT_MODELS.some(m=>m.id===engineId) && existing.probW!=null) {
                 updateCalibration(target.label, engineId, existing.probW, outcome);
                 updateModelScore(target.label, engineId, existing.probW, outcome);
@@ -1677,6 +1715,10 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
         try {
           await savePrediction({ target:target.label, minMult:target.min, outcome, lo:absLow, hi:absHigh, anchorRound, hitRound:status.hitRound||null, generation:existing.generation||1, source:engineId });
           recordTimingOutcome(target.label, outcome === 'early');
+          // Record this engine's last WIN round independently — drives per-engine gapSinceLast
+          if (outcome === 'win' && status.hitRound) {
+            if (engineLastHit[engineId]) engineLastHit[engineId][target.label] = status.hitRound;
+          }
           if (STAT_MODELS.some(m=>m.id===engineId) && existing.probW!=null) {
             updateCalibration(target.label, engineId, existing.probW, outcome);
             updateModelScore(target.label, engineId, existing.probW, outcome);
@@ -1888,6 +1930,11 @@ async function initialise() {
       const src = r.source || 'engine';
       const key = makeKey(src, r.target, r.lo, r.hi);
       if (STATE[src]?.savedSet) STATE[src].savedSet.add(key);
+      // Seed per-engine last-hit so windows diverge immediately from history
+      if (r.outcome === 'win' && r.hitRound && engineLastHit[src]?.[r.target] !== undefined) {
+        const prev = engineLastHit[src][r.target];
+        if (prev < r.hitRound) engineLastHit[src][r.target] = r.hitRound;
+      }
     }
     console.log(`[engine] loaded ${rows.length} history keys`);
   } catch(e) { console.error('[engine] history:', e.message); }
