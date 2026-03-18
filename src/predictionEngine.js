@@ -2387,7 +2387,6 @@ function buildMeta(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineG
   // Normalise in case some engines failed
   const metaProb = Math.max(0.05, Math.min(0.95, weightedProb / totalWeight));
 
-  console.log(`[meta] ${targetLabel}: prob=${metaProb.toFixed(3)} from ${validCount}/9 engines`);
   return buildMLWindow(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast, metaProb, 'meta');
 }
 
@@ -2843,11 +2842,14 @@ async function runPredictionEngine() {
     enableMLTraining();
 
     // ── Tier 2: ML engines — run deferred with setImmediate between each ──────
-    // Each engine yields the event loop before running so HTTP stays responsive
-    const mlEngines = allEngines.filter(e => ML_ENGINE_IDS.has(e.id));
+    // META runs last so all sub-engines have trained their models first
+    const mlEngines     = allEngines.filter(e => ML_ENGINE_IDS.has(e.id) && e.id !== 'meta');
+    const metaEngine    = allEngines.find(e => e.id === 'meta');
     for (const eng of mlEngines) {
       await runEngineDeferred(eng, rounds, lastRoundId);
     }
+    // Meta runs after all sub-engines so it reads already-trained model caches
+    if (metaEngine) await runEngineDeferred(metaEngine, rounds, lastRoundId);
     if (mlEngines.length) console.log(`[engine] Tier2 (ML) done in ${Date.now()-t1Start}ms total`);
 
   } catch(e) { console.error('[predictionEngine] Fatal:', e.message, e.stack); }
