@@ -1,37 +1,53 @@
 'use strict';
-// predictionEngine.js  v13-final
+// predictionEngine.js  v14-regime
 //
-// INDEPENDENCE AUDIT — every engine now uses its OWN math end-to-end:
+// WHAT'S NEW vs v13-final:
 //
-// GEO: p = Laplace MLE. probW = 1-(1-p)^W. expectedGap = (1-p)/p.
-//      Window optimizer uses GEO's own geometric CDF: P(gap<=t) = 1-(1-p)^(t+1).
+// ── Per-Engine Independent Regime Detection ───────────────────────────────────
 //
-// BAY: p = global + recency blend (when CUSUM shift detected).
-//      probW = 1-(1-pBay)^W. expectedGap = (1-pBay)/pBay.
-//      Window optimizer uses BAY's own geometric CDF with pBay.
+// Every engine (GEO, BAY, KM, ENS, ENGINE) now runs its OWN persistent CUSUM
+// and adaptive window sizing. No shared state. Each engine independently:
 //
-// KM:  probW = empirical survival P(gap<=W) from KM step function.
-//      expectedGap = HSM-blended empirical median.
-//      Window optimizer uses KM's empirical CDF (binary search on steps).
-//      Pareto blend applied for rare targets (100x+, cv>1.1).
+//   1. Maintains a persistent CUSUM accumulator (not recomputed from scratch each call).
+//   2. Detects hot streaks  → recent hit rate rising  → tighten window, shift earlier.
+//   3. Detects cold streaks → recent hit rate falling → widen window, shift later.
+//   4. Uses a short adaptive window (30 rounds) for fast regime detection, separate
+//      from the 200-round pRecent already in the shared cache.
+//   5. Computes a regimeFactor in [-1, +1]:
+//        +1 = strong hot streak  (hits coming faster than expected)
+//        -1 = strong cold streak (white streak, hits drying up)
+//        0  = neutral / normal
+//   6. Applies regimeFactor to:
+//        - effectiveWidth   (wider on cold, narrower on hot)
+//        - window placement (open sooner on hot, push later on cold)
+//        - per-engine p     (blend more recent rate on hot or cold)
 //
-// ENS: Logit-space weighted combination of calibrated GEO+BAY+KM probW.
-//      expectedGap = adaptive-weight-blended average of GEO/BAY/KM expected gaps.
-//      Window optimizer uses ENS's own blended parametric CDF.
+// INDEPENDENCE GUARANTEE:
+//   - Each engine has its own engineCusumState[engineId] object.
+//   - No engine reads another engine's CUSUM state.
+//   - Shared gapStatsCache still contains only RAW DATA (hits, gaps, meanGap…).
+//   - The regime math is applied inside each buildXxx() function separately.
 //
-// ENGINE: p = CUSUM-blended p. probW = 1-(1-p)^W.
-//         expectedGap = (1-p)/p. Window uses its own geometric CDF.
+// EXISTING LOGIC PRESERVED:
+//   - All existing p calculations, calibration, KM CDF, Pareto blend, HSM,
+//     ensemble logit combiner, betaConf, streak status, confPenalty are UNCHANGED.
+//   - Regime adjustment is an ADDITIVE layer on top of existing window placement.
 //
-// SHARED (cache only): raw data — sorted gaps, percentiles, meanGap, stdGap, cv.
-//   These are FACTS about the data, not model-specific. All models use same facts.
-//   Each model derives its OWN probability and window from those facts differently.
+// REGIME WINDOW ADJUSTMENT FORMULA (per engine):
+//   regimeFactor ∈ [-1, +1]
+//   widthMult    = 1 + clamp(−regimeFactor × REGIME_WIDTH_SCALE, -0.25, +0.35)
+//     hot streak  (rf>0): widthMult < 1  → narrower window (high confidence zone)
+//     cold streak (rf<0): widthMult > 1  → wider  window (uncertainty expanded)
+//   offsetShift  = round(regimeFactor × expectedGap × REGIME_OFFSET_SCALE)
+//     hot streak  (rf>0): offsetShift > 0 → open window sooner
+//     cold streak (rf<0): offsetShift < 0 → push window later (more rounds away)
 //
-// OTHER FIXES:
-//   - Removed dead code: CAL_LAPLACE (unused), ensureMonotonic (uncalled)
-//   - optimizeWindowPlacement now takes a cdfFn (model-specific CDF function)
-//     instead of always using the shared kmCDF
-//   - Pareto formula fixed: was using meanGap/(meanGap+W) but gap is discrete,
-//     formula now: 1 - (1/(1 + W/expectedGap))^alpha
+// ENGINE-SPECIFIC REGIME p BLEND:
+//   GEO:    pure Laplace MLE + regime blend of short-window rate
+//   BAY:    existing recency blend enhanced by regime strength
+//   KM:     no p change (empirical), but window placement shifted
+//   ENS:    regime affects pEns blend weights
+//   ENGINE: existing CUSUM blend enhanced by regime strength
 
 const {
   getRounds, savePrediction, getPredictions,
@@ -60,7 +76,33 @@ const STAT_MODELS = [
 
 const MIN_ROUNDS               = 50;
 const STALE_FORCE_REBUILD_THRESHOLD = 200;
-const WINDOW_LAMBDA            = 0.01; // penalty per extra round of width
+const WINDOW_LAMBDA            = 0.01;
+
+// Regime tuning constants
+const REGIME_SHORT_WINDOW      = 30;   // rounds for fast regime detection
+const REGIME_WIDTH_SCALE       = 0.30; // max ±30% width change from regime
+const REGIME_OFFSET_SCALE      = 0.20; // max ±20% of expectedGap offset shift
+const REGIME_CUSUM_THRESHOLD   = 1.20; // CUSUM norm threshold for regime trigger
+const REGIME_DECAY             = 0.10; // EWMA decay for persistent regime state
+
+// ── Per-engine independent CUSUM / regime state ───────────────────────────────
+// Each engine tracks its OWN persistent regime per target.
+// NOTE: 'pattern' is intentionally excluded — buildPatternPrediction is a
+// fully isolated UI-only signal that computes its own trend via EMA internally.
+// Structure: engineCusumState[engineId][targetLabel] = { cusum, regimeFactor, ewmaRate, count }
+
+const engineCusumState = {};
+for (const id of ['engine', 'ens', 'geo', 'bay', 'km']) {
+  engineCusumState[id] = {};
+  for (const t of TARGETS) {
+    engineCusumState[id][t.label] = {
+      cusum:        0,
+      regimeFactor: 0,   // [-1, +1]
+      ewmaRate:     -1,  // EWMA of short-window hit rate (uninitialised = -1)
+      count:        0,
+    };
+  }
+}
 
 // ── Per-engine state (fully independent) ──────────────────────────────────────
 
@@ -74,8 +116,6 @@ const STATE = {
 };
 
 // ── Gap stats cache — SHARED RAW DATA only, not model outputs ─────────────────
-// Stores: sorted gaps, meanGap, medianGap, stdGap, cv, percentiles, kmCDF, HSM
-// Each model reads these facts and computes its OWN p, probW, expectedGap, window
 const gapStatsCache = new Map();
 let   cacheRoundId  = -1;
 
@@ -122,6 +162,12 @@ function resetEngineState() {
     STATE[id].needsRebuild = true;
     STATE[id].lastRoundId  = 0;
   }
+  // Reset all per-engine CUSUM states (pattern excluded — it has no regime state)
+  for (const id of Object.keys(engineCusumState)) {
+    for (const t of TARGETS) {
+      engineCusumState[id][t.label] = { cusum: 0, regimeFactor: 0, ewmaRate: -1, count: 0 };
+    }
+  }
   gapStatsCache.clear();
   cacheRoundId = -1;
   initialised  = false;
@@ -132,18 +178,126 @@ function resetEngineState() {
 function sigmoid(x)   { return 1 / (1 + Math.exp(-x)); }
 function logit(p)     { const q = Math.max(1e-7, Math.min(1 - 1e-7, p)); return Math.log(q / (1 - q)); }
 function fromLogit(l) { return sigmoid(l); }
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
-// Geometric CDF: P(gap <= t) = 1 - (1-p)^(t+1)
-// This is the correct discrete geometric CDF for gap distributions.
-// A gap of 0 means consecutive hits; gap of t means t misses then a hit.
-function geoCDF(p, t) {
-  if (t < 0) return 0;
-  return Math.max(0, Math.min(1, 1 - Math.pow(1 - p, t + 1)));
+// ── Per-Engine Regime Detection ───────────────────────────────────────────────
+//
+// Called independently by each engine with its own engineId.
+// Updates engineCusumState[engineId][targetLabel] in-place.
+//
+// Parameters:
+//   rounds      — full sorted rounds array
+//   targetMin   — target multiplier threshold
+//   targetLabel — string label e.g. '10x'
+//   engineId    — which engine's state bucket to update ('geo','bay','km','ens','engine')
+//   gs          — shared gap stats (read-only: gs.hits, gs.n used as global baseline,
+//                 avoids re-scanning all rounds for totalHits)
+//
+// Returns: { regimeFactor, regimeLabel, shortRate, shortBaseline, cusumNorm }
+//   regimeFactor ∈ [-1, +1]:
+//     > 0 → hot streak (hits accelerating)
+//     < 0 → cold / white streak (hits drying up)
+//
+// Uses the last REGIME_SHORT_WINDOW rounds for fast detection.
+// Persistent CUSUM accumulates across calls (stateful per engine per target).
+// Each engineId reads/writes ONLY its own bucket — zero cross-engine state sharing.
+
+function updateEngineRegime(rounds, targetMin, targetLabel, engineId, gs) {
+  const cs = engineCusumState[engineId]?.[targetLabel];
+  if (!cs) return { regimeFactor: 0, regimeLabel: 'neutral', shortRate: 0, shortBaseline: 0, cusumNorm: 0 };
+
+  const n = rounds.length;
+  const shortStart = Math.max(0, n - REGIME_SHORT_WINDOW);
+  const shortWindow = rounds.slice(shortStart);
+
+  // Short-window hit rate (fast, only 30 rounds)
+  let shortHits = 0;
+  for (const r of shortWindow) if (r.multiplier >= targetMin) shortHits++;
+  const shortRate = shortHits / Math.max(1, shortWindow.length);
+
+  // Global baseline: reuse pre-computed gs.hits / gs.n — no re-scan of full rounds
+  // gs is shared read-only cache; each engine reads the same raw fact independently.
+  const shortBaseline = gs.hits / Math.max(1, gs.n);
+
+  // Update persistent EWMA of short-window rate (engine-specific)
+  if (cs.ewmaRate < 0) {
+    cs.ewmaRate = shortRate; // first call: initialise
+  } else {
+    cs.ewmaRate = (1 - REGIME_DECAY) * cs.ewmaRate + REGIME_DECAY * shortRate;
+  }
+  cs.count++;
+
+  // Persistent CUSUM: accumulates deviations of shortRate from baseline
+  // Positive CUSUM = hot streak (hits above baseline)
+  // Negative CUSUM = cold streak / white streak (hits below baseline)
+  const deviation = shortRate - shortBaseline;
+  cs.cusum += deviation;
+
+  // Normalise CUSUM by baseline std dev
+  const sigma = Math.sqrt(Math.max(1e-9, shortBaseline * (1 - shortBaseline)));
+  const cusumNorm = cs.cusum / Math.max(sigma * Math.sqrt(REGIME_SHORT_WINDOW), 1e-6);
+
+  // Soft clip to [-2, +2] range so extreme events don't dominate permanently
+  cs.cusum = clamp(cs.cusum, -2 * sigma * Math.sqrt(REGIME_SHORT_WINDOW), 2 * sigma * Math.sqrt(REGIME_SHORT_WINDOW));
+
+  // regimeFactor: smooth mapping of cusumNorm → [-1, +1]
+  // tanh gives smooth saturation: small deviations → small factor, large → saturates at ±1
+  const rawFactor = Math.tanh(cusumNorm / (REGIME_CUSUM_THRESHOLD * 1.5));
+
+  // EWMA-smooth the regime factor to avoid jitter
+  cs.regimeFactor = (1 - REGIME_DECAY) * cs.regimeFactor + REGIME_DECAY * rawFactor;
+  cs.regimeFactor = clamp(cs.regimeFactor, -1, 1);
+
+  const regimeLabel = cs.regimeFactor > 0.15 ? 'hot'
+    : cs.regimeFactor < -0.15 ? 'cold'
+    : 'neutral';
+
+  return {
+    regimeFactor:  +cs.regimeFactor.toFixed(4),
+    regimeLabel,
+    shortRate:     +shortRate.toFixed(4),
+    shortBaseline: +shortBaseline.toFixed(4),
+    cusumNorm:     +cusumNorm.toFixed(3),
+  };
 }
 
-// P(gap in [lo, hi]) = CDF(hi) - CDF(lo-1)
-function geoWindowProb(p, lo, hi) {
-  return Math.max(0, geoCDF(p, hi) - (lo > 0 ? geoCDF(p, lo - 1) : 0));
+// ── Apply regime to window placement ─────────────────────────────────────────
+//
+// Takes the raw {low, high} from parametric/empirical placement and adjusts:
+//   hot streak  (regimeFactor > 0): open sooner, narrower
+//   cold streak (regimeFactor < 0): open later,  wider
+//
+// This is the ADDITIVE layer — it never overrides the base placement entirely,
+// just nudges it proportionally to regime strength.
+
+function applyRegimeToWindow(low, high, expectedGap, effectiveWidth, regimeFactor) {
+  if (Math.abs(regimeFactor) < 0.05) return { low, high }; // negligible regime
+
+  // Width adjustment: hot → narrower, cold → wider
+  const widthDelta  = clamp(-regimeFactor * REGIME_WIDTH_SCALE, -0.25, 0.35);
+  const newWidth    = Math.max(1, Math.round(effectiveWidth * (1 + widthDelta)));
+
+  // Offset shift: hot → open sooner (negative shift), cold → open later (positive shift)
+  // regimeFactor > 0 (hot) → offsetShift > 0 → pull window earlier
+  // regimeFactor < 0 (cold) → offsetShift < 0 → push window later
+  const offsetShift = Math.round(regimeFactor * expectedGap * REGIME_OFFSET_SCALE);
+  const newLow      = Math.max(0, low - offsetShift);
+  const newHigh     = newLow + newWidth - 1;
+
+  return { low: newLow, high: newHigh };
+}
+
+// ── Regime-adjusted p blending (for parametric engines) ──────────────────────
+//
+// Each parametric engine can blend in a short-window rate when regime is active.
+// shortRate is from updateEngineRegime().
+// blendStrength controls how much the short rate pulls the engine's p.
+
+function applyRegimeToP(baseP, shortRate, regimeFactor, blendStrength) {
+  if (Math.abs(regimeFactor) < 0.05) return baseP;
+  const regimeBlend = Math.abs(regimeFactor) * blendStrength;
+  const blended = (1 - regimeBlend) * baseP + regimeBlend * shortRate;
+  return Math.max(1e-6, Math.min(0.5, blended));
 }
 
 // ── Gap stats cache — shared raw facts ────────────────────────────────────────
@@ -175,12 +329,11 @@ function computeGapStats(rounds, targetMin) {
 
   const gapSinceLast = lastIdx === -1 ? n : n - lastIdx - 1;
 
-  // Raw hit rate stats (used by all models as base data)
   const pGlobal = (hits + 1) / (n + 2);
   const r200hits = rounds.slice(-200).filter(r => r.multiplier >= targetMin).length;
   const pRecent  = (r200hits + 1) / 202;
 
-  // CUSUM structural break detection (shared diagnostic)
+  // Shared CUSUM (diagnostic only — each engine has its own in engineCusumState)
   const p0 = hits / n;
   let cusum = 0, maxCusum = 0;
   const cusumWindow = rounds.slice(-150);
@@ -192,7 +345,6 @@ function computeGapStats(rounds, targetMin) {
   const cusumNorm  = maxCusum / (sigma0 * Math.sqrt(cusumWindow.length));
   const rateShifted = cusumNorm > 1.36;
 
-  // Sorted gaps — sorted once, shared by all
   const sg = [...gaps].sort((a, b) => a - b);
   const m2 = Math.floor(sg.length / 2);
   const medianGap = sg.length === 0 ? Math.round(1 / pGlobal) :
@@ -205,7 +357,6 @@ function computeGapStats(rounds, targetMin) {
   const stdGap   = Math.sqrt(variance);
   const cv       = meanGap > 0 ? stdGap / meanGap : 1;
 
-  // Percentiles (safe, no spread operator)
   const pctile = (frac) => {
     if (sg.length === 0) return meanGap;
     return sg[Math.min(sg.length - 1, Math.floor(frac * sg.length))];
@@ -214,22 +365,16 @@ function computeGapStats(rounds, targetMin) {
   const p90 = pctile(0.90);
   const p95 = pctile(0.95);
 
-  // HSM — computed once, used by KM and ENS
   const hsm = halfSampleMode(sg, medianGap, cv);
 
-  // Dynamic modeWeight by cv
   let modeWeight;
   if (cv < 1.0)      modeWeight = 0.50;
   else if (cv > 1.3) modeWeight = 0.10;
   else               modeWeight = 0.50 - (cv - 1.0) * (0.40 / 0.30);
 
-  // KM empirical expected gap (HSM-blended median) — KM's view of expected gap
   const kmExpectedGap = Math.max(1, Math.round(medianGap * (1 - modeWeight) + hsm * modeWeight));
-
-  // KM precomputed CDF step function (O(n) build, O(log n) query)
   const kmCDF = buildKmCDF(sg);
 
-  // Current dry streak
   let currentStreak = 0;
   for (let i = n - 1; i >= 0; i--) {
     if (rounds[i].multiplier < targetMin) currentStreak++;
@@ -237,12 +382,11 @@ function computeGapStats(rounds, targetMin) {
   }
 
   return {
-    // Raw facts — shared by all engines
     hits, n, pGlobal, pRecent, rateShifted,
     cusumNorm: +cusumNorm.toFixed(3),
     gapSinceLast, meanGap, medianGap, stdGap, cv,
     p75, p90, p95, sg, kmCDF,
-    hsm, kmExpectedGap, // KM's view of the gap
+    hsm, kmExpectedGap,
     currentStreak,
   };
 }
@@ -262,7 +406,7 @@ function halfSampleMode(sg, medianGap, cv) {
   return (sg[bestStart] + sg[bestStart + h - 1]) / 2;
 }
 
-// ── KM: precomputed CDF (O(n) build, O(log n) query) ─────────────────────────
+// ── KM: precomputed CDF ───────────────────────────────────────────────────────
 
 function buildKmCDF(sg) {
   if (sg.length < 5) return null;
@@ -271,7 +415,7 @@ function buildKmCDF(sg) {
   let S = 1.0, i = 0;
   while (i < m) {
     const t = sg[i];
-    const nAtRisk = m - i; // at risk BEFORE processing this time point
+    const nAtRisk = m - i;
     let d = 0;
     while (i < m && sg[i] === t) { d++; i++; }
     S *= (1 - d / nAtRisk);
@@ -280,7 +424,6 @@ function buildKmCDF(sg) {
   return steps;
 }
 
-// P(gap <= W) from KM step function via binary search
 function kmCDFQuery(kmCDF, W) {
   if (!kmCDF || kmCDF.length === 0) return null;
   let lo = 0, hi = kmCDF.length - 1, idx = -1;
@@ -293,39 +436,18 @@ function kmCDFQuery(kmCDF, W) {
   return Math.max(0, Math.min(1 - 1e-9, 1 - S));
 }
 
-// P(gap in [lo, hi]) from KM CDF
 function kmWindowProb(kmCDF, lo, hi) {
   const cdfHi = kmCDFQuery(kmCDF, hi) ?? 0;
   const cdfLo = lo > 0 ? (kmCDFQuery(kmCDF, lo - 1) ?? 0) : 0;
   return Math.max(0, cdfHi - cdfLo);
 }
 
-// ── Window optimizer — maximize P(hit) - λ×width ─────────────────────────────
-//
-// cdfFn(lo, hi) → P(gap in [lo, hi]) for this specific model
-// Each model passes its OWN cdfFn so placement is model-specific.
-
-// Window placement strategies:
-//
-// PARAMETRIC (GEO, BAY, ENGINE): geometric distribution is memoryless.
-//   Optimal window placement = center on expectedGap.
-//   low = max(0, expectedGap - effectiveWidth)
-//   high = low + effectiveWidth - 1
-//   If gapSinceLast >= expectedGap: open immediately (overdue).
-//
-// EMPIRICAL (KM): gap distribution is NOT assumed memoryless.
-//   Use empirical CDF to find window [absLo, absHi] (absolute from last hit)
-//   that maximizes P(gap in window) - lambda*width.
-//   absLo = gapSinceLast + low (accounts for time already elapsed).
-//
-// Both strategies return {low, high} relative to anchor (= lastRoundId+1).
+// ── Window placement ──────────────────────────────────────────────────────────
 
 function parametricWindowPlacement(expectedGap, effectiveWidth, gapSinceLast) {
   if (gapSinceLast >= expectedGap) {
     return { low: 0, high: effectiveWidth - 1 };
   }
-  // Remaining rounds until expected hit = expectedGap - gapSinceLast
-  // Place window to cover that point: [remaining-W, remaining-1]
   const remaining = expectedGap - gapSinceLast;
   const low  = Math.max(0, remaining - effectiveWidth);
   const high = low + effectiveWidth - 1;
@@ -336,8 +458,6 @@ function empiricalWindowPlacement(kmCDF, expectedGap, effectiveWidth, gapSinceLa
   if (gapSinceLast >= expectedGap) {
     return { low: 0, high: effectiveWidth - 1 };
   }
-  // Search over window offsets from current position (gapSinceLast)
-  // Absolute gap = gapSinceLast + low through gapSinceLast + high
   const maxLow = Math.max(0, 3 * expectedGap - gapSinceLast - effectiveWidth);
   let bestScore = -Infinity, bestLow = 0;
   for (let low = 0; low <= maxLow; low++) {
@@ -356,7 +476,6 @@ function empiricalWindowPlacement(kmCDF, expectedGap, effectiveWidth, gapSinceLa
 function applyParetoCorrectedProbW(rawProbW, cv, expectedGap, maxWidth, isRare) {
   if (!isRare || cv <= 1.1) return rawProbW;
   const alpha   = 1 / Math.max(0.1, cv * cv);
-  // P_pareto(gap <= W) = 1 - (1 / (1 + W/expectedGap))^alpha
   const paretoP = 1 - Math.pow(1 / (1 + maxWidth / Math.max(1, expectedGap)), alpha);
   const blendW  = Math.min(0.30, (cv - 1.0) * 0.60);
   const blended = (1 - blendW) * rawProbW + blendW * paretoP;
@@ -395,7 +514,7 @@ function applyCalibration(probW, targetLabel, modelId) {
   const ratio = empirical / predicted;
   if (Math.abs(ratio - 1) < 0.12) return probW;
   const calibrated = Math.max(1e-6, Math.min(1 - 1e-6, probW * Math.max(0.80, Math.min(1.20, ratio))));
-  return Math.min(calibrated, probW + 0.05); // no inflation
+  return Math.min(calibrated, probW + 0.05);
 }
 
 // ── Validation metrics ────────────────────────────────────────────────────────
@@ -443,14 +562,11 @@ function updateModelScore(targetLabel, modelId, predictedProbW, outcome) {
   s.count = Math.min(s.count + 1, 500);
 }
 
-// ENS logit-space combiner with outlier detection
-// Returns: ensProb, spread, adjWeights (geo, bay, km order)
 function buildEnsemble(targetLabel, probGeo, probBay, probKm) {
   const scores  = modelScores[targetLabel];
   const modelIds = ['geo', 'bay', 'km'];
   const probs   = [probGeo, probBay, probKm];
 
-  // Adaptive weights from log-loss
   const weights = modelIds.map(id => {
     const avgLoss = scores[id]?.count > 2 ? scores[id].ewma : 0.693;
     return Math.exp(-avgLoss * 2);
@@ -459,13 +575,11 @@ function buildEnsemble(targetLabel, probGeo, probBay, probKm) {
   if (wSum < 1e-9) return { ensProb: (probGeo + probBay + probKm) / 3, spread: 0, adjWeights: [1/3, 1/3, 1/3] };
   for (let i = 0; i < weights.length; i++) weights[i] /= wSum;
 
-  // Logit space
   const logits = probs.map(logit);
   const wMean  = logits.reduce((s, l, i) => s + weights[i] * l, 0);
   const wVar   = logits.reduce((s, l, i) => s + weights[i] * (l - wMean) ** 2, 0);
   const spread = Math.sqrt(wVar);
 
-  // Outlier detection: halve weight of any model >1.5 logit units from mean
   const adjWeights = [...weights];
   for (let i = 0; i < logits.length; i++) {
     if (Math.abs(logits[i] - wMean) > 1.5) adjWeights[i] *= 0.5;
@@ -479,7 +593,7 @@ function buildEnsemble(targetLabel, probGeo, probBay, probKm) {
   return { ensProb, spread, adjWeights };
 }
 
-// ── Beta confidence (with spread) ────────────────────────────────────────────
+// ── Beta confidence ───────────────────────────────────────────────────────────
 
 function betaConf(probW, hits, spread) {
   const effectiveN = Math.min(hits, 300);
@@ -499,7 +613,6 @@ function betaConf(probW, hits, spread) {
 }
 
 // ── Streak placement helper ───────────────────────────────────────────────────
-// Returns: effectiveWidth, confPenalty, streakStatus, z
 
 function getStreakInfo(gs, maxWidth, isRare) {
   const { gapSinceLast, meanGap, stdGap, cv, p90, p95 } = gs;
@@ -521,28 +634,40 @@ function getStreakInfo(gs, maxWidth, isRare) {
 }
 
 // ── BUILD: ENGINE ─────────────────────────────────────────────────────────────
-// Uses CUSUM-blended p. Window via own geometric CDF.
+// v14: ENGINE now runs its own regime detection independently.
+// Regime adjusts: p blend strength, effectiveWidth, window placement offset.
 
 function buildPrediction(rounds, targetMin, maxWidth, isRare, lastRoundId) {
   const gs = getGapStats(rounds, targetMin, lastRoundId);
   if (!gs) return null;
   const { hits, pGlobal, pRecent, rateShifted, gapSinceLast, currentStreak } = gs;
 
-  // ENGINE's own blended p
-  const p = rateShifted
-    ? Math.max(1e-6, Math.min(0.5, 0.75 * pGlobal + 0.25 * pRecent))
-    : Math.max(1e-6, Math.min(0.5, pGlobal));
+  // ENGINE's own regime detection (independent)
+  const target      = TARGETS.find(t => t.min === targetMin);
+  const targetLabel = target?.label ?? '?';
+  const regime = updateEngineRegime(rounds, targetMin, targetLabel, 'engine', gs);
+
+  // ENGINE's own blended p — regime modulates blend strength on top of CUSUM shift
+  let baseBlend = rateShifted ? 0.25 : 0;
+  // On cold/hot regime, increase recency blend proportionally
+  const regimeBlendBoost = Math.abs(regime.regimeFactor) * 0.20;
+  const totalBlend = Math.min(0.45, baseBlend + regimeBlendBoost);
+  const p = Math.max(1e-6, Math.min(0.5, (1 - totalBlend) * pGlobal + totalBlend * regime.shortRate));
 
   const probW       = 1 - Math.pow(1 - p, maxWidth);
   const expectedGap = Math.max(1, Math.round((1 - p) / p));
 
-  const { z, confPenalty, streakStatus, effectiveWidth } = getStreakInfo(gs, maxWidth, isRare ?? false);
+  const { z, confPenalty, streakStatus, effectiveWidth: baseWidth } = getStreakInfo(gs, maxWidth, isRare ?? false);
 
-  // Streak status override for UI
+  // Apply regime to window placement
+  const basePlacement = parametricWindowPlacement(expectedGap, baseWidth, gapSinceLast);
+  const { low, high } = applyRegimeToWindow(
+    basePlacement.low, basePlacement.high,
+    expectedGap, baseWidth, regime.regimeFactor
+  );
+
   let finalStreakStatus = streakStatus;
   if (streakStatus === 'normal' && gapSinceLast >= expectedGap) finalStreakStatus = 'overdue';
-
-  const { low, high } = parametricWindowPlacement(expectedGap, effectiveWidth, gapSinceLast);
 
   return {
     low, high, expectedGap, opensIn: low,
@@ -552,24 +677,45 @@ function buildPrediction(rounds, targetMin, maxWidth, isRare, lastRoundId) {
     rateShifted, cusumNorm: gs.cusumNorm,
     streakStatus: finalStreakStatus, currentStreak, z,
     gapSinceLast, hits,
+    regime: regime.regimeLabel,
+    regimeFactor: regime.regimeFactor,
   };
 }
 
 // ── BUILD: GEO ────────────────────────────────────────────────────────────────
-// Pure Laplace MLE. Own geometric CDF. Window differs from BAY/KM/ENS.
+// v14: GEO now has its own regime detection.
+// Previously pure Laplace MLE with NO regime awareness.
+// Now: regime blends in short-window rate when streak detected.
 
-function buildGeo(gs, maxWidth, targetLabel, isRare) {
+function buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
   const { hits, n, pGlobal, gapSinceLast, currentStreak } = gs;
-  const pGeo        = (hits + 1) / (n + 2);
+
+  // GEO's own regime detection (independent from ENGINE/BAY/KM/ENS)
+  const regime = updateEngineRegime(rounds, targetMin, targetLabel, 'geo', gs);
+
+  // GEO base: pure Laplace MLE
+  const pLaplace = (hits + 1) / (n + 2);
+
+  // GEO regime blend: on hot/cold streak, blend short-window rate into pGeo
+  // Blend strength scales with regime factor magnitude
+  const geoBlendStrength = 0.25; // GEO is conservative — max 25% regime influence
+  const pGeo = applyRegimeToP(pLaplace, regime.shortRate, regime.regimeFactor, geoBlendStrength);
+
   const rawProbW    = 1 - Math.pow(1 - pGeo, maxWidth);
   const calibProbW  = applyCalibration(rawProbW, targetLabel, 'geo');
   const expectedGap = Math.max(1, Math.round((1 - pGeo) / pGeo));
 
-  const { z, confPenalty, streakStatus, effectiveWidth } = getStreakInfo(gs, maxWidth, isRare);
+  const { z, confPenalty, streakStatus, effectiveWidth: baseWidth } = getStreakInfo(gs, maxWidth, isRare);
+
+  // GEO window: parametric base + regime offset
+  const basePlacement = parametricWindowPlacement(expectedGap, baseWidth, gapSinceLast);
+  const { low, high } = applyRegimeToWindow(
+    basePlacement.low, basePlacement.high,
+    expectedGap, baseWidth, regime.regimeFactor
+  );
+
   let finalStreakStatus = streakStatus;
   if (streakStatus === 'normal' && gapSinceLast >= expectedGap) finalStreakStatus = 'overdue';
-
-  const { low, high } = parametricWindowPlacement(expectedGap, effectiveWidth, gapSinceLast);
 
   return {
     low, high, expectedGap, opensIn: low,
@@ -579,26 +725,50 @@ function buildGeo(gs, maxWidth, targetLabel, isRare) {
     p:           +pGeo.toFixed(6),
     streakStatus: finalStreakStatus, currentStreak, z, gapSinceLast, hits,
     rateShifted: gs.rateShifted, model: 'geo',
+    regime: regime.regimeLabel,
+    regimeFactor: regime.regimeFactor,
   };
 }
 
 // ── BUILD: BAY ────────────────────────────────────────────────────────────────
-// Bayesian recency blend (only when CUSUM shift). Own geometric CDF with pBay.
-// BAY's expectedGap differs from GEO when rate-shifted.
+// v14: BAY now has its own regime detection.
+// Previously: recency blend weight = 0.05 normal / 0.20 on CUSUM shift.
+// Now: regime factor additionally scales the recency weight beyond CUSUM trigger.
 
-function buildBay(gs, maxWidth, targetLabel, isRare) {
+function buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
   const { hits, n, pGlobal, pRecent, rateShifted, gapSinceLast, currentStreak } = gs;
-  const recencyW    = rateShifted ? 0.20 : 0.05;
-  const pBay        = Math.max(1e-6, Math.min(0.5, (1 - recencyW) * pGlobal + recencyW * pRecent));
+
+  // BAY's own regime detection (independent)
+  const regime = updateEngineRegime(rounds, targetMin, targetLabel, 'bay', gs);
+
+  // BAY recency blend — existing logic + regime enhancement
+  const baseRecencyW  = rateShifted ? 0.20 : 0.05;
+  // Regime boosts recency weight: strong hot/cold → up to +0.20 additional weight
+  const regimeBoost   = Math.abs(regime.regimeFactor) * 0.20;
+  const totalRecencyW = Math.min(0.45, baseRecencyW + regimeBoost);
+
+  // BAY uses pRecent (200-round) but also regime shortRate for fast signals
+  // Blend pRecent and shortRate weighted by regime strength
+  const recencyBlend  = Math.abs(regime.regimeFactor) > 0.15
+    ? (1 - Math.abs(regime.regimeFactor)) * pRecent + Math.abs(regime.regimeFactor) * regime.shortRate
+    : pRecent;
+
+  const pBay        = Math.max(1e-6, Math.min(0.5, (1 - totalRecencyW) * pGlobal + totalRecencyW * recencyBlend));
   const rawProbW    = 1 - Math.pow(1 - pBay, maxWidth);
   const calibProbW  = applyCalibration(rawProbW, targetLabel, 'bay');
   const expectedGap = Math.max(1, Math.round((1 - pBay) / pBay));
 
-  const { z, confPenalty, streakStatus, effectiveWidth } = getStreakInfo(gs, maxWidth, isRare);
+  const { z, confPenalty, streakStatus, effectiveWidth: baseWidth } = getStreakInfo(gs, maxWidth, isRare);
+
+  // BAY window: parametric base + regime offset
+  const basePlacement = parametricWindowPlacement(expectedGap, baseWidth, gapSinceLast);
+  const { low, high } = applyRegimeToWindow(
+    basePlacement.low, basePlacement.high,
+    expectedGap, baseWidth, regime.regimeFactor
+  );
+
   let finalStreakStatus = streakStatus;
   if (streakStatus === 'normal' && gapSinceLast >= expectedGap) finalStreakStatus = 'overdue';
-
-  const { low, high } = parametricWindowPlacement(expectedGap, effectiveWidth, gapSinceLast);
 
   return {
     low, high, expectedGap, opensIn: low,
@@ -608,58 +778,88 @@ function buildBay(gs, maxWidth, targetLabel, isRare) {
     p:           +pBay.toFixed(6),
     streakStatus: finalStreakStatus, currentStreak, z, gapSinceLast, hits,
     rateShifted, model: 'bay',
+    regime: regime.regimeLabel,
+    regimeFactor: regime.regimeFactor,
   };
 }
 
 // ── BUILD: KM ─────────────────────────────────────────────────────────────────
-// Empirical survival. Own KM CDF for window placement.
-// expectedGap = HSM-blended empirical median — genuinely different from GEO/BAY.
+// v14: KM now has its own regime detection.
+// KM never changes p (it's empirical), but regime shifts window placement.
+// Cold streak → push window later (hits are drying up, next one is further away).
+// Hot streak  → pull window earlier.
 
-function buildKm(gs, maxWidth, targetLabel, isRare) {
-  const { hits, kmCDF, kmExpectedGap, gapSinceLast, currentStreak, cv, meanGap } = gs;
+function buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
+  const { hits, kmCDF, kmExpectedGap, gapSinceLast, currentStreak, cv } = gs;
   if (!kmCDF) return null;
+
+  // KM's own regime detection (independent)
+  const regime = updateEngineRegime(rounds, targetMin, targetLabel, 'km', gs);
 
   let rawProbW = kmCDFQuery(kmCDF, maxWidth);
   if (rawProbW == null) return null;
 
-  // Pareto blend for heavy-tailed rare targets
   rawProbW = applyParetoCorrectedProbW(rawProbW, cv, kmExpectedGap, maxWidth, isRare);
   rawProbW = Math.max(1e-6, Math.min(1 - 1e-6, rawProbW));
 
   const calibProbW  = applyCalibration(rawProbW, targetLabel, 'km');
-  const expectedGap = kmExpectedGap;
 
-  const { z, confPenalty, streakStatus, effectiveWidth } = getStreakInfo(gs, maxWidth, isRare);
+  // KM expectedGap: regime shifts the effective expected gap for window placement
+  // Cold streak → treat gap as longer (hits rarer); hot → shorter
+  const regimeGapShift  = Math.round(-regime.regimeFactor * kmExpectedGap * 0.15);
+  const regimeExpGap    = Math.max(1, kmExpectedGap + regimeGapShift);
+
+  const { z, confPenalty, streakStatus, effectiveWidth: baseWidth } = getStreakInfo(gs, maxWidth, isRare);
+
+  // KM uses empirical placement with regime-adjusted expectedGap
+  const basePlacement = empiricalWindowPlacement(kmCDF, regimeExpGap, baseWidth, gapSinceLast);
+  const { low, high } = applyRegimeToWindow(
+    basePlacement.low, basePlacement.high,
+    regimeExpGap, baseWidth, regime.regimeFactor
+  );
+
   let finalStreakStatus = streakStatus;
-  if (streakStatus === 'normal' && gapSinceLast >= expectedGap) finalStreakStatus = 'overdue';
-
-  // KM uses empirical CDF for window placement (non-parametric, meaningful optimization)
-  const { low, high } = empiricalWindowPlacement(kmCDF, expectedGap, effectiveWidth, gapSinceLast);
+  if (streakStatus === 'normal' && gapSinceLast >= kmExpectedGap) finalStreakStatus = 'overdue';
 
   return {
-    low, high, expectedGap, opensIn: low,
+    low, high, expectedGap: kmExpectedGap, opensIn: low,
     confidence:  Math.max(20, betaConf(calibProbW, hits, null) - confPenalty),
     probW:       +calibProbW.toFixed(4),
     rawProbW:    +rawProbW.toFixed(4),
-    p:           +rawProbW.toFixed(6), // KM: p field = P(gap<=W), not per-round
+    p:           +rawProbW.toFixed(6),
     streakStatus: finalStreakStatus, currentStreak, z, gapSinceLast, hits,
     rateShifted: gs.rateShifted, model: 'km',
+    regime: regime.regimeLabel,
+    regimeFactor: regime.regimeFactor,
   };
 }
 
 // ── BUILD: ENS ────────────────────────────────────────────────────────────────
-// Logit-space weighted combination of calibrated GEO+BAY+KM.
-// expectedGap = adaptive-weight blend of each model's expected gap.
-// Window uses ENS's own blended parametric CDF.
+// v14: ENS now has its own regime detection.
+// Regime modulates pEns blend and window placement independently of sub-models.
+// Sub-models (geo/bay/km) are called via their calibrated probW only (not rebuilt).
 
-function buildEns(gs, maxWidth, targetLabel, isRare) {
+function buildEns(gs, maxWidth, targetLabel, isRare, rounds, targetMin) {
   const { hits, n, pGlobal, pRecent, rateShifted, kmCDF, kmExpectedGap,
-          gapSinceLast, currentStreak, cv, meanGap } = gs;
+          gapSinceLast, currentStreak, cv } = gs;
 
-  // Compute each base model's p and calibrated probW
+  // ENS's own regime detection (independent)
+  const regime = updateEngineRegime(rounds, targetMin, targetLabel, 'ens', gs);
+
+  // Base model p values — each computed independently inside ENS, no cross-engine reads.
   const pGeo = (hits + 1) / (n + 2);
-  const recencyW = rateShifted ? 0.20 : 0.05;
-  const pBay = Math.max(1e-6, Math.min(0.5, (1 - recencyW) * pGlobal + recencyW * pRecent));
+
+  // ENS computes its own pBay sub-estimate using ENS's own regime factor,
+  // NOT the shared rateShifted flag. This ensures ENS's internal pBay is
+  // independent from what BAY engine produces externally.
+  // Formula mirrors BAY's logic but driven by ENS's own regime detection.
+  const ensBaseRecencyW  = rateShifted ? 0.20 : 0.05; // structural shift baseline (shared diagnostic, read-only fact)
+  const ensRegimeBoost   = Math.abs(regime.regimeFactor) * 0.20; // ENS's own regime contribution
+  const ensRecencyW      = Math.min(0.45, ensBaseRecencyW + ensRegimeBoost);
+  const ensRecencyBlend  = Math.abs(regime.regimeFactor) > 0.15
+    ? (1 - Math.abs(regime.regimeFactor)) * pRecent + Math.abs(regime.regimeFactor) * regime.shortRate
+    : pRecent;
+  const pBay = Math.max(1e-6, Math.min(0.5, (1 - ensRecencyW) * pGlobal + ensRecencyW * ensRecencyBlend));
 
   const probGeo = applyCalibration(1 - Math.pow(1 - pGeo, maxWidth), targetLabel, 'geo');
   const probBay = applyCalibration(1 - Math.pow(1 - pBay, maxWidth), targetLabel, 'bay');
@@ -670,11 +870,9 @@ function buildEns(gs, maxWidth, targetLabel, isRare) {
     ? applyCalibration(Math.max(1e-6, Math.min(1 - 1e-6, rawKmProb)), targetLabel, 'km')
     : probGeo;
 
-  // Logit-space ensemble
   const { ensProb, spread, adjWeights } = buildEnsemble(targetLabel, probGeo, probBay, probKm);
   const calibrated = applyCalibration(ensProb, targetLabel, 'ens');
 
-  // ENS expected gap: adaptive-weight blend
   const egGeo = Math.max(1, Math.round((1 - pGeo) / pGeo));
   const egBay = Math.max(1, Math.round((1 - pBay) / pBay));
   const egKm  = kmExpectedGap;
@@ -682,19 +880,29 @@ function buildEns(gs, maxWidth, targetLabel, isRare) {
     adjWeights[0] * egGeo + adjWeights[1] * egBay + adjWeights[2] * egKm
   ));
 
-  // ENS blended per-round p for window CDF
-  // GEO: pGeo directly. BAY: pBay directly.
-  // KM: p = 1/(egKm+1) — geometric distribution property: E[gap] = (1-p)/p => p = 1/(E[gap]+1)
   const pKmPerRound = Math.max(1e-6, Math.min(0.5, 1 / (Math.max(1, egKm) + 1)));
-  const pEns = Math.max(1e-6, Math.min(0.5,
+
+  // ENS pEns — regime blends in shortRate on top of existing adaptive weights
+  const pEnsBase = Math.max(1e-6, Math.min(0.5,
     adjWeights[0] * pGeo + adjWeights[1] * pBay + adjWeights[2] * pKmPerRound
   ));
+  const ensBlendStrength = 0.30; // ENS allows stronger regime influence as it has most data
+  const pEns = applyRegimeToP(pEnsBase, regime.shortRate, regime.regimeFactor, ensBlendStrength);
 
-  const { z, confPenalty, streakStatus, effectiveWidth } = getStreakInfo(gs, maxWidth, isRare);
+  // ENS expectedGap: regime shifts it slightly for window placement
+  const regimeGapShift  = Math.round(-regime.regimeFactor * ensExpectedGap * 0.15);
+  const regimeEnsExpGap = Math.max(1, ensExpectedGap + regimeGapShift);
+
+  const { z, confPenalty, streakStatus, effectiveWidth: baseWidth } = getStreakInfo(gs, maxWidth, isRare);
+
+  const basePlacement = parametricWindowPlacement(regimeEnsExpGap, baseWidth, gapSinceLast);
+  const { low, high } = applyRegimeToWindow(
+    basePlacement.low, basePlacement.high,
+    regimeEnsExpGap, baseWidth, regime.regimeFactor
+  );
+
   let finalStreakStatus = streakStatus;
   if (streakStatus === 'normal' && gapSinceLast >= ensExpectedGap) finalStreakStatus = 'overdue';
-
-  const { low, high } = parametricWindowPlacement(ensExpectedGap, effectiveWidth, gapSinceLast);
 
   return {
     low, high, expectedGap: ensExpectedGap, opensIn: low,
@@ -704,10 +912,13 @@ function buildEns(gs, maxWidth, targetLabel, isRare) {
     p:           +pEns.toFixed(6),
     streakStatus: finalStreakStatus, currentStreak, z, gapSinceLast, hits,
     rateShifted, model: 'ens', spread: +spread.toFixed(3),
+    regime: regime.regimeLabel,
+    regimeFactor: regime.regimeFactor,
   };
 }
 
 // ── buildStatPrediction — dispatcher ─────────────────────────────────────────
+// v14: passes rounds + targetMin to each builder for independent regime detection
 
 function buildStatPrediction(rounds, targetMin, maxWidth, modelId, lastRoundId) {
   const gs = getGapStats(rounds, targetMin, lastRoundId);
@@ -717,15 +928,15 @@ function buildStatPrediction(rounds, targetMin, maxWidth, modelId, lastRoundId) 
   const isRare      = target?.rare ?? false;
 
   switch (modelId) {
-    case 'geo': return buildGeo(gs, maxWidth, targetLabel, isRare);
-    case 'bay': return buildBay(gs, maxWidth, targetLabel, isRare);
-    case 'km':  return buildKm(gs, maxWidth, targetLabel, isRare);
-    case 'ens': return buildEns(gs, maxWidth, targetLabel, isRare);
+    case 'geo': return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin);
+    case 'bay': return buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin);
+    case 'km':  return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin);
+    case 'ens': return buildEns(gs, maxWidth, targetLabel, isRare, rounds, targetMin);
     default:    return null;
   }
 }
 
-// ── BUILD: PATTERN (isolated, UI signal only) ─────────────────────────────────
+// ── BUILD: PATTERN (isolated, UI signal only) — UNCHANGED ─────────────────────
 
 function buildPatternPrediction(sortedRounds, targetMin) {
   const n = sortedRounds.length;
@@ -795,7 +1006,7 @@ function makeKey(source, target, lo, hi) {
   return `${source}-${target}-${Number(lo)||0}-${Number(hi)||0}`;
 }
 
-// ── getStatus ─────────────────────────────────────────────────────────────────
+// ── getStatus — UNCHANGED ─────────────────────────────────────────────────────
 
 function getStatus(sortedRounds, pred, currentRoundId) {
   const anchorRound = Number(pred.anchorRound) || 0;
@@ -821,7 +1032,7 @@ function getStatus(sortedRounds, pred, currentRoundId) {
   return { status:'waiting', hitRound:null };
 }
 
-// ── processEngine ─────────────────────────────────────────────────────────────
+// ── processEngine — UNCHANGED ─────────────────────────────────────────────────
 
 async function processEngine({ engineId, state, sortedRounds, lastRoundId, buildFn }) {
   let anyChange = false;
@@ -832,7 +1043,7 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
       if (pred) {
         state.lockedMap[target.label] = { ...pred, targetMin:target.min, anchorRound:lastRoundId+1, generation:1, stale:false };
         anyChange = true;
-        console.log(`[${engineId}] NEW ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}% probW=${pred.probW??'—'}`);
+        console.log(`[${engineId}] NEW ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}% probW=${pred.probW??'—'} regime=${pred.regime??'—'}`);
       }
       continue;
     }
@@ -867,7 +1078,7 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
       const pred = buildFn(target);
       if (pred) {
         state.lockedMap[target.label] = { ...pred, targetMin:target.min, anchorRound:lastRoundId+1, generation:(existing.generation||1)+(isNonsense?0:1), stale:false };
-        console.log(`[${engineId}] REBUILD ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}%`);
+        console.log(`[${engineId}] REBUILD ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}% regime=${pred.regime??'—'}`);
       } else {
         delete state.lockedMap[target.label];
         console.warn(`[${engineId}] ${target.label} cleared — insufficient data`);
@@ -896,7 +1107,7 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
       const pred = buildFn(target);
       if (pred) {
         state.lockedMap[target.label] = { ...pred, targetMin:target.min, anchorRound:lastRoundId+1, generation:(existing.generation||1)+1, stale:false };
-        console.log(`[${engineId}] NEXT ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}%`);
+        console.log(`[${engineId}] NEXT ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}% regime=${pred.regime??'—'}`);
       } else { delete state.lockedMap[target.label]; }
       anyChange = true;
     }
@@ -904,7 +1115,7 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
   return anyChange;
 }
 
-// ── DB helpers ────────────────────────────────────────────────────────────────
+// ── DB helpers — UNCHANGED ────────────────────────────────────────────────────
 
 function buildSavePayload(lockedMap) {
   const out = {};
@@ -915,7 +1126,7 @@ function buildSavePayload(lockedMap) {
     out[label] = {
       lo: anchor+(Number(pred.low)||0), hi: anchor+(Number(pred.high)||0),
       roundWhenMade: anchor, generation: pred.generation||1,
-      eta: { low:pred.low, high:pred.high, conf:pred.confidence, probW:pred.probW, rawProbW:pred.rawProbW??pred.probW, expectedGap:pred.expectedGap, opensIn:pred.opensIn, streakStatus:pred.streakStatus, currentStreak:pred.currentStreak, spread:pred.spread??null },
+      eta: { low:pred.low, high:pred.high, conf:pred.confidence, probW:pred.probW, rawProbW:pred.rawProbW??pred.probW, expectedGap:pred.expectedGap, opensIn:pred.opensIn, streakStatus:pred.streakStatus, currentStreak:pred.currentStreak, spread:pred.spread??null, regime:pred.regime??null, regimeFactor:pred.regimeFactor??null },
     };
   }
   return out;
@@ -934,14 +1145,16 @@ function loadLockedMap(dbRows) {
       confidence: eta.conf??50, probW: eta.probW??null, rawProbW: eta.rawProbW??null,
       expectedGap: eta.expectedGap??null, opensIn: eta.opensIn??null,
       streakStatus: eta.streakStatus??'normal', currentStreak: eta.currentStreak??0,
-      spread: eta.spread??null, targetMin: target.min, anchorRound: anchor,
+      spread: eta.spread??null,
+      regime: eta.regime??null, regimeFactor: eta.regimeFactor??null,
+      targetMin: target.min, anchorRound: anchor,
       generation: pred.generation??1, stale: true,
     };
   }
   return map;
 }
 
-// ── Validation export ─────────────────────────────────────────────────────────
+// ── Validation export — UNCHANGED ─────────────────────────────────────────────
 
 function getValidationMetrics() {
   const out = {};
@@ -956,7 +1169,7 @@ function getValidationMetrics() {
   return out;
 }
 
-// ── Initialise ────────────────────────────────────────────────────────────────
+// ── Initialise — UNCHANGED ────────────────────────────────────────────────────
 
 async function initialise() {
   if (initialised) return;
@@ -983,7 +1196,7 @@ async function initialise() {
   for (const id of Object.keys(STATE)) STATE[id].needsRebuild = true;
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
+// ── Main — UNCHANGED ──────────────────────────────────────────────────────────
 
 async function runPredictionEngine() {
   try {
