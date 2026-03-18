@@ -44,10 +44,10 @@ const TARGETS = [
 ];
 
 const STAT_MODELS = [
-  { id: 'ens', wOffset: 1 },
-  { id: 'geo', wOffset: 0 },
-  { id: 'bay', wOffset: 2 },
-  { id: 'km',  wOffset: 4 },
+  { id: 'ens' },
+  { id: 'geo' },
+  { id: 'bay' },
+  { id: 'km'  },
 ];
 
 const MIN_ROUNDS = 50;
@@ -197,30 +197,37 @@ function buildStatPrediction(sortedRounds, targetMin, maxWidth, modelId) {
     pModel = (hits + 1) / (n + 2);
 
   } else if (modelId === 'bay') {
-    // Bayesian: global + recency blend, heavier recency if CUSUM shift
-    const recencyW = rateShifted ? 0.35 : 0.10;
+    // Bayesian: global posterior + small recency correction
+    // Only blend recent when CUSUM confirms actual rate shift
+    // Low weight to avoid overfitting streaks
+    const recencyW = rateShifted ? 0.20 : 0.05;
     pModel = (1 - recencyW) * pGlobal + recencyW * pRecent;
 
   } else if (modelId === 'km') {
-    // KM: empirical P(gap ≤ maxWidth) from historical gaps
+    // KM: estimate per-round p from empirical gap distribution median
+    // Then apply same geometric formula as other models — no special treatment
     if (gaps.length < 5) return null;
-    const hitsInW = gaps.filter(g => g <= maxWidth).length;
-    pModel = (hitsInW + 1) / (gaps.length + 2);
+    // Use median gap as the best non-parametric estimate of expected inter-event time
+    const sg = [...gaps].sort((a, b) => a - b);
+    const mid = Math.floor(sg.length / 2);
+    const empiricalMedian = sg.length % 2 === 1 ? sg[mid] : (sg[mid-1] + sg[mid]) / 2;
+    // p = 1 / (median + 1) — geometric distribution property
+    pModel = Math.max(1e-6, Math.min(0.5, 1 / (empiricalMedian + 1)));
 
   } else {
     // ENS: independent weighted combination — geo 0.60, bay 0.30, km 0.10
     const pGeo = (hits + 1) / (n + 2);
-    const recencyW = rateShifted ? 0.35 : 0.10;
+    const recencyW = rateShifted ? 0.20 : 0.05;
     const pBay = (1 - recencyW) * pGlobal + recencyW * pRecent;
     const pKm = gaps.length >= 5
       ? (gaps.filter(g => g <= maxWidth).length + 1) / (gaps.length + 2)
       : pGeo;
-    pModel = 0.60 * pGeo + 0.30 * pBay + 0.10 * pKm;
+    pModel = 0.55 * pGeo + 0.30 * pBay + 0.15 * pKm;
   }
 
-  pModel = Math.max(1e-6, Math.min(0.999, pModel));
-  // KM pModel is already P(gap ≤ W), others need geometric transform
-  const probW = modelId === 'km' ? pModel : 1 - Math.pow(1 - pModel, maxWidth);
+  pModel = Math.max(1e-6, Math.min(0.5, pModel));
+  // All models use the same geometric window probability
+  const probW = 1 - Math.pow(1 - pModel, maxWidth);
 
   // Expected gap from pGlobal (unblended, pure base rate)
   const rawExpectedGap = (1 - pGlobal) / pGlobal;
@@ -581,7 +588,7 @@ async function runPredictionEngine() {
       ...STAT_MODELS.map(model => ({
         id: model.id,
         state: STATE[model.id],
-        buildFn: (t) => buildStatPrediction(rounds, t.min, t.maxWidth + model.wOffset, model.id),
+        buildFn: (t) => buildStatPrediction(rounds, t.min, t.maxWidth, model.id),
         saveFn:  async (p) => { if (Object.keys(p).length) await saveLockedStatPreds(model.id, p); },
       })),
     ];
