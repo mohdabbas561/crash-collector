@@ -92,6 +92,7 @@ const STAT_MODELS = [
   { id: 'prp'  },   // Prophet               — pure JS seasonality/cycle
   { id: 'gru'  },   // GRU Neural Net        — pure JS gated recurrent
   { id: 'ifor' },   // Isolation Forest      — pure JS anomaly detection
+  { id: 'meta' },   // Meta-Ensemble         — weighted average of all 9 ML engines
 ];
 
 // ── Lazy-load ML libraries (installed via npm, optional) ─────────────────────
@@ -213,7 +214,7 @@ for (const t of TARGETS) {
 
 // ── Per-engine independent CUSUM / regime state ───────────────────────────────
 const engineCusumState = {};
-for (const id of ['engine', 'ens', 'geo', 'bay', 'km', 'rf', 'gbt', 'lr', 'nb', 'lstm', 'lgbm', 'prp', 'gru', 'ifor']) {
+for (const id of ['engine', 'ens', 'geo', 'bay', 'km', 'rf', 'gbt', 'lr', 'nb', 'lstm', 'lgbm', 'prp', 'gru', 'ifor', 'meta']) {
   engineCusumState[id] = {};
   for (const t of TARGETS) {
     engineCusumState[id][t.label] = {
@@ -246,6 +247,7 @@ const STATE = {
   prp:     { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
   gru:     { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
   ifor:    { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
+  meta:    { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
 };
 
 // ── Per-engine last-hit tracker ────────────────────────────────────────────────
@@ -253,7 +255,7 @@ const STATE = {
 // per target. This drives independent gapSinceLast so windows diverge.
 // Initialised to -1 (unknown — falls back to shared gapStats on first run).
 const engineLastHit = {};
-for (const id of ['engine', 'ens', 'geo', 'bay', 'km', 'rf', 'gbt', 'lr', 'nb', 'lstm', 'lgbm', 'prp', 'gru', 'ifor']) {
+for (const id of ['engine', 'ens', 'geo', 'bay', 'km', 'rf', 'gbt', 'lr', 'nb', 'lstm', 'lgbm', 'prp', 'gru', 'ifor', 'meta']) {
   engineLastHit[id] = {};
   for (const t of TARGETS) engineLastHit[id][t.label] = -1;
 }
@@ -1596,6 +1598,7 @@ function buildStatPrediction(rounds, targetMin, maxWidth, modelId, lastRoundId) 
     case 'prp':  return buildServerPRP(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
     case 'gru':  return buildServerGRU(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
     case 'ifor': return buildServerIFOR(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
+    case 'meta':  return buildMeta(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
     default:     return null;
   }
 }
@@ -1650,11 +1653,12 @@ function extractMLFeatures(gs, rounds, targetMin) {
 // Converts feature vector to labelled training rows from historical gaps
 // Returns { X: number[][], y: number[] } for binary classification (hit in next W rounds)
 function buildMLDataset(rounds, targetMin, maxWidth) {
-  // Fast O(n) dataset builder — caps at last 500 rounds, no O(n²) re-scanning
+  // O(n) sliding window — uses ALL available rounds for richer training signal
+  // Each sample uses a fixed CONTEXT window so complexity stays O(n), not O(n²)
   const X = [], y = [];
-  const CAP = 500; // hard cap — prevents blocking the event loop
-  const CONTEXT = 100; // feature context window per sample
-  const trainRounds = rounds.slice(-Math.min(rounds.length, CAP + maxWidth));
+  const CONTEXT = 100; // fixed context window per sample — keeps O(n)
+  // Use all rounds passed in (up to 5000 from DB fetch)
+  const trainRounds = rounds;
   if (trainRounds.length < CONTEXT + maxWidth + 10) return { X, y };
 
   for (let i = CONTEXT; i < trainRounds.length - maxWidth; i++) {
@@ -2073,15 +2077,14 @@ function buildLSTM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineG
         return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
       }
 
-      // Build training sequences — cap at last 400 rounds to prevent blocking
+      // Build training sequences — all available rounds for richer pattern learning
       const sequences = [], labels = [];
-      const lstmTrainRounds = rounds.slice(-Math.min(rounds.length, 400 + maxWidth));
-      for (let i = LSTM_SEQ_LEN; i < lstmTrainRounds.length - maxWidth; i++) {
-        const seq = lstmTrainRounds.slice(i-LSTM_SEQ_LEN, i).map(r => {
+      for (let i = LSTM_SEQ_LEN; i < rounds.length - maxWidth; i++) {
+        const seq = rounds.slice(i-LSTM_SEQ_LEN, i).map(r => {
           const v = r.multiplier;
           return Math.min(1, Math.log(Math.max(1, v)) / Math.log(Math.max(2, targetMin*2)));
         });
-        const label = lstmTrainRounds.slice(i, i+maxWidth).some(r=>r.multiplier>=targetMin) ? 1 : 0;
+        const label = rounds.slice(i, i+maxWidth).some(r=>r.multiplier>=targetMin) ? 1 : 0;
         sequences.push(seq);
         labels.push(label);
       }
@@ -2144,10 +2147,10 @@ function srvExtractFeatures(gs, rounds, targetMin) {
 }
 
 function srvBuildDataset(rounds, targetMin, maxWidth) {
-  // O(n) sliding window — cap at 500 rounds to prevent blocking
+  // O(n) sliding window — uses ALL available rounds for richer training signal
   const X = [], y = [];
-  const CAP = 500, CONTEXT = 100;
-  const trainRounds = rounds.slice(-Math.min(rounds.length, CAP + maxWidth));
+  const CONTEXT = 100; // fixed context window per sample — keeps O(n)
+  const trainRounds = rounds;
   if (trainRounds.length < CONTEXT + maxWidth + 10) return { X, y };
   for (let i = CONTEXT; i < trainRounds.length - maxWidth; i++) {
     const ctx = trainRounds.slice(i - CONTEXT, i);
@@ -2254,8 +2257,7 @@ function buildServerGRU(gs, maxWidth, targetLabel, isRare, rounds, targetMin, en
     if(srvNeedsRetrain(key,rounds.length)){
       if(rounds.length<80)return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
       const seqs=[],labels=[],logMax=Math.log(Math.max(2,targetMin*2));
-      const gruTrainRounds=rounds.slice(-Math.min(rounds.length,400+maxWidth));
-      for(let i=SRV_GRU_SEQ;i<gruTrainRounds.length-maxWidth;i++){const seq=gruTrainRounds.slice(i-SRV_GRU_SEQ,i).map(r=>Math.min(1,Math.log(Math.max(1,r.multiplier))/logMax));const label=gruTrainRounds.slice(i,i+maxWidth).some(r=>r.multiplier>=targetMin)?1:0;seqs.push(seq);labels.push(label);}
+      for(let i=SRV_GRU_SEQ;i<rounds.length-maxWidth;i++){const seq=rounds.slice(i-SRV_GRU_SEQ,i).map(r=>Math.min(1,Math.log(Math.max(1,r.multiplier))/logMax));const label=rounds.slice(i,i+maxWidth).some(r=>r.multiplier>=targetMin)?1:0;seqs.push(seq);labels.push(label);}
       if(seqs.length<15)return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
       let w=srvModelCache[key]?.model??srvInitGRU();
       for(let e=0;e<3;e++){let dwO=w.Wo.map(r=>r.map(()=>0)),dbO=[0];for(let i=0;i<seqs.length;i++){const p=srvGRUFwd(w,seqs[i]),err=p-labels[i];dwO=dwO.map(row=>row.map(ww=>ww+err*0.1));dbO=[dbO[0]+err];}const N=seqs.length;w.Wo=w.Wo.map(row=>row.map((ww,j)=>ww-0.01*dwO[0][j]/N));w.bo=[w.bo[0]-0.01*dbO[0]/N];}
@@ -2293,6 +2295,100 @@ function buildServerIFOR(gs, maxWidth, targetLabel, isRare, rounds, targetMin, e
     prob=anomaly*0.7+Math.min(0.25,(gs.gapSinceLast/Math.max(1,gs.meanGap))*0.12);
   }catch(e){console.warn('[ifor]',e.message);return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);}
   return buildMLWindow(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast,Math.max(0.05,Math.min(0.95,prob)),'ifor');
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ── META ENGINE — Weighted stacking ensemble of all 9 ML engines ──────────────
+//
+// How it works:
+//   1. Runs all 9 ML engines to get their raw probabilities for this target
+//   2. Weights each engine by its ACTUAL win rate from historical DB predictions
+//      (modelScores[target][engineId].ewma — updated every time a window resolves)
+//   3. Takes a weighted average → the single best combined probability
+//   4. Builds a window using buildMLWindow with this blended probability
+//
+// Why it works:
+//   No single model is best for all targets/conditions. Meta learns which engines
+//   are more reliable for each specific target and conditions it over time.
+//   This is "stacking" — the classic ML meta-learning technique.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Per-target per-engine win rate tracker for meta weighting
+// Seeded from modelScores which is already updated from DB history
+function getMetaWeights(targetLabel) {
+  const ML_ENGINE_IDS_LIST = ['rf','gbt','lr','nb','lstm','lgbm','prp','gru','ifor'];
+  const weights = {};
+  let totalW = 0;
+
+  for (const eid of ML_ENGINE_IDS_LIST) {
+    const score = modelScores[targetLabel]?.[eid];
+    // modelScores.ewma is log-loss based: lower = better predictor
+    // Convert to weight: higher win-rate engines get higher weight
+    // ewma starts at 0.693 (log(2), neutral), goes lower as engine improves
+    // Weight = e^(-ewma) so better engines (lower ewma) get higher weight
+    const w = score ? Math.exp(-score.ewma) : 0.5;
+    weights[eid] = w;
+    totalW += w;
+  }
+
+  // Normalise to sum=1
+  if (totalW > 0) {
+    for (const eid of ML_ENGINE_IDS_LIST) weights[eid] /= totalW;
+  } else {
+    // Equal weights fallback
+    const eq = 1 / ML_ENGINE_IDS_LIST.length;
+    for (const eid of ML_ENGINE_IDS_LIST) weights[eid] = eq;
+  }
+
+  return weights;
+}
+
+function buildMeta(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) {
+  // Collect raw probabilities from all 9 ML engines
+  // Each engine uses its own independent model — no shared state
+  const ML_ENGINES = [
+    { id: 'rf',   fn: () => buildRF(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) },
+    { id: 'gbt',  fn: () => buildGBT(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) },
+    { id: 'lr',   fn: () => buildLR(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) },
+    { id: 'nb',   fn: () => buildNB(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) },
+    { id: 'lstm', fn: () => buildLSTM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) },
+    { id: 'lgbm', fn: () => buildServerLGBM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) },
+    { id: 'prp',  fn: () => buildServerPRP(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) },
+    { id: 'gru',  fn: () => buildServerGRU(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) },
+    { id: 'ifor', fn: () => buildServerIFOR(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) },
+  ];
+
+  const weights = getMetaWeights(targetLabel);
+  let weightedProb = 0;
+  let totalWeight  = 0;
+  let validCount   = 0;
+
+  for (const { id, fn } of ML_ENGINES) {
+    try {
+      const result = fn();
+      if (!result || result.probW == null) continue;
+      const prob = Number(result.probW);
+      if (!isFinite(prob)) continue;
+      const w = weights[id] ?? (1 / ML_ENGINES.length);
+      weightedProb += prob * w;
+      totalWeight  += w;
+      validCount++;
+    } catch(e) {
+      console.warn(`[meta] ${id} error:`, e.message);
+    }
+  }
+
+  if (validCount === 0 || totalWeight === 0) {
+    // All engines failed — fall back to geo
+    return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+  }
+
+  // Normalise in case some engines failed
+  const metaProb = Math.max(0.05, Math.min(0.95, weightedProb / totalWeight));
+
+  console.log(`[meta] ${targetLabel}: prob=${metaProb.toFixed(3)} from ${validCount}/9 engines`);
+  return buildMLWindow(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast, metaProb, 'meta');
 }
 
 function buildPatternPrediction(sortedRounds, targetMin) {
@@ -2616,7 +2712,7 @@ function getEngineStats() {
   const out = {};
   for (const t of TARGETS) {
     out[t.label] = {};
-    for (const id of ['engine', 'ens', 'geo', 'bay', 'km', 'rf', 'gbt', 'lr', 'nb', 'lstm', 'lgbm', 'prp', 'gru', 'ifor']) {
+    for (const id of ['engine', 'ens', 'geo', 'bay', 'km', 'rf', 'gbt', 'lr', 'nb', 'lstm', 'lgbm', 'prp', 'gru', 'ifor', 'meta']) {
       const cs = engineCusumState[id]?.[t.label];
       if (!cs) continue;
       const ece = STAT_MODELS.some(m => m.id === id) ? getECE(t.label, id) : null;
@@ -2677,15 +2773,24 @@ async function initialise() {
         const prev = engineLastHit[src][r.target];
         if (prev < r.hitRound) engineLastHit[src][r.target] = r.hitRound;
       }
+      // Seed calibration + model scores from historical outcomes so accuracy
+      // doesn't reset to zero after every server restart
+      if (r.probW != null && ['win','loss','early'].includes(r.outcome) &&
+          STAT_MODELS.some(m => m.id === src)) {
+        try {
+          updateCalibration(r.target, src, r.probW, r.outcome);
+          updateModelScore(r.target, src, r.probW, r.outcome);
+        } catch(_) {}
+      }
     }
-    console.log(`[engine] loaded ${rows.length} history keys`);
+    console.log(`[engine] loaded ${rows.length} history keys (calibration pre-warmed)`);
   } catch(e) { console.error('[engine] history:', e.message); }
   for (const id of Object.keys(STATE)) STATE[id].needsRebuild = true;
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 // ── ML engine IDs — run deferred so they never block the HTTP server ──────────
-const ML_ENGINE_IDS = new Set(['rf','gbt','lr','nb','lstm','lgbm','prp','gru','ifor']);
+const ML_ENGINE_IDS = new Set(['rf','gbt','lr','nb','lstm','lgbm','prp','gru','ifor','meta']);
 
 // Run a single engine, yielding event loop before each one
 function runEngineDeferred(eng, rounds, lastRoundId) {
