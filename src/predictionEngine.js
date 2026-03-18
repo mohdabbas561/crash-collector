@@ -2812,6 +2812,30 @@ function runEngineDeferred(eng, rounds, lastRoundId) {
   });
 }
 
+// Tracks whether a Tier2 background run is already in progress
+// Prevents overlapping Tier2 runs if Tier1 ticks faster than Tier2 completes
+let tier2Running = false;
+
+async function runTier2Background(allEngines, rounds, lastRoundId) {
+  if (tier2Running) return; // skip if previous Tier2 still running
+  tier2Running = true;
+  const t2Start = Date.now();
+  try {
+    const mlEngines  = allEngines.filter(e => ML_ENGINE_IDS.has(e.id) && e.id !== 'meta');
+    const metaEngine = allEngines.find(e => e.id === 'meta');
+    for (const eng of mlEngines) {
+      await runEngineDeferred(eng, rounds, lastRoundId);
+    }
+    // Meta runs last — reads already-trained caches from sub-engines
+    if (metaEngine) await runEngineDeferred(metaEngine, rounds, lastRoundId);
+    console.log(`[engine] Tier2 (ML) done in ${Date.now()-t2Start}ms`);
+  } catch(e) {
+    console.error('[engine] Tier2 error:', e.message);
+  } finally {
+    tier2Running = false;
+  }
+}
+
 async function runPredictionEngine() {
   try {
     await initialise();
@@ -2826,8 +2850,7 @@ async function runPredictionEngine() {
       ...STAT_MODELS.map(model=>({ id:model.id, state:STATE[model.id], buildFn:(t)=>buildStatPrediction(rounds,t.min,t.maxWidth,model.id,lastRoundId), saveFn:async(p)=>{if(Object.keys(p).length)await saveLockedStatPreds(model.id,p);} })),
     ];
 
-    // ── Tier 1: Fast stat engines — run synchronously, these never block ──────
-    // engine, pattern, ens, geo, bay, km
+    // ── Tier 1: Fast stat engines — await this, it's quick (~100ms) ──────────
     const t1Start = Date.now();
     for (const eng of allEngines.filter(e => !ML_ENGINE_IDS.has(e.id))) {
       if (!(lastRoundId > eng.state.lastRoundId || eng.state.needsRebuild)) continue;
@@ -2836,21 +2859,16 @@ async function runPredictionEngine() {
       eng.state.lastRoundId = lastRoundId;
       if (changed) { const p=buildSavePayload(eng.state.lockedMap); try{await eng.saveFn(p);}catch(e){console.error(`[${eng.id}] save:`,e.message);} }
     }
-
     console.log(`[engine] Tier1 done in ${Date.now()-t1Start}ms`);
-    // Enable ML training after fast engines complete
+
+    // Enable ML training after Tier1
     enableMLTraining();
 
-    // ── Tier 2: ML engines — run deferred with setImmediate between each ──────
-    // META runs last so all sub-engines have trained their models first
-    const mlEngines     = allEngines.filter(e => ML_ENGINE_IDS.has(e.id) && e.id !== 'meta');
-    const metaEngine    = allEngines.find(e => e.id === 'meta');
-    for (const eng of mlEngines) {
-      await runEngineDeferred(eng, rounds, lastRoundId);
-    }
-    // Meta runs after all sub-engines so it reads already-trained model caches
-    if (metaEngine) await runEngineDeferred(metaEngine, rounds, lastRoundId);
-    if (mlEngines.length) console.log(`[engine] Tier2 (ML) done in ${Date.now()-t1Start}ms total`);
+    // ── Tier 2: ML engines — fire and forget, runs in background ─────────────
+    // poll() returns immediately after Tier1. Tier2 runs in background.
+    // tier2Running flag prevents overlapping runs.
+    runTier2Background(allEngines, rounds, lastRoundId);
+    // intentionally NOT awaited — poll loop stays on schedule
 
   } catch(e) { console.error('[predictionEngine] Fatal:', e.message, e.stack); }
 }
