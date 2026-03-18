@@ -1751,7 +1751,6 @@ function buildRF(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap
     if (needsRetrain(key, rounds.length)) {
       const { X, y } = buildMLDataset(rounds, targetMin, maxWidth);
       if (X.length < 30) {
-        // Not enough data — fall back
         return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
       }
       const RFClass = RF.RandomForestClassifier || RF;
@@ -1759,6 +1758,9 @@ function buildRF(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap
       rf.train(X, y);
       mlModelCache[key] = { model: rf, trainedAt: rounds.length };
     }
+
+    // Not trained yet — fall back
+    if (!mlModelCache[key]) return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
 
     const feat = extractMLFeatures(gs, rounds, targetMin);
     if (!feat) return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
@@ -1826,6 +1828,9 @@ function buildGBT(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGa
     const feat = extractMLFeatures(gs, rounds, targetMin);
     if (!feat) return buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
 
+    // Not trained yet — fall back
+    if (!mlModelCache[key]) return buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+
     // Score: average of tree predictions weighted by lr
     const { model: trees } = mlModelCache[key];
     const baseRate = gs.pGlobal * maxWidth;
@@ -1892,6 +1897,9 @@ function buildLR(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap
     const feat = extractMLFeatures(gs, rounds, targetMin);
     if (!feat) return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
 
+    // Not trained yet — fall back
+    if (!mlModelCache[key]) return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+
     const { w, b, means, stds } = mlModelCache[key].model;
     const sig = v => 1 / (1 + Math.exp(-Math.max(-20, Math.min(20, v))));
     const xn  = feat.map((v, j) => (v - means[j]) / stds[j]);
@@ -1930,6 +1938,9 @@ function buildNB(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap
 
     const feat = extractMLFeatures(gs, rounds, targetMin);
     if (!feat) return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+
+    // Not trained yet — fall back
+    if (!mlModelCache[key]) return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
 
     // Predict returns class labels; use predictProba if available
     if (mlModelCache[key].model.predictProba) {
@@ -2080,6 +2091,9 @@ function buildLSTM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineG
     if (seq.length < LSTM_SEQ_LEN) {
       return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
     }
+
+    // Not trained yet — fall back
+    if (!mlModelCache[key]) return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
 
     prob = lstmForward(mlModelCache[key].model, seq);
   } catch(e) {
