@@ -116,7 +116,7 @@ function enableMLTraining() {
 }
 
 const MIN_ROUNDS                    = 50;
-const STALE_FORCE_REBUILD_THRESHOLD = 200;
+const STALE_FORCE_REBUILD_THRESHOLD = 500;
 const WINDOW_LAMBDA                 = 0.008;
 
 // ── Regime constants ──────────────────────────────────────────────────────────
@@ -1780,11 +1780,13 @@ function buildRF(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap
     const pred   = mlModelCache[key].model.predict([feat])[0];
     const probas = mlModelCache[key].model.predictProbability ? mlModelCache[key].model.predictProbability([feat]) : null;
     // ml-random-forest returns class label; try to get probability of class 1
-    if (probas && probas[0] && probas[0][1] != null) {
-      prob = probas[0][1];
+    if (probas && probas[0] != null) {
+      const row = probas[0];
+      prob = (Array.isArray(row) ? row[1] : row['1']) ?? (Array.isArray(row) ? row[1] : 0.5);
+      if (prob == null) prob = pred === 1 ? Math.min(0.85, gs.pGlobal * maxWidth * 1.3) : Math.max(0.05, gs.pGlobal * maxWidth * 0.7);
     } else {
-      // Fall back: use hit rate from geo but modulate by prediction
-      prob = pred === 1 ? Math.min(0.85, gs.pGlobal * maxWidth * 1.3) : Math.max(0.05, gs.pGlobal * maxWidth * 0.7);
+      const isHit = pred === 1 || pred === '1';
+      prob = isHit ? Math.min(0.85, gs.pGlobal * maxWidth * 1.3) : Math.max(0.05, gs.pGlobal * maxWidth * 0.7);
     }
   } catch(e) {
     console.warn('[rf] predict error:', e.message);
@@ -1837,11 +1839,11 @@ function buildGBT(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGa
       mlModelCache[key] = { model: trees, trainedAt: rounds.length, lr };
     }
 
-    const feat = extractMLFeatures(gs, rounds, targetMin);
-    if (!feat) return buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
-
     // Not trained yet — fall back
     if (!mlModelCache[key]) return buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+
+    const feat = extractMLFeatures(gs, rounds, targetMin);
+    if (!feat) return buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
 
     // Score: average of tree predictions weighted by lr
     const { model: trees } = mlModelCache[key];
@@ -1944,7 +1946,7 @@ function buildNB(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap
 
       // ml-naivebayes: GaussianNB
       const nb = new NB();  // getNB() returns GaussianNB class directly
-      nb.train(X, y);
+      nb.train(X, y.map(String)); // ml-naivebayes expects string labels
       mlModelCache[key] = { model: nb, trainedAt: rounds.length };
     }
 
@@ -1957,11 +1959,13 @@ function buildNB(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap
     // Predict returns class labels; use predictProba if available
     if (mlModelCache[key].model.predictProba) {
       const probas = mlModelCache[key].model.predictProba([feat]);
-      // Returns [[p0, p1]] — probability of class 1
-      prob = probas[0][1] ?? 0.5;
+      // Returns [[p0, p1]] or {0: p0, 1: p1} depending on version
+      const row = probas[0];
+      prob = (Array.isArray(row) ? row[1] : row['1']) ?? 0.5;
     } else {
       const pred = mlModelCache[key].model.predict([feat])[0];
-      prob = pred === 1
+      const isHit = pred === 1 || pred === '1' || pred === true;
+      prob = isHit
         ? Math.min(0.85, gs.pGlobal * maxWidth * 1.25)
         : Math.max(0.05, gs.pGlobal * maxWidth * 0.75);
     }
@@ -2025,22 +2029,20 @@ function lstmForward(weights, seq) {
 }
 
 function trainLSTMWeights(weights, sequences, labels, lr, epochs) {
-  // Approximate gradient via finite differences on output layer only (fast)
-  const eps  = 1e-4;
-  const { Wy, by } = weights;
+  // Train output layer weights only (fast approximation)
   for (let epoch = 0; epoch < epochs; epoch++) {
-    let dwY = Wy.map(r=>r.map(()=>0));
+    let dwY = weights.Wy.map(r=>r.map(()=>0));
     let dbY = [0];
     for (let i = 0; i < sequences.length; i++) {
       const pred = lstmForward(weights, sequences[i]);
       const err  = pred - labels[i];
-      // Only backprop through the output layer weights
+      // Get final hidden state by running forward pass
       const h = (() => {
         const seq = sequences[i];
         const H = LSTM_HIDDEN;
         let hh = new Array(H).fill(0), cc = new Array(H).fill(0);
         const { Wi,Ui,bi,Wf,Uf,bf,Wg,Ug,bg,Wo,Uo,bo } = weights;
-        const mv = (M,v)=>M.map(row=>row.reduce((s,w,k)=>s+w*v[k],0));
+        const mv = (M,v)=>M.map(row=>row.reduce((s,ww,k)=>s+ww*v[k],0));
         const add=(a,b)=>a.map((x,j)=>x+b[j]);
         for (const x of seq) {
           const xv=[x];
@@ -2057,8 +2059,9 @@ function trainLSTMWeights(weights, sequences, labels, lr, epochs) {
       dbY = [dbY[0] + err];
     }
     const N = sequences.length;
-    weights.Wy = Wy.map((row,ri) => row.map((w,j) => w - lr * dwY[ri][j] / N));
-    weights.by = [by[0] - lr * dbY[0] / N];
+    // Update weights in-place using current epoch's weights (not stale captured vars)
+    weights.Wy = weights.Wy.map((row,ri) => row.map((w,j) => w - lr * dwY[ri][j] / N));
+    weights.by = [weights.by[0] - lr * dbY[0] / N];
   }
   return weights;
 }
@@ -2688,6 +2691,30 @@ async function initialise() {
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
+// ── ML engine IDs — run deferred so they never block the HTTP server ──────────
+const ML_ENGINE_IDS = new Set(['rf','gbt','lr','nb','lstm','lgbm','prp','gru','ifor']);
+
+// Run a single engine, yielding event loop before each one
+function runEngineDeferred(eng, rounds, lastRoundId) {
+  return new Promise((resolve) => {
+    setImmediate(async () => {
+      try {
+        if (!(lastRoundId > eng.state.lastRoundId || eng.state.needsRebuild)) {
+          resolve(); return;
+        }
+        eng.state.needsRebuild = false;
+        const changed = await processEngine({ engineId:eng.id, state:eng.state, sortedRounds:rounds, lastRoundId, buildFn:eng.buildFn });
+        eng.state.lastRoundId = lastRoundId;
+        if (changed) {
+          const p = buildSavePayload(eng.state.lockedMap);
+          try { await eng.saveFn(p); } catch(e) { console.error(`[${eng.id}] save:`, e.message); }
+        }
+      } catch(e) { console.error(`[${eng.id}] error:`, e.message); }
+      resolve();
+    });
+  });
+}
+
 async function runPredictionEngine() {
   try {
     await initialise();
@@ -2702,15 +2729,29 @@ async function runPredictionEngine() {
       ...STAT_MODELS.map(model=>({ id:model.id, state:STATE[model.id], buildFn:(t)=>buildStatPrediction(rounds,t.min,t.maxWidth,model.id,lastRoundId), saveFn:async(p)=>{if(Object.keys(p).length)await saveLockedStatPreds(model.id,p);} })),
     ];
 
-    for (const eng of allEngines) {
+    // ── Tier 1: Fast stat engines — run synchronously, these never block ──────
+    // engine, pattern, ens, geo, bay, km
+    const t1Start = Date.now();
+    for (const eng of allEngines.filter(e => !ML_ENGINE_IDS.has(e.id))) {
       if (!(lastRoundId > eng.state.lastRoundId || eng.state.needsRebuild)) continue;
       eng.state.needsRebuild = false;
       const changed = await processEngine({ engineId:eng.id, state:eng.state, sortedRounds:rounds, lastRoundId, buildFn:eng.buildFn });
       eng.state.lastRoundId = lastRoundId;
       if (changed) { const p=buildSavePayload(eng.state.lockedMap); try{await eng.saveFn(p);}catch(e){console.error(`[${eng.id}] save:`,e.message);} }
     }
-    // Enable ML training after first successful cycle — they train on next tick
+
+    console.log(`[engine] Tier1 done in ${Date.now()-t1Start}ms`);
+    // Enable ML training after fast engines complete
     enableMLTraining();
+
+    // ── Tier 2: ML engines — run deferred with setImmediate between each ──────
+    // Each engine yields the event loop before running so HTTP stays responsive
+    const mlEngines = allEngines.filter(e => ML_ENGINE_IDS.has(e.id));
+    for (const eng of mlEngines) {
+      await runEngineDeferred(eng, rounds, lastRoundId);
+    }
+    if (mlEngines.length) console.log(`[engine] Tier2 (ML) done in ${Date.now()-t1Start}ms total`);
+
   } catch(e) { console.error('[predictionEngine] Fatal:', e.message, e.stack); }
 }
 
