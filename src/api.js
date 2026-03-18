@@ -83,7 +83,7 @@ app.get('/storage-stats', rateLimit(20), async (req,res) => { try { res.json({ o
 app.get('/health', (req,res) => res.json({ ok:true, ts:new Date().toISOString() }));
 
 // ── PREDICTIONS ───────────────────────────────────────────────────────────────
-const VALID_SOURCES = ['engine','pattern','ens','geo','bay','km'];
+const VALID_SOURCES = ['engine','pattern','ens','geo','bay','km','rf','gbt','lr','nb','lstm'];
 
 app.get("/predictions", rateLimit(300), async (req, res) => {
   try {
@@ -98,13 +98,18 @@ app.get("/predictions", rateLimit(300), async (req, res) => {
 app.get('/predictions-all', rateLimit(120), async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit||'300'), 1000);
-    const [ens, geo, bay, km] = await Promise.all([
-      getPredictions({ limit, source: 'ens' }),
-      getPredictions({ limit, source: 'geo' }),
-      getPredictions({ limit, source: 'bay' }),
-      getPredictions({ limit, source: 'km'  }),
+    const [ens, geo, bay, km, rf, gbt, lr, nb, lstm] = await Promise.all([
+      getPredictions({ limit, source: 'ens'  }),
+      getPredictions({ limit, source: 'geo'  }),
+      getPredictions({ limit, source: 'bay'  }),
+      getPredictions({ limit, source: 'km'   }),
+      getPredictions({ limit, source: 'rf'   }),
+      getPredictions({ limit, source: 'gbt'  }),
+      getPredictions({ limit, source: 'lr'   }),
+      getPredictions({ limit, source: 'nb'   }),
+      getPredictions({ limit, source: 'lstm' }),
     ]);
-    res.json({ ok:true, ens, geo, bay, km });
+    res.json({ ok:true, ens, geo, bay, km, rf, gbt, lr, nb, lstm });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 

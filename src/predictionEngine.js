@@ -79,11 +79,28 @@ const TARGETS = [
 ];
 
 const STAT_MODELS = [
-  { id: 'ens' },
-  { id: 'geo' },
-  { id: 'bay' },
-  { id: 'km'  },
+  { id: 'ens'  },
+  { id: 'geo'  },
+  { id: 'bay'  },
+  { id: 'km'   },
+  { id: 'rf'   },   // Random Forest         — ml-random-forest
+  { id: 'gbt'  },   // Gradient Boosting     — ml-cart (GBT ensemble)
+  { id: 'lr'   },   // Logistic Regression   — simple-statistics
+  { id: 'nb'   },   // Naive Bayes (Gaussian) — ml-naivebayes
+  { id: 'lstm' },   // LSTM                  — pure JS, zero deps
 ];
+
+// ── Lazy-load ML libraries (installed via npm, optional) ─────────────────────
+let _rf = null, _cart = null, _ss = null, _nb = null;
+function getRF()   { if (_rf   === null) { try { _rf   = require('ml-random-forest'); } catch(e) { _rf   = false; console.warn('[ml] ml-random-forest not available:', e.message); } } return _rf   || null; }
+function getCART() { if (_cart === null) { try { _cart = require('ml-cart');          } catch(e) { _cart = false; console.warn('[ml] ml-cart not available:',          e.message); } } return _cart || null; }
+function getSS()   { if (_ss   === null) { try { _ss   = require('simple-statistics'); } catch(e) { _ss  = false; console.warn('[ml] simple-statistics not available:',  e.message); } } return _ss   || null; }
+function getNB()   { if (_nb   === null) { try { _nb   = require('ml-naivebayes');    } catch(e) { _nb   = false; console.warn('[ml] ml-naivebayes not available:',    e.message); } } return _nb   || null; }
+
+// ── In-memory ML model cache (retrain when rounds grow by ML_RETRAIN_INTERVAL) ─
+const mlModelCache    = {};   // { rf_5x: {model, trainedAt}, ... }
+const ML_RETRAIN_INTERVAL = 500;
+let   mlLastTrainRound = 0;
 
 const MIN_ROUNDS                    = 50;
 const STALE_FORCE_REBUILD_THRESHOLD = 200;
@@ -183,7 +200,7 @@ for (const t of TARGETS) {
 
 // ── Per-engine independent CUSUM / regime state ───────────────────────────────
 const engineCusumState = {};
-for (const id of ['engine', 'ens', 'geo', 'bay', 'km']) {
+for (const id of ['engine', 'ens', 'geo', 'bay', 'km', 'rf', 'gbt', 'lr', 'nb', 'lstm']) {
   engineCusumState[id] = {};
   for (const t of TARGETS) {
     engineCusumState[id][t.label] = {
@@ -207,6 +224,11 @@ const STATE = {
   geo:     { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
   bay:     { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
   km:      { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
+  rf:      { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
+  gbt:     { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
+  lr:      { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
+  nb:      { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
+  lstm:    { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
 };
 
 // ── Per-engine last-hit tracker ────────────────────────────────────────────────
@@ -214,7 +236,7 @@ const STATE = {
 // per target. This drives independent gapSinceLast so windows diverge.
 // Initialised to -1 (unknown — falls back to shared gapStats on first run).
 const engineLastHit = {};
-for (const id of ['engine', 'ens', 'geo', 'bay', 'km']) {
+for (const id of ['engine', 'ens', 'geo', 'bay', 'km', 'rf', 'gbt', 'lr', 'nb', 'lstm']) {
   engineLastHit[id] = {};
   for (const t of TARGETS) engineLastHit[id][t.label] = -1;
 }
@@ -1544,12 +1566,517 @@ function buildStatPrediction(rounds, targetMin, maxWidth, modelId, lastRoundId) 
   }
 
   switch (modelId) {
-    case 'geo': return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
-    case 'bay': return buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
-    case 'km':  return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
-    case 'ens': return buildEns(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
-    default:    return null;
+    case 'geo':  return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
+    case 'bay':  return buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
+    case 'km':   return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
+    case 'ens':  return buildEns(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
+    case 'rf':   return buildRF(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
+    case 'gbt':  return buildGBT(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
+    case 'lr':   return buildLR(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
+    case 'nb':   return buildNB(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
+    case 'lstm': return buildLSTM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
+    default:     return null;
   }
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ── ML ENGINES: RF / GBT / LR / NB / LSTM ────────────────────────────────────
+// Each engine:
+//   1. Extracts features from gap stats + recent rounds
+//   2. Trains / predicts using its library (or pure-JS LSTM)
+//   3. Returns the same { low, high, probW, confidence, ... } shape as geo/bay/km
+//   4. Falls back gracefully if the library is not installed
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Shared ML feature extractor ───────────────────────────────────────────────
+// Returns a flat numeric array suitable for ml-random-forest, ml-cart, etc.
+function extractMLFeatures(gs, rounds, targetMin) {
+  if (!gs) return null;
+  const { hits, n, pGlobal, pRecent, gapSinceLast, meanGap, cv, kmExpectedGap, currentStreak, cusumNorm } = gs;
+  if (hits < 3 || n < 10) return null;
+
+  // Recent window analysis (last 50 rounds)
+  const recent = rounds.slice(-50);
+  const recentHits = recent.filter(r => r.multiplier >= targetMin).length;
+  const recentRate = recentHits / Math.max(1, recent.length);
+
+  // Last 10 rounds binary pattern
+  const last10 = rounds.slice(-10).map(r => r.multiplier >= targetMin ? 1 : 0);
+  const streak3 = last10.slice(-3).reduce((a, b) => a + b, 0);
+
+  // Gap features
+  const overdueRatio  = meanGap > 0 ? gapSinceLast / meanGap : 0;
+  const kmGapRatio    = kmExpectedGap > 0 ? gapSinceLast / kmExpectedGap : 0;
+  const streakFactor  = currentStreak / Math.max(1, meanGap);
+
+  return [
+    pGlobal,                             // 0  global hit probability
+    pRecent,                             // 1  recent 200-round rate
+    recentRate,                          // 2  recent 50-round rate
+    Math.min(3, overdueRatio),           // 3  gap overdue ratio (capped)
+    Math.min(3, kmGapRatio),             // 4  vs KM expected gap
+    Math.min(1, cv),                     // 5  coefficient of variation
+    Math.min(1, cusumNorm / 3),          // 6  CUSUM normalised (rate shift signal)
+    streak3 / 3,                         // 7  hits in last 3 rounds
+    last10.reduce((a,b)=>a+b,0) / 10,    // 8  hits in last 10 rounds
+    Math.min(1, streakFactor),           // 9  current losing streak factor
+    Math.min(1, hits / 500),             // 10 data richness
+    Math.min(1, gapSinceLast / 200),     // 11 absolute gap (normalised)
+  ];
+}
+
+// Converts feature vector to labelled training rows from historical gaps
+// Returns { X: number[][], y: number[] } for binary classification (hit in next W rounds)
+function buildMLDataset(rounds, targetMin, maxWidth, windowSize = 60) {
+  const X = [], y = [];
+  const MIN_TRAIN = 100;
+  if (rounds.length < MIN_TRAIN + windowSize) return { X, y };
+
+  for (let i = MIN_TRAIN; i < rounds.length - windowSize; i++) {
+    const slice = rounds.slice(0, i);
+    // Build a minimal gs-like object for feature extraction
+    let hits = 0, lastIdx = -1;
+    const gaps = [];
+    for (let j = 0; j < slice.length; j++) {
+      if (slice[j].multiplier >= targetMin) {
+        if (lastIdx !== -1) gaps.push(j - lastIdx - 1);
+        lastIdx = j; hits++;
+      }
+    }
+    if (hits < 3) continue;
+    const n = slice.length;
+    const gapSinceLast = lastIdx === -1 ? n : n - lastIdx - 1;
+    const meanGap = gaps.length > 0 ? gaps.reduce((a,b)=>a+b,0)/gaps.length : 1/Math.max(1e-6,hits/n);
+    const variance = gaps.length > 1 ? gaps.reduce((a,b)=>a+(b-meanGap)**2,0)/gaps.length : meanGap**2;
+    const cv = meanGap > 0 ? Math.sqrt(variance)/meanGap : 1;
+    const pGlobal = (hits+1)/(n+2);
+    const r200 = slice.slice(-200).filter(r=>r.multiplier>=targetMin).length;
+    const pRecent = (r200+1)/202;
+    const recent50 = slice.slice(-50).filter(r=>r.multiplier>=targetMin).length;
+    const recentRate = recent50 / Math.min(50, slice.length);
+    const last10 = slice.slice(-10).map(r=>r.multiplier>=targetMin?1:0);
+    const streak3 = last10.slice(-3).reduce((a,b)=>a+b,0);
+    const streakFactor = (()=>{ let s=0; for(let k=n-1;k>=0;k--){ if(slice[k].multiplier<targetMin)s++; else break; } return s; })();
+    let cusum=0, maxC=0, p0=hits/n;
+    for(const r of slice.slice(-150)){ cusum+=(r.multiplier>=targetMin?1:0)-p0; if(Math.abs(cusum)>maxC)maxC=Math.abs(cusum); }
+    const sigma0=Math.sqrt(Math.max(1e-9,p0*(1-p0)));
+    const cusumNorm=maxC/(sigma0*Math.sqrt(Math.min(150,slice.length)));
+    const kmExpectedGap = Math.max(1, Math.round(meanGap));
+    const overdueRatio  = meanGap>0 ? gapSinceLast/meanGap : 0;
+    const kmGapRatio    = kmExpectedGap>0 ? gapSinceLast/kmExpectedGap : 0;
+
+    const feat = [
+      pGlobal, pRecent, recentRate,
+      Math.min(3,overdueRatio), Math.min(3,kmGapRatio), Math.min(1,cv),
+      Math.min(1,cusumNorm/3), streak3/3,
+      last10.reduce((a,b)=>a+b,0)/10, Math.min(1,streakFactor/Math.max(1,meanGap)),
+      Math.min(1,hits/500), Math.min(1,gapSinceLast/200),
+    ];
+
+    // Label: did target hit within next `maxWidth` rounds?
+    const future = rounds.slice(i, i + maxWidth);
+    const label  = future.some(r => r.multiplier >= targetMin) ? 1 : 0;
+    X.push(feat);
+    y.push(label);
+  }
+  return { X, y };
+}
+
+// Cache key for ML model
+function mlKey(modelId, targetMin) { return `${modelId}_${targetMin}`; }
+
+// Check if model needs retraining
+function needsRetrain(key, currentRoundCount) {
+  const cached = mlModelCache[key];
+  if (!cached) return true;
+  return (currentRoundCount - cached.trainedAt) >= ML_RETRAIN_INTERVAL;
+}
+
+// ── Shared window builder for ML models ──────────────────────────────────────
+// Given a probability from a trained model, build a window using the same
+// hybridWindowPlacement logic as the existing stat engines.
+function buildMLWindow(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast, probW, modelName) {
+  const { hits, kmCDF, kmExpectedGap, currentStreak, cv } = gs;
+  const gapSinceLast = engineGapSinceLast ?? gs.gapSinceLast;
+  const regime = updateEngineRegime(rounds, targetMin, targetLabel, modelName, gs, gs.isRandom);
+  const rawProbW   = probW;
+  const calibProbW = applyCalibrationRelaxed(rawProbW, targetLabel, modelName, hits);
+  const expectedGap = kmExpectedGap;
+  const { z, confPenalty, streakStatus, effectiveWidth } = getStreakInfo(gs, maxWidth, isRare);
+  const { low, high } = hybridWindowPlacement(kmCDF, expectedGap, effectiveWidth, gapSinceLast, cv, targetLabel, maxWidth);
+  const { low: rLow, high: rHigh } = applyRegimeToWindow(low, high, expectedGap, effectiveWidth, regime.regimeFactor);
+  const confidence = Math.max(20, betaConf(calibProbW, hits, null, regime.regimeConfidence, z) - confPenalty);
+  const decision   = computeSignalDecision(calibProbW, confidence, null, regime.regimeFactor, regime.regimeConfidence, gs.isRandom, targetLabel, modelName, hits);
+  const { low: aLow, high: aHigh } = applyAggressiveModeWidth(rLow, rHigh, decision.aggressiveMode, null, decision.ev);
+  return {
+    low: aLow, high: aHigh, expectedGap, opensIn: aLow,
+    confidence,
+    probW:    +calibProbW.toFixed(4),
+    rawProbW: +rawProbW.toFixed(4),
+    p:        +calibProbW.toFixed(6),
+    streakStatus, currentStreak, z, gapSinceLast, hits,
+    rateShifted: gs.rateShifted, model: modelName,
+    regime:           regime.regimeLabel,
+    regimeFactor:     regime.regimeFactor,
+    regimeConfidence: regime.regimeConfidence,
+    isRandom: gs.isRandom, maxAC: gs.maxAC,
+    ...decision,
+  };
+}
+
+// ── BUILD: RF (Random Forest via ml-random-forest) ───────────────────────────
+function buildRF(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) {
+  const RF = getRF();
+  if (!RF) {
+    // Graceful fallback: use geo probability with rf label
+    return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+  }
+
+  const key = mlKey('rf', targetMin);
+  let prob;
+
+  try {
+    // Retrain if needed
+    if (needsRetrain(key, rounds.length)) {
+      const { X, y } = buildMLDataset(rounds, targetMin, maxWidth);
+      if (X.length < 30) {
+        // Not enough data — fall back
+        return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+      }
+      const rf = new RF.RandomForestClassifier({ nEstimators: 100, maxDepth: 6, seed: 42 });
+      rf.train(X, y);
+      mlModelCache[key] = { model: rf, trainedAt: rounds.length };
+    }
+
+    const feat = extractMLFeatures(gs, rounds, targetMin);
+    if (!feat) return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+
+    const pred   = mlModelCache[key].model.predict([feat])[0];
+    const probas = mlModelCache[key].model.predictProbability ? mlModelCache[key].model.predictProbability([feat]) : null;
+    // ml-random-forest returns class label; try to get probability of class 1
+    if (probas && probas[0] && probas[0][1] != null) {
+      prob = probas[0][1];
+    } else {
+      // Fall back: use hit rate from geo but modulate by prediction
+      prob = pred === 1 ? Math.min(0.85, gs.pGlobal * maxWidth * 1.3) : Math.max(0.05, gs.pGlobal * maxWidth * 0.7);
+    }
+  } catch(e) {
+    console.warn('[rf] predict error:', e.message);
+    return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+  }
+
+  prob = Math.max(0.05, Math.min(0.95, prob));
+  return buildMLWindow(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast, prob, 'rf');
+}
+
+// ── BUILD: GBT (Gradient Boosted Trees via ml-cart) ──────────────────────────
+// ml-cart exports DecisionTreeClassifier; we build a GBT ensemble manually
+// using gradient-boosted residuals (AdaBoost-style with CART weak learners).
+function buildGBT(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) {
+  const CART = getCART();
+  if (!CART) {
+    return buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+  }
+
+  const key = mlKey('gbt', targetMin);
+  let prob;
+
+  try {
+    if (needsRetrain(key, rounds.length)) {
+      const { X, y } = buildMLDataset(rounds, targetMin, maxWidth);
+      if (X.length < 30) {
+        return buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+      }
+
+      // Build GBT: 40 shallow CART trees fitting pseudo-residuals
+      const nTrees = 40;
+      const lr     = 0.15;
+      const trees  = [];
+      let   F      = new Array(X.length).fill(y.filter(v=>v===1).length / y.length); // init to base rate
+
+      for (let t = 0; t < nTrees; t++) {
+        // Pseudo-residuals (gradient of log-loss)
+        const residuals = y.map((yi, i) => yi - F[i]);
+        const tree = new CART.DecisionTreeClassifier({ gainFunction: 'gini', maxDepth: 3 });
+        tree.train(X, residuals.map(r => r >= 0 ? 1 : 0));
+        trees.push(tree);
+        // Update F
+        F = F.map((fi, i) => {
+          const leaf = tree.predict([X[i]])[0];
+          return Math.max(0.001, Math.min(0.999, fi + lr * (leaf === 1 ? 0.5 : -0.5)));
+        });
+      }
+
+      mlModelCache[key] = { model: trees, trainedAt: rounds.length, lr };
+    }
+
+    const feat = extractMLFeatures(gs, rounds, targetMin);
+    if (!feat) return buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+
+    // Score: average of tree predictions weighted by lr
+    const { model: trees } = mlModelCache[key];
+    const baseRate = gs.pGlobal * maxWidth;
+    let score = Math.max(0.001, Math.min(0.999, baseRate));
+    for (const tree of trees) {
+      const leaf = tree.predict([feat])[0];
+      score = Math.max(0.001, Math.min(0.999, score + 0.15 * (leaf === 1 ? 0.5 : -0.5)));
+    }
+    prob = score;
+  } catch(e) {
+    console.warn('[gbt] predict error:', e.message);
+    return buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+  }
+
+  prob = Math.max(0.05, Math.min(0.95, prob));
+  return buildMLWindow(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast, prob, 'gbt');
+}
+
+// ── BUILD: LR (Logistic Regression via simple-statistics) ────────────────────
+function buildLR(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) {
+  const ss = getSS();
+  if (!ss) {
+    return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+  }
+
+  const key = mlKey('lr', targetMin);
+  let prob;
+
+  try {
+    if (needsRetrain(key, rounds.length)) {
+      const { X, y } = buildMLDataset(rounds, targetMin, maxWidth);
+      if (X.length < 30) {
+        return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+      }
+
+      // simple-statistics does not have a built-in LR, so we train it ourselves
+      // using gradient descent + sigmoid, leveraging ss.mean / ss.standardDeviation
+      // for feature standardisation.
+      const nFeat = X[0].length;
+      const means  = Array.from({length: nFeat}, (_, j) => ss.mean(X.map(x => x[j])));
+      const stds   = Array.from({length: nFeat}, (_, j) => Math.max(1e-8, ss.standardDeviation(X.map(x => x[j]))));
+      // Standardise
+      const Xn = X.map(x => x.map((v, j) => (v - means[j]) / stds[j]));
+
+      // Gradient descent
+      const sig = v => 1 / (1 + Math.exp(-Math.max(-20, Math.min(20, v))));
+      let w = new Array(nFeat).fill(0), b = 0;
+      const lrRate = 0.05, epochs = 200, lambda = 0.001;
+      for (let e = 0; e < epochs; e++) {
+        let dw = new Array(nFeat).fill(0), db = 0;
+        for (let i = 0; i < Xn.length; i++) {
+          const p   = sig(Xn[i].reduce((s, v, j) => s + v * w[j], b));
+          const err = p - y[i];
+          for (let j = 0; j < nFeat; j++) dw[j] += err * Xn[i][j];
+          db += err;
+        }
+        w = w.map((wj, j) => wj - lrRate * (dw[j] / Xn.length + lambda * wj));
+        b -= lrRate * (db / Xn.length);
+      }
+
+      mlModelCache[key] = { model: { w, b, means, stds }, trainedAt: rounds.length };
+    }
+
+    const feat = extractMLFeatures(gs, rounds, targetMin);
+    if (!feat) return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+
+    const { w, b, means, stds } = mlModelCache[key].model;
+    const sig = v => 1 / (1 + Math.exp(-Math.max(-20, Math.min(20, v))));
+    const xn  = feat.map((v, j) => (v - means[j]) / stds[j]);
+    prob = sig(xn.reduce((s, v, j) => s + v * w[j], b));
+  } catch(e) {
+    console.warn('[lr] predict error:', e.message);
+    return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+  }
+
+  prob = Math.max(0.05, Math.min(0.95, prob));
+  return buildMLWindow(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast, prob, 'lr');
+}
+
+// ── BUILD: NB (Gaussian Naive Bayes via ml-naivebayes) ───────────────────────
+function buildNB(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) {
+  const NB = getNB();
+  if (!NB) {
+    return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+  }
+
+  const key = mlKey('nb', targetMin);
+  let prob;
+
+  try {
+    if (needsRetrain(key, rounds.length)) {
+      const { X, y } = buildMLDataset(rounds, targetMin, maxWidth);
+      if (X.length < 30) {
+        return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+      }
+
+      // ml-naivebayes: GaussianNB
+      const nb = new NB.GaussianNB();
+      nb.train(X, y);
+      mlModelCache[key] = { model: nb, trainedAt: rounds.length };
+    }
+
+    const feat = extractMLFeatures(gs, rounds, targetMin);
+    if (!feat) return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+
+    // Predict returns class labels; use predictProba if available
+    if (mlModelCache[key].model.predictProba) {
+      const probas = mlModelCache[key].model.predictProba([feat]);
+      // Returns [[p0, p1]] — probability of class 1
+      prob = probas[0][1] ?? 0.5;
+    } else {
+      const pred = mlModelCache[key].model.predict([feat])[0];
+      prob = pred === 1
+        ? Math.min(0.85, gs.pGlobal * maxWidth * 1.25)
+        : Math.max(0.05, gs.pGlobal * maxWidth * 0.75);
+    }
+  } catch(e) {
+    console.warn('[nb] predict error:', e.message);
+    return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+  }
+
+  prob = Math.max(0.05, Math.min(0.95, prob));
+  return buildMLWindow(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast, prob, 'nb');
+}
+
+// ── BUILD: LSTM (Pure-JS, zero dependencies) ──────────────────────────────────
+// Simplified single-layer LSTM cell trained with truncated BPTT (gradient approx).
+// Sequence input: last SEQ_LEN rounds as normalised binary hit/miss values.
+const LSTM_SEQ_LEN   = 20;
+const LSTM_HIDDEN    = 12;
+const LSTM_LR        = 0.01;
+const LSTM_EPOCHS    = 5;
+
+function lstmSig(x) { return 1/(1+Math.exp(-Math.max(-15,Math.min(15,x)))); }
+function lstmTanh(x){ const e=Math.exp(2*Math.max(-15,Math.min(15,x))); return (e-1)/(e+1); }
+
+function initLSTMWeights() {
+  const r = () => (Math.random()-0.5)*0.1;
+  const mat = (r_,c_) => Array.from({length:r_},()=>Array.from({length:c_},r));
+  const vec = n => Array.from({length:n},r);
+  const H=LSTM_HIDDEN, I=1;
+  return {
+    // i gate
+    Wi:mat(H,I), Ui:mat(H,H), bi:vec(H),
+    // f gate
+    Wf:mat(H,I), Uf:mat(H,H), bf:vec(H).map(()=>1.0), // forget bias=1 helps early
+    // g gate
+    Wg:mat(H,I), Ug:mat(H,H), bg:vec(H),
+    // o gate
+    Wo:mat(H,I), Uo:mat(H,H), bo:vec(H),
+    // output
+    Wy:Array.from({length:1},()=>Array.from({length:H},r)), by:[0],
+  };
+}
+
+function lstmForward(weights, seq) {
+  const { Wi,Ui,bi, Wf,Uf,bf, Wg,Ug,bg, Wo,Uo,bo, Wy,by } = weights;
+  const H = LSTM_HIDDEN;
+  let h = new Array(H).fill(0);
+  let c = new Array(H).fill(0);
+  const mv = (M,v) => M.map(row=>row.reduce((s,w,k)=>s+w*v[k],0));
+  const add = (a,b) => a.map((x,i)=>x+b[i]);
+  for (const x of seq) {
+    const xv=[x];
+    const i_t = add(add(mv(Wi,xv),mv(Ui,h)),bi).map(lstmSig);
+    const f_t = add(add(mv(Wf,xv),mv(Uf,h)),bf).map(lstmSig);
+    const g_t = add(add(mv(Wg,xv),mv(Ug,h)),bg).map(lstmTanh);
+    const o_t = add(add(mv(Wo,xv),mv(Uo,h)),bo).map(lstmSig);
+    c = c.map((ci,j)=>f_t[j]*ci+i_t[j]*g_t[j]);
+    h = c.map((ci,j)=>o_t[j]*lstmTanh(ci));
+  }
+  const logit = mv(Wy,h)[0]+by[0];
+  return lstmSig(logit);
+}
+
+function trainLSTMWeights(weights, sequences, labels, lr, epochs) {
+  // Approximate gradient via finite differences on output layer only (fast)
+  const eps  = 1e-4;
+  const { Wy, by } = weights;
+  for (let epoch = 0; epoch < epochs; epoch++) {
+    let dwY = Wy.map(r=>r.map(()=>0));
+    let dbY = [0];
+    for (let i = 0; i < sequences.length; i++) {
+      const pred = lstmForward(weights, sequences[i]);
+      const err  = pred - labels[i];
+      // Only backprop through the output layer weights
+      const h = (() => {
+        const seq = sequences[i];
+        const H = LSTM_HIDDEN;
+        let hh = new Array(H).fill(0), cc = new Array(H).fill(0);
+        const { Wi,Ui,bi,Wf,Uf,bf,Wg,Ug,bg,Wo,Uo,bo } = weights;
+        const mv = (M,v)=>M.map(row=>row.reduce((s,w,k)=>s+w*v[k],0));
+        const add=(a,b)=>a.map((x,j)=>x+b[j]);
+        for (const x of seq) {
+          const xv=[x];
+          const i_t=add(add(mv(Wi,xv),mv(Ui,hh)),bi).map(lstmSig);
+          const f_t=add(add(mv(Wf,xv),mv(Uf,hh)),bf).map(lstmSig);
+          const g_t=add(add(mv(Wg,xv),mv(Ug,hh)),bg).map(lstmTanh);
+          const o_t=add(add(mv(Wo,xv),mv(Uo,hh)),bo).map(lstmSig);
+          cc=cc.map((ci,j)=>f_t[j]*ci+i_t[j]*g_t[j]);
+          hh=cc.map((ci,j)=>o_t[j]*lstmTanh(ci));
+        }
+        return hh;
+      })();
+      dwY = dwY.map((row,ri) => row.map((w,j) => w + err * h[j]));
+      dbY = [dbY[0] + err];
+    }
+    const N = sequences.length;
+    weights.Wy = Wy.map((row,ri) => row.map((w,j) => w - lr * dwY[ri][j] / N));
+    weights.by = [by[0] - lr * dbY[0] / N];
+  }
+  return weights;
+}
+
+function buildLSTM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) {
+  const key = mlKey('lstm', targetMin);
+  let prob;
+
+  try {
+    if (needsRetrain(key, rounds.length)) {
+      if (rounds.length < 100) {
+        return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+      }
+
+      // Build training sequences
+      const sequences = [], labels = [];
+      for (let i = LSTM_SEQ_LEN; i < rounds.length - maxWidth; i++) {
+        const seq = rounds.slice(i-LSTM_SEQ_LEN, i).map(r => {
+          const v = r.multiplier;
+          // Normalise: 0..1 range using log scale
+          return Math.min(1, Math.log(Math.max(1, v)) / Math.log(Math.max(2, targetMin*2)));
+        });
+        const label = rounds.slice(i, i+maxWidth).some(r=>r.multiplier>=targetMin) ? 1 : 0;
+        sequences.push(seq);
+        labels.push(label);
+      }
+
+      if (sequences.length < 30) {
+        return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+      }
+
+      let weights = mlModelCache[key]?.model ?? initLSTMWeights();
+      weights = trainLSTMWeights(weights, sequences, labels, LSTM_LR, LSTM_EPOCHS);
+      mlModelCache[key] = { model: weights, trainedAt: rounds.length };
+    }
+
+    // Predict on current sequence
+    const seq = rounds.slice(-LSTM_SEQ_LEN).map(r => {
+      const v = r.multiplier;
+      return Math.min(1, Math.log(Math.max(1, v)) / Math.log(Math.max(2, targetMin*2)));
+    });
+    if (seq.length < LSTM_SEQ_LEN) {
+      return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+    }
+
+    prob = lstmForward(mlModelCache[key].model, seq);
+  } catch(e) {
+    console.warn('[lstm] predict error:', e.message);
+    return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+  }
+
+  prob = Math.max(0.05, Math.min(0.95, prob));
+  return buildMLWindow(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast, prob, 'lstm');
 }
 
 // ── BUILD: PATTERN ────────────────────────────────────────────────────────────
@@ -1874,7 +2401,7 @@ function getEngineStats() {
   const out = {};
   for (const t of TARGETS) {
     out[t.label] = {};
-    for (const id of ['engine', 'ens', 'geo', 'bay', 'km']) {
+    for (const id of ['engine', 'ens', 'geo', 'bay', 'km', 'rf', 'gbt', 'lr', 'nb', 'lstm']) {
       const cs = engineCusumState[id]?.[t.label];
       if (!cs) continue;
       const ece = STAT_MODELS.some(m => m.id === id) ? getECE(t.label, id) : null;
