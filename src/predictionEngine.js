@@ -1649,55 +1649,52 @@ function extractMLFeatures(gs, rounds, targetMin) {
 
 // Converts feature vector to labelled training rows from historical gaps
 // Returns { X: number[][], y: number[] } for binary classification (hit in next W rounds)
-function buildMLDataset(rounds, targetMin, maxWidth, windowSize = 40) {
+function buildMLDataset(rounds, targetMin, maxWidth) {
+  // Fast O(n) dataset builder — caps at last 500 rounds, no O(n²) re-scanning
   const X = [], y = [];
-  const MIN_TRAIN = 100;
-  if (rounds.length < MIN_TRAIN + windowSize) return { X, y };
+  const CAP = 500; // hard cap — prevents blocking the event loop
+  const CONTEXT = 100; // feature context window per sample
+  const trainRounds = rounds.slice(-Math.min(rounds.length, CAP + maxWidth));
+  if (trainRounds.length < CONTEXT + maxWidth + 10) return { X, y };
 
-  for (let i = MIN_TRAIN; i < rounds.length - windowSize; i++) {
-    const slice = rounds.slice(0, i);
-    // Build a minimal gs-like object for feature extraction
+  for (let i = CONTEXT; i < trainRounds.length - maxWidth; i++) {
+    const ctx = trainRounds.slice(i - CONTEXT, i); // fixed-size context window
+    const n = ctx.length;
+
+    // Hit stats in context window
     let hits = 0, lastIdx = -1;
     const gaps = [];
-    for (let j = 0; j < slice.length; j++) {
-      if (slice[j].multiplier >= targetMin) {
+    for (let j = 0; j < n; j++) {
+      if (ctx[j].multiplier >= targetMin) {
         if (lastIdx !== -1) gaps.push(j - lastIdx - 1);
         lastIdx = j; hits++;
       }
     }
-    if (hits < 3) continue;
-    const n = slice.length;
+    if (hits < 2) continue;
+
     const gapSinceLast = lastIdx === -1 ? n : n - lastIdx - 1;
-    const meanGap = gaps.length > 0 ? gaps.reduce((a,b)=>a+b,0)/gaps.length : 1/Math.max(1e-6,hits/n);
-    const variance = gaps.length > 1 ? gaps.reduce((a,b)=>a+(b-meanGap)**2,0)/gaps.length : meanGap**2;
+    const meanGap = gaps.length > 0 ? gaps.reduce((a,b)=>a+b,0)/gaps.length : n/Math.max(1,hits);
+    const variance = gaps.length > 1 ? gaps.reduce((a,b)=>a+(b-meanGap)**2,0)/gaps.length : meanGap*meanGap;
     const cv = meanGap > 0 ? Math.sqrt(variance)/meanGap : 1;
     const pGlobal = (hits+1)/(n+2);
-    const r200 = slice.slice(-200).filter(r=>r.multiplier>=targetMin).length;
-    const pRecent = (r200+1)/202;
-    const recent50 = slice.slice(-50).filter(r=>r.multiplier>=targetMin).length;
-    const recentRate = recent50 / Math.min(50, slice.length);
-    const last10 = slice.slice(-10).map(r=>r.multiplier>=targetMin?1:0);
+    const r50Hits = ctx.slice(-50).filter(r=>r.multiplier>=targetMin).length;
+    const pRecent = (r50Hits+1)/52;
+    const recentRate = r50Hits / Math.min(50, n);
+    const last10 = ctx.slice(-10).map(r=>r.multiplier>=targetMin?1:0);
     const streak3 = last10.slice(-3).reduce((a,b)=>a+b,0);
-    const streakFactor = (()=>{ let s=0; for(let k=n-1;k>=0;k--){ if(slice[k].multiplier<targetMin)s++; else break; } return s; })();
-    let cusum=0, maxC=0, p0=hits/n;
-    for(const r of slice.slice(-150)){ cusum+=(r.multiplier>=targetMin?1:0)-p0; if(Math.abs(cusum)>maxC)maxC=Math.abs(cusum); }
-    const sigma0=Math.sqrt(Math.max(1e-9,p0*(1-p0)));
-    const cusumNorm=maxC/(sigma0*Math.sqrt(Math.min(150,slice.length)));
-    const kmExpectedGap = Math.max(1, Math.round(meanGap));
-    const overdueRatio  = meanGap>0 ? gapSinceLast/meanGap : 0;
-    const kmGapRatio    = kmExpectedGap>0 ? gapSinceLast/kmExpectedGap : 0;
+    let streak=0; for(let k=n-1;k>=0;k--){if(ctx[k].multiplier<targetMin)streak++;else break;}
+    const kmEG = Math.max(1, Math.round(meanGap));
+    const overdueRatio = meanGap > 0 ? gapSinceLast/meanGap : 0;
 
     const feat = [
       pGlobal, pRecent, recentRate,
-      Math.min(3,overdueRatio), Math.min(3,kmGapRatio), Math.min(1,cv),
-      Math.min(1,cusumNorm/3), streak3/3,
-      last10.reduce((a,b)=>a+b,0)/10, Math.min(1,streakFactor/Math.max(1,meanGap)),
-      Math.min(1,hits/500), Math.min(1,gapSinceLast/200),
+      Math.min(3, overdueRatio), Math.min(3, gapSinceLast/kmEG), Math.min(1, cv),
+      0, streak3/3, // cusumNorm=0 (skip expensive CUSUM in training)
+      last10.reduce((a,b)=>a+b,0)/10, Math.min(1, streak/Math.max(1,meanGap)),
+      Math.min(1, hits/100), Math.min(1, gapSinceLast/200),
     ];
 
-    // Label: did target hit within next `maxWidth` rounds?
-    const future = rounds.slice(i, i + maxWidth);
-    const label  = future.some(r => r.multiplier >= targetMin) ? 1 : 0;
+    const label = trainRounds.slice(i, i+maxWidth).some(r=>r.multiplier>=targetMin) ? 1 : 0;
     X.push(feat);
     y.push(label);
   }
@@ -1766,7 +1763,7 @@ function buildRF(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap
         return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
       }
       const RFClass = RF.RandomForestClassifier || RF;
-      const rf = new RFClass({ nEstimators: 30, maxDepth: 5, seed: 42 });
+      const rf = new RFClass({ nEstimators: 20, maxDepth: 4, seed: 42 });
       rf.train(X, y);
       mlModelCache[key] = { model: rf, trainedAt: rounds.length };
     }
@@ -1817,7 +1814,7 @@ function buildGBT(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGa
       }
 
       // Build GBT: 40 shallow CART trees fitting pseudo-residuals
-      const nTrees = 20;
+      const nTrees = 12;
       const lr     = 0.15;
       const trees  = [];
       let   F      = new Array(X.length).fill(y.filter(v=>v===1).length / y.length); // init to base rate
@@ -1892,7 +1889,7 @@ function buildLR(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap
       // Gradient descent
       const sig = v => 1 / (1 + Math.exp(-Math.max(-20, Math.min(20, v))));
       let w = new Array(nFeat).fill(0), b = 0;
-      const lrRate = 0.05, epochs = 80, lambda = 0.001;
+      const lrRate = 0.05, epochs = 40, lambda = 0.001;
       for (let e = 0; e < epochs; e++) {
         let dw = new Array(nFeat).fill(0), db = 0;
         for (let i = 0; i < Xn.length; i++) {
@@ -1984,7 +1981,7 @@ function buildNB(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap
 const LSTM_SEQ_LEN   = 20;
 const LSTM_HIDDEN    = 12;
 const LSTM_LR        = 0.01;
-const LSTM_EPOCHS    = 3;
+const LSTM_EPOCHS    = 2;
 
 function lstmSig(x) { return 1/(1+Math.exp(-Math.max(-15,Math.min(15,x)))); }
 function lstmTanh(x){ const e=Math.exp(2*Math.max(-15,Math.min(15,x))); return (e-1)/(e+1); }
@@ -2076,20 +2073,20 @@ function buildLSTM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineG
         return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
       }
 
-      // Build training sequences
+      // Build training sequences — cap at last 400 rounds to prevent blocking
       const sequences = [], labels = [];
-      for (let i = LSTM_SEQ_LEN; i < rounds.length - maxWidth; i++) {
-        const seq = rounds.slice(i-LSTM_SEQ_LEN, i).map(r => {
+      const lstmTrainRounds = rounds.slice(-Math.min(rounds.length, 400 + maxWidth));
+      for (let i = LSTM_SEQ_LEN; i < lstmTrainRounds.length - maxWidth; i++) {
+        const seq = lstmTrainRounds.slice(i-LSTM_SEQ_LEN, i).map(r => {
           const v = r.multiplier;
-          // Normalise: 0..1 range using log scale
           return Math.min(1, Math.log(Math.max(1, v)) / Math.log(Math.max(2, targetMin*2)));
         });
-        const label = rounds.slice(i, i+maxWidth).some(r=>r.multiplier>=targetMin) ? 1 : 0;
+        const label = lstmTrainRounds.slice(i, i+maxWidth).some(r=>r.multiplier>=targetMin) ? 1 : 0;
         sequences.push(seq);
         labels.push(label);
       }
 
-      if (sequences.length < 30) {
+      if (sequences.length < 20) {
         return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
       }
 
@@ -2147,33 +2144,28 @@ function srvExtractFeatures(gs, rounds, targetMin) {
 }
 
 function srvBuildDataset(rounds, targetMin, maxWidth) {
+  // O(n) sliding window — cap at 500 rounds to prevent blocking
   const X = [], y = [];
-  const trainRounds = rounds.slice(-800);
-  if (trainRounds.length < 80 + maxWidth) return { X, y };
-  for (let i = 40; i < trainRounds.length - maxWidth; i++) {
-    const slice = trainRounds.slice(0, i);
-    let hits = 0, lastIdx = -1; const gaps = [];
-    for (let j = 0; j < slice.length; j++) {
-      if (slice[j].multiplier >= targetMin) { if (lastIdx !== -1) gaps.push(j - lastIdx - 1); lastIdx = j; hits++; }
-    }
-    if (hits < 3) continue;
-    const nn = slice.length;
-    const gapSinceLast = lastIdx === -1 ? nn : nn - lastIdx - 1;
-    const meanGap = gaps.length > 0 ? gaps.reduce((a,b)=>a+b,0)/gaps.length : 1/Math.max(1e-6,hits/nn);
-    const variance = gaps.length > 1 ? gaps.reduce((a,b)=>a+(b-meanGap)**2,0)/gaps.length : meanGap**2;
-    const cv = meanGap > 0 ? Math.sqrt(variance)/meanGap : 1;
-    const pGlobal = (hits+1)/(nn+2);
-    const r200 = slice.slice(-200).filter(r=>r.multiplier>=targetMin).length;
-    const pRecent = (r200+1)/202;
-    const r50 = slice.slice(-50).filter(r=>r.multiplier>=targetMin).length;
-    const last10 = slice.slice(-10).map(r=>r.multiplier>=targetMin?1:0);
-    let streak=0; for(let k=nn-1;k>=0;k--){if(slice[k].multiplier<targetMin)streak++;else break;}
-    let cusum=0,maxC=0,p0=hits/nn;
-    for(const r of slice.slice(-150)){cusum+=(r.multiplier>=targetMin?1:0)-p0;if(Math.abs(cusum)>maxC)maxC=Math.abs(cusum);}
-    const sigma0=Math.sqrt(Math.max(1e-9,p0*(1-p0)));
-    const cusumNorm=maxC/(sigma0*Math.sqrt(Math.min(150,slice.length)));
+  const CAP = 500, CONTEXT = 100;
+  const trainRounds = rounds.slice(-Math.min(rounds.length, CAP + maxWidth));
+  if (trainRounds.length < CONTEXT + maxWidth + 10) return { X, y };
+  for (let i = CONTEXT; i < trainRounds.length - maxWidth; i++) {
+    const ctx = trainRounds.slice(i - CONTEXT, i);
+    const n = ctx.length;
+    let hits=0, lastIdx=-1; const gaps=[];
+    for(let j=0;j<n;j++){if(ctx[j].multiplier>=targetMin){if(lastIdx!==-1)gaps.push(j-lastIdx-1);lastIdx=j;hits++;}}
+    if(hits<2)continue;
+    const gapSinceLast=lastIdx===-1?n:n-lastIdx-1;
+    const meanGap=gaps.length>0?gaps.reduce((a,b)=>a+b,0)/gaps.length:n/Math.max(1,hits);
+    const variance=gaps.length>1?gaps.reduce((a,b)=>a+(b-meanGap)**2,0)/gaps.length:meanGap*meanGap;
+    const cv=meanGap>0?Math.sqrt(variance)/meanGap:1;
+    const pGlobal=(hits+1)/(n+2);
+    const r50=ctx.slice(-50).filter(r=>r.multiplier>=targetMin).length;
+    const pRecent=(r50+1)/52;
+    const last10=ctx.slice(-10).map(r=>r.multiplier>=targetMin?1:0);
+    let streak=0;for(let k=n-1;k>=0;k--){if(ctx[k].multiplier<targetMin)streak++;else break;}
     const kmEG=Math.max(1,Math.round(meanGap));
-    const feat=[pGlobal,pRecent,r50/Math.min(50,slice.length),Math.min(3,gapSinceLast/meanGap),Math.min(3,gapSinceLast/kmEG),Math.min(1,cv),Math.min(1,cusumNorm/3),last10.slice(-3).reduce((a,b)=>a+b,0)/3,last10.reduce((a,b)=>a+b,0)/10,Math.min(1,streak/Math.max(1,meanGap)),Math.min(1,hits/500),Math.min(1,gapSinceLast/200)];
+    const feat=[pGlobal,pRecent,r50/Math.min(50,n),Math.min(3,gapSinceLast/meanGap),Math.min(3,gapSinceLast/kmEG),Math.min(1,cv),0,last10.slice(-3).reduce((a,b)=>a+b,0)/3,last10.reduce((a,b)=>a+b,0)/10,Math.min(1,streak/Math.max(1,meanGap)),Math.min(1,hits/100),Math.min(1,gapSinceLast/200)];
     const label=trainRounds.slice(i,i+maxWidth).some(r=>r.multiplier>=targetMin)?1:0;
     X.push(feat); y.push(label);
   }
@@ -2205,9 +2197,9 @@ function buildServerLGBM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, e
     if(srvNeedsRetrain(key,rounds.length)){
       const{X,y}=srvBuildDataset(rounds,targetMin,maxWidth);
       if(X.length<20)return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
-      const trees=[],lr=0.12,nT=20;
+      const trees=[],lr=0.12,nT=10; // 10 trees — enough signal, much faster
       let F=new Array(X.length).fill(y.filter(v=>v===1).length/y.length);
-      for(let t=0;t<nT;t++){const sub=X.map((x,i)=>[x,y[i]-F[i]]).filter(()=>Math.random()<0.7);if(sub.length<5)continue;const tree=srvLGBMTree(sub);trees.push(tree);F=F.map((fi,i)=>Math.max(0.001,Math.min(0.999,fi+lr*srvLGBMPred1(tree,X[i]))));}
+      for(let t=0;t<nT;t++){const sub=X.map((x,i)=>[x,y[i]-F[i]]).filter(()=>Math.random()<0.6);if(sub.length<5)continue;const tree=srvLGBMTree(sub);trees.push(tree);F=F.map((fi,i)=>Math.max(0.001,Math.min(0.999,fi+lr*srvLGBMPred1(tree,X[i]))));}
       srvModelCache[key]={model:trees,baseRate:y.filter(v=>v===1).length/y.length,trainedAt:rounds.length};
     }
     if(!srvModelCache[key])return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
@@ -2226,7 +2218,7 @@ function buildServerPRP(gs, maxWidth, targetLabel, isRare, rounds, targetMin, en
     if(srvNeedsRetrain(key,rounds.length)){
       if(rounds.length<100)return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
       const signal=rounds.map(r=>r.multiplier>=targetMin?1:0);
-      const N=Math.min(signal.length,512),seg=signal.slice(-N);
+      const N=Math.min(signal.length,128),seg=signal.slice(-N); // cap DFT at 128 for speed
       let topMag=0,topK=1;
       for(let k=1;k<N/2;k++){let re=0,im=0;for(let n=0;n<N;n++){const a=(2*Math.PI*k*n)/N;re+=seg[n]*Math.cos(a);im-=seg[n]*Math.sin(a);}const mag=Math.sqrt(re*re+im*im);if(mag>topMag){topMag=mag;topK=k;}}
       const dominantPeriod=Math.round(N/topK);
@@ -2262,8 +2254,9 @@ function buildServerGRU(gs, maxWidth, targetLabel, isRare, rounds, targetMin, en
     if(srvNeedsRetrain(key,rounds.length)){
       if(rounds.length<80)return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
       const seqs=[],labels=[],logMax=Math.log(Math.max(2,targetMin*2));
-      for(let i=SRV_GRU_SEQ;i<rounds.length-maxWidth;i++){const seq=rounds.slice(i-SRV_GRU_SEQ,i).map(r=>Math.min(1,Math.log(Math.max(1,r.multiplier))/logMax));const label=rounds.slice(i,i+maxWidth).some(r=>r.multiplier>=targetMin)?1:0;seqs.push(seq);labels.push(label);}
-      if(seqs.length<20)return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
+      const gruTrainRounds=rounds.slice(-Math.min(rounds.length,400+maxWidth));
+      for(let i=SRV_GRU_SEQ;i<gruTrainRounds.length-maxWidth;i++){const seq=gruTrainRounds.slice(i-SRV_GRU_SEQ,i).map(r=>Math.min(1,Math.log(Math.max(1,r.multiplier))/logMax));const label=gruTrainRounds.slice(i,i+maxWidth).some(r=>r.multiplier>=targetMin)?1:0;seqs.push(seq);labels.push(label);}
+      if(seqs.length<15)return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
       let w=srvModelCache[key]?.model??srvInitGRU();
       for(let e=0;e<3;e++){let dwO=w.Wo.map(r=>r.map(()=>0)),dbO=[0];for(let i=0;i<seqs.length;i++){const p=srvGRUFwd(w,seqs[i]),err=p-labels[i];dwO=dwO.map(row=>row.map(ww=>ww+err*0.1));dbO=[dbO[0]+err];}const N=seqs.length;w.Wo=w.Wo.map(row=>row.map((ww,j)=>ww-0.01*dwO[0][j]/N));w.bo=[w.bo[0]-0.01*dbO[0]/N];}
       srvModelCache[key]={model:w,trainedAt:rounds.length};
@@ -2286,7 +2279,7 @@ function buildServerIFOR(gs, maxWidth, targetLabel, isRare, rounds, targetMin, e
     if(srvNeedsRetrain(key,rounds.length)){
       const{X}=srvBuildDataset(rounds,targetMin,maxWidth);
       if(X.length<20)return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
-      const nT=60,subSz=32,trees=[];
+      const nT=30,subSz=32,trees=[];
       for(let t=0;t<nT;t++){const sub=Array.from({length:subSz},()=>X[Math.floor(Math.random()*X.length)]);trees.push(srvITree(sub));}
       srvModelCache[key]={model:{trees,subSz},trainedAt:rounds.length};
     }
