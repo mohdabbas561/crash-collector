@@ -2980,12 +2980,33 @@ async function runTier2Background(allEngines, rounds, lastRoundId) {
   }
 }
 
+// ── In-memory rounds cache — avoid re-fetching all 8000+ rows every tick ──────
+let cachedRounds = [];
+let cachedRoundsLastId = 0;
+
+async function getEngineRounds() {
+  if (cachedRounds.length === 0) {
+    // First load: fetch full history
+    const all = await getRounds({ limit: 100000, order: 'DESC' });
+    cachedRounds = all.sort((a, b) => a.roundId - b.roundId);
+    cachedRoundsLastId = cachedRounds.length ? cachedRounds[cachedRounds.length-1].roundId : 0;
+    console.log(`[engine] loaded ${cachedRounds.length} rounds into memory`);
+  } else {
+    // Subsequent loads: only fetch new rounds since last seen
+    const newRounds = await getRounds({ limit: 500, minRoundId: cachedRoundsLastId + 1 });
+    if (newRounds.length) {
+      cachedRounds = [...cachedRounds, ...newRounds].sort((a,b) => a.roundId - b.roundId);
+      cachedRoundsLastId = cachedRounds[cachedRounds.length-1].roundId;
+    }
+  }
+  return cachedRounds;
+}
+
 async function runPredictionEngine() {
   try {
     await initialise();
-    const rounds = await getRounds({ limit: 100000, order: 'DESC' }); // full history — use all collected data
+    const rounds = await getEngineRounds();
     if (rounds.length < MIN_ROUNDS) { console.log(`[engine] waiting (${rounds.length}/${MIN_ROUNDS})`); return; }
-    rounds.sort((a, b) => a.roundId - b.roundId);
     const lastRoundId = rounds[rounds.length - 1].roundId;
 
     const allEngines = [

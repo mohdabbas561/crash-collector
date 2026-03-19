@@ -114,12 +114,13 @@ async function saveRounds(rounds) {
   return res.rowCount;
 }
 
-async function getRounds({ limit = 1000, offset = 0, from = null, to = null, order = 'ASC' } = {}) {
+async function getRounds({ limit = 1000, offset = 0, from = null, to = null, order = 'ASC', minRoundId = null } = {}) {
   const conditions = [];
   const params = [];
   let idx = 1;
   if (from) { conditions.push(`created_at >= $${idx++}`); params.push(new Date(from)); }
   if (to)   { conditions.push(`created_at <= $${idx++}`); params.push(new Date(to)); }
+  if (minRoundId) { conditions.push(`round_id >= $${idx++}`); params.push(minRoundId); }
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   params.push(limit, offset);
   const sortDir = order === 'DESC' ? 'DESC' : 'ASC';
