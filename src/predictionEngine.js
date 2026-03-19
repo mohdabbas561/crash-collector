@@ -1653,11 +1653,13 @@ function extractMLFeatures(gs, rounds, targetMin) {
 // Converts feature vector to labelled training rows from historical gaps
 // Returns { X: number[][], y: number[] } for binary classification (hit in next W rounds)
 function buildMLDataset(rounds, targetMin, maxWidth) {
-  // O(n) sliding window — uses ALL collected rounds, CONTEXT=100 keeps complexity linear
+  // O(n) sliding window. npm ML libs (RF/GBT/LR/NB/LSTM) are slow in pure JS —
+  // cap at last 2000 rounds. Still 2x richer than before, fast enough.
+  // Server-side engines (LGBM/IFOR/PRP/GRU) use srvBuildDataset with full data.
   const X = [], y = [];
-  const CONTEXT = 100; // fixed context window per sample — keeps O(n)
-  // Use ALL rounds — full history gives richer signal for rare targets
-  const trainRounds = rounds;
+  const CONTEXT = 100;
+  const NPM_CAP = 2000;
+  const trainRounds = rounds.slice(-Math.min(rounds.length, NPM_CAP + maxWidth));
   if (trainRounds.length < CONTEXT + maxWidth + 10) return { X, y };
 
   for (let i = CONTEXT; i < trainRounds.length - maxWidth; i++) {
@@ -2121,7 +2123,7 @@ function buildLSTM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineG
 
       // Build training sequences — last 1000 rounds for speed
       const sequences = [], labels = [];
-      const lstmTrain = rounds; // full history
+      const lstmTrain = rounds.slice(-Math.min(rounds.length, 2000 + maxWidth)); // cap: sequential training slow on 8000+
       for (let i = LSTM_SEQ_LEN; i < lstmTrain.length - maxWidth; i++) {
         const seq = lstmTrain.slice(i-LSTM_SEQ_LEN, i).map(r => {
           const v = r.multiplier;
@@ -2306,7 +2308,7 @@ function buildServerGRU(gs, maxWidth, targetLabel, isRare, rounds, targetMin, en
     if(srvNeedsRetrain(key,rounds.length)){
       if(rounds.length<80)return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
       const seqs=[],labels=[],logMax=Math.log(Math.max(2,targetMin*2));
-      const gruTrain=rounds; // full history
+      const gruTrain=rounds.slice(-Math.min(rounds.length,2000+maxWidth)); // cap: sequential
       for(let i=SRV_GRU_SEQ;i<gruTrain.length-maxWidth;i++){const seq=gruTrain.slice(i-SRV_GRU_SEQ,i).map(r=>Math.min(1,Math.log(Math.max(1,r.multiplier))/logMax));const label=gruTrain.slice(i,i+maxWidth).some(r=>r.multiplier>=targetMin)?1:0;seqs.push(seq);labels.push(label);}
       if(seqs.length<15){srvModelCache[key]={model:null,trainedAt:rounds.length};return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);}
       let w=srvModelCache[key]?.model??srvInitGRU();
