@@ -104,7 +104,7 @@ function getNB()   { if (_nb   === null) { try { const _m = require('ml-naivebay
 
 // ── In-memory ML model cache (retrain when rounds grow by ML_RETRAIN_INTERVAL) ─
 const mlModelCache       = {};   // { rf_5x: {model, trainedAt}, ... }
-const ML_RETRAIN_INTERVAL = 1000; // retrain every 1000 new rounds
+const ML_RETRAIN_INTERVAL = 500;  // retrain every 500 new rounds (~7 min)
 let   mlTrainingEnabled  = false; // stays false until after first full engine cycle
 let   mlLastTrainRound   = 0;
 
@@ -1653,12 +1653,11 @@ function extractMLFeatures(gs, rounds, targetMin) {
 // Converts feature vector to labelled training rows from historical gaps
 // Returns { X: number[][], y: number[] } for binary classification (hit in next W rounds)
 function buildMLDataset(rounds, targetMin, maxWidth) {
-  // O(n) sliding window — caps training at last 1000 rounds for speed
-  // Full 5000 rounds are used only for predictions (gap stats, window placement)
+  // O(n) sliding window — uses ALL collected rounds, CONTEXT=100 keeps complexity linear
   const X = [], y = [];
   const CONTEXT = 100; // fixed context window per sample — keeps O(n)
-  const TRAIN_CAP = 1000; // cap training data — 1000 rounds ~= 14 min of game history
-  const trainRounds = rounds.slice(-Math.min(rounds.length, TRAIN_CAP + maxWidth));
+  // Use ALL rounds — full history gives richer signal for rare targets
+  const trainRounds = rounds;
   if (trainRounds.length < CONTEXT + maxWidth + 10) return { X, y };
 
   for (let i = CONTEXT; i < trainRounds.length - maxWidth; i++) {
@@ -2122,7 +2121,7 @@ function buildLSTM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineG
 
       // Build training sequences — last 1000 rounds for speed
       const sequences = [], labels = [];
-      const lstmTrain = rounds.slice(-Math.min(rounds.length, 1000 + maxWidth));
+      const lstmTrain = rounds; // full history
       for (let i = LSTM_SEQ_LEN; i < lstmTrain.length - maxWidth; i++) {
         const seq = lstmTrain.slice(i-LSTM_SEQ_LEN, i).map(r => {
           const v = r.multiplier;
@@ -2192,11 +2191,11 @@ function srvExtractFeatures(gs, rounds, targetMin) {
 }
 
 function srvBuildDataset(rounds, targetMin, maxWidth) {
-  // O(n) sliding window — caps training at last 1000 rounds for speed
+  // O(n) sliding window — uses ALL collected rounds, CONTEXT=100 keeps it linear
   const X = [], y = [];
   const CONTEXT = 100; // fixed context window per sample — keeps O(n)
-  const TRAIN_CAP = 1000;
-  const trainRounds = rounds.slice(-Math.min(rounds.length, TRAIN_CAP + maxWidth));
+  // Use ALL rounds — full history
+  const trainRounds = rounds;
   if (trainRounds.length < CONTEXT + maxWidth + 10) return { X, y };
   for (let i = CONTEXT; i < trainRounds.length - maxWidth; i++) {
     const ctx = trainRounds.slice(i - CONTEXT, i);
@@ -2222,7 +2221,7 @@ function srvBuildDataset(rounds, targetMin, maxWidth) {
 }
 
 const srvModelCache = {};
-const SRV_RETRAIN_INTERVAL = 1000;
+const SRV_RETRAIN_INTERVAL = 500;  // retrain every 500 new rounds
 function srvNeedsRetrain(key, n) {
   if (!mlTrainingEnabled) return false;
   const c = srvModelCache[key];
@@ -2307,7 +2306,7 @@ function buildServerGRU(gs, maxWidth, targetLabel, isRare, rounds, targetMin, en
     if(srvNeedsRetrain(key,rounds.length)){
       if(rounds.length<80)return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
       const seqs=[],labels=[],logMax=Math.log(Math.max(2,targetMin*2));
-      const gruTrain=rounds.slice(-Math.min(rounds.length,1000+maxWidth));
+      const gruTrain=rounds; // full history
       for(let i=SRV_GRU_SEQ;i<gruTrain.length-maxWidth;i++){const seq=gruTrain.slice(i-SRV_GRU_SEQ,i).map(r=>Math.min(1,Math.log(Math.max(1,r.multiplier))/logMax));const label=gruTrain.slice(i,i+maxWidth).some(r=>r.multiplier>=targetMin)?1:0;seqs.push(seq);labels.push(label);}
       if(seqs.length<15){srvModelCache[key]={model:null,trainedAt:rounds.length};return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);}
       let w=srvModelCache[key]?.model??srvInitGRU();
@@ -2928,7 +2927,7 @@ async function runTier2Background(allEngines, rounds, lastRoundId) {
 async function runPredictionEngine() {
   try {
     await initialise();
-    const rounds = await getRounds({ limit: 5000, order: 'DESC' });
+    const rounds = await getRounds({ limit: 100000, order: 'DESC' }); // full history — use all collected data
     if (rounds.length < MIN_ROUNDS) { console.log(`[engine] waiting (${rounds.length}/${MIN_ROUNDS})`); return; }
     rounds.sort((a, b) => a.roundId - b.roundId);
     const lastRoundId = rounds[rounds.length - 1].roundId;
