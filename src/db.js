@@ -167,27 +167,68 @@ async function getStorageStats() {
 }
 
 async function getStats() {
-  const res = await pool.query(`
-    SELECT
-      COUNT(*)                                                        AS total,
-      AVG(multiplier)::NUMERIC(10,4)                                 AS avg,
-      MAX(multiplier)::NUMERIC(10,4)                                 AS highest,
-      (SELECT round_id FROM rounds ORDER BY round_id DESC LIMIT 1)  AS current_round,
-      SUM(CASE WHEN multiplier < 2    THEN 1 ELSE 0 END)            AS lt2,
-      SUM(CASE WHEN multiplier >= 2   AND multiplier < 5   THEN 1 ELSE 0 END) AS b2_5,
-      SUM(CASE WHEN multiplier >= 5   AND multiplier < 10  THEN 1 ELSE 0 END) AS b5_10,
-      SUM(CASE WHEN multiplier >= 10  AND multiplier < 20  THEN 1 ELSE 0 END) AS b10_20,
-      SUM(CASE WHEN multiplier >= 20  AND multiplier < 50  THEN 1 ELSE 0 END) AS b20_50,
-      SUM(CASE WHEN multiplier >= 50  AND multiplier < 100 THEN 1 ELSE 0 END) AS b50_100,
-      SUM(CASE WHEN multiplier >= 100 THEN 1 ELSE 0 END)            AS gt100
-    FROM rounds
-  `);
-  const row = res.rows[0];
+  const [mainRes, gapRes] = await Promise.all([
+    pool.query(`
+      SELECT
+        COUNT(*)                                                        AS total,
+        AVG(multiplier)::NUMERIC(10,4)                                 AS avg,
+        MAX(multiplier)::NUMERIC(10,4)                                 AS highest,
+        (SELECT round_id FROM rounds ORDER BY round_id DESC LIMIT 1)  AS current_round,
+        SUM(CASE WHEN multiplier < 2    THEN 1 ELSE 0 END)            AS lt2,
+        SUM(CASE WHEN multiplier >= 2   AND multiplier < 5   THEN 1 ELSE 0 END) AS b2_5,
+        SUM(CASE WHEN multiplier >= 5   AND multiplier < 10  THEN 1 ELSE 0 END) AS b5_10,
+        SUM(CASE WHEN multiplier >= 10  AND multiplier < 20  THEN 1 ELSE 0 END) AS b10_20,
+        SUM(CASE WHEN multiplier >= 20  AND multiplier < 50  THEN 1 ELSE 0 END) AS b20_50,
+        SUM(CASE WHEN multiplier >= 50  AND multiplier < 100 THEN 1 ELSE 0 END) AS b50_100,
+        SUM(CASE WHEN multiplier >= 100 THEN 1 ELSE 0 END)            AS gt100
+      FROM rounds
+    `),
+    // Gap tracker: rounds since last hit for each target (from full DB)
+    pool.query(`
+      WITH latest AS (SELECT round_id FROM rounds ORDER BY round_id DESC LIMIT 1),
+      last_hits AS (
+        SELECT
+          MAX(CASE WHEN multiplier >= 2    THEN round_id END) AS h2,
+          MAX(CASE WHEN multiplier >= 5    THEN round_id END) AS h5,
+          MAX(CASE WHEN multiplier >= 10   THEN round_id END) AS h10,
+          MAX(CASE WHEN multiplier >= 20   THEN round_id END) AS h20,
+          MAX(CASE WHEN multiplier >= 25   THEN round_id END) AS h25,
+          MAX(CASE WHEN multiplier >= 30   THEN round_id END) AS h30,
+          MAX(CASE WHEN multiplier >= 50   THEN round_id END) AS h50,
+          MAX(CASE WHEN multiplier >= 100  THEN round_id END) AS h100,
+          MAX(CASE WHEN multiplier >= 200  THEN round_id END) AS h200,
+          MAX(CASE WHEN multiplier >= 500  THEN round_id END) AS h500,
+          MAX(CASE WHEN multiplier >= 1000 THEN round_id END) AS h1000
+        FROM rounds
+      )
+      SELECT
+        l.round_id - COALESCE(lh.h2,    0) AS g2,
+        l.round_id - COALESCE(lh.h5,    0) AS g5,
+        l.round_id - COALESCE(lh.h10,   0) AS g10,
+        l.round_id - COALESCE(lh.h20,   0) AS g20,
+        l.round_id - COALESCE(lh.h25,   0) AS g25,
+        l.round_id - COALESCE(lh.h30,   0) AS g30,
+        l.round_id - COALESCE(lh.h50,   0) AS g50,
+        l.round_id - COALESCE(lh.h100,  0) AS g100,
+        l.round_id - COALESCE(lh.h200,  0) AS g200,
+        l.round_id - COALESCE(lh.h500,  0) AS g500,
+        l.round_id - COALESCE(lh.h1000, 0) AS g1000
+      FROM latest l, last_hits lh
+    `)
+  ]);
+  const row = mainRes.rows[0];
+  const g   = gapRes.rows[0] || {};
   return {
     tracked     : Number(row.total),
     avg         : row.avg,
     highest     : row.highest,
     currentRound: Number(row.current_round) || null,
+    gaps: {
+      2: Number(g.g2)||0, 5: Number(g.g5)||0, 10: Number(g.g10)||0,
+      20: Number(g.g20)||0, 25: Number(g.g25)||0, 30: Number(g.g30)||0,
+      50: Number(g.g50)||0, 100: Number(g.g100)||0,
+      200: Number(g.g200)||0, 500: Number(g.g500)||0, 1000: Number(g.g1000)||0,
+    },
     distribution: {
       lt2    : Number(row.lt2),
       b2_5   : Number(row.b2_5),
