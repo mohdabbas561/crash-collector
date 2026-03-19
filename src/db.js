@@ -38,6 +38,14 @@ async function initDB() {
   `);
 
   await pool.query(`
+    -- FIX: probW column needed so calibration survives server restarts.
+    -- Without it getPredictions returns probW:null and the warm-up in
+    -- initialise() can't update modelScores/calibState from history.
+    ALTER TABLE predictions
+      ADD COLUMN IF NOT EXISTS prob_w NUMERIC(8,6);
+  `);
+
+  await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_predictions_source ON predictions(source);
   `);
 
@@ -58,12 +66,12 @@ async function initDB() {
   `).catch(() => {});
 }
 
-async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation, source = 'engine' }) {
+async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation, source = 'engine', probW = null }) {
   await pool.query(
-    `INSERT INTO predictions (target, min_mult, outcome, window_lo, window_hi, hit_round, generation, source)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    `INSERT INTO predictions (target, min_mult, outcome, window_lo, window_hi, hit_round, generation, source, prob_w)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      ON CONFLICT (source, target, window_lo, window_hi) DO NOTHING`,
-    [target, minMult, outcome, lo, hi, hitRound ?? null, generation, source]
+    [target, minMult, outcome, lo, hi, hitRound ?? null, generation, source, probW ?? null]
   );
 }
 
@@ -76,7 +84,7 @@ async function getPredictions({ limit = 500, target = null, source = null } = {}
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   params.push(limit);
   const res = await pool.query(
-    `SELECT id, target, min_mult, outcome, window_lo, window_hi, hit_round, generation, source, created_at
+    `SELECT id, target, min_mult, outcome, window_lo, window_hi, hit_round, generation, source, prob_w, created_at
      FROM predictions ${where}
      ORDER BY created_at DESC
      LIMIT $${idx}`,
@@ -92,6 +100,7 @@ async function getPredictions({ limit = 500, target = null, source = null } = {}
     hitRound:   r.hit_round ? Number(r.hit_round) : null,
     generation: r.generation,
     source:     r.source || 'engine',
+    probW:      r.prob_w != null ? parseFloat(r.prob_w) : null,
     ts:         new Date(r.created_at).getTime(),
   }));
 }

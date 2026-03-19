@@ -89,7 +89,6 @@ const STAT_MODELS = [
   { id: 'nb'   },   // Naive Bayes (Gaussian) — ml-naivebayes
   { id: 'lstm' },   // LSTM                  — pure JS, zero deps
   { id: 'lgbm' },   // LightGBM              — pure JS leaf-wise boosting
-  { id: 'prp'  },   // Prophet               — pure JS seasonality/cycle
   { id: 'gru'  },   // GRU Neural Net        — pure JS gated recurrent
   { id: 'ifor' },   // Isolation Forest      — pure JS anomaly detection
   { id: 'meta' },   // Meta-Ensemble         — weighted average of all 9 ML engines
@@ -214,7 +213,7 @@ for (const t of TARGETS) {
 
 // ── Per-engine independent CUSUM / regime state ───────────────────────────────
 const engineCusumState = {};
-for (const id of ['engine', 'ens', 'geo', 'bay', 'km', 'rf', 'gbt', 'lr', 'nb', 'lstm', 'lgbm', 'prp', 'gru', 'ifor', 'meta']) {
+for (const id of ['engine', 'ens', 'geo', 'bay', 'km', 'rf', 'gbt', 'lr', 'nb', 'lstm', 'lgbm', 'gru', 'ifor', 'meta']) {
   engineCusumState[id] = {};
   for (const t of TARGETS) {
     engineCusumState[id][t.label] = {
@@ -244,7 +243,6 @@ const STATE = {
   nb:      { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
   lstm:    { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
   lgbm:    { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
-  prp:     { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
   gru:     { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
   ifor:    { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
   meta:    { lockedMap: null, savedSet: null, needsRebuild: true, lastRoundId: 0 },
@@ -255,7 +253,7 @@ const STATE = {
 // per target. This drives independent gapSinceLast so windows diverge.
 // Initialised to -1 (unknown — falls back to shared gapStats on first run).
 const engineLastHit = {};
-for (const id of ['engine', 'ens', 'geo', 'bay', 'km', 'rf', 'gbt', 'lr', 'nb', 'lstm', 'lgbm', 'prp', 'gru', 'ifor', 'meta']) {
+for (const id of ['engine', 'ens', 'geo', 'bay', 'km', 'rf', 'gbt', 'lr', 'nb', 'lstm', 'lgbm', 'gru', 'ifor', 'meta']) {
   engineLastHit[id] = {};
   for (const t of TARGETS) engineLastHit[id][t.label] = -1;
 }
@@ -1595,7 +1593,6 @@ function buildStatPrediction(rounds, targetMin, maxWidth, modelId, lastRoundId) 
     case 'nb':   return buildNB(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
     case 'lstm': return buildLSTM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
     case 'lgbm': return buildServerLGBM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
-    case 'prp':  return buildServerPRP(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
     case 'gru':  return buildServerGRU(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
     case 'ifor': return buildServerIFOR(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
     case 'meta':  return buildMeta(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap);
@@ -2314,37 +2311,6 @@ function buildServerLGBM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, e
   return buildMLWindow(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast,Math.max(0.05,Math.min(0.95,prob)),'lgbm');
 }
 
-function buildServerPRP(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) {
-  const key=`prp_${targetMin}`; let prob=0.5;
-  try {
-    if(srvNeedsRetrain(key,rounds.length)){
-      srvTrainingInProgress.add(key);
-      if(rounds.length<100){srvTrainingInProgress.delete(key);return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);}
-      const signal=rounds.map(r=>r.multiplier>=targetMin?1:0);
-      const N=Math.min(signal.length,128),seg=signal.slice(-N); // cap DFT at 128 for speed
-      let topMag=0,topK=1;
-      for(let k=1;k<N/2;k++){let re=0,im=0;for(let n=0;n<N;n++){const a=(2*Math.PI*k*n)/N;re+=seg[n]*Math.cos(a);im-=seg[n]*Math.sin(a);}const mag=Math.sqrt(re*re+im*im);if(mag>topMag){topMag=mag;topK=k;}}
-      const dominantPeriod=Math.round(N/topK);
-      const baseRate=signal.filter(Boolean).length/signal.length;
-      const lastHitIdx=signal.reduceRight((acc,v,i)=>acc===-1&&v?i:acc,-1);
-      const phase=lastHitIdx>=0?(signal.length-1-lastHitIdx)%dominantPeriod:dominantPeriod/2;
-      const winSz=20,windows=[];
-      for(let i=0;i+winSz<=signal.length;i++)windows.push(signal.slice(i,i+winSz).filter(Boolean).length/winSz);
-      const wMean=windows.reduce((a,b)=>a+b,0)/Math.max(1,windows.length);
-      const wStd=Math.sqrt(windows.reduce((a,b)=>a+(b-wMean)**2,0)/Math.max(1,windows.length));
-      const clusterScore=((windows.slice(-1)[0]||0)-wMean)/Math.max(0.001,wStd);
-      srvModelCache[key]={baseRate,dominantPeriod,phase,clusterScore,trainedAt:rounds.length};
-      srvTrainingInProgress.delete(key);
-    }
-    if(!srvModelCache[key]||!srvModelCache[key].baseRate)return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
-    const{baseRate,dominantPeriod,phase,clusterScore}=srvModelCache[key];
-    const seasonality=0.5*(1+Math.sin((2*Math.PI*phase)/Math.max(1,dominantPeriod)));
-    const clusterAdj=Math.min(0.2,Math.max(-0.2,clusterScore*0.08));
-    const overdueBoost=Math.min(0.25,(gs.gapSinceLast/Math.max(1,gs.meanGap))*0.12);
-    prob=baseRate+0.12*(seasonality-0.5)+clusterAdj+overdueBoost;
-  }catch(e){console.warn('[prp]',e.message);return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);}
-  return buildMLWindow(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast,Math.max(0.05,Math.min(0.95,prob)),'prp');
-}
 
 const SRV_GRU_H=12,SRV_GRU_SEQ=20;
 function srvGSig(x){return 1/(1+Math.exp(-Math.max(-15,Math.min(15,x))));}
@@ -2453,7 +2419,7 @@ function buildServerIFOR(gs, maxWidth, targetLabel, isRare, rounds, targetMin, e
 // Per-target per-engine win rate tracker for meta weighting
 // Seeded from modelScores which is already updated from DB history
 function getMetaWeights(targetLabel) {
-  const ML_ENGINE_IDS_LIST = ['rf','gbt','lr','nb','lstm','lgbm','prp','gru','ifor'];
+  const ML_ENGINE_IDS_LIST = ['rf','gbt','lr','nb','lstm','lgbm','gru','ifor'];
   const weights = {};
   let totalW = 0;
 
@@ -2490,7 +2456,6 @@ function buildMeta(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineG
     { id: 'nb',   fn: () => buildNB(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) },
     { id: 'lstm', fn: () => buildLSTM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) },
     { id: 'lgbm', fn: () => buildServerLGBM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) },
-    { id: 'prp',  fn: () => buildServerPRP(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) },
     { id: 'gru',  fn: () => buildServerGRU(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) },
     { id: 'ifor', fn: () => buildServerIFOR(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast) },
   ];
@@ -2640,7 +2605,12 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
     const isNonsense  = !Number.isFinite(absLow)||!Number.isFinite(absHigh)||absHigh<absLow||anchorRound===0;
     const isExpired   = lastRoundId > absHigh;
     const isStale     = !!existing.stale;
-    const isTooOld    = isExpired && (lastRoundId - absHigh) > STALE_FORCE_REBUILD_THRESHOLD;
+    // FIX: was 500 — caused outcomes to be silently dropped after server restart
+    // when lastRoundId had advanced far past the window. Raised to 50000 so
+    // virtually no window is ever "too old to save". The only effect of isTooOld
+    // is skipping the save attempt; we still always rebuild. History was broken
+    // because every window on restart was considered isTooOld and outcomes were lost.
+    const isTooOld    = isExpired && (lastRoundId - absHigh) > 50000;
 
     if (isNonsense || isExpired || isStale) {
       if (!isNonsense && !isTooOld) {
@@ -2651,7 +2621,7 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
           if (!state.savedSet.has(key)) {
             state.savedSet.add(key);
             try {
-              await savePrediction({ target:target.label, minMult:target.min, outcome, lo:absLow, hi:absHigh, anchorRound, hitRound:status.hitRound||null, generation:existing.generation||1, source:engineId });
+              await savePrediction({ target:target.label, minMult:target.min, outcome, lo:absLow, hi:absHigh, anchorRound, hitRound:status.hitRound||null, generation:existing.generation||1, source:engineId, probW:existing.probW??null });
               recordTimingOutcome(target.label, outcome === 'early');
               // Record this engine's last WIN round independently — drives per-engine gapSinceLast
               // Track last hit for BOTH win and early — target DID hit regardless
@@ -2687,7 +2657,7 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
       if (!state.savedSet.has(key)) {
         state.savedSet.add(key);
         try {
-          await savePrediction({ target:target.label, minMult:target.min, outcome, lo:absLow, hi:absHigh, anchorRound, hitRound:status.hitRound||null, generation:existing.generation||1, source:engineId });
+          await savePrediction({ target:target.label, minMult:target.min, outcome, lo:absLow, hi:absHigh, anchorRound, hitRound:status.hitRound||null, generation:existing.generation||1, source:engineId, probW:existing.probW??null });
           recordTimingOutcome(target.label, outcome === 'early');
           // Track last hit for BOTH win and early — target DID hit regardless of window timing
           if ((outcome === 'win' || outcome === 'early') && status.hitRound) {
@@ -2848,7 +2818,7 @@ function getEngineStats() {
   const out = {};
   for (const t of TARGETS) {
     out[t.label] = {};
-    for (const id of ['engine', 'ens', 'geo', 'bay', 'km', 'rf', 'gbt', 'lr', 'nb', 'lstm', 'lgbm', 'prp', 'gru', 'ifor', 'meta']) {
+    for (const id of ['engine', 'ens', 'geo', 'bay', 'km', 'rf', 'gbt', 'lr', 'nb', 'lstm', 'lgbm', 'gru', 'ifor', 'meta']) {
       const cs = engineCusumState[id]?.[t.label];
       if (!cs) continue;
       const ece = STAT_MODELS.some(m => m.id === id) ? getECE(t.label, id) : null;
@@ -2926,7 +2896,7 @@ async function initialise() {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 // ── ML engine IDs — run deferred so they never block the HTTP server ──────────
-const ML_ENGINE_IDS = new Set(['rf','gbt','lr','nb','lstm','lgbm','prp','gru','ifor','meta']);
+const ML_ENGINE_IDS = new Set(['rf','gbt','lr','nb','lstm','lgbm','gru','ifor','meta']);
 
 // Run a single engine, yielding event loop before each one
 function runEngineDeferred(eng, rounds, lastRoundId) {
