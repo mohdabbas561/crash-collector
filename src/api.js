@@ -117,10 +117,47 @@ app.post('/predictions', rateLimit(120), async (req, res) => {
 app.delete('/predictions', requireAdmin, async (req, res) => {
   try {
     await clearPredictions();
+    // Also bust the predictions-all cache so next request is fresh
+    predsAllCache = null;
     require('./predictionEngine').resetEngineState();
     console.log('[api] predictions cleared + engine reset');
     res.json({ ok:true });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// ── Batch history — all model histories in one request ────────────────────────
+// Cached for 15s — history doesn't change every second and this fires 14 DB
+// queries per call. Was previously deleted by accident causing blank history.
+let predsAllCache    = null;
+let predsAllCacheTs  = 0;
+const PREDS_ALL_TTL = 15000;
+
+app.get('/predictions-all', rateLimit(120), async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit || '300'), 1000);
+    const now   = Date.now();
+    if (!predsAllCache || (now - predsAllCacheTs) > PREDS_ALL_TTL) {
+      const [ens, geo, bay, km, rf, gbt, lr, nb, lstm, lgbm, prp, gru, ifor, meta] = await Promise.all([
+        getPredictions({ limit, source: 'ens'  }),
+        getPredictions({ limit, source: 'geo'  }),
+        getPredictions({ limit, source: 'bay'  }),
+        getPredictions({ limit, source: 'km'   }),
+        getPredictions({ limit, source: 'rf'   }),
+        getPredictions({ limit, source: 'gbt'  }),
+        getPredictions({ limit, source: 'lr'   }),
+        getPredictions({ limit, source: 'nb'   }),
+        getPredictions({ limit, source: 'lstm' }),
+        getPredictions({ limit, source: 'lgbm' }),
+        getPredictions({ limit, source: 'prp'  }),
+        getPredictions({ limit, source: 'gru'  }),
+        getPredictions({ limit, source: 'ifor' }),
+        getPredictions({ limit, source: 'meta' }),
+      ]);
+      predsAllCache   = { ens, geo, bay, km, rf, gbt, lr, nb, lstm, lgbm, prp, gru, ifor, meta };
+      predsAllCacheTs = now;
+    }
+    res.json({ ok: true, ...predsAllCache });
+  } catch(e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 // ── ENGINE LOCKED ─────────────────────────────────────────────────────────────
