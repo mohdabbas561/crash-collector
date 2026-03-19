@@ -1653,11 +1653,14 @@ function extractMLFeatures(gs, rounds, targetMin) {
 // Converts feature vector to labelled training rows from historical gaps
 // Returns { X: number[][], y: number[] } for binary classification (hit in next W rounds)
 function buildMLDataset(rounds, targetMin, maxWidth) {
-  // O(n) sliding window — uses ALL rounds. Training runs in worker thread
-  // so it never blocks the main event loop regardless of dataset size.
+  // O(n) sliding window. Cap at 3000 rounds — npm JS libs (RF/GBT/LR/NB/LSTM)
+  // are CPU-bound and block on large datasets. 3000 rows = rich signal for all
+  // targets including 1000x (~15 hits), runs in <2s. Server-side engines
+  // (LGBM/IFOR/PRP/GRU via srvBuildDataset) use full data — they're faster.
   const X = [], y = [];
   const CONTEXT = 100;
-  const trainRounds = rounds; // full history — worker thread handles the cost
+  const CAP = 3000;
+  const trainRounds = rounds.slice(-Math.min(rounds.length, CAP + maxWidth));
   if (trainRounds.length < CONTEXT + maxWidth + 10) return { X, y };
 
   for (let i = CONTEXT; i < trainRounds.length - maxWidth; i++) {
@@ -2134,7 +2137,7 @@ function buildLSTM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineG
 
       // Build training sequences — last 1000 rounds for speed
       const sequences = [], labels = [];
-      const lstmTrain = rounds; // full history — runs in worker thread
+      const lstmTrain = rounds.slice(-Math.min(rounds.length, 3000 + maxWidth)); // cap 3000
       for (let i = LSTM_SEQ_LEN; i < lstmTrain.length - maxWidth; i++) {
         const seq = lstmTrain.slice(i-LSTM_SEQ_LEN, i).map(r => {
           const v = r.multiplier;
@@ -2328,7 +2331,7 @@ function buildServerGRU(gs, maxWidth, targetLabel, isRare, rounds, targetMin, en
       srvTrainingInProgress.add(key);
       if(rounds.length<80){srvTrainingInProgress.delete(key);return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);}
       const seqs=[],labels=[],logMax=Math.log(Math.max(2,targetMin*2));
-      const gruTrain=rounds; // full history — runs in worker thread
+      const gruTrain=rounds.slice(-Math.min(rounds.length,3000+maxWidth)); // cap 3000
       for(let i=SRV_GRU_SEQ;i<gruTrain.length-maxWidth;i++){const seq=gruTrain.slice(i-SRV_GRU_SEQ,i).map(r=>Math.min(1,Math.log(Math.max(1,r.multiplier))/logMax));const label=gruTrain.slice(i,i+maxWidth).some(r=>r.multiplier>=targetMin)?1:0;seqs.push(seq);labels.push(label);}
       if(seqs.length<15){srvModelCache[key]={model:null,trainedAt:rounds.length};return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);}
       let w=srvModelCache[key]?.model??srvInitGRU();
