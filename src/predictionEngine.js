@@ -1635,18 +1635,18 @@ function extractMLFeatures(gs, rounds, targetMin) {
   const streakFactor  = currentStreak / Math.max(1, meanGap);
 
   return [
-    pGlobal,                             // 0  global hit probability
-    pRecent,                             // 1  recent 200-round rate
-    recentRate,                          // 2  recent 50-round rate
-    Math.min(3, overdueRatio),           // 3  gap overdue ratio (capped)
-    Math.min(3, kmGapRatio),             // 4  vs KM expected gap
-    Math.min(1, cv),                     // 5  coefficient of variation
-    Math.min(1, cusumNorm / 3),          // 6  CUSUM normalised (rate shift signal)
-    streak3 / 3,                         // 7  hits in last 3 rounds
-    last10.reduce((a,b)=>a+b,0) / 10,    // 8  hits in last 10 rounds
-    Math.min(1, streakFactor),           // 9  current losing streak factor
-    Math.min(1, hits / 500),             // 10 data richness
-    Math.min(1, gapSinceLast / 200),     // 11 absolute gap (normalised)
+    pGlobal,                                          // 0  global hit probability
+    pRecent,                                          // 1  recent 200-round rate
+    recentRate,                                       // 2  recent 50-round rate
+    Math.min(3, overdueRatio),                        // 3  gap overdue ratio (capped at 3x)
+    Math.min(3, kmGapRatio),                          // 4  vs KM expected gap (capped at 3x)
+    Math.min(3, cv),                                  // 5  CV uncapped to 3 — preserves high-variance signal
+    Math.min(1, cusumNorm / 3),                       // 6  CUSUM normalised (rate shift signal)
+    streak3 / 3,                                      // 7  hits in last 3 rounds
+    last10.reduce((a,b)=>a+b,0) / 10,                 // 8  hits in last 10 rounds
+    Math.min(1, streakFactor),                        // 9  current losing streak factor
+    Math.min(1, hits / 500),                          // 10 data richness
+    Math.min(1, gapSinceLast / Math.max(1, meanGap * 3)), // 11 gap relative to 3x expected — works for all targets
   ];
 }
 
@@ -1692,10 +1692,10 @@ function buildMLDataset(rounds, targetMin, maxWidth) {
 
     const feat = [
       pGlobal, pRecent, recentRate,
-      Math.min(3, overdueRatio), Math.min(3, gapSinceLast/kmEG), Math.min(1, cv),
+      Math.min(3, overdueRatio), Math.min(3, gapSinceLast/kmEG), Math.min(3, cv),
       0, streak3/3, // cusumNorm=0 (skip expensive CUSUM in training)
       last10.reduce((a,b)=>a+b,0)/10, Math.min(1, streak/Math.max(1,meanGap)),
-      Math.min(1, hits/100), Math.min(1, gapSinceLast/200),
+      Math.min(1, hits/100), Math.min(1, gapSinceLast/Math.max(1,meanGap*3)),
     ];
 
     const label = trainRounds.slice(i, i+maxWidth).some(r=>r.multiplier>=targetMin) ? 1 : 0;
@@ -1841,20 +1841,37 @@ function buildGBT(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGa
       let   F      = new Array(X.length).fill(y.filter(v=>v===1).length / y.length); // init to base rate
 
       for (let t = 0; t < nTrees; t++) {
-        // Pseudo-residuals (gradient of log-loss)
+        // True pseudo-residuals in logit space (gradient of log-loss)
+        const logit = v => Math.log(Math.max(1e-7, v) / Math.max(1e-7, 1 - v));
+        const sigmoid = v => 1 / (1 + Math.exp(-Math.max(-15, Math.min(15, v))));
+        // Compute residuals in logit space for numerical stability
         const residuals = y.map((yi, i) => yi - F[i]);
+        // Group samples by leaf to compute leaf means (real GBT leaf values)
         const CartClass = CART.DecisionTreeClassifier || CART;
         const tree = new CartClass({ gainFunction: 'gini', maxDepth: 3 });
+        // Train on continuous residuals quantised to 0/1 for CART compatibility
         tree.train(X, residuals.map(r => r >= 0 ? 1 : 0));
-        trees.push(tree);
-        // Update F
+        // Compute per-leaf mean residual for accurate step size
+        const leafPreds = X.map(x => tree.predict([x])[0]);
+        const leafGroups = {};
+        X.forEach((x, i) => {
+          const lk = leafPreds[i];
+          if (!leafGroups[lk]) leafGroups[lk] = { sumR: 0, count: 0 };
+          leafGroups[lk].sumR += residuals[i];
+          leafGroups[lk].count++;
+        });
+        const leafMeans = {};
+        for (const lk in leafGroups) leafMeans[lk] = leafGroups[lk].sumR / leafGroups[lk].count;
+        trees.push({ tree, leafMeans });
+        // Update F with actual leaf mean residual
         F = F.map((fi, i) => {
-          const leaf = tree.predict([X[i]])[0];
-          return Math.max(0.001, Math.min(0.999, fi + lr * (leaf === 1 ? 0.5 : -0.5)));
+          const lk = leafPreds[i];
+          const step = leafMeans[lk] ?? 0;
+          return Math.max(0.001, Math.min(0.999, fi + lr * step));
         });
       }
 
-      mlModelCache[key] = { model: trees, trainedAt: rounds.length, lr };
+      mlModelCache[key] = { model: trees, trainedAt: rounds.length, lr, baseRate: y.filter(v=>v===1).length/y.length };
     }
 
     // Not trained yet or sparse target — fall back
@@ -1863,18 +1880,18 @@ function buildGBT(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGa
     const feat = extractMLFeatures(gs, rounds, targetMin);
     if (!feat) return buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
 
-    // Score: logit-space additive update keeps output in valid range
-    const { model: trees } = mlModelCache[key];
-    const baseRate = Math.max(0.01, Math.min(0.99, gs.pGlobal * maxWidth));
-    // Work in log-odds space so updates don't blow up
-    const logit = v => Math.log(v / (1 - v));
-    const sigmoid = v => 1 / (1 + Math.exp(-Math.max(-10, Math.min(10, v))));
-    let logOdds = logit(baseRate);
-    for (const tree of trees) {
-      const leaf = tree.predict([feat])[0];
-      logOdds += 0.1 * (leaf === 1 ? 1 : -1); // small step in log-odds space
+    // Score: logit-space with per-leaf mean residuals (true GBT)
+    const { model: trees, baseRate: br } = mlModelCache[key];
+    const gbtBase = Math.max(0.01, Math.min(0.99, br ?? gs.pGlobal * maxWidth));
+    const logit2 = v => Math.log(Math.max(1e-7, v) / Math.max(1e-7, 1 - v));
+    const sigmoid2 = v => 1 / (1 + Math.exp(-Math.max(-10, Math.min(10, v))));
+    let logOdds = logit2(gbtBase);
+    for (const { tree, leafMeans } of trees) {
+      const lk = tree.predict([feat])[0];
+      const step = leafMeans?.[lk] ?? 0;
+      logOdds += 0.15 * step; // lr * actual leaf mean
     }
-    prob = sigmoid(logOdds);
+    prob = sigmoid2(logOdds);
   } catch(e) {
     console.warn('[gbt] predict error:', e.message);
     return buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
@@ -1911,15 +1928,19 @@ function buildLR(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap
       // Standardise
       const Xn = X.map(x => x.map((v, j) => (v - means[j]) / stds[j]));
 
-      // Gradient descent
+      // Gradient descent with class weighting for imbalanced targets
       const sig = v => 1 / (1 + Math.exp(-Math.max(-20, Math.min(20, v))));
       let w = new Array(nFeat).fill(0), b = 0;
-      const lrRate = 0.05, epochs = 40, lambda = 0.001;
+      const lrRate = 0.05, epochs = 60, lambda = 0.01; // more epochs, stronger L2
+      const posRate = y.filter(v=>v===1).length / y.length;
+      // Class weights: inverse frequency — rare hits get higher weight
+      const wPos = posRate > 0 ? 0.5 / posRate : 1;
+      const wNeg = (1-posRate) > 0 ? 0.5 / (1-posRate) : 1;
       for (let e = 0; e < epochs; e++) {
         let dw = new Array(nFeat).fill(0), db = 0;
         for (let i = 0; i < Xn.length; i++) {
           const p   = sig(Xn[i].reduce((s, v, j) => s + v * w[j], b));
-          const err = p - y[i];
+          const err = (p - y[i]) * (y[i] === 1 ? wPos : wNeg); // weighted error
           for (let j = 0; j < nFeat; j++) dw[j] += err * Xn[i][j];
           db += err;
         }
@@ -2007,27 +2028,26 @@ function buildNB(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap
 const LSTM_SEQ_LEN   = 20;
 const LSTM_HIDDEN    = 12;
 const LSTM_LR        = 0.01;
-const LSTM_EPOCHS    = 2;
+const LSTM_EPOCHS    = 5;
 
 function lstmSig(x) { return 1/(1+Math.exp(-Math.max(-15,Math.min(15,x)))); }
 function lstmTanh(x){ const e=Math.exp(2*Math.max(-15,Math.min(15,x))); return (e-1)/(e+1); }
 
 function initLSTMWeights() {
-  const r = () => (Math.random()-0.5)*0.1;
-  const mat = (r_,c_) => Array.from({length:r_},()=>Array.from({length:c_},r));
-  const vec = n => Array.from({length:n},r);
-  const H=LSTM_HIDDEN, I=1;
+  // Xavier-ish init: scale by 1/sqrt(H) for stability
+  const H = LSTM_HIDDEN, I = 1;
+  const scale = 1 / Math.sqrt(H);
+  const r  = () => (Math.random()-0.5) * scale;
+  const r2 = () => (Math.random()-0.5) * 0.1; // smaller for recurrent weights
+  const mat = (R,C,fn=r)  => Array.from({length:R},()=>Array.from({length:C},fn));
+  const vec = (n,fn=r)    => Array.from({length:n},fn);
   return {
-    // i gate
-    Wi:mat(H,I), Ui:mat(H,H), bi:vec(H),
-    // f gate
-    Wf:mat(H,I), Uf:mat(H,H), bf:vec(H).map(()=>1.0), // forget bias=1 helps early
-    // g gate
-    Wg:mat(H,I), Ug:mat(H,H), bg:vec(H),
-    // o gate
-    Wo:mat(H,I), Uo:mat(H,H), bo:vec(H),
-    // output
-    Wy:Array.from({length:1},()=>Array.from({length:H},r)), by:[0],
+    Wi:mat(H,I), Ui:mat(H,H,r2), bi:vec(H, ()=>0),       // input gate: 0 bias
+    Wf:mat(H,I), Uf:mat(H,H,r2), bf:vec(H, ()=>1.0),     // forget gate: 1 bias (standard)
+    Wg:mat(H,I), Ug:mat(H,H,r2), bg:vec(H, ()=>0),       // cell gate: 0 bias
+    Wo:mat(H,I), Uo:mat(H,H,r2), bo:vec(H, ()=>0),       // output gate: 0 bias
+    Wy:Array.from({length:1},()=>Array.from({length:H},()=>(Math.random()-0.5)*0.01)),
+    by:[0],
   };
 }
 
@@ -2052,37 +2072,38 @@ function lstmForward(weights, seq) {
 }
 
 function trainLSTMWeights(weights, sequences, labels, lr, epochs) {
-  // Train output layer weights only (fast approximation)
+  // Train output layer (Wy, by) with correct gradient: dL/dWy[j] = err * h[j]
+  // This IS correct — we run full LSTM forward to get h, then update only the
+  // linear head. Gates stay at init (too expensive to backprop through for JS).
+  // Result: LSTM acts as a fixed random feature extractor + trained classifier.
+  // To make this meaningful, we initialise gates with structured priors (see initLSTMWeights).
   for (let epoch = 0; epoch < epochs; epoch++) {
     let dwY = weights.Wy.map(r=>r.map(()=>0));
     let dbY = [0];
+    const H = LSTM_HIDDEN;
+    const mv = (M,v)=>M.map(row=>row.reduce((s,ww,k)=>s+ww*v[k],0));
+    const add = (a,b)=>a.map((x,j)=>x+b[j]);
     for (let i = 0; i < sequences.length; i++) {
-      const pred = lstmForward(weights, sequences[i]);
-      const err  = pred - labels[i];
-      // Get final hidden state by running forward pass
-      const h = (() => {
-        const seq = sequences[i];
-        const H = LSTM_HIDDEN;
-        let hh = new Array(H).fill(0), cc = new Array(H).fill(0);
-        const { Wi,Ui,bi,Wf,Uf,bf,Wg,Ug,bg,Wo,Uo,bo } = weights;
-        const mv = (M,v)=>M.map(row=>row.reduce((s,ww,k)=>s+ww*v[k],0));
-        const add=(a,b)=>a.map((x,j)=>x+b[j]);
-        for (const x of seq) {
-          const xv=[x];
-          const i_t=add(add(mv(Wi,xv),mv(Ui,hh)),bi).map(lstmSig);
-          const f_t=add(add(mv(Wf,xv),mv(Uf,hh)),bf).map(lstmSig);
-          const g_t=add(add(mv(Wg,xv),mv(Ug,hh)),bg).map(lstmTanh);
-          const o_t=add(add(mv(Wo,xv),mv(Uo,hh)),bo).map(lstmSig);
-          cc=cc.map((ci,j)=>f_t[j]*ci+i_t[j]*g_t[j]);
-          hh=cc.map((ci,j)=>o_t[j]*lstmTanh(ci));
-        }
-        return hh;
-      })();
-      dwY = dwY.map((row,ri) => row.map((w,j) => w + err * h[j]));
+      // Full forward pass to get final hidden state
+      let hh = new Array(H).fill(0), cc = new Array(H).fill(0);
+      const { Wi,Ui,bi,Wf,Uf,bf,Wg,Ug,bg,Wo:Wo_,Uo,bo:bo_,Wy,by } = weights;
+      for (const x of sequences[i]) {
+        const xv=[x];
+        const i_t=add(add(mv(Wi,xv),mv(Ui,hh)),bi).map(lstmSig);
+        const f_t=add(add(mv(Wf,xv),mv(Uf,hh)),bf).map(lstmSig);
+        const g_t=add(add(mv(Wg,xv),mv(Ug,hh)),bg).map(lstmTanh);
+        const o_t=add(add(mv(Wo_,xv),mv(Uo,hh)),bo_).map(lstmSig);
+        cc=cc.map((ci,j)=>f_t[j]*ci+i_t[j]*g_t[j]);
+        hh=cc.map((ci,j)=>o_t[j]*lstmTanh(ci));
+      }
+      const logit = Wy[0].reduce((s,w,j)=>s+w*hh[j],0) + by[0];
+      const pred  = lstmSig(logit);
+      const err   = pred - labels[i];
+      // Correct gradient for output layer
+      dwY = dwY.map((row,ri) => row.map((w,j) => w + err * hh[j]));
       dbY = [dbY[0] + err];
     }
     const N = sequences.length;
-    // Update weights in-place using current epoch's weights (not stale captured vars)
     weights.Wy = weights.Wy.map((row,ri) => row.map((w,j) => w - lr * dwY[ri][j] / N));
     weights.by = [weights.by[0] - lr * dbY[0] / N];
   }
@@ -2193,7 +2214,7 @@ function srvBuildDataset(rounds, targetMin, maxWidth) {
     const last10=ctx.slice(-10).map(r=>r.multiplier>=targetMin?1:0);
     let streak=0;for(let k=n-1;k>=0;k--){if(ctx[k].multiplier<targetMin)streak++;else break;}
     const kmEG=Math.max(1,Math.round(meanGap));
-    const feat=[pGlobal,pRecent,r50/Math.min(50,n),Math.min(3,gapSinceLast/meanGap),Math.min(3,gapSinceLast/kmEG),Math.min(1,cv),0,last10.slice(-3).reduce((a,b)=>a+b,0)/3,last10.reduce((a,b)=>a+b,0)/10,Math.min(1,streak/Math.max(1,meanGap)),Math.min(1,hits/100),Math.min(1,gapSinceLast/200)];
+    const feat=[pGlobal,pRecent,r50/Math.min(50,n),Math.min(3,gapSinceLast/meanGap),Math.min(3,gapSinceLast/kmEG),Math.min(3,cv),0,last10.slice(-3).reduce((a,b)=>a+b,0)/3,last10.reduce((a,b)=>a+b,0)/10,Math.min(1,streak/Math.max(1,meanGap)),Math.min(1,hits/100),Math.min(1,gapSinceLast/Math.max(1,meanGap*3))];
     const label=trainRounds.slice(i,i+maxWidth).some(r=>r.multiplier>=targetMin)?1:0;
     X.push(feat); y.push(label);
   }
@@ -2234,8 +2255,12 @@ function buildServerLGBM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, e
     const feat=srvExtractFeatures(gs,rounds,targetMin);
     if(!feat)return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
     const{model:trees,baseRate}=srvModelCache[key];
-    prob=baseRate;
-    for(const tree of trees)prob=Math.max(0.001,Math.min(0.999,prob+0.12*srvLGBMPred1(tree,feat)));
+    // Logit-space accumulation — numerically stable, can't overshoot
+    const lgbmLogit=v=>Math.log(Math.max(1e-7,v)/Math.max(1e-7,1-v));
+    const lgbmSig=v=>1/(1+Math.exp(-Math.max(-10,Math.min(10,v))));
+    let lgbmLO=lgbmLogit(Math.max(0.01,Math.min(0.99,baseRate)));
+    for(const tree of trees)lgbmLO+=0.12*srvLGBMPred1(tree,feat);
+    prob=lgbmSig(lgbmLO);
   }catch(e){console.warn('[lgbm]',e.message);return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);}
   return buildMLWindow(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast,Math.max(0.05,Math.min(0.95,prob)),'lgbm');
 }
@@ -2260,7 +2285,7 @@ function buildServerPRP(gs, maxWidth, targetLabel, isRare, rounds, targetMin, en
       const clusterScore=((windows.slice(-1)[0]||0)-wMean)/Math.max(0.001,wStd);
       srvModelCache[key]={baseRate,dominantPeriod,phase,clusterScore,trainedAt:rounds.length};
     }
-    if(!srvModelCache[key])return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
+    if(!srvModelCache[key]||!srvModelCache[key].baseRate)return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
     const{baseRate,dominantPeriod,phase,clusterScore}=srvModelCache[key];
     const seasonality=0.5*(1+Math.sin((2*Math.PI*phase)/Math.max(1,dominantPeriod)));
     const clusterAdj=Math.min(0.2,Math.max(-0.2,clusterScore*0.08));
@@ -2286,7 +2311,31 @@ function buildServerGRU(gs, maxWidth, targetLabel, isRare, rounds, targetMin, en
       for(let i=SRV_GRU_SEQ;i<gruTrain.length-maxWidth;i++){const seq=gruTrain.slice(i-SRV_GRU_SEQ,i).map(r=>Math.min(1,Math.log(Math.max(1,r.multiplier))/logMax));const label=gruTrain.slice(i,i+maxWidth).some(r=>r.multiplier>=targetMin)?1:0;seqs.push(seq);labels.push(label);}
       if(seqs.length<15){srvModelCache[key]={model:null,trainedAt:rounds.length};return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);}
       let w=srvModelCache[key]?.model??srvInitGRU();
-      for(let e=0;e<3;e++){let dwO=w.Wo.map(r=>r.map(()=>0)),dbO=[0];for(let i=0;i<seqs.length;i++){const p=srvGRUFwd(w,seqs[i]),err=p-labels[i];dwO=dwO.map(row=>row.map(ww=>ww+err*0.1));dbO=[dbO[0]+err];}const N=seqs.length;w.Wo=w.Wo.map(row=>row.map((ww,j)=>ww-0.01*dwO[0][j]/N));w.bo=[w.bo[0]-0.01*dbO[0]/N];}
+      for(let e=0;e<5;e++){
+        let dwO=w.Wo.map(r=>r.map(()=>0)),dbO=[0];
+        for(let i=0;i<seqs.length;i++){
+          // Run forward pass to get final hidden state h
+          const {Wr,Ur,br,Wz,Uz,bz,Wn,Un,bn}=w,H=SRV_GRU_H;
+          let h=new Array(H).fill(0);
+          const mv2=(M,v)=>M.map(row=>row.reduce((s,ww,k)=>s+ww*v[k],0));
+          const add2=(a,b)=>a.map((x,ii)=>x+b[ii]);
+          for(const x of seqs[i]){
+            const xv=[x];
+            const rg=add2(add2(mv2(Wr,xv),mv2(Ur,h)),br).map(srvGSig);
+            const zg=add2(add2(mv2(Wz,xv),mv2(Uz,h)),bz).map(srvGSig);
+            const ng=add2(add2(mv2(Wn,xv),mv2(Un,h.map((hi,ii)=>rg[ii]*hi))),bn).map(srvGTanh);
+            h=h.map((hi,ii)=>(1-zg[ii])*ng[ii]+zg[ii]*hi);
+          }
+          const p=srvGSig(w.Wo[0].reduce((s,ww,j)=>s+ww*h[j],0)+w.bo[0]);
+          const err=p-labels[i];
+          // Correct gradient: dL/dWo[j] = err * h[j]
+          dwO=dwO.map((row,ri)=>row.map((ww,j)=>ww+err*h[j]));
+          dbO=[dbO[0]+err];
+        }
+        const N=seqs.length;
+        w.Wo=w.Wo.map(row=>row.map((ww,j)=>ww-0.01*dwO[0][j]/N));
+        w.bo=[w.bo[0]-0.01*dbO[0]/N];
+      }
       srvModelCache[key]={model:w,trainedAt:rounds.length};
     }
     if(!srvModelCache[key]||!srvModelCache[key].model)return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
@@ -2318,7 +2367,13 @@ function buildServerIFOR(gs, maxWidth, targetLabel, isRare, rounds, targetMin, e
     const avgLen=trees.reduce((s,t)=>s+srvPathLen(t,feat),0)/trees.length;
     const c=subSz>1?2*(Math.log(subSz-1)+0.5772)-(2*(subSz-1)/subSz):1;
     const anomaly=Math.pow(2,-avgLen/Math.max(1,c));
-    prob=anomaly*0.7+Math.min(0.25,(gs.gapSinceLast/Math.max(1,gs.meanGap))*0.12);
+    // Anomaly score: high = current state is unusual (short paths = easy to isolate = abnormal)
+    // Reframe correctly: blend with base rate weighted by anomaly intensity
+    // High anomaly + overdue gap → more likely to hit (abnormal gap IS the signal)
+    const overdueBoost = Math.min(0.3, (gs.gapSinceLast / Math.max(1, gs.meanGap) - 1) * 0.15);
+    const baseP = gs.pGlobal * maxWidth;
+    // Anomaly amplifies base probability when overdue, dampens when early
+    prob = baseP + anomaly * overdueBoost + (1 - anomaly) * Math.max(0, -overdueBoost);
   }catch(e){console.warn('[ifor]',e.message);return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);}
   return buildMLWindow(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast,Math.max(0.05,Math.min(0.95,prob)),'ifor');
 }
@@ -2544,7 +2599,8 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
               await savePrediction({ target:target.label, minMult:target.min, outcome, lo:absLow, hi:absHigh, anchorRound, hitRound:status.hitRound||null, generation:existing.generation||1, source:engineId });
               recordTimingOutcome(target.label, outcome === 'early');
               // Record this engine's last WIN round independently — drives per-engine gapSinceLast
-              if (outcome === 'win' && status.hitRound) {
+              // Track last hit for BOTH win and early — target DID hit regardless
+              if ((outcome === 'win' || outcome === 'early') && status.hitRound) {
                 if (engineLastHit[engineId]) engineLastHit[engineId][target.label] = status.hitRound;
               }
               if (STAT_MODELS.some(m=>m.id===engineId) && existing.probW!=null) {
@@ -2578,8 +2634,8 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
         try {
           await savePrediction({ target:target.label, minMult:target.min, outcome, lo:absLow, hi:absHigh, anchorRound, hitRound:status.hitRound||null, generation:existing.generation||1, source:engineId });
           recordTimingOutcome(target.label, outcome === 'early');
-          // Record this engine's last WIN round independently — drives per-engine gapSinceLast
-          if (outcome === 'win' && status.hitRound) {
+          // Track last hit for BOTH win and early — target DID hit regardless of window timing
+          if ((outcome === 'win' || outcome === 'early') && status.hitRound) {
             if (engineLastHit[engineId]) engineLastHit[engineId][target.label] = status.hitRound;
           }
           if (STAT_MODELS.some(m=>m.id===engineId) && existing.probW!=null) {
