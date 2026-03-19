@@ -2798,7 +2798,7 @@ function loadLockedMap(dbRows) {
       alpha:           eta.alpha??null,
       rareSignal:      eta.rareSignal??null,
       targetMin: target.min, anchorRound: anchor,
-      generation: pred.generation??1, stale: true,
+      generation: pred.generation??1, stale: false, // FIX: was always true causing instant REBUILDING on restart
     };
   }
   return map;

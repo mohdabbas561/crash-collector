@@ -70,11 +70,15 @@ const APP_SECRET = process.env.APP_SECRET || process.env.ADMIN_SECRET;
 // ── ROUNDS ────────────────────────────────────────────────────────────────────
 app.get('/rounds', rateLimit(60), async (req, res) => {
   try {
-    const limit  = Math.min(parseInt(req.query.limit  || '1000'), 10000);
-    const offset = parseInt(req.query.offset || '0');
-    const rounds = await getRounds({ limit, offset, from: req.query.from||null, to: req.query.to||null });
-    const since  = req.query.since ? Number(req.query.since) : 0;
-    res.json({ ok:true, count: rounds.length, rounds: since ? rounds.filter(r=>r.roundId>since) : rounds });
+    const limit      = Math.min(parseInt(req.query.limit  || '1000'), 10000);
+    const offset     = parseInt(req.query.offset || '0');
+    // FIX: push 'since' into the DB query as minRoundId so we don't fetch
+    // thousands of rows and filter in JS — this was the cause of stale data
+    // and slow responses when the frontend polled with ?since=<lastRoundId>
+    const since      = req.query.since ? Number(req.query.since) : null;
+    const minRoundId = since && since > 0 ? since + 1 : null;
+    const rounds = await getRounds({ limit, offset, from: req.query.from||null, to: req.query.to||null, minRoundId });
+    res.json({ ok:true, count: rounds.length, rounds });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
@@ -94,29 +98,6 @@ app.get("/predictions", rateLimit(300), async (req, res) => {
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
-// u2500u2500 Batch history u2014 returns all 4 model histories in one request u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500u2500
-app.get('/predictions-all', rateLimit(120), async (req, res) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit||'300'), 1000);
-    const [ens, geo, bay, km, rf, gbt, lr, nb, lstm, lgbm, prp, gru, ifor, meta] = await Promise.all([
-      getPredictions({ limit, source: 'ens'  }),
-      getPredictions({ limit, source: 'geo'  }),
-      getPredictions({ limit, source: 'bay'  }),
-      getPredictions({ limit, source: 'km'   }),
-      getPredictions({ limit, source: 'rf'   }),
-      getPredictions({ limit, source: 'gbt'  }),
-      getPredictions({ limit, source: 'lr'   }),
-      getPredictions({ limit, source: 'nb'   }),
-      getPredictions({ limit, source: 'lstm' }),
-      getPredictions({ limit, source: 'lgbm' }),
-      getPredictions({ limit, source: 'prp'  }),
-      getPredictions({ limit, source: 'gru'  }),
-      getPredictions({ limit, source: 'ifor' }),
-      getPredictions({ limit, source: 'meta' }),
-    ]);
-    res.json({ ok:true, ens, geo, bay, km, rf, gbt, lr, nb, lstm, lgbm, prp, gru, ifor, meta });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
-});
 
 app.post('/predictions', rateLimit(120), async (req, res) => {
   try {
@@ -202,10 +183,22 @@ app.delete('/locked-pattern', requireAdmin, async (req, res) => {
 // GET /locked-stat?model=ens  → returns locked preds for that model
 // GET /locked-stat            → returns all models { ens:{}, geo:{}, bay:{}, km:{} }
 
+// FIX: cache /locked-stat for 8s — it was re-querying the full stat preds
+// table on every frontend poll (every 10s per client). With multiple users
+// this caused DB overload. 8s TTL is safe since engines only update every 8s.
+let lockedStatCache = null;
+let lockedStatCacheTs = 0;
+const LOCKED_STAT_CACHE_MS = 8000;
+
 app.get('/locked-stat', rateLimit(120), async (req, res) => {
   try {
     const model = req.query.model;
-    const all   = await getLockedStatPreds();
+    const now = Date.now();
+    if (!lockedStatCache || (now - lockedStatCacheTs) > LOCKED_STAT_CACHE_MS) {
+      lockedStatCache = await getLockedStatPreds();
+      lockedStatCacheTs = now;
+    }
+    const all = lockedStatCache;
     if (model && all[model] !== undefined) {
       res.json({ ok:true, model, preds: all[model] });
     } else {
