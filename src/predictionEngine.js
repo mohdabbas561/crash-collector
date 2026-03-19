@@ -1725,7 +1725,21 @@ function buildMLWindow(gs, maxWidth, targetLabel, isRare, rounds, targetMin, eng
   const regime = updateEngineRegime(rounds, targetMin, targetLabel, modelName, gs, gs.isRandom);
   const rawProbW   = probW;
   const calibProbW = applyCalibrationRelaxed(rawProbW, targetLabel, modelName, hits);
-  const expectedGap = kmExpectedGap;
+
+  // ── KEY FIX: derive expectedGap from THIS engine's own probability ──────────
+  // Each ML engine produces a different probW. Back-calculate what per-round
+  // probability p gives P(hit in maxWidth rounds) = probW, then expectedGap = 1/p.
+  // This makes every engine produce a DIFFERENT window position.
+  //
+  // P(hit in W rounds) = 1 - (1-p)^W  =>  p = 1 - (1-probW)^(1/W)
+  // Clamp to avoid degenerate values, blend 50/50 with KM gap for stability.
+  const pPerRound = Math.max(1e-4, Math.min(0.5,
+    1 - Math.pow(Math.max(1e-9, 1 - Math.max(0.01, Math.min(0.99, calibProbW))), 1 / Math.max(1, maxWidth))
+  ));
+  const mlExpectedGap = Math.max(1, Math.round(1 / pPerRound));
+  // Blend: 50% engine's own gap estimate, 50% KM empirical for stability
+  const expectedGap = Math.max(1, Math.round(0.5 * mlExpectedGap + 0.5 * kmExpectedGap));
+
   const { z, confPenalty, streakStatus, effectiveWidth } = getStreakInfo(gs, maxWidth, isRare);
   const { low, high } = hybridWindowPlacement(kmCDF, expectedGap, effectiveWidth, gapSinceLast, cv, targetLabel, maxWidth);
   const { low: rLow, high: rHigh } = applyRegimeToWindow(low, high, expectedGap, effectiveWidth, regime.regimeFactor);
