@@ -87,7 +87,7 @@ app.get('/storage-stats', rateLimit(20), async (req,res) => { try { res.json({ o
 app.get('/health', (req,res) => res.json({ ok:true, ts:new Date().toISOString() }));
 
 // ── PREDICTIONS ───────────────────────────────────────────────────────────────
-const VALID_SOURCES = ['engine','pattern','ens','geo','bay','km','rf','gbt','lr','nb','lstm','lgbm','gru','ifor','meta'];
+const VALID_SOURCES = ['engine','pattern','ens','geo','bay','km'];
 
 app.get("/predictions", rateLimit(300), async (req, res) => {
   try {
@@ -137,22 +137,13 @@ app.get('/predictions-all', rateLimit(120), async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit || '300'), 1000);
     const now   = Date.now();
     if (!predsAllCache || (now - predsAllCacheTs) > PREDS_ALL_TTL) {
-      const [ens, geo, bay, km, rf, gbt, lr, nb, lstm, lgbm, gru, ifor, meta] = await Promise.all([
-        getPredictions({ limit, source: 'ens'  }),
-        getPredictions({ limit, source: 'geo'  }),
-        getPredictions({ limit, source: 'bay'  }),
-        getPredictions({ limit, source: 'km'   }),
-        getPredictions({ limit, source: 'rf'   }),
-        getPredictions({ limit, source: 'gbt'  }),
-        getPredictions({ limit, source: 'lr'   }),
-        getPredictions({ limit, source: 'nb'   }),
-        getPredictions({ limit, source: 'lstm' }),
-        getPredictions({ limit, source: 'lgbm' }),
-        getPredictions({ limit, source: 'gru'  }),
-        getPredictions({ limit, source: 'ifor' }),
-        getPredictions({ limit, source: 'meta' }),
+      const [ens, geo, bay, km] = await Promise.all([
+        getPredictions({ limit, source: 'ens' }),
+        getPredictions({ limit, source: 'geo' }),
+        getPredictions({ limit, source: 'bay' }),
+        getPredictions({ limit, source: 'km'  }),
       ]);
-      predsAllCache   = { ens, geo, bay, km, rf, gbt, lr, nb, lstm, lgbm, gru, ifor, meta };
+      predsAllCache   = { ens, geo, bay, km };
       predsAllCacheTs = now;
     }
     res.json({ ok: true, ...predsAllCache });
