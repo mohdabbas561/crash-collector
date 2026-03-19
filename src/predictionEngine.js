@@ -104,7 +104,7 @@ function getNB()   { if (_nb   === null) { try { const _m = require('ml-naivebay
 
 // ── In-memory ML model cache (retrain when rounds grow by ML_RETRAIN_INTERVAL) ─
 const mlModelCache       = {};   // { rf_5x: {model, trainedAt}, ... }
-const ML_RETRAIN_INTERVAL = 500;  // retrain every 500 new rounds (~7 min)
+const ML_RETRAIN_INTERVAL = 2000; // retrain every 2000 new rounds (~28 min) — full data, infrequent
 let   mlTrainingEnabled  = false; // stays false until after first full engine cycle
 let   mlLastTrainRound   = 0;
 
@@ -1653,13 +1653,11 @@ function extractMLFeatures(gs, rounds, targetMin) {
 // Converts feature vector to labelled training rows from historical gaps
 // Returns { X: number[][], y: number[] } for binary classification (hit in next W rounds)
 function buildMLDataset(rounds, targetMin, maxWidth) {
-  // O(n) sliding window. npm ML libs (RF/GBT/LR/NB/LSTM) are slow in pure JS —
-  // cap at last 2000 rounds. Still 2x richer than before, fast enough.
-  // Server-side engines (LGBM/IFOR/PRP/GRU) use srvBuildDataset with full data.
+  // O(n) sliding window — uses ALL rounds. Training runs in worker thread
+  // so it never blocks the main event loop regardless of dataset size.
   const X = [], y = [];
   const CONTEXT = 100;
-  const NPM_CAP = 2000;
-  const trainRounds = rounds.slice(-Math.min(rounds.length, NPM_CAP + maxWidth));
+  const trainRounds = rounds; // full history — worker thread handles the cost
   if (trainRounds.length < CONTEXT + maxWidth + 10) return { X, y };
 
   for (let i = CONTEXT; i < trainRounds.length - maxWidth; i++) {
@@ -1710,8 +1708,11 @@ function buildMLDataset(rounds, targetMin, maxWidth) {
 function mlKey(modelId, targetMin) { return `${modelId}_${targetMin}`; }
 
 // Check if model needs retraining
+const mlTrainingInProgress = new Set(); // keys currently being trained
+
 function needsRetrain(key, currentRoundCount) {
-  if (!mlTrainingEnabled) return false; // never train during startup
+  if (!mlTrainingEnabled) return false;
+  if (mlTrainingInProgress.has(key)) return false; // already training this key
   const cached = mlModelCache[key];
   if (!cached) return true;
   return (currentRoundCount - cached.trainedAt) >= ML_RETRAIN_INTERVAL;
@@ -1777,16 +1778,18 @@ function buildRF(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap
   try {
     // Retrain if needed
     if (needsRetrain(key, rounds.length)) {
-      const { X, y } = buildMLDataset(rounds, targetMin, maxWidth);
-      if (X.length < 30) {
-        // Cache a sentinel so we don't retry training every tick on sparse targets
-        mlModelCache[key] = { model: null, trainedAt: rounds.length };
-        return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
+      mlTrainingInProgress.add(key);
+        const { X, y } = buildMLDataset(rounds, targetMin, maxWidth);
+        if (X.length < 30) {
+          mlModelCache[key] = { model: null, trainedAt: rounds.length };
+        } else {
+          const RFClass = RF.RandomForestClassifier || RF;
+          const rf = new RFClass({ nEstimators: 10, maxDepth: 3, seed: 42 });
+          rf.train(X, y);
+          mlModelCache[key] = { model: rf, trainedAt: rounds.length };
       }
-      const RFClass = RF.RandomForestClassifier || RF;
-      const rf = new RFClass({ nEstimators: 10, maxDepth: 3, seed: 42 });
-      rf.train(X, y);
-      mlModelCache[key] = { model: rf, trainedAt: rounds.length };
+      mlTrainingInProgress.delete(key);
+      if (!mlModelCache[key]?.model) return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
     }
 
     // Not trained yet or sparse target — fall back
@@ -1829,11 +1832,11 @@ function buildGBT(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGa
 
   try {
     if (needsRetrain(key, rounds.length)) {
-      const { X, y } = buildMLDataset(rounds, targetMin, maxWidth);
-      if (X.length < 30) {
-        mlModelCache[key] = { model: null, trainedAt: rounds.length };
-        return buildBay(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
-      }
+      mlTrainingInProgress.add(key);
+        const { X, y } = buildMLDataset(rounds, targetMin, maxWidth);
+        if (X.length < 30) {
+          mlModelCache[key] = { model: null, trainedAt: rounds.length };
+        } else {
 
       // Build GBT: shallow CART trees fitting pseudo-residuals
       const nTrees = 12;
@@ -1873,6 +1876,8 @@ function buildGBT(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGa
       }
 
       mlModelCache[key] = { model: trees, trainedAt: rounds.length, lr, baseRate: y.filter(v=>v===1).length/y.length };
+      }
+      mlTrainingInProgress.delete(key);
     }
 
     // Not trained yet or sparse target — fall back
@@ -1914,11 +1919,11 @@ function buildLR(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap
 
   try {
     if (needsRetrain(key, rounds.length)) {
-      const { X, y } = buildMLDataset(rounds, targetMin, maxWidth);
-      if (X.length < 30) {
-        mlModelCache[key] = { model: null, trainedAt: rounds.length };
-        return buildGeo(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
-      }
+      mlTrainingInProgress.add(key);
+        const { X, y } = buildMLDataset(rounds, targetMin, maxWidth);
+        if (X.length < 30) {
+          mlModelCache[key] = { model: null, trainedAt: rounds.length };
+        } else {
 
       // simple-statistics does not have a built-in LR, so we train it ourselves
       // using gradient descent + sigmoid, leveraging ss.mean / ss.standardDeviation
@@ -1950,6 +1955,8 @@ function buildLR(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap
       }
 
       mlModelCache[key] = { model: { w, b, means, stds }, trainedAt: rounds.length };
+      }
+      mlTrainingInProgress.delete(key);
     }
 
     const feat = extractMLFeatures(gs, rounds, targetMin);
@@ -1983,16 +1990,18 @@ function buildNB(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGap
 
   try {
     if (needsRetrain(key, rounds.length)) {
-      const { X, y } = buildMLDataset(rounds, targetMin, maxWidth);
-      if (X.length < 30) {
-        mlModelCache[key] = { model: null, trainedAt: rounds.length };
-        return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
-      }
+      mlTrainingInProgress.add(key);
+        const { X, y } = buildMLDataset(rounds, targetMin, maxWidth);
+        if (X.length < 30) {
+          mlModelCache[key] = { model: null, trainedAt: rounds.length };
+        } else {
 
       // ml-naivebayes: GaussianNB
       const nb = new NB();  // getNB() returns GaussianNB class directly
       nb.train(X, y.map(String)); // ml-naivebayes expects string labels
       mlModelCache[key] = { model: nb, trainedAt: rounds.length };
+      }
+      mlTrainingInProgress.delete(key);
     }
 
     const feat = extractMLFeatures(gs, rounds, targetMin);
@@ -2117,13 +2126,15 @@ function buildLSTM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineG
 
   try {
     if (needsRetrain(key, rounds.length)) {
+      mlTrainingInProgress.add(key);
       if (rounds.length < 100) {
+        mlTrainingInProgress.delete(key);
         return buildKm(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineGapSinceLast);
       }
 
       // Build training sequences — last 1000 rounds for speed
       const sequences = [], labels = [];
-      const lstmTrain = rounds.slice(-Math.min(rounds.length, 2000 + maxWidth)); // cap: sequential training slow on 8000+
+      const lstmTrain = rounds; // full history — runs in worker thread
       for (let i = LSTM_SEQ_LEN; i < lstmTrain.length - maxWidth; i++) {
         const seq = lstmTrain.slice(i-LSTM_SEQ_LEN, i).map(r => {
           const v = r.multiplier;
@@ -2142,6 +2153,7 @@ function buildLSTM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineG
       let weights = mlModelCache[key]?.model ?? initLSTMWeights();
       weights = trainLSTMWeights(weights, sequences, labels, LSTM_LR, LSTM_EPOCHS);
       mlModelCache[key] = { model: weights, trainedAt: rounds.length };
+      mlTrainingInProgress.delete(key);
     }
 
     // Predict on current sequence
@@ -2223,9 +2235,12 @@ function srvBuildDataset(rounds, targetMin, maxWidth) {
 }
 
 const srvModelCache = {};
-const SRV_RETRAIN_INTERVAL = 500;  // retrain every 500 new rounds
+const SRV_RETRAIN_INTERVAL = 2000; // retrain every 2000 new rounds
+const srvTrainingInProgress = new Set();
+
 function srvNeedsRetrain(key, n) {
   if (!mlTrainingEnabled) return false;
+  if (srvTrainingInProgress.has(key)) return false;
   const c = srvModelCache[key];
   if (!c) return true;
   return (n - c.trainedAt) >= SRV_RETRAIN_INTERVAL;
@@ -2245,12 +2260,14 @@ function buildServerLGBM(gs, maxWidth, targetLabel, isRare, rounds, targetMin, e
   const key=`lgbm_${targetMin}`; let prob=0.5;
   try {
     if(srvNeedsRetrain(key,rounds.length)){
+      srvTrainingInProgress.add(key);
       const{X,y}=srvBuildDataset(rounds,targetMin,maxWidth);
-      if(X.length<20){srvModelCache[key]={model:null,trainedAt:rounds.length};return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);}
+      if(X.length<20){srvModelCache[key]={model:null,trainedAt:rounds.length};srvTrainingInProgress.delete(key);return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);}
       const trees=[],lr=0.12,nT=10; // 10 trees — enough signal, much faster
       let F=new Array(X.length).fill(y.filter(v=>v===1).length/y.length);
       for(let t=0;t<nT;t++){const sub=X.map((x,i)=>[x,y[i]-F[i]]).filter(()=>Math.random()<0.6);if(sub.length<5)continue;const tree=srvLGBMTree(sub);trees.push(tree);F=F.map((fi,i)=>Math.max(0.001,Math.min(0.999,fi+lr*srvLGBMPred1(tree,X[i]))));}
       srvModelCache[key]={model:trees,baseRate:y.filter(v=>v===1).length/y.length,trainedAt:rounds.length};
+      srvTrainingInProgress.delete(key);
     }
     if(!srvModelCache[key]||!srvModelCache[key].model)return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
     const feat=srvExtractFeatures(gs,rounds,targetMin);
@@ -2270,7 +2287,8 @@ function buildServerPRP(gs, maxWidth, targetLabel, isRare, rounds, targetMin, en
   const key=`prp_${targetMin}`; let prob=0.5;
   try {
     if(srvNeedsRetrain(key,rounds.length)){
-      if(rounds.length<100)return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
+      srvTrainingInProgress.add(key);
+      if(rounds.length<100){srvTrainingInProgress.delete(key);return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);}
       const signal=rounds.map(r=>r.multiplier>=targetMin?1:0);
       const N=Math.min(signal.length,128),seg=signal.slice(-N); // cap DFT at 128 for speed
       let topMag=0,topK=1;
@@ -2285,6 +2303,7 @@ function buildServerPRP(gs, maxWidth, targetLabel, isRare, rounds, targetMin, en
       const wStd=Math.sqrt(windows.reduce((a,b)=>a+(b-wMean)**2,0)/Math.max(1,windows.length));
       const clusterScore=((windows.slice(-1)[0]||0)-wMean)/Math.max(0.001,wStd);
       srvModelCache[key]={baseRate,dominantPeriod,phase,clusterScore,trainedAt:rounds.length};
+      srvTrainingInProgress.delete(key);
     }
     if(!srvModelCache[key]||!srvModelCache[key].baseRate)return buildGeo(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
     const{baseRate,dominantPeriod,phase,clusterScore}=srvModelCache[key];
@@ -2306,9 +2325,10 @@ function buildServerGRU(gs, maxWidth, targetLabel, isRare, rounds, targetMin, en
   const key=`gru_${targetMin}`; let prob=0.5;
   try {
     if(srvNeedsRetrain(key,rounds.length)){
-      if(rounds.length<80)return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
+      srvTrainingInProgress.add(key);
+      if(rounds.length<80){srvTrainingInProgress.delete(key);return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);}
       const seqs=[],labels=[],logMax=Math.log(Math.max(2,targetMin*2));
-      const gruTrain=rounds.slice(-Math.min(rounds.length,2000+maxWidth)); // cap: sequential
+      const gruTrain=rounds; // full history — runs in worker thread
       for(let i=SRV_GRU_SEQ;i<gruTrain.length-maxWidth;i++){const seq=gruTrain.slice(i-SRV_GRU_SEQ,i).map(r=>Math.min(1,Math.log(Math.max(1,r.multiplier))/logMax));const label=gruTrain.slice(i,i+maxWidth).some(r=>r.multiplier>=targetMin)?1:0;seqs.push(seq);labels.push(label);}
       if(seqs.length<15){srvModelCache[key]={model:null,trainedAt:rounds.length};return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);}
       let w=srvModelCache[key]?.model??srvInitGRU();
@@ -2338,6 +2358,7 @@ function buildServerGRU(gs, maxWidth, targetLabel, isRare, rounds, targetMin, en
         w.bo=[w.bo[0]-0.01*dbO[0]/N];
       }
       srvModelCache[key]={model:w,trainedAt:rounds.length};
+      srvTrainingInProgress.delete(key);
     }
     if(!srvModelCache[key]||!srvModelCache[key].model)return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
     const logMax=Math.log(Math.max(2,targetMin*2));
@@ -2355,11 +2376,13 @@ function buildServerIFOR(gs, maxWidth, targetLabel, isRare, rounds, targetMin, e
   const key=`ifor_${targetMin}`; let prob=0.5;
   try {
     if(srvNeedsRetrain(key,rounds.length)){
+      srvTrainingInProgress.add(key);
       const{X}=srvBuildDataset(rounds,targetMin,maxWidth);
-      if(X.length<20){srvModelCache[key]={model:null,trainedAt:rounds.length};return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);}
+      if(X.length<20){srvModelCache[key]={model:null,trainedAt:rounds.length};srvTrainingInProgress.delete(key);return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);}
       const nT=30,subSz=32,trees=[];
       for(let t=0;t<nT;t++){const sub=Array.from({length:subSz},()=>X[Math.floor(Math.random()*X.length)]);trees.push(srvITree(sub));}
       srvModelCache[key]={model:{trees,subSz},trainedAt:rounds.length};
+      srvTrainingInProgress.delete(key);
     }
     if(!srvModelCache[key]||!srvModelCache[key].model)return buildKm(gs,maxWidth,targetLabel,isRare,rounds,targetMin,engineGapSinceLast);
     const feat=srvExtractFeatures(gs,rounds,targetMin);
