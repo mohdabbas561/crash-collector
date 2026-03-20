@@ -23,6 +23,9 @@ async function main() {
   const r3 = await pool.query('DELETE FROM locked_preds_stat');
   console.log(`✅ locked_preds_stat:    deleted ${r3.rowCount} rows`);
 
+  const r4 = await pool.query('DELETE FROM locked_preds_adv');
+  console.log(`✅ locked_preds_adv:     deleted ${r4.rowCount} rows`);
+
   console.log('\nAll stale windows cleared. Restart the server now.');
   console.log('On startup you should see: [engine] NEW 100x: ..., [engine] NEW 500x: ..., etc.');
 
