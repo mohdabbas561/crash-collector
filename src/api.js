@@ -8,6 +8,7 @@ const {
   saveLockedPreds, getLockedPreds,
   saveLockedPatternPreds, getLockedPatternPreds,
   saveLockedStatPreds, getLockedStatPreds,
+  saveLockedAdvPreds, getLockedAdvPreds,
   initWalletStorage, saveWallet, getWallets, deleteWallet,
 } = require('./db');
 
@@ -87,7 +88,13 @@ app.get('/storage-stats', rateLimit(20), async (req,res) => { try { res.json({ o
 app.get('/health', (req,res) => res.json({ ok:true, ts:new Date().toISOString() }));
 
 // ── PREDICTIONS ───────────────────────────────────────────────────────────────
-const VALID_SOURCES = ['engine','pattern','ens','geo','bay','km'];
+const VALID_SOURCES = [
+  'engine','pattern','ens','geo','bay','km',
+  // Advanced engines (client-side, DB-backed)
+  'lstm','xgb','rf','tfjs','cat',
+  'hardgap','softgap','markov','montecarlo','bayes',
+  'sha256','mt','lcg',
+];
 
 app.get("/predictions", rateLimit(300), async (req, res) => {
   try {
@@ -137,13 +144,32 @@ app.get('/predictions-all', rateLimit(120), async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit || '300'), 1000);
     const now   = Date.now();
     if (!predsAllCache || (now - predsAllCacheTs) > PREDS_ALL_TTL) {
-      const [ens, geo, bay, km] = await Promise.all([
+      const [ens, geo, bay, km,
+             lstm, xgb, rf, tfjs, cat,
+             hardgap, softgap, markov, montecarlo, bayes,
+             sha256, mt, lcg] = await Promise.all([
         getPredictions({ limit, source: 'ens' }),
         getPredictions({ limit, source: 'geo' }),
         getPredictions({ limit, source: 'bay' }),
         getPredictions({ limit, source: 'km'  }),
+        getPredictions({ limit, source: 'lstm' }),
+        getPredictions({ limit, source: 'xgb' }),
+        getPredictions({ limit, source: 'rf' }),
+        getPredictions({ limit, source: 'tfjs' }),
+        getPredictions({ limit, source: 'cat' }),
+        getPredictions({ limit, source: 'hardgap' }),
+        getPredictions({ limit, source: 'softgap' }),
+        getPredictions({ limit, source: 'markov' }),
+        getPredictions({ limit, source: 'montecarlo' }),
+        getPredictions({ limit, source: 'bayes' }),
+        getPredictions({ limit, source: 'sha256' }),
+        getPredictions({ limit, source: 'mt' }),
+        getPredictions({ limit, source: 'lcg' }),
       ]);
-      predsAllCache   = { ens, geo, bay, km };
+      predsAllCache   = { ens, geo, bay, km,
+        lstm, xgb, rf, tfjs, cat,
+        hardgap, softgap, markov, montecarlo, bayes,
+        sha256, mt, lcg };
       predsAllCacheTs = now;
     }
     res.json({ ok: true, ...predsAllCache });
@@ -241,6 +267,51 @@ app.delete('/locked-stat', requireAdmin, async (req, res) => {
     await pool.query('DELETE FROM locked_preds_stat');
     await pool.end();
     require('./predictionEngine').resetEngineState();
+    res.json({ ok:true });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// ── ADVANCED ENGINE LOCKED PREDS (lstm/xgb/rf/tfjs/cat/hardgap/...) ──────────
+// Same pattern as /locked-stat but for client-side advanced engines.
+// GET /locked-adv          → { ok, preds: { lstm:{}, xgb:{}, ... } }
+// POST /locked-adv         → save locked windows for one engine { model, preds }
+// DELETE /locked-adv       → admin wipe
+
+let lockedAdvCache   = null;
+let lockedAdvCacheTs = 0;
+const LOCKED_ADV_CACHE_MS = 8000;
+
+app.get('/locked-adv', rateLimit(120), async (req, res) => {
+  try {
+    const now = Date.now();
+    if (!lockedAdvCache || (now - lockedAdvCacheTs) > LOCKED_ADV_CACHE_MS) {
+      lockedAdvCache   = await getLockedAdvPreds();
+      lockedAdvCacheTs = now;
+    }
+    res.json({ ok: true, preds: lockedAdvCache });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+app.post('/locked-adv', rateLimit(120), async (req, res) => {
+  if (APP_SECRET && req.headers['x-app-secret'] !== APP_SECRET)
+    return res.status(403).json({ ok:false, error:'Forbidden' });
+  try {
+    const { model, preds } = req.body;
+    if (!model || !preds || typeof preds !== 'object')
+      return res.status(400).json({ ok:false, error:'model and preds required' });
+    await saveLockedAdvPreds(model, preds);
+    lockedAdvCache = null; // bust cache
+    res.json({ ok:true });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+app.delete('/locked-adv', requireAdmin, async (req, res) => {
+  try {
+    const { Pool } = require('pg');
+    const pool = new Pool({ connectionString:process.env.DATABASE_URL, ssl:{rejectUnauthorized:false} });
+    await pool.query('DELETE FROM locked_preds_adv');
+    await pool.end();
+    lockedAdvCache = null;
     res.json({ ok:true });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });

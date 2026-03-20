@@ -290,6 +290,21 @@ async function deleteWallet(id) {
 // ── ACCESS CODES + ALL LOCKED PRED TABLES ────────────────────────────────────
 async function initAccessCodes() {
 
+  // ── Advanced engine locked preds (lstm/xgb/rf/tfjs/cat/hardgap/...) ─────────
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS locked_preds_adv (
+      model           VARCHAR(20) NOT NULL,
+      target          VARCHAR(10) NOT NULL,
+      lo              BIGINT      NOT NULL,
+      hi              BIGINT      NOT NULL,
+      round_when_made BIGINT      NOT NULL,
+      generation      INT         NOT NULL DEFAULT 1,
+      eta_json        TEXT,
+      updated_at      TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (model, target)
+    );
+  `).catch(() => {});
+
   // ── Engine locked preds ───────────────────────────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS locked_preds (
@@ -478,10 +493,44 @@ async function getLockedStatPreds() {
   return out;
 }
 
+// ── Advanced engine locked preds ──────────────────────────────────────────────
+async function saveLockedAdvPreds(modelId, preds) {
+  for (const [target, data] of Object.entries(preds)) {
+    await pool.query(
+      `INSERT INTO locked_preds_adv (model, target, lo, hi, round_when_made, generation, eta_json, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+       ON CONFLICT (model, target) DO UPDATE
+       SET lo=$3, hi=$4, round_when_made=$5, generation=$6, eta_json=$7, updated_at=NOW()`,
+      [modelId, target, data.lo, data.hi, data.roundWhenMade, data.generation ?? 1,
+       data.eta ? JSON.stringify(data.eta) : null]
+    );
+  }
+}
+
+async function getLockedAdvPreds() {
+  const res = await pool.query(`SELECT * FROM locked_preds_adv`);
+  const ADV_ENGINES = ['lstm','xgb','rf','tfjs','cat','hardgap','softgap','markov','montecarlo','bayes','sha256','mt','lcg'];
+  const out = {};
+  ADV_ENGINES.forEach(e => { out[e] = {}; });
+  for (const r of res.rows) {
+    if (!out[r.model]) out[r.model] = {};
+    out[r.model][r.target] = {
+      lo:            Number(r.lo),
+      hi:            Number(r.hi),
+      roundWhenMade: Number(r.round_when_made),
+      generation:    r.generation,
+      eta:           r.eta_json ? JSON.parse(r.eta_json) : null,
+      locked:        true,
+    };
+  }
+  return out;
+}
+
 module.exports = {
   initDB, saveRounds, getRounds, getStorageStats, getStats,
   saveLockedPreds, getLockedPreds,
   saveLockedPatternPreds, getLockedPatternPreds,
+  saveLockedAdvPreds, getLockedAdvPreds,
   saveLockedStatPreds, getLockedStatPreds,
   initWalletStorage, saveWallet, getWallets, deleteWallet,
   savePrediction, getPredictions, clearPredictions,
