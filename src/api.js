@@ -91,8 +91,8 @@ app.get('/health', (req,res) => res.json({ ok:true, ts:new Date().toISOString() 
 const VALID_SOURCES = [
   'engine','pattern','ens','geo','bay','km',
   // Advanced engines (client-side, DB-backed)
-  'lstm','xgb','rf','tfjs','cat',
-  'hardgap','softgap','markov','montecarlo','bayes',
+  'lstm','xgb','rf','ols','cat',
+  'hardgap','softgap','markov','percentile','bayes',
   'sha256','mt','lcg',
 ];
 
@@ -145,8 +145,8 @@ app.get('/predictions-all', rateLimit(120), async (req, res) => {
     const now   = Date.now();
     if (!predsAllCache || (now - predsAllCacheTs) > PREDS_ALL_TTL) {
       const [ens, geo, bay, km,
-             lstm, xgb, rf, tfjs, cat,
-             hardgap, softgap, markov, montecarlo, bayes,
+             lstm, xgb, rf, ols, cat,
+             hardgap, softgap, markov, percentile, bayes,
              sha256, mt, lcg] = await Promise.all([
         getPredictions({ limit, source: 'ens' }),
         getPredictions({ limit, source: 'geo' }),
@@ -155,20 +155,20 @@ app.get('/predictions-all', rateLimit(120), async (req, res) => {
         getPredictions({ limit, source: 'lstm' }),
         getPredictions({ limit, source: 'xgb' }),
         getPredictions({ limit, source: 'rf' }),
-        getPredictions({ limit, source: 'tfjs' }),
+        getPredictions({ limit, source: 'ols' }),
         getPredictions({ limit, source: 'cat' }),
         getPredictions({ limit, source: 'hardgap' }),
         getPredictions({ limit, source: 'softgap' }),
         getPredictions({ limit, source: 'markov' }),
-        getPredictions({ limit, source: 'montecarlo' }),
+        getPredictions({ limit, source: 'percentile' }),
         getPredictions({ limit, source: 'bayes' }),
         getPredictions({ limit, source: 'sha256' }),
         getPredictions({ limit, source: 'mt' }),
         getPredictions({ limit, source: 'lcg' }),
       ]);
       predsAllCache   = { ens, geo, bay, km,
-        lstm, xgb, rf, tfjs, cat,
-        hardgap, softgap, markov, montecarlo, bayes,
+        lstm, xgb, rf, ols, cat,
+        hardgap, softgap, markov, percentile, bayes,
         sha256, mt, lcg };
       predsAllCacheTs = now;
     }
