@@ -294,7 +294,7 @@ async function deleteWallet(id) {
 // ── ACCESS CODES + ALL LOCKED PRED TABLES ────────────────────────────────────
 async function initAccessCodes() {
 
-  // ── Advanced engine locked preds (lstm/xgb/rf/tfjs/cat/hardgap/...) ─────────
+  // ── Advanced engine locked preds (lstm/xgb/rf/ols/cat/hardgap/...) ─────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS locked_preds_adv (
       model           VARCHAR(20) NOT NULL,
@@ -513,7 +513,7 @@ async function saveLockedAdvPreds(modelId, preds) {
 
 async function getLockedAdvPreds() {
   const res = await pool.query(`SELECT * FROM locked_preds_adv`);
-  const ADV_ENGINES = ['lstm','xgb','rf','tfjs','cat','hardgap','softgap','markov','montecarlo','bayes','sha256','mt','lcg'];
+  const ADV_ENGINES = ['lstm','xgb','rf','ols','cat','hardgap','softgap','markov','percentile','bayes','sha256','mt','lcg'];
   const out = {};
   ADV_ENGINES.forEach(e => { out[e] = {}; });
   for (const r of res.rows) {
