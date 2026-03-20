@@ -159,12 +159,12 @@ const RARE_CAL_REDUCED_WEIGHT    = 0.30;
 const RARE_PAYOUT = { '100x': 0.95, '250x': 0.92, '500x': 0.90, '1000x': 0.88 };
 
 // ── Timing feedback constants (UNCHANGED) ────────────────────────────────────
-const TIMING_MAX_SHIFT_FACTOR     = 0.35;
-const TIMING_GAP_CORRECTION_SCALE = 0.20;
-const TIMING_CENTER_PULL_SCALE    = 0.25;
+const TIMING_MAX_SHIFT_FACTOR     = 0.15;  // was 0.35 — reduced to prevent feedback loop
+const TIMING_GAP_CORRECTION_SCALE = 0.08;  // was 0.20 — too aggressive, caused self-reinforcing early spiral
+const TIMING_CENTER_PULL_SCALE    = 0.10;  // was 0.25 — pulls window so early it creates more earls
 const TIMING_RECENT_WINDOW        = 20;
-const TIMING_RECENT_SPIKE_THRESH  = 0.30;
-const TIMING_RECENT_SPIKE_SHIFT   = 0.10;
+const TIMING_RECENT_SPIKE_THRESH  = 0.50;  // was 0.30 — fires too easily
+const TIMING_RECENT_SPIKE_SHIFT   = 0.05;  // was 0.10 — shift was too large
 
 // ── BMA ensemble weights (slowed) ────────────────────────────────────────────
 const BMA_WARMUP_COUNT  = 80;
