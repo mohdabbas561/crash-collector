@@ -9,6 +9,7 @@ const {
   saveLockedPatternPreds, getLockedPatternPreds,
   saveLockedStatPreds, getLockedStatPreds,
   saveLockedAdvPreds, getLockedAdvPreds,
+  saveLockedConsensusPreds, getLockedConsensusPreds,
   initWalletStorage, saveWallet, getWallets, deleteWallet,
 } = require('./db');
 
@@ -94,6 +95,8 @@ const VALID_SOURCES = [
   'lstm','xgb','rf','ols','cat',
   'hardgap','softgap','markov','percentile','bayes',
   'sha256','mt','lcg',
+  // Master Signal — consensus of ≥3 engines
+  'consensus',
 ];
 
 app.get("/predictions", rateLimit(300), async (req, res) => {
@@ -148,7 +151,7 @@ app.get('/predictions-all', rateLimit(120), async (req, res) => {
       const [ens, geo, bay, km,
              lstm, xgb, rf, ols, cat,
              hardgap, softgap, markov, percentile, bayes,
-             sha256, mt, lcg] = await Promise.all([
+             sha256, mt, lcg, consensus] = await Promise.all([
         getPredictions({ limit, source: 'ens' }),
         getPredictions({ limit, source: 'geo' }),
         getPredictions({ limit, source: 'bay' }),
@@ -166,11 +169,12 @@ app.get('/predictions-all', rateLimit(120), async (req, res) => {
         getPredictions({ limit, source: 'sha256' }),
         getPredictions({ limit, source: 'mt' }),
         getPredictions({ limit, source: 'lcg' }),
+        getPredictions({ limit, source: 'consensus' }),
       ]);
       predsAllCache   = { ens, geo, bay, km,
         lstm, xgb, rf, ols, cat,
         hardgap, softgap, markov, percentile, bayes,
-        sha256, mt, lcg };
+        sha256, mt, lcg, consensus };
       predsAllCacheTs = now;
     }
     res.json({ ok: true, ...predsAllCache });
@@ -317,6 +321,48 @@ app.delete('/locked-adv', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
+// ── CONSENSUS MASTER SIGNAL LOCKED PREDS ─────────────────────────────────────
+// GET  /locked-consensus → { ok, preds: { '5x':{lo,hi,...}, ... } }
+// POST /locked-consensus → save consensus locked window { preds: {target: {lo,hi,...}} }
+// DELETE /locked-consensus → admin wipe
+
+let lockedConsensusCache   = null;
+let lockedConsensusCacheTs = 0;
+const LOCKED_CONSENSUS_CACHE_MS = 8000;
+
+app.get('/locked-consensus', rateLimit(120), async (req, res) => {
+  try {
+    const now = Date.now();
+    if (!lockedConsensusCache || (now - lockedConsensusCacheTs) > LOCKED_CONSENSUS_CACHE_MS) {
+      lockedConsensusCache   = await getLockedConsensusPreds();
+      lockedConsensusCacheTs = now;
+    }
+    res.json({ ok: true, preds: lockedConsensusCache });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+app.post('/locked-consensus', rateLimit(120), async (req, res) => {
+  try {
+    const { preds } = req.body;
+    if (!preds || typeof preds !== 'object')
+      return res.status(400).json({ ok:false, error:'preds required' });
+    await saveLockedConsensusPreds(preds);
+    lockedConsensusCache = null; // bust cache
+    res.json({ ok:true });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+app.delete('/locked-consensus', requireAdmin, async (req, res) => {
+  try {
+    const { Pool } = require('pg');
+    const pool = new Pool({ connectionString:process.env.DATABASE_URL, ssl:{rejectUnauthorized:false} });
+    await pool.query('DELETE FROM locked_preds_consensus');
+    await pool.end();
+    lockedConsensusCache = null;
+    res.json({ ok:true });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
 // ── FULL RESET ────────────────────────────────────────────────────────────────
 app.delete('/reset', requireAdmin, async (req, res) => {
   try {
@@ -326,12 +372,14 @@ app.delete('/reset', requireAdmin, async (req, res) => {
     await pool.query('DELETE FROM locked_preds');
     await pool.query('DELETE FROM locked_preds_pattern');
     await pool.query('DELETE FROM locked_preds_stat');
-    await pool.query('DELETE FROM locked_preds_adv');  // Advanced engines
+    await pool.query('DELETE FROM locked_preds_adv');
+    await pool.query('DELETE FROM locked_preds_consensus');
     await pool.end();
-    lockedAdvCache = null;  // bust adv cache
-    predsAllCache  = null;  // bust history cache
+    lockedAdvCache       = null;
+    lockedConsensusCache = null;
+    predsAllCache        = null;
     require('./predictionEngine').resetEngineState();
-    console.log('[api] /reset — all prediction data cleared including adv engines');
+    console.log('[api] /reset — all prediction data cleared including adv engines + consensus');
     res.json({ ok:true, message:'All prediction data cleared and engine reset' });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });

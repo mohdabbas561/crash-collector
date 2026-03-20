@@ -294,6 +294,19 @@ async function deleteWallet(id) {
 // ── ACCESS CODES + ALL LOCKED PRED TABLES ────────────────────────────────────
 async function initAccessCodes() {
 
+  // ── Consensus (Master Signal) locked preds ────────────────────────────────
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS locked_preds_consensus (
+      target          VARCHAR(10) PRIMARY KEY,
+      lo              BIGINT      NOT NULL,
+      hi              BIGINT      NOT NULL,
+      round_when_made BIGINT      NOT NULL,
+      generation      INT         NOT NULL DEFAULT 1,
+      eta_json        TEXT,
+      updated_at      TIMESTAMPTZ DEFAULT NOW()
+    );
+  `).catch(() => {});
+
   // ── Advanced engine locked preds (lstm/xgb/rf/ols/cat/hardgap/...) ─────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS locked_preds_adv (
@@ -513,12 +526,42 @@ async function saveLockedAdvPreds(modelId, preds) {
 
 async function getLockedAdvPreds() {
   const res = await pool.query(`SELECT * FROM locked_preds_adv`);
-  const ADV_ENGINES = ['lstm','xgb','rf','ols','cat','hardgap','softgap','markov','percentile','bayes','sha256','mt','lcg'];
+  const ADV_ENGINES = ['lstm','xgb','rf','ols','cat','hardgap','softgap','markov','percentile','bayes','sha256','mt','lcg','consensus'];
   const out = {};
   ADV_ENGINES.forEach(e => { out[e] = {}; });
   for (const r of res.rows) {
     if (!out[r.model]) out[r.model] = {};
     out[r.model][r.target] = {
+      lo:            Number(r.lo),
+      hi:            Number(r.hi),
+      roundWhenMade: Number(r.round_when_made),
+      generation:    r.generation,
+      eta:           r.eta_json ? JSON.parse(r.eta_json) : null,
+      locked:        true,
+    };
+  }
+  return out;
+}
+
+// ── Consensus locked preds (Master Signal — separate table, same structure) ───
+async function saveLockedConsensusPreds(preds) {
+  for (const [target, data] of Object.entries(preds)) {
+    await pool.query(
+      `INSERT INTO locked_preds_consensus (target, lo, hi, round_when_made, generation, eta_json, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,NOW())
+       ON CONFLICT (target) DO UPDATE
+       SET lo=$2, hi=$3, round_when_made=$4, generation=$5, eta_json=$6, updated_at=NOW()`,
+      [target, data.lo, data.hi, data.roundWhenMade, data.generation ?? 1,
+       data.eta ? JSON.stringify(data.eta) : null]
+    );
+  }
+}
+
+async function getLockedConsensusPreds() {
+  const res = await pool.query(`SELECT * FROM locked_preds_consensus`);
+  const out = {};
+  for (const r of res.rows) {
+    out[r.target] = {
       lo:            Number(r.lo),
       hi:            Number(r.hi),
       roundWhenMade: Number(r.round_when_made),
@@ -536,6 +579,7 @@ module.exports = {
   saveLockedPatternPreds, getLockedPatternPreds,
   saveLockedAdvPreds, getLockedAdvPreds,
   saveLockedStatPreds, getLockedStatPreds,
+  saveLockedConsensusPreds, getLockedConsensusPreds,
   initWalletStorage, saveWallet, getWallets, deleteWallet,
   savePrediction, getPredictions, clearPredictions,
   initAccessCodes, createAccessCode, getAccessCode,
