@@ -117,6 +117,7 @@ app.post('/predictions', rateLimit(120), async (req, res) => {
       return res.status(400).json({ ok:false, error:'Invalid window' });
     const validSource = VALID_SOURCES.includes(source) ? source : 'engine';
     await savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation, source:validSource });
+    predsAllCache = null; // bust cache so next poll returns fresh history immediately
     res.json({ ok:true });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
@@ -137,7 +138,7 @@ app.delete('/predictions', requireAdmin, async (req, res) => {
 // queries per call. Was previously deleted by accident causing blank history.
 let predsAllCache    = null;
 let predsAllCacheTs  = 0;
-const PREDS_ALL_TTL = 15000;
+const PREDS_ALL_TTL = 3000;  // 3s — fast enough for live history updates
 
 app.get('/predictions-all', rateLimit(120), async (req, res) => {
   try {
