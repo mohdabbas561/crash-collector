@@ -124,8 +124,8 @@ app.post('/predictions', rateLimit(120), async (req, res) => {
 app.delete('/predictions', requireAdmin, async (req, res) => {
   try {
     await clearPredictions();
-    // Also bust the predictions-all cache so next request is fresh
-    predsAllCache = null;
+    predsAllCache  = null;  // bust history cache
+    lockedAdvCache = null;  // bust adv cache
     require('./predictionEngine').resetEngineState();
     console.log('[api] predictions cleared + engine reset');
     res.json({ ok:true });
@@ -293,8 +293,8 @@ app.get('/locked-adv', rateLimit(120), async (req, res) => {
 });
 
 app.post('/locked-adv', rateLimit(120), async (req, res) => {
-  if (APP_SECRET && req.headers['x-app-secret'] !== APP_SECRET)
-    return res.status(403).json({ ok:false, error:'Forbidden' });
+  // No APP_SECRET check — client-side engines POST their own locked windows.
+  // This endpoint only stores prediction window numbers (lo/hi), not credentials.
   try {
     const { model, preds } = req.body;
     if (!model || !preds || typeof preds !== 'object')
@@ -325,9 +325,12 @@ app.delete('/reset', requireAdmin, async (req, res) => {
     await pool.query('DELETE FROM locked_preds');
     await pool.query('DELETE FROM locked_preds_pattern');
     await pool.query('DELETE FROM locked_preds_stat');
+    await pool.query('DELETE FROM locked_preds_adv');  // Advanced engines
     await pool.end();
+    lockedAdvCache = null;  // bust adv cache
+    predsAllCache  = null;  // bust history cache
     require('./predictionEngine').resetEngineState();
-    console.log('[api] /reset — all prediction data cleared');
+    console.log('[api] /reset — all prediction data cleared including adv engines');
     res.json({ ok:true, message:'All prediction data cleared and engine reset' });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
