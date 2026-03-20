@@ -71,7 +71,7 @@ const APP_SECRET = process.env.APP_SECRET || process.env.ADMIN_SECRET;
 // ── ROUNDS ────────────────────────────────────────────────────────────────────
 app.get('/rounds', rateLimit(60), async (req, res) => {
   try {
-    const limit      = Math.min(parseInt(req.query.limit  || '1000'), 10000);
+    const limit      = Math.min(parseInt(req.query.limit  || '1000'), 100000);
     const offset     = parseInt(req.query.offset || '0');
     // FIX: push 'since' into the DB query as minRoundId so we don't fetch
     // thousands of rows and filter in JS — this was the cause of stale data
