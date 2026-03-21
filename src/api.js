@@ -263,6 +263,24 @@ app.get('/locked-stat', rateLimit(120), async (req, res) => {
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
+// POST /locked-stat — server-side stat engine pushes updated locked preds
+// Busts cache immediately so next frontend poll sees fresh data
+app.post('/locked-stat', rateLimit(120), async (req, res) => {
+  if (APP_SECRET && req.headers['x-app-secret'] !== APP_SECRET)
+    return res.status(403).json({ ok:false, error:'Forbidden' });
+  try {
+    const { model, preds } = req.body;
+    if (!model || !preds || typeof preds !== 'object')
+      return res.status(400).json({ ok:false, error:'model and preds required' });
+    const VALID_STAT_MODELS = ['ens','geo','bay','km'];
+    if (!VALID_STAT_MODELS.includes(model))
+      return res.status(400).json({ ok:false, error:'Unknown stat model' });
+    await saveLockedStatPreds(model, preds);
+    lockedStatCache = null; // bust immediately
+    res.json({ ok:true });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
 app.delete('/locked-stat', requireAdmin, async (req, res) => {
   try {
     await pool.query('DELETE FROM locked_preds_stat');

@@ -60,7 +60,9 @@ function analysePattern(sortedRounds, targetMin) {
   const n = sortedRounds.length;
   if (n < MIN_ROUNDS) return null;
 
-  const W1 = 15, W2 = 50, W3 = 150;
+  // FIX: W3=200 (was 150) — use more data for the long-window cluster score.
+  // FIX: lags up to 5 (was 3) — detect longer-range autocorrelation patterns.
+  const W1 = 15, W2 = 50, W3 = 200;
   const s1 = Math.max(0, n - W1), s2 = Math.max(0, n - W2), s3 = Math.max(0, n - W3);
 
   let hits = 0, lastIdx = -1, hW1 = 0, hW2 = 0, hW3 = 0;
@@ -83,14 +85,18 @@ function analysePattern(sortedRounds, targetMin) {
 
   if (hits < MIN_HITS || gaps.length < MIN_GAPS) return null;
 
-  const globalRate = hits / n;
+  const globalRate   = hits / n;
+  // FIX: compute gapSinceLast — essential for correct window placement
+  const gapSinceLast = lastIdx === -1 ? n : n - lastIdx - 1;
+
   let gSum = 0, gSS = 0;
   for (const g of gaps) { gSum += g; gSS += g * g; }
-  const meanGap = gSum / gaps.length;
-  const sg = [...gaps].sort((a, b) => a - b);
-  const mid2 = Math.floor(sg.length / 2);
+  const meanGap   = gSum / gaps.length;
+  const stdGap    = Math.sqrt(Math.max(0, gSS / gaps.length - meanGap ** 2));
+  const cv        = meanGap > 0 ? stdGap / meanGap : 1;
+  const sg        = [...gaps].sort((a, b) => a - b);
+  const mid2      = Math.floor(sg.length / 2);
   const medianGap = sg.length % 2 === 1 ? sg[mid2] : (sg[mid2 - 1] + sg[mid2]) / 2;
-  const cv = meanGap > 0 ? Math.sqrt(Math.max(0, gSS / gaps.length - meanGap ** 2)) / meanGap : 1;
 
   const dW1 = hW1 / W1;
   const dW2 = hW2 / W2;
@@ -105,42 +111,80 @@ function analysePattern(sortedRounds, targetMin) {
   let varSum = 0;
   for (const g of gaps) varSum += (g - meanGap) ** 2;
   let bestAC = 0;
-  for (let lag = 1; lag <= Math.min(3, gaps.length - 1); lag++) {
+  // FIX: 5 lags (was 3) — matches frontend, detects more patterns
+  for (let lag = 1; lag <= Math.min(5, gaps.length - 1); lag++) {
     let cov = 0;
     for (let i = lag; i < gaps.length; i++) cov += (gaps[i - lag] - meanGap) * (gaps[i] - meanGap);
     const ac = varSum > 0 ? cov / varSum : 0;
     if (Math.abs(ac) > Math.abs(bestAC)) bestAC = ac;
   }
   const patternScore = safe(bestAC * 0.9);
-  const composite    = clusterScore * 0.50 + trendScore * 0.35 + patternScore * 0.15;
+
+  // FIX: add momentum signal — last 5 gaps vs mean (matches frontend)
+  const last5     = gaps.slice(-5);
+  const last5Mean = last5.reduce((s, v) => s + v, 0) / last5.length;
+  const momentum  = meanGap > 0 ? (meanGap - last5Mean) / meanGap : 0;
+
+  // FIX: weights now match frontend — 0.40/0.30/0.15/0.15 (was 0.50/0.35/0.15)
+  const composite    = clusterScore * 0.40 + trendScore * 0.30 + patternScore * 0.15 + safe(momentum) * 0.15;
   const absComposite = Math.abs(composite);
-  const direction    = composite > 0.10 ? 'bullish' : composite < -0.10 ? 'bearish' : 'neutral';
+  const direction    = composite > 0.08 ? 'bullish' : composite < -0.08 ? 'bearish' : 'neutral';
   const agree = Math.max(
-    [clusterScore, trendScore, patternScore].filter(s => s > 0.10).length,
-    [clusterScore, trendScore, patternScore].filter(s => s < -0.10).length
+    [clusterScore, trendScore, patternScore].filter(s => s > 0.08).length,
+    [clusterScore, trendScore, patternScore].filter(s => s < -0.08).length
   );
   const conf = Math.max(25, Math.min(82,
-    Math.round(32 + Math.min(18, Math.log2(hits + 1) * 4) + absComposite * 30 + (agree - 1) * 6 - (cv > 1.5 ? 8 : cv > 1.2 ? 4 : 0))
+    Math.round(32 + Math.min(18, Math.log2(hits + 1) * 4) + absComposite * 30 + (agree - 1) * 6
+      - (cv > 1.5 ? 8 : cv > 1.2 ? 4 : 0)
+      - (gapSinceLast > meanGap * 2 ? 5 : 0))
   ));
 
   return {
     direction, confidence: conf, hits,
-    meanGap:   Math.round(meanGap),
-    medianGap: Math.round(medianGap),
-    composite: +composite.toFixed(3),
+    meanGap:      Math.round(meanGap),
+    medianGap:    Math.round(medianGap),
+    composite:    +composite.toFixed(3),
+    momentum:     +momentum.toFixed(3),
+    gapSinceLast,
+    clusterScore: +clusterScore.toFixed(3),
+    trendScore:   +trendScore.toFixed(3),
+    patternScore: +patternScore.toFixed(3),
+    cv:           +cv.toFixed(2),
   };
 }
 
 // Build a locked window from pattern analysis
 function buildWindow(patternResult, maxWidth) {
   if (!patternResult) return null;
-  const expectedGap = patternResult.medianGap || patternResult.meanGap || maxWidth;
-  const low  = Math.max(0, expectedGap - maxWidth);
+
+  // FIX: Use gapSinceLast + momentum + overdueFactor for window placement.
+  // Old code placed window at expectedGap - maxWidth regardless of current gap —
+  // this meant a window that should open NOW was placed far in the future.
+  const medianGap    = patternResult.medianGap || patternResult.meanGap || maxWidth;
+  const gapSinceLast = patternResult.gapSinceLast ?? 0;
+  const momentum     = patternResult.momentum     ?? 0;
+  const meanGap      = patternResult.meanGap      || medianGap;
+
+  // Momentum adjustment: bullish (gaps shortening) → predict sooner
+  const momentumAdj   = Math.max(0.70, Math.min(1.30, 1 - momentum * 0.30));
+  // Overdue adjustment: been waiting > 1.5× mean → shift window earlier
+  const overdueFactor = gapSinceLast > meanGap * 1.5 ? 0.80 : 1.0;
+  const expectedGap   = Math.max(1, Math.round(medianGap * momentumAdj * overdueFactor));
+
+  // Center window on remaining rounds until predicted hit
+  const remaining = Math.max(1, expectedGap - gapSinceLast);
+  const low       = Math.max(0, remaining - Math.floor(maxWidth / 2));
+
   return {
     low, high: low + maxWidth - 1, expectedGap,
-    opensIn: low, confidence: patternResult.confidence,
-    direction: patternResult.direction,
-    streakStatus: 'normal', currentStreak: 0,
+    opensIn:   low,
+    confidence: patternResult.confidence,
+    direction:  patternResult.direction,
+    composite:  patternResult.composite  ?? null,
+    momentum:   patternResult.momentum   ?? null,
+    gapSinceLast,
+    streakStatus:  'normal',
+    currentStreak: 0,
   };
 }
 
@@ -190,7 +234,10 @@ function buildSavePayload(lockedMap) {
       eta: {
         low: pred.low, high: pred.high, conf: pred.confidence,
         expectedGap: pred.expectedGap, opensIn: pred.opensIn,
-        direction: pred.direction, streakStatus: pred.streakStatus,
+        direction:   pred.direction,   streakStatus: pred.streakStatus,
+        composite:   pred.composite   ?? null,
+        momentum:    pred.momentum    ?? null,
+        gapSinceLast: pred.gapSinceLast ?? null,
       },
     };
   }
@@ -213,16 +260,19 @@ function loadLockedMap(dbRows) {
     }
     map[label] = {
       low, high,
-      confidence: eta.conf ?? 50,
-      expectedGap: eta.expectedGap ?? null,
-      opensIn: eta.opensIn ?? null,
-      direction: eta.direction ?? 'neutral',
+      confidence:   eta.conf         ?? 50,
+      expectedGap:  eta.expectedGap  ?? null,
+      opensIn:      eta.opensIn      ?? null,
+      direction:    eta.direction    ?? 'neutral',
       streakStatus: eta.streakStatus ?? 'normal',
+      composite:    eta.composite    ?? null,
+      momentum:     eta.momentum     ?? null,
+      gapSinceLast: eta.gapSinceLast ?? null,
       currentStreak: 0,
-      targetMin: target.min,
+      targetMin:   target.min,
       anchorRound: anchor,
-      generation: pred.generation ?? 1,
-      stale: false,
+      generation:  pred.generation ?? 1,
+      stale:       false,
     };
   }
   return map;
