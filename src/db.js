@@ -451,15 +451,27 @@ async function getLockedPreds() {
 
 // ── Pattern locked preds ──────────────────────────────────────────────────────
 async function saveLockedPatternPreds(preds) {
-  for (const [target, data] of Object.entries(preds)) {
-    await pool.query(
-      `INSERT INTO locked_preds_pattern (target, lo, hi, round_when_made, generation, eta_json, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,NOW())
-       ON CONFLICT (target) DO UPDATE
-       SET lo=$2, hi=$3, round_when_made=$4, generation=$5, eta_json=$6, updated_at=NOW()`,
-      [target, data.lo, data.hi, data.roundWhenMade, data.generation,
-       data.eta ? JSON.stringify(data.eta) : null]
-    );
+  const entries = Object.entries(preds);
+  if (!entries.length) return;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const [target, data] of entries) {
+      await client.query(
+        `INSERT INTO locked_preds_pattern (target, lo, hi, round_when_made, generation, eta_json, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,NOW())
+         ON CONFLICT (target) DO UPDATE
+         SET lo=$2, hi=$3, round_when_made=$4, generation=$5, eta_json=$6, updated_at=NOW()`,
+        [target, data.lo, data.hi, data.roundWhenMade, data.generation,
+         data.eta ? JSON.stringify(data.eta) : null]
+      );
+    }
+    await client.query('COMMIT');
+  } catch(e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
   }
 }
 
@@ -481,15 +493,27 @@ async function getLockedPatternPreds() {
 
 // ── Stat model locked preds (ens / geo / bay / km) ────────────────────────────
 async function saveLockedStatPreds(modelId, preds) {
-  for (const [target, data] of Object.entries(preds)) {
-    await pool.query(
-      `INSERT INTO locked_preds_stat (model, target, lo, hi, round_when_made, generation, eta_json, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-       ON CONFLICT (model, target) DO UPDATE
-       SET lo=$3, hi=$4, round_when_made=$5, generation=$6, eta_json=$7, updated_at=NOW()`,
-      [modelId, target, data.lo, data.hi, data.roundWhenMade, data.generation,
-       data.eta ? JSON.stringify(data.eta) : null]
-    );
+  const entries = Object.entries(preds);
+  if (!entries.length) return;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const [target, data] of entries) {
+      await client.query(
+        `INSERT INTO locked_preds_stat (model, target, lo, hi, round_when_made, generation, eta_json, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+         ON CONFLICT (model, target) DO UPDATE
+         SET lo=$3, hi=$4, round_when_made=$5, generation=$6, eta_json=$7, updated_at=NOW()`,
+        [modelId, target, data.lo, data.hi, data.roundWhenMade, data.generation,
+         data.eta ? JSON.stringify(data.eta) : null]
+      );
+    }
+    await client.query('COMMIT');
+  } catch(e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
   }
 }
 
@@ -512,15 +536,27 @@ async function getLockedStatPreds() {
 
 // ── Advanced engine locked preds ──────────────────────────────────────────────
 async function saveLockedAdvPreds(modelId, preds) {
-  for (const [target, data] of Object.entries(preds)) {
-    await pool.query(
-      `INSERT INTO locked_preds_adv (model, target, lo, hi, round_when_made, generation, eta_json, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-       ON CONFLICT (model, target) DO UPDATE
-       SET lo=$3, hi=$4, round_when_made=$5, generation=$6, eta_json=$7, updated_at=NOW()`,
-      [modelId, target, data.lo, data.hi, data.roundWhenMade, data.generation ?? 1,
-       data.eta ? JSON.stringify(data.eta) : null]
-    );
+  const entries = Object.entries(preds);
+  if (!entries.length) return;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const [target, data] of entries) {
+      await client.query(
+        `INSERT INTO locked_preds_adv (model, target, lo, hi, round_when_made, generation, eta_json, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+         ON CONFLICT (model, target) DO UPDATE
+         SET lo=$3, hi=$4, round_when_made=$5, generation=$6, eta_json=$7, updated_at=NOW()`,
+        [modelId, target, data.lo, data.hi, data.roundWhenMade, data.generation ?? 1,
+         data.eta ? JSON.stringify(data.eta) : null]
+      );
+    }
+    await client.query('COMMIT');
+  } catch(e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
   }
 }
 
@@ -545,15 +581,27 @@ async function getLockedAdvPreds() {
 
 // ── Consensus locked preds (Master Signal — separate table, same structure) ───
 async function saveLockedConsensusPreds(preds) {
-  for (const [target, data] of Object.entries(preds)) {
-    await pool.query(
-      `INSERT INTO locked_preds_consensus (target, lo, hi, round_when_made, generation, eta_json, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,NOW())
-       ON CONFLICT (target) DO UPDATE
-       SET lo=$2, hi=$3, round_when_made=$4, generation=$5, eta_json=$6, updated_at=NOW()`,
-      [target, data.lo, data.hi, data.roundWhenMade, data.generation ?? 1,
-       data.eta ? JSON.stringify(data.eta) : null]
-    );
+  const entries = Object.entries(preds);
+  if (!entries.length) return;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const [target, data] of entries) {
+      await client.query(
+        `INSERT INTO locked_preds_consensus (target, lo, hi, round_when_made, generation, eta_json, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,NOW())
+         ON CONFLICT (target) DO UPDATE
+         SET lo=$2, hi=$3, round_when_made=$4, generation=$5, eta_json=$6, updated_at=NOW()`,
+        [target, data.lo, data.hi, data.roundWhenMade, data.generation ?? 1,
+         data.eta ? JSON.stringify(data.eta) : null]
+      );
+    }
+    await client.query('COMMIT');
+  } catch(e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
   }
 }
 
@@ -574,6 +622,7 @@ async function getLockedConsensusPreds() {
 }
 
 module.exports = {
+  pool,
   initDB, saveRounds, getRounds, getStorageStats, getStats,
   saveLockedPreds, getLockedPreds,
   saveLockedPatternPreds, getLockedPatternPreds,

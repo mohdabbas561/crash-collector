@@ -1,6 +1,7 @@
 const express    = require('express');
 const cors       = require('cors');
 const {
+  pool,
   getRounds, getStats, getStorageStats,
   savePrediction, getPredictions, clearPredictions,
   initAccessCodes, createAccessCode, getAccessCode,
@@ -109,7 +110,7 @@ app.get("/predictions", rateLimit(300), async (req, res) => {
 });
 
 
-app.post('/predictions', rateLimit(120), async (req, res) => {
+app.post('/predictions', rateLimit(600), async (req, res) => {
   try {
     const { target, minMult, outcome, lo, hi, hitRound, generation, source } = req.body;
     if (!target || !outcome || lo==null || hi==null)
@@ -200,10 +201,7 @@ app.post('/locked', rateLimit(120), async (req, res) => {
 
 app.delete('/locked', requireAdmin, async (req, res) => {
   try {
-    const { Pool } = require('pg');
-    const pool = new Pool({ connectionString:process.env.DATABASE_URL, ssl:{rejectUnauthorized:false} });
     await pool.query('DELETE FROM locked_preds');
-    await pool.end();
     require('./predictionEngine').resetEngineState();
     res.json({ ok:true });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
@@ -228,10 +226,7 @@ app.post('/locked-pattern', rateLimit(120), async (req, res) => {
 
 app.delete('/locked-pattern', requireAdmin, async (req, res) => {
   try {
-    const { Pool } = require('pg');
-    const pool = new Pool({ connectionString:process.env.DATABASE_URL, ssl:{rejectUnauthorized:false} });
     await pool.query('DELETE FROM locked_preds_pattern');
-    await pool.end();
     require('./predictionEngine').resetEngineState();
     res.json({ ok:true });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
@@ -267,10 +262,8 @@ app.get('/locked-stat', rateLimit(120), async (req, res) => {
 
 app.delete('/locked-stat', requireAdmin, async (req, res) => {
   try {
-    const { Pool } = require('pg');
-    const pool = new Pool({ connectionString:process.env.DATABASE_URL, ssl:{rejectUnauthorized:false} });
     await pool.query('DELETE FROM locked_preds_stat');
-    await pool.end();
+    lockedStatCache = null;
     require('./predictionEngine').resetEngineState();
     res.json({ ok:true });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
@@ -312,10 +305,7 @@ app.post('/locked-adv', rateLimit(120), async (req, res) => {
 
 app.delete('/locked-adv', requireAdmin, async (req, res) => {
   try {
-    const { Pool } = require('pg');
-    const pool = new Pool({ connectionString:process.env.DATABASE_URL, ssl:{rejectUnauthorized:false} });
     await pool.query('DELETE FROM locked_preds_adv');
-    await pool.end();
     lockedAdvCache = null;
     res.json({ ok:true });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
@@ -354,10 +344,7 @@ app.post('/locked-consensus', rateLimit(120), async (req, res) => {
 
 app.delete('/locked-consensus', requireAdmin, async (req, res) => {
   try {
-    const { Pool } = require('pg');
-    const pool = new Pool({ connectionString:process.env.DATABASE_URL, ssl:{rejectUnauthorized:false} });
     await pool.query('DELETE FROM locked_preds_consensus');
-    await pool.end();
     lockedConsensusCache = null;
     res.json({ ok:true });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
@@ -366,10 +353,7 @@ app.delete('/locked-consensus', requireAdmin, async (req, res) => {
 // ── CLEAR HISTORY ONLY (predictions only, locked windows preserved) ───────────
 app.delete('/clear-history', requireAdmin, async (req, res) => {
   try {
-    const { Pool } = require('pg');
-    const pool = new Pool({ connectionString:process.env.DATABASE_URL, ssl:{rejectUnauthorized:false} });
     await pool.query('DELETE FROM predictions');
-    await pool.end();
     predsAllCache = null;
     console.log('[api] /clear-history — predictions cleared, locked windows preserved');
     res.json({ ok:true, message:'Prediction history cleared' });
@@ -378,23 +362,28 @@ app.delete('/clear-history', requireAdmin, async (req, res) => {
 
 // ── FULL RESET ────────────────────────────────────────────────────────────────
 app.delete('/reset', requireAdmin, async (req, res) => {
+  const client = await pool.connect();
   try {
-    const { Pool } = require('pg');
-    const pool = new Pool({ connectionString:process.env.DATABASE_URL, ssl:{rejectUnauthorized:false} });
-    await pool.query('DELETE FROM predictions');
-    await pool.query('DELETE FROM locked_preds');
-    await pool.query('DELETE FROM locked_preds_pattern');
-    await pool.query('DELETE FROM locked_preds_stat');
-    await pool.query('DELETE FROM locked_preds_adv');
-    await pool.query('DELETE FROM locked_preds_consensus');
-    await pool.end();
+    await client.query('BEGIN');
+    await client.query('DELETE FROM predictions');
+    await client.query('DELETE FROM locked_preds');
+    await client.query('DELETE FROM locked_preds_pattern');
+    await client.query('DELETE FROM locked_preds_stat');
+    await client.query('DELETE FROM locked_preds_adv');
+    await client.query('DELETE FROM locked_preds_consensus');
+    await client.query('COMMIT');
     lockedAdvCache       = null;
     lockedConsensusCache = null;
     predsAllCache        = null;
     require('./predictionEngine').resetEngineState();
     console.log('[api] /reset — all prediction data cleared including adv engines + consensus');
     res.json({ ok:true, message:'All prediction data cleared and engine reset' });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+  } catch(e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ ok:false, error:e.message });
+  } finally {
+    client.release();
+  }
 });
 
 // ── ACCESS CODES ──────────────────────────────────────────────────────────────
