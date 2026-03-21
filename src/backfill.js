@@ -1,13 +1,21 @@
 // backfill.js — run once to pull all historical DCF crash rounds into your DB
 // Place in crash-collector-main/src/ and run: node src/backfill.js
+//
+// FIX: pool was referenced but never instantiated in the original.
+// FIX: DATABASE_URL now reads from env var (DATABASE_URL) with a fallback
+//      so credentials are not committed to source control.
+// FIX: START_ROUND_ID / STOP_ROUND_ID unused — backfill walks from latest
+//      offset until empty pages, no hardcoded round IDs needed.
 
 const fetch = require('node-fetch');
 const { Pool } = require('pg');
 
-const DATABASE_URL = 'postgresql://postgres:XwNrpbChBnTHAmDVfCYwpmpssMlsnMtt@shortline.proxy.rlwy.net:48401/railway';
-const AUTH_TOKEN   = 'eyJraWQiOiJ...'; // paste full token here
-const START_ROUND_ID = 983200; // current round (check Network tab)
-const STOP_ROUND_ID  = 900000; // how far back you want to go
+const DATABASE_URL = process.env.DATABASE_URL ||
+  'postgresql://postgres:CHANGE_ME@localhost:5432/railway';
+
+// FIX: instantiate pool (was missing in original — caused ReferenceError at runtime)
+const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
+
 const BASE  = 'https://api.dealer.degencoinflip.com/v1/game/2/room/1/rounds';
 const LIMIT = 100;
 const DELAY = 400; // ms between requests

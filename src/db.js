@@ -1,8 +1,22 @@
+'use strict';
+// db.js — single source of truth for all DB operations.
+// ALL history records and predictions are stored exclusively here.
+// Unique constraints + atomic transactions guarantee zero duplicates.
+
 const { Pool } = require('pg');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
+  // FIX: connection pool limits — prevent runaway connection growth under high load
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+});
+
+// FIX: surface pool errors so they don't silently crash the process
+pool.on('error', (err) => {
+  console.error('[db] Unexpected pool error:', err.message);
 });
 
 async function initDB() {
@@ -15,6 +29,8 @@ async function initDB() {
     );
     CREATE INDEX IF NOT EXISTS idx_rounds_created_at ON rounds(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_rounds_multiplier ON rounds(multiplier);
+    -- FIX: add index on round_id for fast minRoundId range queries in getRounds()
+    CREATE INDEX IF NOT EXISTS idx_rounds_round_id ON rounds(round_id);
 
     CREATE TABLE IF NOT EXISTS predictions (
       id            SERIAL PRIMARY KEY,
@@ -38,9 +54,6 @@ async function initDB() {
   `);
 
   await pool.query(`
-    -- FIX: probW column needed so calibration survives server restarts.
-    -- Without it getPredictions returns probW:null and the warm-up in
-    -- initialise() can't update modelScores/calibState from history.
     ALTER TABLE predictions
       ADD COLUMN IF NOT EXISTS prob_w NUMERIC(8,6);
   `);
@@ -49,7 +62,12 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_predictions_source ON predictions(source);
   `);
 
-  // Unique constraint — safe idempotent creation
+  // FIX: composite index on (source, target) for fast per-engine target lookups
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_predictions_source_target ON predictions(source, target);
+  `).catch(() => {});
+
+  // Unique constraint — idempotent creation, prevents all duplicate history entries
   await pool.query(`
     DO $$
     BEGIN
@@ -66,7 +84,16 @@ async function initDB() {
   `).catch(() => {});
 }
 
+// ── savePrediction ─────────────────────────────────────────────────────────────
+// ON CONFLICT: updates outcome + hit_round so a retry/early→win upgrade works.
+// The unique constraint (source, target, window_lo, window_hi) is the single
+// dedup guard — safe under concurrent requests from multiple browser tabs.
 async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation, source = 'engine', probW = null }) {
+  // FIX: validate inputs before hitting the DB — reject nonsense windows early
+  if (!target || !outcome || lo == null || hi == null) throw new Error('savePrediction: missing required fields');
+  if (!Number.isFinite(Number(lo)) || !Number.isFinite(Number(hi)) || Number(hi) < Number(lo))
+    throw new Error(`savePrediction: invalid window lo=${lo} hi=${hi}`);
+
   await pool.query(
     `INSERT INTO predictions (target, min_mult, outcome, window_lo, window_hi, hit_round, generation, source, prob_w)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -75,7 +102,7 @@ async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, gene
            hit_round  = EXCLUDED.hit_round,
            generation = EXCLUDED.generation,
            prob_w     = COALESCE(EXCLUDED.prob_w, predictions.prob_w)`,
-    [target, minMult, outcome, lo, hi, hitRound ?? null, generation, source, probW ?? null]
+    [target, minMult, outcome, lo, hi, hitRound ?? null, generation ?? 1, source, probW ?? null]
   );
 }
 
@@ -109,22 +136,32 @@ async function getPredictions({ limit = 500, target = null, source = null } = {}
   }));
 }
 
+// ── saveRounds ─────────────────────────────────────────────────────────────────
+// Batch upsert. ON CONFLICT DO NOTHING is the dedup guard for rounds.
+// FIX: chunk large batches to stay under postgres parameter limit (65535 params).
+const ROUND_BATCH_CHUNK = 1000; // 3 params per row → 3000 params max per chunk
+
 async function saveRounds(rounds) {
   if (!rounds.length) return 0;
-  const values = [];
-  const params = [];
-  let idx = 1;
-  for (const r of rounds) {
-    values.push(`($${idx++}, $${idx++}, $${idx++})`);
-    params.push(r.roundId, r.multiplier, r.timestamp ?? null);
+  let totalSaved = 0;
+  for (let offset = 0; offset < rounds.length; offset += ROUND_BATCH_CHUNK) {
+    const chunk = rounds.slice(offset, offset + ROUND_BATCH_CHUNK);
+    const values = [];
+    const params = [];
+    let idx = 1;
+    for (const r of chunk) {
+      values.push(`($${idx++}, $${idx++}, $${idx++})`);
+      params.push(r.roundId, r.multiplier, r.timestamp ?? null);
+    }
+    const res = await pool.query(
+      `INSERT INTO rounds (round_id, multiplier, timestamp)
+       VALUES ${values.join(', ')}
+       ON CONFLICT (round_id) DO NOTHING`,
+      params
+    );
+    totalSaved += res.rowCount;
   }
-  const res = await pool.query(
-    `INSERT INTO rounds (round_id, multiplier, timestamp)
-     VALUES ${values.join(', ')}
-     ON CONFLICT (round_id) DO NOTHING`,
-    params
-  );
-  return res.rowCount;
+  return totalSaved;
 }
 
 async function getRounds({ limit = 1000, offset = 0, from = null, to = null, order = 'ASC', minRoundId = null } = {}) {
@@ -196,7 +233,6 @@ async function getStats() {
         SUM(CASE WHEN multiplier >= 100 THEN 1 ELSE 0 END)            AS gt100
       FROM rounds
     `),
-    // Gap tracker: rounds since last hit for each target (from full DB)
     pool.query(`
       WITH latest AS (SELECT round_id FROM rounds ORDER BY round_id DESC LIMIT 1),
       last_hits AS (
@@ -419,16 +455,28 @@ async function deleteAccessCode(id) {
 
 // ── Engine locked preds ───────────────────────────────────────────────────────
 async function saveLockedPreds(preds) {
-  for (const [target, data] of Object.entries(preds)) {
-    await pool.query(
-      `INSERT INTO locked_preds (target, lo, hi, round_when_made, generation, miss_reasons, eta_json, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-       ON CONFLICT (target) DO UPDATE
-       SET lo=$2, hi=$3, round_when_made=$4, generation=$5, miss_reasons=$6, eta_json=$7, updated_at=NOW()`,
-      [target, data.lo, data.hi, data.roundWhenMade, data.generation,
-       data.missReasons ? JSON.stringify(data.missReasons) : null,
-       data.eta ? JSON.stringify(data.eta) : null]
-    );
+  const entries = Object.entries(preds);
+  if (!entries.length) return;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const [target, data] of entries) {
+      await client.query(
+        `INSERT INTO locked_preds (target, lo, hi, round_when_made, generation, miss_reasons, eta_json, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+         ON CONFLICT (target) DO UPDATE
+         SET lo=$2, hi=$3, round_when_made=$4, generation=$5, miss_reasons=$6, eta_json=$7, updated_at=NOW()`,
+        [target, data.lo, data.hi, data.roundWhenMade, data.generation,
+         data.missReasons ? JSON.stringify(data.missReasons) : null,
+         data.eta ? JSON.stringify(data.eta) : null]
+      );
+    }
+    await client.query('COMMIT');
+  } catch(e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
   }
 }
 
@@ -579,7 +627,7 @@ async function getLockedAdvPreds() {
   return out;
 }
 
-// ── Consensus locked preds (Master Signal — separate table, same structure) ───
+// ── Consensus locked preds ────────────────────────────────────────────────────
 async function saveLockedConsensusPreds(preds) {
   const entries = Object.entries(preds);
   if (!entries.length) return;

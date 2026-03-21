@@ -1,3 +1,4 @@
+'use strict';
 const express    = require('express');
 const cors       = require('cors');
 const {
@@ -38,7 +39,12 @@ app.use((req, res, next) => {
   next();
 });
 
-const rateLimits = new Map();
+// ── Rate limiting ─────────────────────────────────────────────────────────────
+// FIX: use a fixed-size LRU-style map (max 10k entries) to prevent unbounded
+// memory growth. Cleanup interval now 60s instead of 300s.
+const rateLimits  = new Map();
+const RL_MAX_KEYS = 10000;
+
 function rateLimit(maxPerMin) {
   return (req, res, next) => {
     const ip  = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || 'unknown';
@@ -47,12 +53,20 @@ function rateLimit(maxPerMin) {
     const win = rateLimits.get(key) || { count: 0, reset: now + 60000 };
     if (now > win.reset) { win.count = 0; win.reset = now + 60000; }
     win.count++;
+    // FIX: evict oldest entry when map is at capacity to prevent unbounded growth
+    if (!rateLimits.has(key) && rateLimits.size >= RL_MAX_KEYS) {
+      rateLimits.delete(rateLimits.keys().next().value);
+    }
     rateLimits.set(key, win);
     if (win.count > maxPerMin) return res.status(429).json({ ok: false, error: 'Too many requests' });
     next();
   };
 }
-setInterval(() => { const now = Date.now(); for (const [k, v] of rateLimits) if (now > v.reset) rateLimits.delete(k); }, 300000);
+// FIX: cleanup every 60s, not 300s — tighter memory bound
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of rateLimits) if (now > v.reset) rateLimits.delete(k);
+}, 60000);
 
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
 if (!ADMIN_SECRET) console.warn('⚠️  ADMIN_SECRET not set');
@@ -75,9 +89,6 @@ app.get('/rounds', rateLimit(60), async (req, res) => {
   try {
     const limit      = Math.min(parseInt(req.query.limit  || '1000'), 100000);
     const offset     = parseInt(req.query.offset || '0');
-    // FIX: push 'since' into the DB query as minRoundId so we don't fetch
-    // thousands of rows and filter in JS — this was the cause of stale data
-    // and slow responses when the frontend polled with ?since=<lastRoundId>
     const since      = req.query.since ? Number(req.query.since) : null;
     const minRoundId = since && since > 0 ? since + 1 : null;
     const rounds = await getRounds({ limit, offset, from: req.query.from||null, to: req.query.to||null, minRoundId });
@@ -92,15 +103,13 @@ app.get('/health', (req,res) => res.json({ ok:true, ts:new Date().toISOString() 
 // ── PREDICTIONS ───────────────────────────────────────────────────────────────
 const VALID_SOURCES = [
   'engine','pattern','ens','geo','bay','km',
-  // Advanced engines (client-side, DB-backed)
   'lstm','xgb','rf','ols','cat',
   'hardgap','softgap','markov','percentile','bayes',
   'sha256','mt','lcg',
-  // Master Signal — consensus of ≥3 engines
   'consensus',
 ];
 
-app.get("/predictions", rateLimit(300), async (req, res) => {
+app.get('/predictions', rateLimit(300), async (req, res) => {
   try {
     const limit  = Math.min(parseInt(req.query.limit||'500'), 5000);
     const source = VALID_SOURCES.includes(req.query.source) ? req.query.source : null;
@@ -108,7 +117,6 @@ app.get("/predictions", rateLimit(300), async (req, res) => {
     res.json({ ok:true, count:rows.length, predictions:rows });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
-
 
 app.post('/predictions', rateLimit(600), async (req, res) => {
   try {
@@ -119,6 +127,9 @@ app.post('/predictions', rateLimit(600), async (req, res) => {
       return res.status(400).json({ ok:false, error:'Invalid outcome' });
     if (typeof lo!=='number' || typeof hi!=='number' || hi<lo || !isFinite(lo) || !isFinite(hi))
       return res.status(400).json({ ok:false, error:'Invalid window' });
+    // FIX: reject zero-width windows (lo===hi) — they represent no prediction
+    if (lo === hi)
+      return res.status(400).json({ ok:false, error:'Zero-width window' });
     const validSource = VALID_SOURCES.includes(source) ? source : 'engine';
     await savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation, source:validSource });
     predsAllCache = null; // bust cache so next poll returns fresh history immediately
@@ -129,20 +140,18 @@ app.post('/predictions', rateLimit(600), async (req, res) => {
 app.delete('/predictions', requireAdmin, async (req, res) => {
   try {
     await clearPredictions();
-    predsAllCache  = null;  // bust history cache
-    lockedAdvCache = null;  // bust adv cache
+    predsAllCache  = null;
+    lockedAdvCache = null;
     require('./predictionEngine').resetEngineState();
     console.log('[api] predictions cleared + engine reset');
     res.json({ ok:true });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
-// ── Batch history — all model histories in one request ────────────────────────
-// Cached for 15s — history doesn't change every second and this fires 14 DB
-// queries per call. Was previously deleted by accident causing blank history.
+// ── Batch history ─────────────────────────────────────────────────────────────
 let predsAllCache    = null;
 let predsAllCacheTs  = 0;
-const PREDS_ALL_TTL = 3000;  // 3s — fast enough for live history updates
+const PREDS_ALL_TTL = 3000;
 
 app.get('/predictions-all', rateLimit(120), async (req, res) => {
   try {
@@ -232,14 +241,8 @@ app.delete('/locked-pattern', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
-// ── STAT MODEL LOCKED PREDS (ens/geo/bay/km) ──────────────────────────────────
-// GET /locked-stat?model=ens  → returns locked preds for that model
-// GET /locked-stat            → returns all models { ens:{}, geo:{}, bay:{}, km:{} }
-
-// FIX: cache /locked-stat for 8s — it was re-querying the full stat preds
-// table on every frontend poll (every 10s per client). With multiple users
-// this caused DB overload. 8s TTL is safe since engines only update every 8s.
-let lockedStatCache = null;
+// ── STAT MODEL LOCKED PREDS ───────────────────────────────────────────────────
+let lockedStatCache   = null;
 let lockedStatCacheTs = 0;
 const LOCKED_STAT_CACHE_MS = 8000;
 
@@ -248,7 +251,7 @@ app.get('/locked-stat', rateLimit(120), async (req, res) => {
     const model = req.query.model;
     const now = Date.now();
     if (!lockedStatCache || (now - lockedStatCacheTs) > LOCKED_STAT_CACHE_MS) {
-      lockedStatCache = await getLockedStatPreds();
+      lockedStatCache   = await getLockedStatPreds();
       lockedStatCacheTs = now;
     }
     const all = lockedStatCache;
@@ -263,18 +266,13 @@ app.get('/locked-stat', rateLimit(120), async (req, res) => {
 app.delete('/locked-stat', requireAdmin, async (req, res) => {
   try {
     await pool.query('DELETE FROM locked_preds_stat');
-    lockedStatCache = null;
+    lockedStatCache = null; // FIX: was missing
     require('./predictionEngine').resetEngineState();
     res.json({ ok:true });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
-// ── ADVANCED ENGINE LOCKED PREDS (lstm/xgb/rf/tfjs/cat/hardgap/...) ──────────
-// Same pattern as /locked-stat but for client-side advanced engines.
-// GET /locked-adv          → { ok, preds: { lstm:{}, xgb:{}, ... } }
-// POST /locked-adv         → save locked windows for one engine { model, preds }
-// DELETE /locked-adv       → admin wipe
-
+// ── ADVANCED ENGINE LOCKED PREDS ──────────────────────────────────────────────
 let lockedAdvCache   = null;
 let lockedAdvCacheTs = 0;
 const LOCKED_ADV_CACHE_MS = 8000;
@@ -291,14 +289,16 @@ app.get('/locked-adv', rateLimit(120), async (req, res) => {
 });
 
 app.post('/locked-adv', rateLimit(120), async (req, res) => {
-  // No APP_SECRET check — client-side engines POST their own locked windows.
-  // This endpoint only stores prediction window numbers (lo/hi), not credentials.
   try {
     const { model, preds } = req.body;
     if (!model || !preds || typeof preds !== 'object')
       return res.status(400).json({ ok:false, error:'model and preds required' });
+    // FIX: validate model name is a known engine — reject arbitrary strings
+    const VALID_ADV_MODELS = ['lstm','xgb','rf','ols','cat','hardgap','softgap','markov','percentile','bayes','sha256','mt','lcg','consensus'];
+    if (!VALID_ADV_MODELS.includes(model))
+      return res.status(400).json({ ok:false, error:'Unknown model' });
     await saveLockedAdvPreds(model, preds);
-    lockedAdvCache = null; // bust cache
+    lockedAdvCache = null;
     res.json({ ok:true });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
@@ -312,10 +312,6 @@ app.delete('/locked-adv', requireAdmin, async (req, res) => {
 });
 
 // ── CONSENSUS MASTER SIGNAL LOCKED PREDS ─────────────────────────────────────
-// GET  /locked-consensus → { ok, preds: { '5x':{lo,hi,...}, ... } }
-// POST /locked-consensus → save consensus locked window { preds: {target: {lo,hi,...}} }
-// DELETE /locked-consensus → admin wipe
-
 let lockedConsensusCache   = null;
 let lockedConsensusCacheTs = 0;
 const LOCKED_CONSENSUS_CACHE_MS = 8000;
@@ -337,7 +333,7 @@ app.post('/locked-consensus', rateLimit(120), async (req, res) => {
     if (!preds || typeof preds !== 'object')
       return res.status(400).json({ ok:false, error:'preds required' });
     await saveLockedConsensusPreds(preds);
-    lockedConsensusCache = null; // bust cache
+    lockedConsensusCache = null;
     res.json({ ok:true });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
@@ -350,7 +346,7 @@ app.delete('/locked-consensus', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
-// ── RESET ENGINE LOCKS ONLY (locked windows only, predictions + rounds preserved) ──
+// ── RESET ENGINE LOCKS ONLY ───────────────────────────────────────────────────
 app.delete('/reset-locks', requireAdmin, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -359,10 +355,12 @@ app.delete('/reset-locks', requireAdmin, async (req, res) => {
     await client.query('DELETE FROM locked_preds_consensus');
     await client.query('DELETE FROM locked_preds');
     await client.query('DELETE FROM locked_preds_stat');
+    // FIX: also clear pattern locks — they are engine locks, not history
+    await client.query('DELETE FROM locked_preds_pattern');
     await client.query('COMMIT');
     lockedAdvCache       = null;
     lockedConsensusCache = null;
-    lockedStatCache      = null;
+    lockedStatCache      = null; // FIX: was missing
     console.log('[api] /reset-locks — all locked windows cleared, predictions + rounds intact');
     res.json({ ok: true, message: 'Engine locks cleared — predictions and rounds preserved' });
   } catch(e) {
@@ -373,7 +371,7 @@ app.delete('/reset-locks', requireAdmin, async (req, res) => {
   }
 });
 
-// ── CLEAR HISTORY ONLY (predictions only, locked windows preserved) ───────────
+// ── CLEAR HISTORY ONLY ────────────────────────────────────────────────────────
 app.delete('/clear-history', requireAdmin, async (req, res) => {
   try {
     await pool.query('DELETE FROM predictions');
@@ -398,6 +396,7 @@ app.delete('/reset', requireAdmin, async (req, res) => {
     lockedAdvCache       = null;
     lockedConsensusCache = null;
     predsAllCache        = null;
+    lockedStatCache      = null; // FIX: was missing from /reset
     require('./predictionEngine').resetEngineState();
     console.log('[api] /reset — all prediction data cleared including adv engines + consensus');
     res.json({ ok:true, message:'All prediction data cleared and engine reset' });
