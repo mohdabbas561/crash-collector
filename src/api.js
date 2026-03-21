@@ -363,6 +363,19 @@ app.delete('/locked-consensus', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
+// ── CLEAR HISTORY ONLY (predictions only, locked windows preserved) ───────────
+app.delete('/clear-history', requireAdmin, async (req, res) => {
+  try {
+    const { Pool } = require('pg');
+    const pool = new Pool({ connectionString:process.env.DATABASE_URL, ssl:{rejectUnauthorized:false} });
+    await pool.query('DELETE FROM predictions');
+    await pool.end();
+    predsAllCache = null;
+    console.log('[api] /clear-history — predictions cleared, locked windows preserved');
+    res.json({ ok:true, message:'Prediction history cleared' });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
 // ── FULL RESET ────────────────────────────────────────────────────────────────
 app.delete('/reset', requireAdmin, async (req, res) => {
   try {
