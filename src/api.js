@@ -350,6 +350,29 @@ app.delete('/locked-consensus', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
+// ── RESET ENGINE LOCKS ONLY (locked windows only, predictions + rounds preserved) ──
+app.delete('/reset-locks', requireAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM locked_preds_adv');
+    await client.query('DELETE FROM locked_preds_consensus');
+    await client.query('DELETE FROM locked_preds');
+    await client.query('DELETE FROM locked_preds_stat');
+    await client.query('COMMIT');
+    lockedAdvCache       = null;
+    lockedConsensusCache = null;
+    lockedStatCache      = null;
+    console.log('[api] /reset-locks — all locked windows cleared, predictions + rounds intact');
+    res.json({ ok: true, message: 'Engine locks cleared — predictions and rounds preserved' });
+  } catch(e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ ok: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
 // ── CLEAR HISTORY ONLY (predictions only, locked windows preserved) ───────────
 app.delete('/clear-history', requireAdmin, async (req, res) => {
   try {
