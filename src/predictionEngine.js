@@ -15,7 +15,7 @@
 //   - Reset functions
 // ─────────────────────────────────────────────────────────────────────────────
 
-const { runPatternEngine, resetPatternEngineState } = require('./PatternEngine');
+const { runPatternEngine, resetPatternEngineState } = require('./patternEngine');
 const { runStatEngine,    resetStatEngineState, getLockedStatMap, getValidationMetrics } = require('./statEngine');
 
 // Run both engines every tick — each manages its own dirty state
