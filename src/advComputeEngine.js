@@ -368,7 +368,7 @@ async function runAdvComputeEngine() {
 
     const lastRoundId = rounds[rounds.length - 1].roundId;
 
-    // Get existing locked windows to compare
+    // Get existing locked windows (for generation tracking)
     const existingAdv  = await getLockedAdvPreds();
     const existingCons = await getLockedConsensusPreds();
 
@@ -389,79 +389,52 @@ async function runAdvComputeEngine() {
       }
     }
 
-    // Save windows for each engine if changed
+    // Always write fresh computed windows every tick.
+    // advResolutionEngine uses savedSet to avoid re-resolving already-saved outcomes.
+    // If we only write on change, resolved windows stay in DB and block new predictions.
     let savedEngines = 0;
     for (const engineId of ENGINE_IDS) {
       const results = allResults[engineId];
       if (!Object.keys(results).length) continue;
 
       const payload = {};
-      let hasChanges = false;
-
       for (const target of TARGETS) {
         const r = results[target.label];
         if (!r) continue;
-
-        const newLo = lastRoundId + r.low;
-        const newHi = lastRoundId + r.high;
-
         const existing = existingAdv[engineId]?.[target.label];
-        // Only update if window changed meaningfully (different lo/hi)
-        // or if existing window has expired
-        const existingExpired = existing && existing.hi <= lastRoundId;
-        const windowChanged   = !existing || existing.lo !== newLo || existing.hi !== newHi;
-
-        if (existingExpired || windowChanged) {
-          payload[target.label] = {
-            lo: newLo,
-            hi: newHi,
-            roundWhenMade: lastRoundId,
-            generation: (existing?.generation ?? 0) + (existingExpired ? 1 : 0),
-            eta: { probW: r.probW, conf: r.conf, expectedGap: r.expectedGap },
-          };
-          hasChanges = true;
-        }
+        payload[target.label] = {
+          lo: lastRoundId + r.low,
+          hi: lastRoundId + r.high,
+          roundWhenMade: lastRoundId,
+          generation: (existing?.generation ?? 0) + 1,
+          eta: { probW: r.probW, conf: r.conf, expectedGap: r.expectedGap },
+        };
       }
-
-      if (hasChanges) {
-        await saveLockedAdvPreds(engineId, payload);
-        savedEngines++;
-      }
+      await saveLockedAdvPreds(engineId, payload);
+      savedEngines++;
     }
 
     // Compute and save consensus
     const consensus = computeConsensus(allResults, lastRoundId);
     const consPayload = {};
-    let consHasChanges = false;
-
     for (const target of TARGETS) {
       const c = consensus[target.label];
       if (!c) continue;
-
       const existing = existingCons[target.label];
-      const existingExpired = existing && existing.hi <= lastRoundId;
-      const windowChanged   = !existing || existing.lo !== c.lo || existing.hi !== c.hi;
-
-      if (existingExpired || windowChanged) {
-        consPayload[target.label] = {
-          lo: c.lo,
-          hi: c.hi,
-          roundWhenMade: lastRoundId,
-          generation: (existing?.generation ?? 0) + (existingExpired ? 1 : 0),
-          eta: { engineCount: c.engineCount, engines: c.engines },
-        };
-        consHasChanges = true;
-      }
+      consPayload[target.label] = {
+        lo: c.lo,
+        hi: c.hi,
+        roundWhenMade: lastRoundId,
+        generation: (existing?.generation ?? 0) + 1,
+        eta: { engineCount: c.engineCount, engines: c.engines },
+      };
     }
-
-    if (consHasChanges) {
+    if (Object.keys(consPayload).length) {
       await saveLockedConsensusPreds(consPayload);
     }
 
-    if (savedEngines > 0 || consHasChanges) {
-      bustLockedCache(); // tell advResolutionEngine to re-read locked windows
-      console.log(`[advCompute] updated ${savedEngines} engines + consensus=${consHasChanges} @ #${lastRoundId}`);
-    }
+    bustLockedCache(); // tell advResolutionEngine to always read fresh windows
+    console.log(`[advCompute] computed ${savedEngines} engines + consensus @ #${lastRoundId}`);
 
   } catch(e) {
     console.error('[advCompute] Fatal:', e.message, e.stack);
