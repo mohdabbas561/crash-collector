@@ -155,7 +155,7 @@ app.get('/predictions-all', rateLimit(120), async (req, res) => {
            hardgap, softgap, markov, percentile, bayes,
            sha256, mt, lcg, consensus,
            hlstm_xgb, htrans_lstm, htft, tft, nbeats, tcn,
-           lgbm, gru, bilstm, stacking, sha512] = await Promise.all([
+           lgbm, gru, bilstm, stacking, sha512, ng_consensus] = await Promise.all([
       getPredictions({ limit, source: 'ens' }),
       getPredictions({ limit, source: 'geo' }),
       getPredictions({ limit, source: 'bay' }),
@@ -186,13 +186,14 @@ app.get('/predictions-all', rateLimit(120), async (req, res) => {
       getPredictions({ limit, source: 'bilstm' }),
       getPredictions({ limit, source: 'stacking' }),
       getPredictions({ limit, source: 'sha512' }),
+      getPredictions({ limit, source: 'ng_consensus' }),
     ]);
     res.json({ ok: true, ens, geo, bay, km,
       lstm, xgb, rf, ols, cat,
       hardgap, softgap, markov, percentile, bayes,
       sha256, mt, lcg, consensus,
       hlstm_xgb, htrans_lstm, htft, tft, nbeats, tcn,
-      lgbm, gru, bilstm, stacking, sha512 });
+      lgbm, gru, bilstm, stacking, sha512, ng_consensus });
   } catch(e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -319,7 +320,7 @@ app.post('/locked-adv', rateLimit(120), async (req, res) => {
     // FIX: validate model name is a known engine — reject arbitrary strings
     const VALID_ADV_MODELS = [
       'lstm','xgb','rf','ols','cat','hardgap','softgap','markov','percentile','bayes','sha256','mt','lcg','consensus',
-      'hlstm_xgb','htrans_lstm','htft','tft','nbeats','tcn','lgbm','gru','bilstm','stacking','sha512',
+      'hlstm_xgb','htrans_lstm','htft','tft','nbeats','tcn','lgbm','gru','bilstm','stacking','sha512','ng_consensus',
     ];
     if (!VALID_ADV_MODELS.includes(model))
       return res.status(400).json({ ok:false, error:'Unknown model' });

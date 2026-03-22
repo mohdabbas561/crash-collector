@@ -617,7 +617,7 @@ async function getLockedAdvPreds() {
   // NG_ENGINE_IDS added — same table (locked_preds_adv), new model names, zero schema change
   const ADV_ENGINES = [
     'lstm','xgb','rf','ols','cat','hardgap','softgap','markov','percentile','bayes','sha256','mt','lcg','consensus',
-    'hlstm_xgb','htrans_lstm','htft','tft','nbeats','tcn','lgbm','gru','bilstm','stacking','sha512',
+    'hlstm_xgb','htrans_lstm','htft','tft','nbeats','tcn','lgbm','gru','bilstm','stacking','sha512','ng_consensus',
   ];
   const out = {};
   ADV_ENGINES.forEach(e => { out[e] = {}; });

@@ -29,6 +29,7 @@ const NG_ENGINE_IDS = [
   'bilstm',         // bi_lstm
   'stacking',       // stacking_meta
   'sha512',
+  'ng_consensus',   // Next-Gen Master Signal — intersection of all 11 NG engines
 ];
 
 const TARGETS = [
@@ -615,6 +616,58 @@ async function saveNgOutcome(engineId, target, outcome, lo, hi, hitRound, genera
   }
 }
 
+
+// ── computeNgConsensus — Master Signal for Next-Gen engines ──────────────────
+// Same algorithm as advComputeEngine.computeConsensus:
+// finds the largest group of NG engines whose predicted windows OVERLAP,
+// then narrows to the intersection. Requires ≥3 engines to agree.
+// Stored under source='ng_consensus' in locked_preds_adv and predictions.
+function computeNgConsensus(allNgResults, lastRoundId) {
+  const consensus = {};
+  for (const target of TARGETS) {
+    const windows = [];
+    // Collect windows from all 11 NG engines (exclude stacking to avoid circularity)
+    const SOURCE_IDS = ['hlstm_xgb','htrans_lstm','htft','tft','nbeats','tcn','lgbm','gru','bilstm','sha512'];
+    for (const eid of SOURCE_IDS) {
+      const r = allNgResults[eid]?.[target.label];
+      if (!r) continue;
+      const lo = lastRoundId + r.low;
+      const hi = lastRoundId + r.high;
+      windows.push({ engineId: eid, lo, hi });
+    }
+    if (windows.length < 3) { consensus[target.label] = null; continue; }
+
+    // Find largest group of overlapping windows (same greedy algorithm as ADV consensus)
+    let bestGroup = [], bestLo = 0, bestHi = 0;
+    for (let i = 0; i < windows.length; i++) {
+      const grp = [windows[i]]; let runLo = windows[i].lo, runHi = windows[i].hi;
+      for (let j = 0; j < windows.length; j++) {
+        if (j === i) continue;
+        const nl = Math.max(runLo, windows[j].lo), nh = Math.min(runHi, windows[j].hi);
+        if (nl <= nh) { grp.push(windows[j]); runLo = nl; runHi = nh; }
+      }
+      if (grp.length > bestGroup.length) { bestGroup = grp; bestLo = runLo; bestHi = runHi; }
+    }
+    if (bestGroup.length < 2) { consensus[target.label] = null; continue; }
+
+    // Expand intersection to full maxWidth if too narrow
+    const baseW = target.maxWidth;
+    if (bestHi - bestLo + 1 < baseW) {
+      const center = Math.round((bestLo + bestHi) / 2);
+      bestLo = center - Math.floor(baseW / 2); bestHi = bestLo + baseW - 1;
+    }
+    // Ensure window is in the future
+    if (bestLo <= lastRoundId) { bestLo = lastRoundId + 1; bestHi = bestLo + baseW - 1; }
+
+    consensus[target.label] = {
+      lo: bestLo, hi: bestHi,
+      engineCount: bestGroup.length,
+      engines: bestGroup.map(w => w.engineId),
+    };
+  }
+  return consensus;
+}
+
 // ── Main tick ─────────────────────────────────────────────────────────────────
 async function runNgComputeEngine() {
   try {
@@ -654,6 +707,24 @@ async function runNgComputeEngine() {
         const r = runStackingMeta(rounds, target, allNgResults, lastRoundId);
         if (r) allNgResults['stacking'][target.label] = r;
       } catch (e) { console.error(`[ngCompute] stacking/${target.label}:`, e.message); }
+    }
+
+    // ── Pass 3: ng_consensus master signal ───────────────────────────────────
+    const ngConsensus = computeNgConsensus(allNgResults, lastRoundId);
+    allNgResults['ng_consensus'] = {};
+    for (const target of TARGETS) {
+      const c = ngConsensus[target.label];
+      if (c) {
+        // Store as a fake "result" so Phase 1+2 loop handles it uniformly
+        allNgResults['ng_consensus'][target.label] = {
+          low:  c.lo - lastRoundId,
+          high: c.hi - lastRoundId,
+          expectedGap: Math.round((c.lo + c.hi) / 2 - lastRoundId),
+          probW: null,
+          conf:  55 + Math.round(c.engineCount * 4), // confidence scales with agreement
+          _meta: { engineCount: c.engineCount, engines: c.engines },
+        };
+      }
     }
 
     // ── Phase 1+2: resolve old windows, lock new ones ─────────────────────────
@@ -697,9 +768,11 @@ async function runNgComputeEngine() {
           const newLo = lastRoundId + fresh.low;
           const newHi = lastRoundId + fresh.high;
           const gen   = (ngWindows[engineId][target.label]?.generation ?? 0) + 1;
+          // For ng_consensus, carry engineCount and engines list in eta
+          const baseEta = { probW: fresh.probW, conf: fresh.conf, expectedGap: fresh.expectedGap };
+          const eta = fresh._meta ? { ...baseEta, ...fresh._meta } : baseEta;
           ngWindows[engineId][target.label] = {
-            lo: newLo, hi: newHi, roundWhenMade: lastRoundId, generation: gen,
-            eta: { probW: fresh.probW, conf: fresh.conf, expectedGap: fresh.expectedGap },
+            lo: newLo, hi: newHi, roundWhenMade: lastRoundId, generation: gen, eta,
           };
           payload[target.label] = ngWindows[engineId][target.label];
         }
