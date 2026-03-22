@@ -59,7 +59,9 @@ let cachedRoundsLastId  = 0;
 // TTL=30s means at most 3-4 stale ticks after a new window is posted.
 // The api.js lockedAdvCache already caches GET responses for 8s, but the
 // advResolutionEngine calls db functions directly (bypassing api cache).
-const LOCKED_CACHE_TTL_MS = 30000;
+// FIXED: reduced from 30000ms to 8000ms (1 tick) to prevent stale window
+// data causing incorrect earlyHit range calculations during resolution.
+const LOCKED_CACHE_TTL_MS = 8000;
 let lockedAdvCache      = null;
 let lockedAdvCacheTs    = 0;
 let lockedConsCache     = null;
@@ -74,6 +76,14 @@ function bustLockedCache() {
 }
 
 // ── Binary search — O(log n) hit detection on 12k+ rounds ─────────────────────
+
+// FIXED: earlyHit tolerance cap — prevents large pre-window gaps from inflating
+// early counts. Only rounds within floor(maxWidth/2) of the window start count
+// as early; anything further back is scored as a LOSS (wrong timing prediction).
+function earlyHitTolerance(maxWidth) {
+  return Math.floor(maxWidth / 2);
+}
+
 function bisectLeft(rounds, targetId) {
   let lo = 0, hi = rounds.length;
   while (lo < hi) {
@@ -179,9 +189,14 @@ async function resolveEngineWindows(engineId, lockedByTarget, rounds, lastRoundI
     const key = makeKey(engineId, target.label, lo, hi);
     if (savedSet.has(key)) continue; // already resolved
 
-    // Check for early hit (hit before window opened)
-    const earlyHit = lo > rwm
-      ? findHitInRange(rounds, rwm, lo - 1, target.min)
+    // FIXED: earlyHit range bounded by earlyHitTolerance(maxWidth).
+    // Previously checked full [rwm...lo-1] which for large windows (e.g. 50x maxWidth=12)
+    // could scan 12+ rounds before the window, producing near-certain early hits on
+    // common targets. Now only the floor(maxWidth/2) rounds closest to the window open
+    // count as early — hits further back are scored LOSS (engine mispredicted timing).
+    const earlyCheckLo = Math.max(rwm, lo - earlyHitTolerance(target.maxWidth));
+    const earlyHit = lo > rwm + 1 && earlyCheckLo <= lo - 1
+      ? findHitInRange(rounds, earlyCheckLo, lo - 1, target.min)
       : null;
 
     if (earlyHit) {

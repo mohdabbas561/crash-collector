@@ -45,6 +45,13 @@ let initialised        = false;
 // ── Math helpers ──────────────────────────────────────────────────────────────
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
+// FIXED: earlyHit tolerance — only hits within floor(maxWidth/2) rounds of
+// the window open are scored 'early'. Hits further back = 'loss'.
+// Prevents large pre-window gaps from inflating early counts.
+function earlyHitTolerance(maxWidth) {
+  return Math.floor(maxWidth / 2);
+}
+
 function bisectLeft(rounds, targetId) {
   let lo = 0, hi = rounds.length;
   while (lo < hi) { const mid = (lo + hi) >>> 1; if (rounds[mid].roundId < targetId) lo = mid + 1; else hi = mid; }
@@ -219,8 +226,13 @@ async function processPatternEngine(rounds, lastRoundId) {
       const { lo, hi, generation } = win;
       const isTooOld = lastRoundId - hi > STALE_THRESHOLD;
 
-      // Check for early hit (before window opened)
-      const earlyHit = findHitInRange(rounds, win.roundWhenMade + 1, lo - 1, target.min);
+      // FIXED: earlyHit range bounded by earlyHitTolerance(maxWidth).
+      // Only checks the floor(maxWidth/2) rounds immediately before window open.
+      // Hits further back from roundWhenMade are scored as LOSS, not EARLY.
+      const earlyCheckLo = Math.max(win.roundWhenMade + 1, lo - earlyHitTolerance(target.maxWidth));
+      const earlyHit = lo > win.roundWhenMade + 1 && earlyCheckLo <= lo - 1
+        ? findHitInRange(rounds, earlyCheckLo, lo - 1, target.min)
+        : null;
       if (earlyHit) {
         await saveOutcome(target, 'early', lo, hi, earlyHit.roundId, generation);
         delete state.windows[target.label];

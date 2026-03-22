@@ -79,6 +79,14 @@ function placeWindow(expectedGap,currentGap,width){
   const low=Math.max(1,remaining-Math.floor(width/2));
   return {low,high:low+width-1};
 }
+// FIXED: earlyHit tolerance — max rounds before window open that count as early.
+// Previously the full [roundWhenMade...lo-1] range was checked, which for large
+// expectedGap values could be 10-20+ rounds, producing a near-100% early rate on
+// common targets (5x, 10x). Now capped at floor(maxWidth/2) rounds so only hits
+// very close to the window edge count as early; hits further back are scored LOSS.
+function earlyHitTolerance(width) {
+  return Math.floor(width / 2);
+}
 function olsLinear(ys){
   const n=ys.length; if(n<3) return {a:mean(ys),b:0,r2:0};
   let sx=0,sy=0,sxy=0,sxx=0;
@@ -354,7 +362,12 @@ async function runAdvComputeEngine() {
         if (win) {
           const { lo, hi, generation, roundWhenMade } = win;
           // Phase 1: check for early hit
-          const earlyHit = findHitInRange(rounds, roundWhenMade + 1, lo - 1, target.min);
+          // FIXED: earlyHit range bounded by earlyHitTolerance(width) to prevent
+          // large pre-window gaps inflating early counts. Hits outside tolerance = LOSS.
+          const earlyCheckLo = Math.max(roundWhenMade + 1, lo - earlyHitTolerance(target.maxWidth));
+          const earlyHit = lo > roundWhenMade + 1 && earlyCheckLo <= lo - 1
+            ? findHitInRange(rounds, earlyCheckLo, lo - 1, target.min)
+            : null;
           if (earlyHit) {
             await saveOutcome(engineId, target, 'early', lo, hi, earlyHit.roundId, generation);
             delete windows[engineId][target.label];
@@ -399,7 +412,11 @@ async function runAdvComputeEngine() {
       const win = windows['consensus'][target.label];
 
       if (win) {
-        const earlyHit = findHitInRange(rounds, win.roundWhenMade + 1, win.lo - 1, target.min);
+        // FIXED: bounded earlyHit tolerance for consensus windows
+        const consEarlyLo = Math.max(win.roundWhenMade + 1, win.lo - earlyHitTolerance(target.maxWidth));
+        const earlyHit = win.lo > win.roundWhenMade + 1 && consEarlyLo <= win.lo - 1
+          ? findHitInRange(rounds, consEarlyLo, win.lo - 1, target.min)
+          : null;
         if (earlyHit) {
           await saveOutcome('consensus', target, 'early', win.lo, win.hi, earlyHit.roundId, win.generation);
           delete windows['consensus'][target.label];

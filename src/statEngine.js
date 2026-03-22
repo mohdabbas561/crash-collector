@@ -522,7 +522,10 @@ function updateCalibration(targetLabel, modelId, predictedProbW, outcome) {
   const bins = calibState[targetLabel]?.[modelId];
   if (!bins) return;
   const decay  = TARGETS.find(t => t.label === targetLabel)?.rare ? CAL_DECAY.rare : CAL_DECAY.normal;
-  const actual = outcome === 'win' ? 1 : outcome === 'early' ? 0.5 : 0;
+  // FIXED: early treated as actual=0 (loss) for calibration purposes.
+  // Early hits mean the engine predicted the WRONG time window — that is a calibration
+  // failure. Treating as 0.5 softened probability estimates and masked the timing bias.
+  const actual = outcome === 'win' ? 1 : 0;
   const bin    = bins[getCalBinIdx(predictedProbW)];
   bin.ewmaAct  = (1 - decay) * bin.ewmaAct  + decay * actual;
   bin.ewmaPred = (1 - decay) * bin.ewmaPred + decay * predictedProbW;
@@ -565,7 +568,8 @@ function applyCalibrationRelaxed(probW, targetLabel, modelId, hits) {
 function updateValidationMetrics(targetLabel, modelId, predictedProbW, outcome, recommendation) {
   const v = valMetrics[targetLabel]?.[modelId];
   if (!v) return;
-  const actual = outcome === 'win' ? 1 : outcome === 'early' ? 0.5 : 0;
+  // FIXED: early treated as actual=0 for validation metrics (wrong timing = miss).
+  const actual = outcome === 'win' ? 1 : 0;
   const p = Math.max(1e-7, Math.min(1 - 1e-7, predictedProbW));
   v.brierSum   += (actual - p) ** 2;
   v.logLossSum += -(actual * Math.log(p) + (1 - actual) * Math.log(1 - p));
@@ -583,7 +587,8 @@ function logLossVal(actual, probW) {
 function updateModelScore(targetLabel, modelId, predictedProbW, outcome) {
   const s = modelScores[targetLabel]?.[modelId];
   if (!s) return;
-  const actual = outcome === 'win' ? 1 : outcome === 'early' ? 0.5 : 0;
+  // FIXED: early treated as actual=0 for model scoring (wrong timing = miss).
+  const actual = outcome === 'win' ? 1 : 0;
   const decay  = TARGETS.find(t => t.label === targetLabel)?.rare ? 0.015 : 0.03;
   s.ewma  = s.count === 0 ? logLossVal(actual, predictedProbW) : (1 - decay) * s.ewma + decay * logLossVal(actual, predictedProbW);
   s.count = Math.min(s.count + 1, 500);
@@ -909,11 +914,20 @@ function getStatus(sortedRounds, pred, currentRoundId) {
   if (!Number.isFinite(absLow) || !Number.isFinite(absHigh) || absHigh < absLow) return { status: 'miss', hitRound: null };
   let lo = 0, hi = sortedRounds.length - 1, startIdx = sortedRounds.length;
   while (lo <= hi) { const mid = (lo + hi) >>> 1; if (sortedRounds[mid].roundId >= anchorRound) { startIdx = mid; hi = mid - 1; } else lo = mid + 1; }
+  // FIXED: earlyHit only within floor(maxWidth/2) rounds before window open.
+  // Hits further back are treated as MISS (engine had wrong timing entirely).
+  const target = TARGETS.find(t => t.min === pred.targetMin);
+  const maxW   = target?.maxWidth ?? 5;
+  const earlyFloor = absLow - Math.floor(maxW / 2); // earliest round that counts as early
   for (let i = startIdx; i < sortedRounds.length; i++) {
     const r = sortedRounds[i];
     if (r.roundId > absHigh) break;
     if (r.multiplier < pred.targetMin) continue;
-    if (r.roundId < absLow) return { status: 'early', hitRound: r.roundId };
+    if (r.roundId < absLow) {
+      // Only mark as early if within tolerance window; otherwise ignore (let window expire as loss)
+      if (r.roundId >= earlyFloor) return { status: 'early', hitRound: r.roundId };
+      continue; // hit too far before window — not counted, keep scanning
+    }
     return { status: 'hit', hitRound: r.roundId };
   }
   if (currentRoundId >= absHigh) return { status: 'miss', hitRound: null };
