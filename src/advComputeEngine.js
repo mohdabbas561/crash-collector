@@ -336,9 +336,12 @@ async function runAdvComputeEngine() {
     if (rounds.length < 50) return;
     const lastRoundId = rounds[rounds.length - 1].roundId;
 
-    // Compute fresh window predictions for all 13 engines
+    // Compute fresh window predictions for all 13 engines (for consensus input only).
+    // ENGINE_IDS is empty so no individual windows are locked/saved.
+    // But allResults must still be populated so computeConsensus has engine inputs.
+    const ALL_ALGO_IDS = Object.keys(ALGOS); // all 13 engine IDs
     const allResults = {};
-    for (const engineId of ENGINE_IDS) {
+    for (const engineId of ALL_ALGO_IDS) {
       const algo = ALGOS[engineId];
       if (!algo) continue;
       allResults[engineId] = {};
