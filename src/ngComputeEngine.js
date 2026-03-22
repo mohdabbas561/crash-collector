@@ -834,4 +834,12 @@ function resetNgComputeState() {
   cachedRounds = []; cachedRoundsLastId = 0; initialised = false;
 }
 
-module.exports = { runNgComputeEngine: runNgComputeEngineWithInit, resetNgComputeState, NG_ENGINE_IDS };
+// Clears only in-memory locked windows (not savedSets or history).
+// Called by /reset-locks so the engine immediately recomputes fresh windows
+// on next tick without a full state rebuild.
+function resetNgWindowsOnly() {
+  for (const id of NG_ENGINE_IDS) ngWindows[id] = {};
+  console.log('[ngCompute] in-memory windows cleared (lock reset)');
+}
+
+module.exports = { runNgComputeEngine: runNgComputeEngineWithInit, resetNgComputeState, resetNgWindowsOnly, NG_ENGINE_IDS };

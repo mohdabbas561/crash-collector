@@ -314,7 +314,9 @@ app.delete('/reset-locks', requireAdmin, async (req, res) => {
     await client.query('COMMIT');
     lockedAdvCache       = null;
     lockedConsensusCache = null;
-    lockedStatCache      = null; // FIX: was missing
+    // Bust NG compute engine in-memory window cache so fresh windows are locked next tick
+    try { require('./ngComputeEngine').resetNgWindowsOnly(); } catch(_) {}
+    try { require('./advResolutionEngine').bustLockedCache(); } catch(_) {}
     console.log('[api] /reset-locks — all locked windows cleared, predictions + rounds intact');
     res.json({ ok: true, message: 'Engine locks cleared — predictions and rounds preserved' });
   } catch(e) {
@@ -352,6 +354,7 @@ app.delete('/reset', requireAdmin, async (req, res) => {
     lockedAdvCache       = null;
     lockedConsensusCache = null;
     require('./predictionEngine').resetEngineState();
+    try { require('./advResolutionEngine').bustLockedCache(); } catch(_) {}
     console.log('[api] /reset — all prediction data cleared including adv engines + consensus');
     res.json({ ok:true, message:'All prediction data cleared and engine reset' });
   } catch(e) {
