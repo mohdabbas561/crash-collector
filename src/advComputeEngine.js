@@ -280,6 +280,8 @@ async function saveOutcome(engineId, target, outcome, lo, hi, hitRound, generati
 }
 
 // ── Compute consensus ─────────────────────────────────────────────────────────
+// Only uses FRESH computed windows (relative offsets from lastRoundId).
+// Never uses existing/active windows from DB — those may be from a previous cycle.
 function computeConsensus(allResults, lastRoundId) {
   const consensus = {};
   for (const target of TARGETS) {
@@ -287,7 +289,10 @@ function computeConsensus(allResults, lastRoundId) {
     for (const [eid, res] of Object.entries(allResults)) {
       const r = res[target.label];
       if (!r) continue;
-      windows.push({ engineId: eid, lo: lastRoundId + r.low, hi: lastRoundId + r.high });
+      // fresh.low is always >= 1, so lo always > lastRoundId (future window)
+      const lo = lastRoundId + r.low;
+      const hi = lastRoundId + r.high;
+      windows.push({ engineId: eid, lo, hi });
     }
     if (windows.length < 3) { consensus[target.label] = null; continue; }
     let bestGroup = [], bestLo = 0, bestHi = 0;
