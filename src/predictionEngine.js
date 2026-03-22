@@ -1,40 +1,42 @@
 'use strict';
 // predictionEngine.js — Orchestrator
 // ─────────────────────────────────────────────────────────────────────────────
-// This file is now a thin orchestrator only.
-// All logic lives in fully independent modules:
-//   • patternEngine.js — Pattern Engine (clustering/trend/autocorrelation)
-//   • statEngine.js    — Stat Engine (GEO / BAY / KM / ENS)
+// Coordinates three fully independent engine modules:
+//   • patternEngine.js        — PTN (clustering/trend/autocorrelation)
+//   • statEngine.js           — Stat (GEO/BAY/KM/ENS)
+//   • advResolutionEngine.js  — Resolves advanced engine windows server-side
 //
-// These two engines share ZERO code. They have independent:
-//   - TARGETS definitions
-//   - State (lockedMap, savedSet, calibration, timing, CUSUM)
-//   - DB table access (pattern → locked_preds_pattern, stat → locked_preds + locked_preds_stat)
-//   - Rounds caches
-//   - initialised flags
-//   - Reset functions
+// CRITICAL: advResolutionEngine solves the offline history problem.
+// Advanced engines (lstm/xgb/rf etc) lock windows from the browser.
+// Without server-side resolution, outcomes are only saved when a user
+// has the tab open. advResolutionEngine runs every tick and saves
+// win/loss/early regardless of whether any browser is connected.
+//
+// All three modules share ZERO code with each other.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const { runPatternEngine, resetPatternEngineState } = require('./patternEngine');
-const { runStatEngine,    resetStatEngineState, getLockedStatMap, getValidationMetrics } = require('./statEngine');
+const { runPatternEngine,       resetPatternEngineState  } = require('./patternEngine');
+const { runStatEngine,          resetStatEngineState,
+        getLockedStatMap,       getValidationMetrics     } = require('./statEngine');
+const { runAdvResolutionEngine, resetAdvResolutionState  } = require('./advResolutionEngine');
 
-// Run both engines every tick — each manages its own dirty state
+// Run all three engines every tick — each manages its own dirty state
 async function runPredictionEngine() {
   // Run sequentially to avoid DB connection saturation under load.
-  // Each engine has its own internal dirty/needsRebuild check.
   await runStatEngine();
   await runPatternEngine();
+  await runAdvResolutionEngine();
 }
 
 function resetEngineState() {
   resetStatEngineState();
   resetPatternEngineState();
+  resetAdvResolutionState();
 }
 
 module.exports = {
   runPredictionEngine,
   resetEngineState,
-  // Re-export stat engine introspection for API status endpoints
   getLockedStatMap,
   getValidationMetrics,
 };

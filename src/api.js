@@ -394,7 +394,10 @@ app.delete('/clear-history', requireAdmin, async (req, res) => {
   try {
     await pool.query('DELETE FROM predictions');
     predsAllCache = null;
-    console.log('[api] /clear-history — predictions cleared, locked windows preserved');
+    // FIX: also reset advResolution savedSet so server re-resolves all
+    // existing locked windows after history is cleared
+    require('./predictionEngine').resetEngineState();
+    console.log('[api] /clear-history — predictions cleared, engine savedSets reset');
     res.json({ ok:true, message:'Prediction history cleared' });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
