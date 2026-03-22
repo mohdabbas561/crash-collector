@@ -153,7 +153,9 @@ app.get('/predictions-all', rateLimit(120), async (req, res) => {
     const [ens, geo, bay, km,
            lstm, xgb, rf, ols, cat,
            hardgap, softgap, markov, percentile, bayes,
-           sha256, mt, lcg, consensus] = await Promise.all([
+           sha256, mt, lcg, consensus,
+           hlstm_xgb, htrans_lstm, htft, tft, nbeats, tcn,
+           lgbm, gru, bilstm, stacking, sha512] = await Promise.all([
       getPredictions({ limit, source: 'ens' }),
       getPredictions({ limit, source: 'geo' }),
       getPredictions({ limit, source: 'bay' }),
@@ -172,11 +174,25 @@ app.get('/predictions-all', rateLimit(120), async (req, res) => {
       getPredictions({ limit, source: 'mt' }),
       getPredictions({ limit, source: 'lcg' }),
       getPredictions({ limit, source: 'consensus' }),
+      // ── Next-Gen SOTA engines ──
+      getPredictions({ limit, source: 'hlstm_xgb' }),
+      getPredictions({ limit, source: 'htrans_lstm' }),
+      getPredictions({ limit, source: 'htft' }),
+      getPredictions({ limit, source: 'tft' }),
+      getPredictions({ limit, source: 'nbeats' }),
+      getPredictions({ limit, source: 'tcn' }),
+      getPredictions({ limit, source: 'lgbm' }),
+      getPredictions({ limit, source: 'gru' }),
+      getPredictions({ limit, source: 'bilstm' }),
+      getPredictions({ limit, source: 'stacking' }),
+      getPredictions({ limit, source: 'sha512' }),
     ]);
     res.json({ ok: true, ens, geo, bay, km,
       lstm, xgb, rf, ols, cat,
       hardgap, softgap, markov, percentile, bayes,
-      sha256, mt, lcg, consensus });
+      sha256, mt, lcg, consensus,
+      hlstm_xgb, htrans_lstm, htft, tft, nbeats, tcn,
+      lgbm, gru, bilstm, stacking, sha512 });
   } catch(e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -301,7 +317,10 @@ app.post('/locked-adv', rateLimit(120), async (req, res) => {
     if (!model || !preds || typeof preds !== 'object')
       return res.status(400).json({ ok:false, error:'model and preds required' });
     // FIX: validate model name is a known engine — reject arbitrary strings
-    const VALID_ADV_MODELS = ['lstm','xgb','rf','ols','cat','hardgap','softgap','markov','percentile','bayes','sha256','mt','lcg','consensus'];
+    const VALID_ADV_MODELS = [
+      'lstm','xgb','rf','ols','cat','hardgap','softgap','markov','percentile','bayes','sha256','mt','lcg','consensus',
+      'hlstm_xgb','htrans_lstm','htft','tft','nbeats','tcn','lgbm','gru','bilstm','stacking','sha512',
+    ];
     if (!VALID_ADV_MODELS.includes(model))
       return res.status(400).json({ ok:false, error:'Unknown model' });
     await saveLockedAdvPreds(model, preds);

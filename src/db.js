@@ -614,7 +614,11 @@ async function saveLockedAdvPreds(modelId, preds) {
 
 async function getLockedAdvPreds() {
   const res = await pool.query(`SELECT * FROM locked_preds_adv`);
-  const ADV_ENGINES = ['lstm','xgb','rf','ols','cat','hardgap','softgap','markov','percentile','bayes','sha256','mt','lcg','consensus'];
+  // NG_ENGINE_IDS added — same table (locked_preds_adv), new model names, zero schema change
+  const ADV_ENGINES = [
+    'lstm','xgb','rf','ols','cat','hardgap','softgap','markov','percentile','bayes','sha256','mt','lcg','consensus',
+    'hlstm_xgb','htrans_lstm','htft','tft','nbeats','tcn','lgbm','gru','bilstm','stacking','sha512',
+  ];
   const out = {};
   ADV_ENGINES.forEach(e => { out[e] = {}; });
   for (const r of res.rows) {

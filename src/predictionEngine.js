@@ -20,6 +20,7 @@ const { runStatEngine,          resetStatEngineState,
         getLockedStatMap,       getValidationMetrics     } = require('./statEngine');
 const { runAdvResolutionEngine, resetAdvResolutionState  } = require('./advResolutionEngine');
 const { runAdvComputeEngine,    resetAdvComputeState     } = require('./advComputeEngine');
+const { runNgComputeEngine,     resetNgComputeState      } = require('./ngComputeEngine');
 
 // Run all engines every tick — each manages its own dirty state
 async function runPredictionEngine() {
@@ -27,6 +28,7 @@ async function runPredictionEngine() {
   await runStatEngine();
   await runPatternEngine();
   await runAdvComputeEngine();   // compute + lock adv windows server-side (no browser needed)
+  await runNgComputeEngine();    // compute + lock Next-Gen SOTA engine windows
   await runAdvResolutionEngine(); // resolve locked adv windows → save to predictions
 }
 
@@ -35,6 +37,7 @@ function resetEngineState() {
   resetPatternEngineState();
   resetAdvResolutionState();
   resetAdvComputeState();
+  resetNgComputeState();
 }
 
 module.exports = {
