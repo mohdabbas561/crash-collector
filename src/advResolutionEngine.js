@@ -162,8 +162,16 @@ async function resolveEngineWindows(engineId, lockedByTarget, rounds, lastRoundI
     const hi  = Number(w.hi);
     const rwm = Number(w.roundWhenMade ?? lo);
 
-    // Skip windows that haven't expired yet
-    if (lastRoundId <= hi) continue;
+    // FIX: Resolve both expired windows AND windows with a hit inside them.
+    // Previously only expired windows (lastRoundId > hi) were resolved.
+    // This caused active windows that had already been hit to not be saved
+    // until after the window closed — meaning a 100x win at round N inside
+    // window [N-5, N+10] would not be saved until round N+11.
+    // Now: check for hit first. If hit found → resolve immediately.
+    // If no hit and window still active → skip (wait for expiry or hit).
+    const isExpiredNow = lastRoundId > hi;
+    const hitNow = isExpiredNow ? null : findHitInRange(rounds, lo, hi, target.min);
+    if (!isExpiredNow && !hitNow) continue; // still active, no hit yet — wait
 
     // Skip windows with bad data
     if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi < lo || lo <= 0) continue;
@@ -195,8 +203,8 @@ async function resolveEngineWindows(engineId, lockedByTarget, rounds, lastRoundI
       continue;
     }
 
-    // Check for hit inside window
-    const hit = findHitInRange(rounds, lo, hi, target.min);
+    // hit is either hitNow (active window with hit) or search full range (expired)
+    const hit = hitNow ?? findHitInRange(rounds, lo, hi, target.min);
 
     savedSet.add(key);
     try {
