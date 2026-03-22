@@ -256,7 +256,7 @@ function getTimingParams(targetLabel) {
 function applyTimingCorrection(expectedGap, effectiveWidth, targetLabel, maxWidth) {
   const { earlyRate, recentEarlyRate, timingShiftFactor, hasData } = getTimingParams(targetLabel);
   if (!hasData) {
-    const low = Math.max(0, expectedGap - effectiveWidth);
+    const low = Math.max(1, expectedGap - effectiveWidth);
     return { low, high: low + effectiveWidth - 1, effectiveWidth, timingShiftFactor: 0 };
   }
   const expectedGapCorrected = Math.max(1, Math.round(expectedGap * (1 - TIMING_GAP_CORRECTION_SCALE * earlyRate)));
@@ -489,10 +489,10 @@ function parametricWindowPlacement(expectedGap, effectiveWidth, gapSinceLast) {
 }
 
 function empiricalWindowPlacement(kmCDF, expectedGap, effectiveWidth, gapSinceLast) {
-  if (gapSinceLast >= expectedGap) return { low: 0, high: effectiveWidth - 1 };
+  if (gapSinceLast >= expectedGap) return { low: 1, high: effectiveWidth };
   const maxLow = Math.max(0, 3 * expectedGap - gapSinceLast - effectiveWidth);
   let bestScore = -Infinity, bestLow = 0;
-  for (let low = 0; low <= maxLow; low++) {
+  for (let low = 1; low <= maxLow; low++) {
     const absLo = gapSinceLast + low, absHi = gapSinceLast + low + effectiveWidth - 1;
     const score = kmWindowProb(kmCDF, absLo, absHi) - WINDOW_LAMBDA * effectiveWidth;
     if (score > bestScore) { bestScore = score; bestLow = low; }
@@ -869,13 +869,13 @@ function buildRare(gs, maxWidth, targetLabel, isRare, rounds, targetMin, engineG
   if (extremeGap) tailProbability = Math.min(0.95, tailProbability + RARE_EXTREME_GAP_BOOST);
   const earlyEnd = Math.max(1, Math.round(kmExpectedGap * RARE_EARLY_WINDOW_FRAC));
   const lateEnd  = Math.max(earlyEnd + 1, Math.round(kmExpectedGap * RARE_LATE_WINDOW_FRAC));
-  const earlyWindow = { low: 0, high: earlyEnd }, lateWindow = { low: kmExpectedGap, high: lateEnd };
+  const earlyWindow = { low: 1, high: earlyEnd + 1 }, lateWindow = { low: kmExpectedGap, high: lateEnd };
   const earlyTailP = kmCDF ? kmWindowProbDirect(kmCDF, earlyWindow.low, earlyWindow.high) : paretoWindowProb(earlyWindow.low, earlyWindow.high, alpha, kmExpectedGap);
   const lateTailP  = kmCDF ? kmWindowProbDirect(kmCDF, lateWindow.low, lateWindow.high)  : paretoWindowProb(lateWindow.low, lateWindow.high, alpha, kmExpectedGap);
   const regimeOffset = Math.round(-regime.regimeFactor * kmExpectedGap * 0.05);
   const baseWin      = earlyTailP >= lateTailP ? earlyWindow : lateWindow;
   const { low: tcLow, high: tcHigh } = applyTimingCorrection(kmExpectedGap, baseWin.high - baseWin.low + 1, targetLabel, maxWidth);
-  const primaryLow  = Math.max(0, tcLow  - regimeOffset);
+  const primaryLow  = Math.max(1, tcLow  - regimeOffset);
   const primaryHigh = Math.min(primaryLow + maxWidth - 1, Math.max(primaryLow, tcHigh - regimeOffset));
   const decision    = computeRareDecision(tailProbability, extremeGapScore, targetLabel, hits);
   return { low: primaryLow, high: primaryHigh, expectedGap: kmExpectedGap, opensIn: primaryLow, confidence: decision.confidence, probW: +calibProbW.toFixed(4), rawProbW: +rawProbW.toFixed(4), p: +pGeo.toFixed(6), streakStatus: extremeGapScore > 0 ? (z > 3 ? 'extreme' : 'severe') : 'normal', currentStreak: gs.currentStreak, z: +z.toFixed(2), gapSinceLast, hits, n, rateShifted: gs.rateShifted, model: 'rare', regime: regime.regimeLabel, regimeFactor: regime.regimeFactor, regimeConfidence: regime.regimeConfidence, isRandom: gs.isRandom, maxAC: gs.maxAC, tailProbability: +tailProbability.toFixed(4), extremeGapScore, alpha: +alpha.toFixed(3), earlyWindow: { ...earlyWindow, tailP: +earlyTailP.toFixed(4) }, lateWindow: { ...lateWindow, tailP: +lateTailP.toFixed(4) }, primaryWindow: earlyTailP >= lateTailP ? 'early' : 'late', ...decision };

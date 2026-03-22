@@ -173,7 +173,7 @@ function buildWindow(patternResult, maxWidth) {
 
   // Center window on remaining rounds until predicted hit
   const remaining = Math.max(1, expectedGap - gapSinceLast);
-  const low       = Math.max(0, remaining - Math.floor(maxWidth / 2));
+  const low       = Math.max(1, remaining - Math.floor(maxWidth / 2));
 
   return {
     low, high: low + maxWidth - 1, expectedGap,
