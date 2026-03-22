@@ -172,7 +172,7 @@ function buildWindow(patternResult, maxWidth) {
   const expectedGap   = Math.max(1, Math.round(medianGap * momentumAdj * overdueFactor));
 
   // Center window on remaining rounds until predicted hit
-  const remaining = Math.max(1, expectedGap - gapSinceLast);
+  const remaining = Math.max(0, expectedGap - gapSinceLast);
   const low       = Math.max(0, remaining - Math.floor(maxWidth / 2));
 
   return {
@@ -291,7 +291,7 @@ async function processPatternEngine(sortedRounds, lastRoundId) {
       if (pred) {
         state.lockedMap[target.label] = {
           ...pred, targetMin: target.min,
-          anchorRound: lastRoundId + 1, generation: 1, stale: false,
+          anchorRound: lastRoundId, generation: 1, stale: false,
         };
         anyChange = true;
         console.log(`[pattern] NEW ${target.label}: +${pred.low}–+${pred.high} dir=${pred.direction} conf=${pred.confidence}%`);
@@ -336,7 +336,7 @@ async function processPatternEngine(sortedRounds, lastRoundId) {
       if (pred) {
         state.lockedMap[target.label] = {
           ...pred, targetMin: target.min,
-          anchorRound: lastRoundId + 1,
+          anchorRound: lastRoundId,
           generation: (existing.generation || 1) + (isNonsense ? 0 : 1),
           stale: false,
         };
@@ -376,7 +376,7 @@ async function processPatternEngine(sortedRounds, lastRoundId) {
       if (pred) {
         state.lockedMap[target.label] = {
           ...pred, targetMin: target.min,
-          anchorRound: lastRoundId + 1,
+          anchorRound: lastRoundId,
           generation: (existing.generation || 1) + 1,
           stale: false,
         };

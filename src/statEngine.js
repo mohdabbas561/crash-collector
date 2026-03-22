@@ -965,7 +965,7 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
     if (!existing) {
       const pred = buildFn(target);
       if (pred) {
-        state.lockedMap[target.label] = { ...pred, targetMin: target.min, anchorRound: lastRoundId + 1, generation: 1, stale: false };
+        state.lockedMap[target.label] = { ...pred, targetMin: target.min, anchorRound: lastRoundId, generation: 1, stale: false };
         anyChange = true;
         console.log(`[${engineId}] NEW ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}% probW=${pred.probW ?? '—'} rec=${pred.recommendation ?? '—'}`);
       }
@@ -988,7 +988,7 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
       }
       const pred = buildFn(target);
       if (pred) {
-        state.lockedMap[target.label] = { ...pred, targetMin: target.min, anchorRound: lastRoundId + 1, generation: (existing.generation || 1) + (isNonsense ? 0 : 1), stale: false };
+        state.lockedMap[target.label] = { ...pred, targetMin: target.min, anchorRound: lastRoundId, generation: (existing.generation || 1) + (isNonsense ? 0 : 1), stale: false };
         console.log(`[${engineId}] REBUILD ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}% rec=${pred.recommendation ?? '—'}`);
       } else { delete state.lockedMap[target.label]; console.warn(`[${engineId}] ${target.label} cleared — insufficient data`); }
       anyChange = true; state.needsRebuild = false; continue;
@@ -999,7 +999,7 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
       await saveOutcome(engineId, target, absLow, absHigh, status, existing, state);
       const pred = buildFn(target);
       if (pred) {
-        state.lockedMap[target.label] = { ...pred, targetMin: target.min, anchorRound: lastRoundId + 1, generation: (existing.generation || 1) + 1, stale: false };
+        state.lockedMap[target.label] = { ...pred, targetMin: target.min, anchorRound: lastRoundId, generation: (existing.generation || 1) + 1, stale: false };
         console.log(`[${engineId}] NEXT ${target.label}: +${pred.low}–+${pred.high} conf=${pred.confidence}% rec=${pred.recommendation ?? '—'}`);
       } else { delete state.lockedMap[target.label]; }
       anyChange = true;
