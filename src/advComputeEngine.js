@@ -16,11 +16,10 @@ const {
 } = require('./db');
 const { bustLockedCache } = require('./advResolutionEngine');
 
-const ENGINE_IDS = [
-  'lstm','xgb','rf','ols','cat',
-  'hardgap','softgap','markov','percentile','bayes',
-  'sha256','mt','lcg',
-];
+// ENGINE_IDS trimmed to empty — individual adv engine windows removed to save DB load.
+// The math functions (runLSTM, runXGB, etc.) are still called by computeConsensus.
+// consensus window computation is preserved 100%.
+const ENGINE_IDS = [];
 
 const TARGETS = [
   { label: '5x',    min: 5,    maxWidth: 3  },

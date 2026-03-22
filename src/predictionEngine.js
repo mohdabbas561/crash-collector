@@ -1,48 +1,22 @@
 'use strict';
 // predictionEngine.js — Orchestrator
-// ─────────────────────────────────────────────────────────────────────────────
-// Coordinates three fully independent engine modules:
-//   • patternEngine.js        — PTN (clustering/trend/autocorrelation)
-//   • statEngine.js           — Stat (GEO/BAY/KM/ENS)
-//   • advResolutionEngine.js  — Resolves advanced engine windows server-side
-//
-// CRITICAL: advResolutionEngine solves the offline history problem.
-// Advanced engines (lstm/xgb/rf etc) lock windows from the browser.
-// Without server-side resolution, outcomes are only saved when a user
-// has the tab open. advResolutionEngine runs every tick and saves
-// win/loss/early regardless of whether any browser is connected.
-//
-// All three modules share ZERO code with each other.
-// ─────────────────────────────────────────────────────────────────────────────
+// Runs: patternEngine, ngComputeEngine (NG SOTA + consensus), advComputeEngine (ADV consensus only)
+// Removed: statEngine (geo/bay/km/ens), advResolutionEngine (only resolved removed adv engines)
 
-const { runPatternEngine,       resetPatternEngineState  } = require('./patternEngine');
-const { runStatEngine,          resetStatEngineState,
-        getLockedStatMap,       getValidationMetrics     } = require('./statEngine');
-const { runAdvResolutionEngine, resetAdvResolutionState  } = require('./advResolutionEngine');
-const { runAdvComputeEngine,    resetAdvComputeState     } = require('./advComputeEngine');
-const { runNgComputeEngine,     resetNgComputeState      } = require('./ngComputeEngine');
+const { runPatternEngine,    resetPatternEngineState } = require('./patternEngine');
+const { runAdvComputeEngine, resetAdvComputeState    } = require('./advComputeEngine');
+const { runNgComputeEngine,  resetNgComputeState     } = require('./ngComputeEngine');
 
-// Run all engines every tick — each manages its own dirty state
 async function runPredictionEngine() {
-  // Run sequentially to avoid DB connection saturation under load.
-  await runStatEngine();
   await runPatternEngine();
-  await runAdvComputeEngine();   // compute + lock adv windows server-side (no browser needed)
-  await runNgComputeEngine();    // compute + lock Next-Gen SOTA engine windows
-  await runAdvResolutionEngine(); // resolve locked adv windows → save to predictions
+  await runAdvComputeEngine();  // ADV consensus + pattern engines (lstm/xgb math kept, windows disabled)
+  await runNgComputeEngine();   // Next-Gen SOTA + ng_consensus master signal
 }
 
 function resetEngineState() {
-  resetStatEngineState();
   resetPatternEngineState();
-  resetAdvResolutionState();
   resetAdvComputeState();
   resetNgComputeState();
 }
 
-module.exports = {
-  runPredictionEngine,
-  resetEngineState,
-  getLockedStatMap,
-  getValidationMetrics,
-};
+module.exports = { runPredictionEngine, resetEngineState };

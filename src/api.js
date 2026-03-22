@@ -9,7 +9,6 @@ const {
   updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,
   saveLockedPreds, getLockedPreds,
   saveLockedPatternPreds, getLockedPatternPreds,
-  saveLockedStatPreds, getLockedStatPreds,
   saveLockedAdvPreds, getLockedAdvPreds,
   saveLockedConsensusPreds, getLockedConsensusPreds,
   initWalletStorage, saveWallet, getWallets, deleteWallet,
@@ -102,11 +101,7 @@ app.get('/health', (req,res) => res.json({ ok:true, ts:new Date().toISOString() 
 
 // ── PREDICTIONS ───────────────────────────────────────────────────────────────
 const VALID_SOURCES = [
-  'engine','pattern','ens','geo','bay','km',
-  'lstm','xgb','rf','ols','cat',
-  'hardgap','softgap','markov','percentile','bayes',
-  'sha256','mt','lcg',
-  'consensus',
+  'engine','pattern','consensus',
 ];
 
 app.get('/predictions', rateLimit(300), async (req, res) => {
@@ -150,31 +145,10 @@ app.delete('/predictions', requireAdmin, async (req, res) => {
 app.get('/predictions-all', rateLimit(120), async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit || '500'), 2000);
-    const [ens, geo, bay, km,
-           lstm, xgb, rf, ols, cat,
-           hardgap, softgap, markov, percentile, bayes,
-           sha256, mt, lcg, consensus,
+    const [consensus,
            hlstm_xgb, htrans_lstm, htft, tft, nbeats, tcn,
            lgbm, gru, bilstm, stacking, sha512, ng_consensus] = await Promise.all([
-      getPredictions({ limit, source: 'ens' }),
-      getPredictions({ limit, source: 'geo' }),
-      getPredictions({ limit, source: 'bay' }),
-      getPredictions({ limit, source: 'km'  }),
-      getPredictions({ limit, source: 'lstm' }),
-      getPredictions({ limit, source: 'xgb' }),
-      getPredictions({ limit, source: 'rf' }),
-      getPredictions({ limit, source: 'ols' }),
-      getPredictions({ limit, source: 'cat' }),
-      getPredictions({ limit, source: 'hardgap' }),
-      getPredictions({ limit, source: 'softgap' }),
-      getPredictions({ limit, source: 'markov' }),
-      getPredictions({ limit, source: 'percentile' }),
-      getPredictions({ limit, source: 'bayes' }),
-      getPredictions({ limit, source: 'sha256' }),
-      getPredictions({ limit, source: 'mt' }),
-      getPredictions({ limit, source: 'lcg' }),
       getPredictions({ limit, source: 'consensus' }),
-      // ── Next-Gen SOTA engines ──
       getPredictions({ limit, source: 'hlstm_xgb' }),
       getPredictions({ limit, source: 'htrans_lstm' }),
       getPredictions({ limit, source: 'htft' }),
@@ -188,10 +162,7 @@ app.get('/predictions-all', rateLimit(120), async (req, res) => {
       getPredictions({ limit, source: 'sha512' }),
       getPredictions({ limit, source: 'ng_consensus' }),
     ]);
-    res.json({ ok: true, ens, geo, bay, km,
-      lstm, xgb, rf, ols, cat,
-      hardgap, softgap, markov, percentile, bayes,
-      sha256, mt, lcg, consensus,
+    res.json({ ok: true, consensus,
       hlstm_xgb, htrans_lstm, htft, tft, nbeats, tcn,
       lgbm, gru, bilstm, stacking, sha512, ng_consensus });
   } catch(e) { res.status(500).json({ ok: false, error: e.message }); }
@@ -247,55 +218,6 @@ app.delete('/locked-pattern', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
-// ── STAT MODEL LOCKED PREDS ───────────────────────────────────────────────────
-let lockedStatCache   = null;
-let lockedStatCacheTs = 0;
-const LOCKED_STAT_CACHE_MS = 8000;
-
-app.get('/locked-stat', rateLimit(120), async (req, res) => {
-  try {
-    const model = req.query.model;
-    const now = Date.now();
-    if (!lockedStatCache || (now - lockedStatCacheTs) > LOCKED_STAT_CACHE_MS) {
-      lockedStatCache   = await getLockedStatPreds();
-      lockedStatCacheTs = now;
-    }
-    const all = lockedStatCache;
-    if (model && all[model] !== undefined) {
-      res.json({ ok:true, model, preds: all[model] });
-    } else {
-      res.json({ ok:true, preds: all });
-    }
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
-});
-
-// POST /locked-stat — server-side stat engine pushes updated locked preds
-// Busts cache immediately so next frontend poll sees fresh data
-app.post('/locked-stat', rateLimit(120), async (req, res) => {
-  if (APP_SECRET && req.headers['x-app-secret'] !== APP_SECRET)
-    return res.status(403).json({ ok:false, error:'Forbidden' });
-  try {
-    const { model, preds } = req.body;
-    if (!model || !preds || typeof preds !== 'object')
-      return res.status(400).json({ ok:false, error:'model and preds required' });
-    const VALID_STAT_MODELS = ['ens','geo','bay','km'];
-    if (!VALID_STAT_MODELS.includes(model))
-      return res.status(400).json({ ok:false, error:'Unknown stat model' });
-    await saveLockedStatPreds(model, preds);
-    lockedStatCache = null; // bust immediately
-    res.json({ ok:true });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
-});
-
-app.delete('/locked-stat', requireAdmin, async (req, res) => {
-  try {
-    await pool.query('DELETE FROM locked_preds_stat');
-    lockedStatCache = null; // FIX: was missing
-    require('./predictionEngine').resetEngineState();
-    res.json({ ok:true });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
-});
-
 // ── ADVANCED ENGINE LOCKED PREDS ──────────────────────────────────────────────
 let lockedAdvCache   = null;
 let lockedAdvCacheTs = 0;
@@ -319,7 +241,7 @@ app.post('/locked-adv', rateLimit(120), async (req, res) => {
       return res.status(400).json({ ok:false, error:'model and preds required' });
     // FIX: validate model name is a known engine — reject arbitrary strings
     const VALID_ADV_MODELS = [
-      'lstm','xgb','rf','ols','cat','hardgap','softgap','markov','percentile','bayes','sha256','mt','lcg','consensus',
+      'consensus',
       'hlstm_xgb','htrans_lstm','htft','tft','nbeats','tcn','lgbm','gru','bilstm','stacking','sha512','ng_consensus',
     ];
     if (!VALID_ADV_MODELS.includes(model))
@@ -429,7 +351,6 @@ app.delete('/reset', requireAdmin, async (req, res) => {
     await client.query('COMMIT');
     lockedAdvCache       = null;
     lockedConsensusCache = null;
-    lockedStatCache      = null; // FIX: was missing from /reset
     require('./predictionEngine').resetEngineState();
     console.log('[api] /reset — all prediction data cleared including adv engines + consensus');
     res.json({ ok:true, message:'All prediction data cleared and engine reset' });

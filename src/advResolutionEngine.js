@@ -26,11 +26,8 @@ const {
 } = require('./db');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-const ENGINE_IDS = [
-  'lstm','xgb','rf','ols','cat',
-  'hardgap','softgap','markov','percentile','bayes',
-  'sha256','mt','lcg',
-];
+// ENGINE_IDS emptied — individual adv engines removed. Resolver still handles consensus.
+const ENGINE_IDS = [];
 const CONSENSUS_ID = 'consensus';
 
 // Targets — defined locally, zero shared imports
