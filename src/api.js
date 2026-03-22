@@ -317,6 +317,9 @@ app.post('/locked-adv', rateLimit(120), async (req, res) => {
       return res.status(400).json({ ok:false, error:'Unknown model' });
     await saveLockedAdvPreds(model, preds);
     lockedAdvCache = null;
+    // FIX: also bust the advResolutionEngine's internal locked cache
+    // so it picks up new windows on the very next tick
+    try { require('./advResolutionEngine').bustLockedCache(); } catch(_) {}
     res.json({ ok:true });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
@@ -352,6 +355,8 @@ app.post('/locked-consensus', rateLimit(120), async (req, res) => {
       return res.status(400).json({ ok:false, error:'preds required' });
     await saveLockedConsensusPreds(preds);
     lockedConsensusCache = null;
+    // FIX: also bust the advResolutionEngine's internal locked cache
+    try { require('./advResolutionEngine').bustLockedCache(); } catch(_) {}
     res.json({ ok:true });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });

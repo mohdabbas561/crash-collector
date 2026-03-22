@@ -54,6 +54,25 @@ let   initialised = false;
 let cachedRounds        = [];
 let cachedRoundsLastId  = 0;
 
+// FIX: Cache locked windows to avoid 2 full DB queries every 8s tick.
+// Locked windows only change when the frontend POSTs new ones (infrequent).
+// TTL=30s means at most 3-4 stale ticks after a new window is posted.
+// The api.js lockedAdvCache already caches GET responses for 8s, but the
+// advResolutionEngine calls db functions directly (bypassing api cache).
+const LOCKED_CACHE_TTL_MS = 30000;
+let lockedAdvCache      = null;
+let lockedAdvCacheTs    = 0;
+let lockedConsCache     = null;
+let lockedConsCacheTs   = 0;
+
+// Call this when admin resets locked windows so cache is immediately busted
+function bustLockedCache() {
+  lockedAdvCache   = null;
+  lockedAdvCacheTs = 0;
+  lockedConsCache  = null;
+  lockedConsCacheTs = 0;
+}
+
 // ── Binary search — O(log n) hit detection on 12k+ rounds ─────────────────────
 function bisectLeft(rounds, targetId) {
   let lo = 0, hi = rounds.length;
@@ -108,16 +127,23 @@ async function initialise() {
     // of history, causing the server to waste cycles re-checking already-saved
     // windows. DB constraint prevents actual duplicates but wastes DB I/O.
     // We batch-load all 14 engines in parallel to minimize startup time.
-    const allIds = [...ENGINE_IDS, CONSENSUS_ID];
-    const allResults = await Promise.all(
-      allIds.map(engineId => getPredictions({ limit: 500000, source: engineId }))
-    );
-    allResults.forEach((rows, i) => {
-      const engineId = allIds[i];
-      for (const r of rows) {
-        savedSet.add(makeKey(engineId, r.target, r.lo, r.hi));
-      }
-    });
+    // FIX: load savedSet in sequential batches of 4 to avoid OOM.
+    // 14 engines × up to 50k rows each = potentially 700k rows in memory at once.
+    // Sequential batches of 4 keep peak memory bounded while still being fast.
+    const allIds   = [...ENGINE_IDS, CONSENSUS_ID];
+    const BATCH    = 4;
+    for (let i = 0; i < allIds.length; i += BATCH) {
+      const batch   = allIds.slice(i, i + BATCH);
+      const results = await Promise.all(
+        batch.map(engineId => getPredictions({ limit: 500000, source: engineId }))
+      );
+      results.forEach((rows, j) => {
+        const engineId = batch[j];
+        for (const r of rows) {
+          savedSet.add(makeKey(engineId, r.target, r.lo, r.hi));
+        }
+      });
+    }
     console.log(`[advRes] pre-warmed savedSet with ${savedSet.size} existing outcomes across ${allIds.length} engines`);
   } catch(e) {
     console.error('[advRes] init error:', e.message);
@@ -199,6 +225,7 @@ function resetAdvResolutionState() {
   cachedRounds       = [];
   cachedRoundsLastId = 0;
   initialised        = false;
+  bustLockedCache(); // FIX: also bust locked window cache on reset
 }
 
 // ── Main entry point — called every collector tick ────────────────────────────
@@ -210,11 +237,19 @@ async function runAdvResolutionEngine() {
 
     const lastRoundId = rounds[rounds.length - 1].roundId;
 
-    // Load all locked adv windows from DB (written by frontend AdvancedEngines.jsx)
-    const [advLocked, consensusLocked] = await Promise.all([
-      getLockedAdvPreds(),
-      getLockedConsensusPreds(),
-    ]);
+    // FIX: Load locked windows with TTL cache — avoids 2 full DB queries every 8s.
+    // Without cache, this was hitting the DB on every single tick regardless of changes.
+    const now = Date.now();
+    if (!lockedAdvCache || (now - lockedAdvCacheTs) > LOCKED_CACHE_TTL_MS) {
+      lockedAdvCache   = await getLockedAdvPreds();
+      lockedAdvCacheTs = now;
+    }
+    if (!lockedConsCache || (now - lockedConsCacheTs) > LOCKED_CACHE_TTL_MS) {
+      lockedConsCache   = await getLockedConsensusPreds();
+      lockedConsCacheTs = now;
+    }
+    const advLocked      = lockedAdvCache;
+    const consensusLocked = lockedConsCache;
 
     let totalResolved = 0;
 
@@ -240,4 +275,4 @@ async function runAdvResolutionEngine() {
   }
 }
 
-module.exports = { runAdvResolutionEngine, resetAdvResolutionState };
+module.exports = { runAdvResolutionEngine, resetAdvResolutionState, bustLockedCache };

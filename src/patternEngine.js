@@ -324,7 +324,10 @@ async function processPatternEngine(sortedRounds, lastRoundId) {
                 source: ENGINE_ID,
                 probW: null,
               });
-            } catch(e) { console.error(`[pattern] save fail:`, e.message); }
+            } catch(e) {
+              console.error(`[pattern] save fail:`, e.message);
+              state.savedSet.delete(key); // FIX: remove so retry is possible next tick
+            }
           }
         }
       }
@@ -363,7 +366,10 @@ async function processPatternEngine(sortedRounds, lastRoundId) {
             probW: null,
           });
           console.log(`[pattern] ${target.label} ${outcome.toUpperCase()} #${absLow}–#${absHigh}${status.hitRound ? ` @#${status.hitRound}` : ''}`);
-        } catch(e) { console.error(`[pattern] save fail:`, e.message); }
+        } catch(e) {
+          console.error(`[pattern] save fail:`, e.message);
+          state.savedSet.delete(key); // FIX: remove so retry is possible next tick
+        }
       }
       const pr   = analysePattern(sortedRounds, target.min);
       const pred = buildWindow(pr, target.maxWidth);

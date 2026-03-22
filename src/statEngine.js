@@ -921,6 +921,42 @@ function getStatus(sortedRounds, pred, currentRoundId) {
   return { status: 'waiting', hitRound: null };
 }
 
+// ── saveOutcome — shared by both branches of processEngine ────────────────────
+// FIX: was duplicated verbatim in isExpired/isStale branch AND active branch.
+// DRY violation fixed: extract into a single helper called from both places.
+async function saveOutcome(engineId, target, absLow, absHigh, status, existing, state) {
+  const outcome = status.status === 'hit' ? 'win' : status.status === 'early' ? 'early' : 'loss';
+  const key     = makeKey(engineId, target.label, absLow, absHigh);
+  if (state.savedSet.has(key)) return false;
+  state.savedSet.add(key);
+  try {
+    await savePrediction({
+      target: target.label, minMult: target.min, outcome,
+      lo: absLow, hi: absHigh,
+      hitRound:   status.hitRound || null,
+      generation: existing.generation || 1,
+      source:     engineId,
+      probW:      existing.probW ?? null,
+    });
+    recordTimingOutcome(target.label, outcome === 'early');
+    if ((outcome === 'win' || outcome === 'early') && status.hitRound && engineLastHit[engineId]) {
+      engineLastHit[engineId][target.label] = status.hitRound;
+    }
+    if (STAT_MODELS.some(m => m.id === engineId) && existing.probW != null) {
+      updateCalibration(target.label, engineId, existing.probW, outcome);
+      updateModelScore(target.label, engineId, existing.probW, outcome);
+      updateValidationMetrics(target.label, engineId, existing.probW, outcome, existing.recommendation ?? null);
+    }
+    const { earlyRate } = getTimingParams(target.label);
+    console.log(`[${engineId}] ${target.label} ${outcome.toUpperCase()} #${absLow}–#${absHigh}${status.hitRound ? ` @#${status.hitRound}` : ''} earlyRate=${earlyRate.toFixed(2)}`);
+    return true;
+  } catch(e) {
+    console.error(`[${engineId}] save fail:`, e.message);
+    state.savedSet.delete(key); // remove from set so retry is possible next tick
+    return false;
+  }
+}
+
 // ── processEngine ─────────────────────────────────────────────────────────────
 async function processEngine({ engineId, state, sortedRounds, lastRoundId, buildFn }) {
   let anyChange = false;
@@ -947,21 +983,7 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
       if (!isNonsense && !isTooOld) {
         const status = getStatus(sortedRounds, existing, lastRoundId);
         if (['hit', 'miss', 'early'].includes(status.status)) {
-          const outcome = status.status === 'hit' ? 'win' : status.status === 'early' ? 'early' : 'loss';
-          const key = makeKey(engineId, target.label, absLow, absHigh);
-          if (!state.savedSet.has(key)) {
-            state.savedSet.add(key);
-            try {
-              await savePrediction({ target: target.label, minMult: target.min, outcome, lo: absLow, hi: absHigh, hitRound: status.hitRound || null, generation: existing.generation || 1, source: engineId, probW: existing.probW ?? null });
-              recordTimingOutcome(target.label, outcome === 'early');
-              if ((outcome === 'win' || outcome === 'early') && status.hitRound && engineLastHit[engineId]) engineLastHit[engineId][target.label] = status.hitRound;
-              if (STAT_MODELS.some(m => m.id === engineId) && existing.probW != null) {
-                updateCalibration(target.label, engineId, existing.probW, outcome);
-                updateModelScore(target.label, engineId, existing.probW, outcome);
-                updateValidationMetrics(target.label, engineId, existing.probW, outcome, existing.recommendation ?? null);
-              }
-            } catch(e) { console.error(`[${engineId}] save fail:`, e.message); }
-          }
+          await saveOutcome(engineId, target, absLow, absHigh, status, existing, state);
         }
       }
       const pred = buildFn(target);
@@ -974,23 +996,7 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
 
     const status = getStatus(sortedRounds, existing, lastRoundId);
     if (['hit', 'miss', 'early'].includes(status.status)) {
-      const outcome = status.status === 'hit' ? 'win' : status.status === 'early' ? 'early' : 'loss';
-      const key = makeKey(engineId, target.label, absLow, absHigh);
-      if (!state.savedSet.has(key)) {
-        state.savedSet.add(key);
-        try {
-          await savePrediction({ target: target.label, minMult: target.min, outcome, lo: absLow, hi: absHigh, hitRound: status.hitRound || null, generation: existing.generation || 1, source: engineId, probW: existing.probW ?? null });
-          recordTimingOutcome(target.label, outcome === 'early');
-          if ((outcome === 'win' || outcome === 'early') && status.hitRound && engineLastHit[engineId]) engineLastHit[engineId][target.label] = status.hitRound;
-          if (STAT_MODELS.some(m => m.id === engineId) && existing.probW != null) {
-            updateCalibration(target.label, engineId, existing.probW, outcome);
-            updateModelScore(target.label, engineId, existing.probW, outcome);
-            updateValidationMetrics(target.label, engineId, existing.probW, outcome, existing.recommendation ?? null);
-          }
-          const { earlyRate } = getTimingParams(target.label);
-          console.log(`[${engineId}] ${target.label} ${outcome.toUpperCase()} #${absLow}–#${absHigh}${status.hitRound ? ` @#${status.hitRound}` : ''} earlyRate=${earlyRate.toFixed(2)}`);
-        } catch(e) { console.error(`[${engineId}] save fail:`, e.message); }
-      }
+      await saveOutcome(engineId, target, absLow, absHigh, status, existing, state);
       const pred = buildFn(target);
       if (pred) {
         state.lockedMap[target.label] = { ...pred, targetMin: target.min, anchorRound: lastRoundId + 1, generation: (existing.generation || 1) + 1, stale: false };
