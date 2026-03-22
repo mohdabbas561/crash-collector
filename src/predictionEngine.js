@@ -19,19 +19,22 @@ const { runPatternEngine,       resetPatternEngineState  } = require('./patternE
 const { runStatEngine,          resetStatEngineState,
         getLockedStatMap,       getValidationMetrics     } = require('./statEngine');
 const { runAdvResolutionEngine, resetAdvResolutionState  } = require('./advResolutionEngine');
+const { runAdvComputeEngine,    resetAdvComputeState     } = require('./advComputeEngine');
 
-// Run all three engines every tick — each manages its own dirty state
+// Run all engines every tick — each manages its own dirty state
 async function runPredictionEngine() {
   // Run sequentially to avoid DB connection saturation under load.
   await runStatEngine();
   await runPatternEngine();
-  await runAdvResolutionEngine();
+  await runAdvComputeEngine();   // compute + lock adv windows server-side (no browser needed)
+  await runAdvResolutionEngine(); // resolve locked adv windows → save to predictions
 }
 
 function resetEngineState() {
   resetStatEngineState();
   resetPatternEngineState();
   resetAdvResolutionState();
+  resetAdvComputeState();
 }
 
 module.exports = {
