@@ -194,7 +194,8 @@ async function resolveEngineWindows(engineId, lockedByTarget, rounds, lastRoundI
     // could scan 12+ rounds before the window, producing near-certain early hits on
     // common targets. Now only the floor(maxWidth/2) rounds closest to the window open
     // count as early — hits further back are scored LOSS (engine mispredicted timing).
-    const earlyCheckLo = Math.max(rwm, lo - earlyHitTolerance(target.maxWidth));
+    // FIXED: rwm+1 (not rwm) — round rwm was already seen when window was created, cannot be early
+    const earlyCheckLo = Math.max(rwm + 1, lo - earlyHitTolerance(target.maxWidth));
     const earlyHit = lo > rwm + 1 && earlyCheckLo <= lo - 1
       ? findHitInRange(rounds, earlyCheckLo, lo - 1, target.min)
       : null;

@@ -1125,7 +1125,9 @@ async function initialise() {
   } catch(e) { console.error('[statEngine] stat init:', e.message); for (const model of STAT_MODELS) STATE[model.id].lockedMap = {}; }
 
   try {
-    const rows = await getPredictions({ limit: 10000 });
+    // FIXED: limit raised from 10000 to 500000 — with many engines and rounds,
+    // 10k was easily exceeded, leaving savedSet incomplete and risking double-resolution.
+    const rows = await getPredictions({ limit: 500000 });
     for (const r of rows) {
       const src = r.source || 'engine';
       // Skip pattern engine history — that belongs to patternEngine.js
