@@ -134,7 +134,6 @@ app.post('/predictions', rateLimit(600), async (req, res) => {
 app.delete('/predictions', requireAdmin, async (req, res) => {
   try {
     await clearPredictions();
-    lockedAdvCache = null;
     require('./predictionEngine').resetEngineState();
     console.log('[api] predictions cleared + engine reset');
     res.json({ ok:true });
@@ -219,18 +218,9 @@ app.delete('/locked-pattern', requireAdmin, async (req, res) => {
 });
 
 // ── ADVANCED ENGINE LOCKED PREDS ──────────────────────────────────────────────
-let lockedAdvCache   = null;
-let lockedAdvCacheTs = 0;
-const LOCKED_ADV_CACHE_MS = 8000;
-
 app.get('/locked-adv', rateLimit(120), async (req, res) => {
   try {
-    const now = Date.now();
-    if (!lockedAdvCache || (now - lockedAdvCacheTs) > LOCKED_ADV_CACHE_MS) {
-      lockedAdvCache   = await getLockedAdvPreds();
-      lockedAdvCacheTs = now;
-    }
-    res.json({ ok: true, preds: lockedAdvCache });
+    res.json({ ok: true, preds: await getLockedAdvPreds() });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
@@ -247,9 +237,6 @@ app.post('/locked-adv', rateLimit(120), async (req, res) => {
     if (!VALID_ADV_MODELS.includes(model))
       return res.status(400).json({ ok:false, error:'Unknown model' });
     await saveLockedAdvPreds(model, preds);
-    lockedAdvCache = null;
-    // FIX: also bust the advResolutionEngine's internal locked cache
-    // so it picks up new windows on the very next tick
     try { require('./advResolutionEngine').bustLockedCache(); } catch(_) {}
     res.json({ ok:true });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
@@ -258,24 +245,14 @@ app.post('/locked-adv', rateLimit(120), async (req, res) => {
 app.delete('/locked-adv', requireAdmin, async (req, res) => {
   try {
     await pool.query('DELETE FROM locked_preds_adv');
-    lockedAdvCache = null;
     res.json({ ok:true });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
 // ── CONSENSUS MASTER SIGNAL LOCKED PREDS ─────────────────────────────────────
-let lockedConsensusCache   = null;
-let lockedConsensusCacheTs = 0;
-const LOCKED_CONSENSUS_CACHE_MS = 8000;
-
 app.get('/locked-consensus', rateLimit(120), async (req, res) => {
   try {
-    const now = Date.now();
-    if (!lockedConsensusCache || (now - lockedConsensusCacheTs) > LOCKED_CONSENSUS_CACHE_MS) {
-      lockedConsensusCache   = await getLockedConsensusPreds();
-      lockedConsensusCacheTs = now;
-    }
-    res.json({ ok: true, preds: lockedConsensusCache });
+    res.json({ ok: true, preds: await getLockedConsensusPreds() });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
@@ -285,8 +262,6 @@ app.post('/locked-consensus', rateLimit(120), async (req, res) => {
     if (!preds || typeof preds !== 'object')
       return res.status(400).json({ ok:false, error:'preds required' });
     await saveLockedConsensusPreds(preds);
-    lockedConsensusCache = null;
-    // FIX: also bust the advResolutionEngine's internal locked cache
     try { require('./advResolutionEngine').bustLockedCache(); } catch(_) {}
     res.json({ ok:true });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
@@ -295,7 +270,6 @@ app.post('/locked-consensus', rateLimit(120), async (req, res) => {
 app.delete('/locked-consensus', requireAdmin, async (req, res) => {
   try {
     await pool.query('DELETE FROM locked_preds_consensus');
-    lockedConsensusCache = null;
     res.json({ ok:true });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
@@ -312,8 +286,6 @@ app.delete('/reset-locks', requireAdmin, async (req, res) => {
     // FIX: also clear pattern locks — they are engine locks, not history
     await client.query('DELETE FROM locked_preds_pattern');
     await client.query('COMMIT');
-    lockedAdvCache       = null;
-    lockedConsensusCache = null;
     // Bust NG compute engine in-memory window cache so fresh windows are locked next tick
     try { require('./ngComputeEngine').resetNgWindowsOnly(); } catch(_) {}
     try { require('./advResolutionEngine').bustLockedCache(); } catch(_) {}
@@ -351,8 +323,6 @@ app.delete('/reset', requireAdmin, async (req, res) => {
     await client.query('DELETE FROM locked_preds_adv');
     await client.query('DELETE FROM locked_preds_consensus');
     await client.query('COMMIT');
-    lockedAdvCache       = null;
-    lockedConsensusCache = null;
     require('./predictionEngine').resetEngineState();
     try { require('./advResolutionEngine').bustLockedCache(); } catch(_) {}
     console.log('[api] /reset — all prediction data cleared including adv engines + consensus');
