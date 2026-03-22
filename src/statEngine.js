@@ -916,8 +916,8 @@ function getStatus(sortedRounds, pred, currentRoundId) {
     if (r.roundId < absLow) return { status: 'early', hitRound: r.roundId };
     return { status: 'hit', hitRound: r.roundId };
   }
-  if (currentRoundId > absHigh) return { status: 'miss', hitRound: null };
-  if (currentRoundId >= absLow && currentRoundId <= absHigh) return { status: 'active', hitRound: null };
+  if (currentRoundId >= absHigh) return { status: 'miss', hitRound: null };
+  if (currentRoundId >= absLow && currentRoundId < absHigh) return { status: 'active', hitRound: null };
   return { status: 'waiting', hitRound: null };
 }
 
