@@ -132,7 +132,6 @@ app.post('/predictions', rateLimit(600), async (req, res) => {
       return res.status(400).json({ ok:false, error:'Zero-width window' });
     const validSource = VALID_SOURCES.includes(source) ? source : 'engine';
     await savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation, source:validSource });
-    predsAllCache = null; // bust cache so next poll returns fresh history immediately
     res.json({ ok:true });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
@@ -140,7 +139,6 @@ app.post('/predictions', rateLimit(600), async (req, res) => {
 app.delete('/predictions', requireAdmin, async (req, res) => {
   try {
     await clearPredictions();
-    predsAllCache  = null;
     lockedAdvCache = null;
     require('./predictionEngine').resetEngineState();
     console.log('[api] predictions cleared + engine reset');
@@ -148,46 +146,37 @@ app.delete('/predictions', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
-// ── Batch history ─────────────────────────────────────────────────────────────
-let predsAllCache    = null;
-let predsAllCacheTs  = 0;
-const PREDS_ALL_TTL = 3000;
-
+// ── Batch history — no cache, always fresh from DB ───────────────────────────
 app.get('/predictions-all', rateLimit(120), async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit || '300'), 1000);
-    const now   = Date.now();
-    if (!predsAllCache || (now - predsAllCacheTs) > PREDS_ALL_TTL) {
-      const [ens, geo, bay, km,
-             lstm, xgb, rf, ols, cat,
-             hardgap, softgap, markov, percentile, bayes,
-             sha256, mt, lcg, consensus] = await Promise.all([
-        getPredictions({ limit, source: 'ens' }),
-        getPredictions({ limit, source: 'geo' }),
-        getPredictions({ limit, source: 'bay' }),
-        getPredictions({ limit, source: 'km'  }),
-        getPredictions({ limit, source: 'lstm' }),
-        getPredictions({ limit, source: 'xgb' }),
-        getPredictions({ limit, source: 'rf' }),
-        getPredictions({ limit, source: 'ols' }),
-        getPredictions({ limit, source: 'cat' }),
-        getPredictions({ limit, source: 'hardgap' }),
-        getPredictions({ limit, source: 'softgap' }),
-        getPredictions({ limit, source: 'markov' }),
-        getPredictions({ limit, source: 'percentile' }),
-        getPredictions({ limit, source: 'bayes' }),
-        getPredictions({ limit, source: 'sha256' }),
-        getPredictions({ limit, source: 'mt' }),
-        getPredictions({ limit, source: 'lcg' }),
-        getPredictions({ limit, source: 'consensus' }),
-      ]);
-      predsAllCache   = { ens, geo, bay, km,
-        lstm, xgb, rf, ols, cat,
-        hardgap, softgap, markov, percentile, bayes,
-        sha256, mt, lcg, consensus };
-      predsAllCacheTs = now;
-    }
-    res.json({ ok: true, ...predsAllCache });
+    const limit = Math.min(parseInt(req.query.limit || '500'), 2000);
+    const [ens, geo, bay, km,
+           lstm, xgb, rf, ols, cat,
+           hardgap, softgap, markov, percentile, bayes,
+           sha256, mt, lcg, consensus] = await Promise.all([
+      getPredictions({ limit, source: 'ens' }),
+      getPredictions({ limit, source: 'geo' }),
+      getPredictions({ limit, source: 'bay' }),
+      getPredictions({ limit, source: 'km'  }),
+      getPredictions({ limit, source: 'lstm' }),
+      getPredictions({ limit, source: 'xgb' }),
+      getPredictions({ limit, source: 'rf' }),
+      getPredictions({ limit, source: 'ols' }),
+      getPredictions({ limit, source: 'cat' }),
+      getPredictions({ limit, source: 'hardgap' }),
+      getPredictions({ limit, source: 'softgap' }),
+      getPredictions({ limit, source: 'markov' }),
+      getPredictions({ limit, source: 'percentile' }),
+      getPredictions({ limit, source: 'bayes' }),
+      getPredictions({ limit, source: 'sha256' }),
+      getPredictions({ limit, source: 'mt' }),
+      getPredictions({ limit, source: 'lcg' }),
+      getPredictions({ limit, source: 'consensus' }),
+    ]);
+    res.json({ ok: true, ens, geo, bay, km,
+      lstm, xgb, rf, ols, cat,
+      hardgap, softgap, markov, percentile, bayes,
+      sha256, mt, lcg, consensus });
   } catch(e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -398,7 +387,6 @@ app.delete('/reset-locks', requireAdmin, async (req, res) => {
 app.delete('/clear-history', requireAdmin, async (req, res) => {
   try {
     await pool.query('DELETE FROM predictions');
-    predsAllCache = null;
     // FIX: also reset advResolution savedSet so server re-resolves all
     // existing locked windows after history is cleared
     require('./predictionEngine').resetEngineState();
@@ -421,7 +409,6 @@ app.delete('/reset', requireAdmin, async (req, res) => {
     await client.query('COMMIT');
     lockedAdvCache       = null;
     lockedConsensusCache = null;
-    predsAllCache        = null;
     lockedStatCache      = null; // FIX: was missing from /reset
     require('./predictionEngine').resetEngineState();
     console.log('[api] /reset — all prediction data cleared including adv engines + consensus');

@@ -98,9 +98,13 @@ async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, gene
     `INSERT INTO predictions (target, min_mult, outcome, window_lo, window_hi, hit_round, generation, source, prob_w)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      ON CONFLICT (source, target, window_lo, window_hi) DO UPDATE
-       SET outcome    = EXCLUDED.outcome,
-           hit_round  = EXCLUDED.hit_round,
-           generation = EXCLUDED.generation,
+       SET outcome    = CASE
+                          WHEN predictions.outcome = 'win'                           THEN predictions.outcome
+                          WHEN predictions.outcome = 'early' AND EXCLUDED.outcome = 'loss' THEN predictions.outcome
+                          ELSE EXCLUDED.outcome
+                        END,
+           hit_round  = COALESCE(predictions.hit_round, EXCLUDED.hit_round),
+           generation = GREATEST(EXCLUDED.generation, predictions.generation),
            prob_w     = COALESCE(EXCLUDED.prob_w, predictions.prob_w)`,
     [target, minMult, outcome, lo, hi, hitRound ?? null, generation ?? 1, source, probW ?? null]
   );
