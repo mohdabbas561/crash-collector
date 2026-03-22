@@ -172,7 +172,7 @@ function buildWindow(patternResult, maxWidth) {
   const expectedGap   = Math.max(1, Math.round(medianGap * momentumAdj * overdueFactor));
 
   // Center window on remaining rounds until predicted hit
-  const remaining = Math.max(0, expectedGap - gapSinceLast);
+  const remaining = Math.max(1, expectedGap - gapSinceLast);
   const low       = Math.max(0, remaining - Math.floor(maxWidth / 2));
 
   return {
@@ -303,7 +303,7 @@ async function processPatternEngine(sortedRounds, lastRoundId) {
     const absLow      = anchorRound + (Number(existing.low)  || 0);
     const absHigh     = anchorRound + (Number(existing.high) || 0);
     const isNonsense  = !Number.isFinite(absLow) || !Number.isFinite(absHigh) || absHigh < absLow || anchorRound === 0;
-    const isExpired   = lastRoundId > absHigh;
+    const isExpired   = lastRoundId >= absHigh;
     const isStale     = !!existing.stale;
     const isTooOld    = isExpired && (lastRoundId - absHigh) > STALE_FORCE_REBUILD_THRESHOLD;
 

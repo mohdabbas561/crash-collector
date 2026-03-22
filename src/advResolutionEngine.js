@@ -169,7 +169,7 @@ async function resolveEngineWindows(engineId, lockedByTarget, rounds, lastRoundI
     // window [N-5, N+10] would not be saved until round N+11.
     // Now: check for hit first. If hit found → resolve immediately.
     // If no hit and window still active → skip (wait for expiry or hit).
-    const isExpiredNow = lastRoundId > hi;
+    const isExpiredNow = lastRoundId >= hi;
     const hitNow = isExpiredNow ? null : findHitInRange(rounds, lo, hi, target.min);
     if (!isExpiredNow && !hitNow) continue; // still active, no hit yet — wait
 

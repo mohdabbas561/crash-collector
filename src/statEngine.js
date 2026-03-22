@@ -261,7 +261,7 @@ function applyTimingCorrection(expectedGap, effectiveWidth, targetLabel, maxWidt
   }
   const expectedGapCorrected = Math.max(1, Math.round(expectedGap * (1 - TIMING_GAP_CORRECTION_SCALE * earlyRate)));
   const center = Math.max(1, Math.round(expectedGapCorrected * (1 - TIMING_CENTER_PULL_SCALE * earlyRate)));
-  let low  = Math.max(0, center - Math.floor(effectiveWidth / 2));
+  let low  = Math.max(1, center - Math.floor(effectiveWidth / 2));
   let high = low + effectiveWidth - 1;
   if (recentEarlyRate > TIMING_RECENT_SPIKE_THRESH) {
     const spikeShift = Math.round(expectedGapCorrected * TIMING_RECENT_SPIKE_SHIFT);
@@ -483,8 +483,8 @@ function hybridWindowPlacement(kmCDF, expectedGap, effectiveWidth, gapSinceLast,
 }
 
 function parametricWindowPlacement(expectedGap, effectiveWidth, gapSinceLast) {
-  if (gapSinceLast >= expectedGap) return { low: 0, high: effectiveWidth - 1 };
-  const low = Math.max(0, (expectedGap - gapSinceLast) - effectiveWidth);
+  if (gapSinceLast >= expectedGap) return { low: 1, high: effectiveWidth };
+  const low = Math.max(1, (expectedGap - gapSinceLast) - effectiveWidth);
   return { low, high: low + effectiveWidth - 1 };
 }
 
@@ -975,7 +975,7 @@ async function processEngine({ engineId, state, sortedRounds, lastRoundId, build
     const absLow      = anchorRound + (Number(existing.low)  || 0);
     const absHigh     = anchorRound + (Number(existing.high) || 0);
     const isNonsense  = !Number.isFinite(absLow) || !Number.isFinite(absHigh) || absHigh < absLow || anchorRound === 0;
-    const isExpired   = lastRoundId > absHigh;
+    const isExpired   = lastRoundId >= absHigh;
     const isStale     = !!existing.stale;
     const isTooOld    = isExpired && (lastRoundId - absHigh) > STALE_FORCE_REBUILD_THRESHOLD;
 
