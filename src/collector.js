@@ -10,7 +10,7 @@ const { saveRounds, getRounds } = require('./db');
 const { runPredictionEngine }   = require('./predictionEngine');
 
 const API_URL     = 'https://api.dealer.degencoinflip.com/v1/game/2/room/1/rounds?limit=100';
-const POLL_MS     = 8000;
+const POLL_MS     = 20000;
 const MAX_RETRIES = 5;
 // FIX: cap gap-fill at 200 pages (20k rounds) — generous but bounded
 const GAP_FILL_MAX_PAGES = 200;
