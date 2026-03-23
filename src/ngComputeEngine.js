@@ -1,5 +1,5 @@
 'use strict';
-// ngComputeEngine.js — NG Master Signal (ng_consensus)
+// ngComputeEngine.js — Next-Gen SOTA & Hybrid Engines (11 engines + ng_consensus)
 // ================================================================================
 // ACCURACY & CALIBRATION REBUILD — v5 (FINAL PRODUCTION)
 //
@@ -874,7 +874,6 @@ function effectiveRegime(sf) {
   return (sf.transitionConfidence ?? 0) >= 68 ? sf.predictedNextRegime : sf.regime;
 }
 
-
 // =============================================================================
 // ENGINE 1: hybrid_lstm_xgb
 // H-10: calib null-guard — b2bBoost only amplifies when sf.calibrated=true
@@ -1439,41 +1438,6 @@ async function saveNgOutcome(engineId,target,outcome,lo,hi,hitRound,generation) 
 // NG CONSENSUS
 // tcBonus requires calibrated===true && tc>75 && hotScore>=72 (aligned with trigger)
 // =============================================================================
-
-// =============================================================================
-// ROUNDS CACHE
-// =============================================================================
-async function getNgRounds() {
-  if (cachedRounds.length===0) {
-    cachedRounds=await getRounds({limit:100000,order:'ASC'});
-    cachedRoundsLastId=cachedRounds.length?cachedRounds[cachedRounds.length-1].roundId:0;
-    console.log(`[ngCompute] loaded ${cachedRounds.length} rounds`);
-  } else {
-    const nr=await getRounds({limit:5000,minRoundId:cachedRoundsLastId+1});
-    if(nr.length){cachedRounds=[...cachedRounds,...nr];cachedRoundsLastId=cachedRounds[cachedRounds.length-1].roundId;}
-  }
-  return cachedRounds;
-}
-
-async function saveNgOutcome(engineId,target,outcome,lo,hi,hitRound,generation) {
-  const key=`${lo}:${hi}`;
-  if(ngSavedSets[engineId].has(key)) return;
-  ngSavedSets[engineId].add(key);
-  try {
-    await savePrediction({target:target.label,minMult:target.min,outcome,lo,hi,
-      hitRound:hitRound??null,generation:generation??1,source:engineId,probW:null});
-    console.log(`[ngCompute] ${engineId} ${target.label} ${outcome.toUpperCase()} #${lo}-#${hi}${hitRound?` @#${hitRound}`:''}`);
-  } catch(e) {
-    console.error(`[ngCompute] save fail ${engineId}:`,e.message);
-    ngSavedSets[engineId].delete(key);
-  }
-}
-
-// =============================================================================
-// NG CONSENSUS
-// tcBonus requires calibrated===true && tc>75 && hotScore>=72 (aligned with trigger)
-// =============================================================================
-
 function computeNgConsensus(allNgResults,lastRoundId,sharedSf) {
   const consensus={};
   for (const target of TARGETS) {
