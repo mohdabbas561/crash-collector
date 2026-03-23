@@ -503,6 +503,9 @@ async function runAdvComputeEngine(){
     }
 
     const consensus=computeConsensus(allResults,lastRoundId);
+    const algoCount = Object.keys(allResults).filter(id => Object.keys(allResults[id]).length > 0).length;
+    const consCount = Object.keys(consensus).filter(k => consensus[k] !== null).length;
+    console.log(`[advCompute] tick: ${algoCount} algos produced results, consensus has ${consCount} targets`);
     const consPayload={};
     for(const target of TARGETS){
       const c=consensus[target.label];
@@ -520,7 +523,15 @@ async function runAdvComputeEngine(){
         consPayload[target.label]=windows['consensus'][target.label];
       }
     }
-    if(Object.keys(consPayload).length)await saveLockedConsensusPreds(consPayload);
+    if(Object.keys(consPayload).length) {
+      await saveLockedConsensusPreds(consPayload);
+      // Only log targets where window was freshly created this tick (lo === lastRoundId + something new)
+      const newWins = Object.keys(consPayload).filter(t => consPayload[t].roundWhenMade === lastRoundId);
+      if(newWins.length) {
+        const targets = newWins.map(t => `${t}:#${consPayload[t].lo}-#${consPayload[t].hi}`).join(' ');
+        console.log(`[advCompute] consensus NEW windows: ${targets}`);
+      }
+    }
     bustLockedCache();
   }catch(e){console.error('[advCompute] Fatal:',e.message,e.stack);}
 }

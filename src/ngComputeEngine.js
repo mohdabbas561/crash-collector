@@ -1556,9 +1556,10 @@ async function runNgComputeEngine() {
       }
     }
 
-    // Phase 1+2: resolve + lock — UNCHANGED FROM v3
+    // Phase 1+2: resolve + lock
     for(const engineId of NG_ENGINE_IDS){
       const payload={};
+      const newlyLocked=[];
       for(const target of TARGETS){
         const win=ngWindows[engineId][target.label];
         const fresh=allNgResults[engineId]?.[target.label];
@@ -1579,6 +1580,7 @@ async function runNgComputeEngine() {
               await saveNgOutcome(engineId,target,'win',lo,hi,hit.roundId,generation);
               delete ngWindows[engineId][target.label];
             } else {
+              // Window still active — re-lock to DB but don't treat as new
               payload[target.label]={lo,hi,roundWhenMade,generation,eta:win.eta};
               continue;
             }
@@ -1591,13 +1593,11 @@ async function runNgComputeEngine() {
           const eta=fresh._meta?{...baseEta,...fresh._meta}:baseEta;
           ngWindows[engineId][target.label]={lo:newLo,hi:newHi,roundWhenMade:lastRoundId,generation:gen,eta};
           payload[target.label]=ngWindows[engineId][target.label];
+          newlyLocked.push(`${target.label}:#${newLo}-#${newHi}`);
         }
       }
-      if(Object.keys(payload).length) {
-        await saveLockedAdvPreds(engineId,payload);
-        const targets = Object.keys(payload).map(t => `${t}:#${payload[t].lo}-#${payload[t].hi}`).join(' ');
-        console.log(`[ngCompute] ${engineId} locked windows: ${targets}`);
-      }
+      if(Object.keys(payload).length) await saveLockedAdvPreds(engineId,payload);
+      if(newlyLocked.length) console.log(`[ngCompute] ${engineId} NEW windows: ${newlyLocked.join(' ')}`);
     }
   } catch(e) {
     console.error('[ngCompute] Fatal:',e.message,e.stack);
