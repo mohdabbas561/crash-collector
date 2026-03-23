@@ -907,43 +907,53 @@ async function saveNgOutcome(engineId,target,outcome,lo,hi,hitRound,generation) 
 // NG CONSENSUS
 // tcBonus requires calibrated===true && tc>75 && hotScore>=72 (aligned with trigger)
 // =============================================================================
-function computeNgConsensus(allNgResults,lastRoundId,sharedSf) {
+function computeNgConsensus(rounds,calibrations,lastRoundId,sharedSf) {
+  // NG Master — standalone signal using the same gap+calibration+streak pipeline
+  // the removed sub-engines used. Runs once per tick with full context.
   const consensus={};
   for (const target of TARGETS) {
-    const windows=[];
-    const SRC=['hlstm_xgb','htrans_lstm','htft','tft','nbeats','tcn','lgbm','gru','bilstm','sha512'];
-    for(const eid of SRC){
-      const r=allNgResults[eid]?.[target.label];
-      if(!r) continue;
-      windows.push({engineId:eid,lo:lastRoundId+r.low,hi:lastRoundId+r.high});
-    }
-    if(windows.length<3){consensus[target.label]=null;continue;}
-    let bestGroup=[],bestLo=0,bestHi=0;
-    for(let i=0;i<windows.length;i++){
-      const grp=[windows[i]];let rLo=windows[i].lo,rHi=windows[i].hi;
-      for(let j=0;j<windows.length;j++){
-        if(j===i)continue;
-        const nl=Math.max(rLo,windows[j].lo),nh=Math.min(rHi,windows[j].hi);
-        if(nl<=nh){grp.push(windows[j]);rLo=nl;rHi=nh;}
-      }
-      if(grp.length>bestGroup.length){bestGroup=grp;bestLo=rLo;bestHi=rHi;}
-    }
-    if(bestGroup.length<2){consensus[target.label]=null;continue;}
+    const sf=sharedSf?.[target.label];
+    if(!sf){consensus[target.label]=null;continue;}
+
+    // Compute gaps directly from rounds (same as sub-engines did)
+    const {gaps,currentGap}=computeGaps(rounds,target.min);
+    if(gaps.length<10){consensus[target.label]=null;continue;}
+
+    // Raw expected gap: use harmonic mean of recent gaps (robust to outliers)
+    const recentGaps=gaps.slice(-Math.min(gaps.length,100));
+    const hrGlobal=recentGaps.length/rounds.length;
+    if(hrGlobal<=0){consensus[target.label]=null;continue;}
+    const rawGap=Math.max(1,Math.round(1/hrGlobal));
+
+    // Apply calibrated adjustment
+    const calib=calibrations[target.label]??CALIB_DUMMY;
+    const {calibMult}=getCalibratedAdjustment(
+      sf.hotScore??0, sf.coldScore??0, calib, target.rare, sf
+    );
+    const calibratedGap=Math.max(1,Math.round(rawGap*calibMult));
+
+    // Apply streak/regime adjustment
+    const adjustedGap=applyStreakAdjustment(calibratedGap,sf,target);
+    const finalGap=Math.max(1,Math.round(adjustedGap));
+
     const bW=target.maxWidth;
+    let {low,high}=placeWindow(finalGap,currentGap,bW);
+    let bestLo=lastRoundId+low, bestHi=lastRoundId+high;
+
+    // Enforce minimum width and future placement
     if(bestHi-bestLo+1<bW){const c=Math.round((bestLo+bestHi)/2);bestLo=c-Math.floor(bW/2);bestHi=bestLo+bW-1;}
     if(bestLo<=lastRoundId){bestLo=lastRoundId+1;bestHi=bestLo+bW-1;}
-    const sf=sharedSf?.[target.label];
+
     // === FINAL PRODUCTION HARDENING START ===
-    // tcBonus requires hotScore>=72 (aligned with v5 trigger), calibrated===true, tc>75.
-    // This is the top 2–3% of all hot signals — the only cases where we should
-    // boost consensus confidence beyond the base engine-count formula.
-    const tcBonus = (sf?.calibrated===true && (sf?.transitionConfidence??0)>75 &&
-      (sf?.hotScore??0)>=72 &&
-      (sf?.predictedNextRegime==='ABOUT_TO_B2B'||sf?.predictedNextRegime==='ABOUT_TO_HOT')) ? 8 : 0;
+    // tcBonus requires hotScore>=72, calibrated===true, tc>75.
+    const tcBonus=(sf.calibrated===true&&(sf.transitionConfidence??0)>75&&
+      (sf.hotScore??0)>=72&&
+      (sf.predictedNextRegime==='ABOUT_TO_B2B'||sf.predictedNextRegime==='ABOUT_TO_HOT'))?8:0;
     // === HARDENING END ===
+
     consensus[target.label]={
-      lo:bestLo,hi:bestHi,engineCount:bestGroup.length,
-      engines:bestGroup.map(w=>w.engineId),tcBonus,
+      lo:bestLo,hi:bestHi,engineCount:1,
+      engines:['ng_master'],tcBonus,
     };
   }
   return consensus;
@@ -988,7 +998,7 @@ async function runNgComputeEngine() {
     // ng_consensus aggregates from an empty set here (no sub-engines),
     // so we build it from streak features directly via computeNgConsensus
     const allNgResults={};
-    const ngConsensus=computeNgConsensus(allNgResults,lastRoundId,streakFeatures);
+    const ngConsensus=computeNgConsensus(rounds,calibrations,lastRoundId,streakFeatures);
     allNgResults['ng_consensus']={};
     for(const target of TARGETS){
       const c=ngConsensus[target.label];
