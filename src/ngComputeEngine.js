@@ -1593,7 +1593,11 @@ async function runNgComputeEngine() {
           payload[target.label]=ngWindows[engineId][target.label];
         }
       }
-      if(Object.keys(payload).length) await saveLockedAdvPreds(engineId,payload);
+      if(Object.keys(payload).length) {
+        await saveLockedAdvPreds(engineId,payload);
+        const targets = Object.keys(payload).map(t => `${t}:#${payload[t].lo}-#${payload[t].hi}`).join(' ');
+        console.log(`[ngCompute] ${engineId} locked windows: ${targets}`);
+      }
     }
   } catch(e) {
     console.error('[ngCompute] Fatal:',e.message,e.stack);
