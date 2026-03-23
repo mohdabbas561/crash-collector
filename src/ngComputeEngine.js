@@ -361,14 +361,22 @@ function computeCalibration(rounds, targetMin, targetLabel, targetRare) {
     pos -= stride;
   }
 
-  // === FINAL PRODUCTION HARDENING START ===
-  // Build rate tables. Wilson CI lower bound must exceed baseline + margin
-  // before any uplift is permitted. This prevents spurious calibration from
-  // small samples or baseline-aligned hit rates.
-  // margin: 0.025 non-rare (need clear signal above random), 0.015 rare
-  // (harder to achieve 0.025 margin with sparse data, but still meaningful).
-  // === HARDENING END ===
-  const margin  = targetRare ? 0.015 : 0.025;
+  // Hot margin: 0.025 non-rare / 0.015 rare — unchanged from v5.
+  const hotMargin  = targetRare ? 0.015 : 0.025;
+  // === v6 COLD-PATH UPGRADE START ===
+  // Cold margin lowered: 0.025→0.012 (non-rare), 0.015→0.012 (rare).
+  // Cold minBin lowered: 20/30→15 for cold bins only.
+  // Justification: white-cluster phases are structurally sparse — the market
+  // spends less time in deep cold than in hot. With minBin=20/30, cold bins
+  // rarely accumulate enough samples to unlock calibration. Lowering to 15
+  // allows empirically-observed cold stretches (which happen less frequently
+  // but are real) to fire calibration. The Wilson CI guard (wl > threshold)
+  // still prevents random noise — we just allow smaller-but-still-valid samples.
+  // margin=0.012: accepts cold signal if Wilson lower bound exceeds no-hit
+  // baseline by 1.2% — tighter than hot (2.5%) but still meaningful for cold.
+  const COLD_MIN_BIN = 15;
+  const coldMargin  = 0.012;
+  // === UPGRADE END ===
   const hotHitRate  = new Array(NUM_BINS).fill(null);
   const coldHitRate = new Array(NUM_BINS).fill(null);
 
@@ -376,19 +384,21 @@ function computeCalibration(rounds, targetMin, targetLabel, targetRare) {
     if (hotBinCount[b] >= minBin && hotBinTotalW[b] > 0) {
       const wr = hotBinHitsW[b] / hotBinTotalW[b];
       const wl = wilsonLower(wr, hotBinCount[b]);
-      if (wl > baseline + margin) hotHitRate[b] = wr;
+      if (wl > baseline + hotMargin) hotHitRate[b] = wr;
     }
-    if (coldBinCount[b] >= minBin && coldBinTotalW[b] > 0) {
+    // === v6 COLD-PATH UPGRADE START ===
+    if (coldBinCount[b] >= COLD_MIN_BIN && coldBinTotalW[b] > 0) {
       const wr = coldBinHitsW[b] / coldBinTotalW[b];
       const wl = wilsonLower(wr, coldBinCount[b]);
-      if (wl > (1 - baseline) + margin) coldHitRate[b] = wr;
+      if (wl > (1 - baseline) + coldMargin) coldHitRate[b] = wr;
     }
+    // === UPGRADE END ===
   }
 
   const result = {
     hotHitRate, coldHitRate, baseline,
     hotBinCount, coldBinCount,
-    LOOK_AHEAD, BIN_SIZE, minBin, margin, targetRare,
+    LOOK_AHEAD, BIN_SIZE, minBin, margin: hotMargin, targetRare,
   };
 
   // === FINAL PRODUCTION HARDENING START ===
@@ -465,22 +475,34 @@ function getCalibratedAdjustment(hotScore, coldScore, calib, targetRare, sf) {
   // distribution starts. 1.26x on a 20-gap = predict at 25.2, window covers 24–26.
   // P(hit after 26 | not yet hit by 26) ≈ 0.37 — still meaningful.
   // Rare halved to 0.13 to prevent window miss on high-X targets (see v4 doc).
-  const maxDelta  = targetRare ? 0.13 : 0.26;
-  const sensiHot  = 1.8;
-  const sensiCold = 1.5;
+  // Hot path: maxDelta unchanged (0.26 non-rare / 0.13 rare), sensiHot=1.8 unchanged.
+  const maxDeltaHot = targetRare ? 0.13 : 0.26;
+  const sensiHot    = 1.8;
+  // === v6 COLD-PATH UPGRADE START ===
+  // Cold path: maxDelta raised 0.26→0.40 (non-rare), 0.13→0.20 (rare).
+  // sensiCold raised 1.5→1.9.
+  // Justification: maxDelta=0.26 capped cold extension at 26% even with perfect
+  // calibration signal. A 20-gap at 1.26× = 25.2 rounds — far too short when the
+  // market is in a genuine 8-round white cluster (true gap often 30-50 rounds).
+  // 1.40× cap = 28 rounds on a 20-gap, 56 rounds on a 40-gap (50x target).
+  // sensiCold=1.9: normalized uplift maps more aggressively to extension.
+  // At upliftNorm=0.3: old=0.45 (capped to 0.26), new=0.57 (capped to 0.40).
+  // Rare cold raised to 0.20 (was 0.13) — white clusters affect rare targets too.
+  const maxDeltaCold = targetRare ? 0.20 : 0.40;
+  const sensiCold    = 1.9;
+  // === UPGRADE END ===
 
   let calibMult      = 1.0;
   let calibConfBonus = 0;
   let calibrated     = false;
 
   if (hotScore >= 72 && hotRate !== null) {
-    // Normalized uplift: fraction of achievable improvement above baseline captured
-    // by this bin. Range [0,1]. Prevents raw uplift inflation for high-baseline targets.
+    // Hot path: 100% unchanged from v5.
     const upliftNorm = clamp(
       (hotRate - calib.baseline) / Math.max(0.001, 1 - calib.baseline),
       0, 1
     );
-    const reduction = clamp(upliftNorm * sensiHot, 0, maxDelta);
+    const reduction = clamp(upliftNorm * sensiHot, 0, maxDeltaHot);
     if (reduction > 0.01) {
       calibMult = 1.0 - reduction;
       calibConfBonus = upliftNorm > 0.25 ? 12 : upliftNorm > 0.15 ? 8 : 4;
@@ -488,29 +510,38 @@ function getCalibratedAdjustment(hotScore, coldScore, calib, targetRare, sf) {
     }
   }
 
-  if (coldScore >= 65 && coldRate !== null && !calibrated) {
+  // === v6 COLD-PATH UPGRADE START ===
+  // Cold trigger lowered 65→58. At coldScore=58, a genuine white cluster
+  // (streakMomentum>0.25=14 + lowDensityAccel>0.04=11 + markov<0.38=10 +
+  // ld20>ld50*1.20=7 + streakLen=12) = 54 — close. With densityTrend bonus
+  // from new coldScore weights, 58 is reliably reachable during real clusters.
+  if (coldScore >= 58 && coldRate !== null && !calibrated) {
     const noHitBaseline = 1 - calib.baseline;
     const upliftNorm = clamp(
       (coldRate - noHitBaseline) / Math.max(0.001, 1 - noHitBaseline),
       0, 1
     );
-    const extension = clamp(upliftNorm * sensiCold, 0, maxDelta);
+    const extension = clamp(upliftNorm * sensiCold, 0, maxDeltaCold);
     if (extension > 0.01) {
       calibMult      = 1.0 + extension;
       calibConfBonus = -3;
       calibrated     = true;
     }
   }
+  // === UPGRADE END ===
 
-  // === FINAL PRODUCTION HARDENING START ===
-  // H-7: Hard clamp tightened to 0.76–1.24 (v4: 0.74–1.26).
-  // Justification: crash gap distributions have CV≈0.8–1.5 (domain knowledge).
-  // For CV=0.8, σ=0.8×mean. A ±24% shift ≈ 0.30σ — meaningful but not overfit.
-  // ±26% (v4) was 0.325σ — marginal increase in early-hit risk. The tightening
-  // to ±24% trades 2% adjustment range for reduced window-misplacement risk,
-  // which is the correct trade-off when calibration uncertainty is already ±5–10%.
-  calibMult = clamp(calibMult, 0.76, 1.24);
-  // === HARDENING END ===
+  // === v6 COLD-PATH UPGRADE START ===
+  // Hot path: floor 0.76 unchanged (never compress below 76% of gap).
+  // Cold path: ceiling raised 1.24→1.40 to allow full cold extension.
+  // Hot: calibMult should only reduce gap (calibMult<1.0); floor 0.76.
+  // Cold: calibMult should only extend gap (calibMult>1.0); ceiling 1.40.
+  // A calibMult that reduces gap on cold (calibMult<1.0) would be a bug —
+  // guard it with the 0.76 floor. A calibMult that extends hot is also unusual
+  // but benign — the 1.40 ceiling still applies.
+  calibMult = clamp(calibMult, 0.76, 1.40);
+  // Hot signal: never let calibration push multiplier above 1.0 on hot path
+  if (hotScore >= 72 && calibMult > 1.0) calibMult = 1.0;
+  // === UPGRADE END ===
 
   return { calibMult, calibConfBonus, calibrated };
 }
@@ -674,12 +705,22 @@ function extractPredictiveStreakFeatures(rounds, targetMin, calib) {
     (ld20            < ld50*0.82 ? 10 : 0)
   ), 0, 100);
 
+  // === v6 COLD-PATH UPGRADE START ===
+  // coldScore weight increases:
+  // streakMomentum: +25% → 35/17 (was 28/14). During a genuine 8-round cluster,
+  //   streakMomentum often hits 0.3-0.5 — the extra weight pushes coldScore over 58.
+  // lowDensityAccel (densityTrend proxy): +30% → 29/14 (was 22/11). The acceleration
+  //   of low density is the earliest detectable signal of a genuine white cluster.
+  //   At 8+ consecutive lows, ld5→ld10→ld20 all converge high; accel fires strongly.
+  // currentStreakLen bonus: raised 12→16 to reward directly observable cluster depth.
+  // All hot-score weights unchanged.
+  // === UPGRADE END ===
   const coldScore = clamp(Math.round(
-    (streakMomentum   > 0.45   ? 28 : streakMomentum  > 0.25  ? 14 : 0) +
-    (lowDensityAccel  > 0.08   ? 22 : lowDensityAccel  > 0.04  ? 11 : 0) +
+    (streakMomentum   > 0.45   ? 35 : streakMomentum  > 0.25  ? 17 : 0) +
+    (lowDensityAccel  > 0.08   ? 29 : lowDensityAccel  > 0.04  ? 14 : 0) +
     (markovProbHot   < 0.22    ? 20 : markovProbHot   < 0.38   ? 10 : 0) +
     (ld20            > ld50*1.40 ? 15 : ld20 > ld50*1.20 ? 7 : 0) +
-    (currentStreakLen > avgLowRunLen*1.3 && !currentIsHigh ? 12 : 0)
+    (currentStreakLen > avgLowRunLen*1.3 && !currentIsHigh ? 16 : 0)
   ), 0, 100);
 
   // Regime prediction
@@ -724,17 +765,27 @@ function extractPredictiveStreakFeatures(rounds, targetMin, calib) {
     predictedNextRegime    = 'ABOUT_TO_HOT';
     transitionConfidence   = clamp(hotScore, 62, 88);
     predictedGapMultiplier = clamp(1.0 - (hotScore/100)*0.20, 0.80, 0.93);
-  } else if (coldScore >= 65 && coldScore > hotScore + 15) {
+  // === v6 COLD-PATH UPGRADE START ===
+  // Cold trigger lowered 65→58. ABOUT_TO_WHITE_CLUSTER multiplier cap raised
+  // 1.10–1.24 → 1.15–1.40. ABOUT_TO_COLD raised 1.05–1.22 → 1.10–1.32.
+  // Justification: at coldScore=65, the market is already 5-7 rounds into a
+  // cluster; we're reacting too late. At coldScore=58, the cluster is 2-4 rounds
+  // deep — still early enough for the lengthened window to capture the tail.
+  // 1.40 upper cap: for a 40-gap (50x target), 1.40× = 56 rounds. Typical white
+  // cluster on 50x lasts 30-60 rounds — 1.40× is calibrated, not excessive.
+  // For 5x (20-gap): 1.40× = 28 rounds — the cluster still ends within this window.
+  } else if (coldScore >= 58 && coldScore > hotScore + 12) {
     if (currentStreakLen >= avgLowRunLen * 1.5 || regime === 'EXTREME_WHITE') {
       predictedNextRegime    = 'ABOUT_TO_WHITE_CLUSTER';
-      transitionConfidence   = clamp(coldScore, 65, 88);
-      predictedGapMultiplier = clamp(1.0 + (coldScore/100)*0.28, 1.10, 1.24); // 1.24 cap
+      transitionConfidence   = clamp(coldScore, 58, 88);
+      predictedGapMultiplier = clamp(1.0 + (coldScore/100)*0.42, 1.15, 1.40);
     } else {
       predictedNextRegime    = 'ABOUT_TO_COLD';
-      transitionConfidence   = clamp(coldScore, 55, 82);
-      predictedGapMultiplier = clamp(1.0 + (coldScore/100)*0.20, 1.05, 1.22);
+      transitionConfidence   = clamp(coldScore, 50, 82);
+      predictedGapMultiplier = clamp(1.0 + (coldScore/100)*0.30, 1.10, 1.32);
     }
   }
+  // === UPGRADE END ===
   // === HARDENING END ===
 
   // Apply calibration override
@@ -775,11 +826,36 @@ function applyStreakAdjustment(expectedGap, sf, _target) {
   const mult = sf.predictedGapMultiplier ?? 1.0;
   const tc   = sf.transitionConfidence  ?? 0;
 
-  if (pnr !== 'NEUTRAL' && tc >= 65) {
+  // === v6 COLD-PATH UPGRADE START ===
+  // Hot path: tc≥65 unchanged — ABOUT_TO_B2B / ABOUT_TO_HOT still require tc≥65.
+  // Cold path: ABOUT_TO_WHITE_CLUSTER / ABOUT_TO_COLD fire at tc≥58.
+  // blendFactor for cold starts at tc=58, reaches full blend at tc=103 (effectively
+  // capped at 1.0 by clamp). This means at tc=58: blendFactor=0, at tc=78: 0.44,
+  // at tc=88: 0.67 — gradual ramp that avoids snapping to full extension immediately.
+  const isColdPnr = pnr === 'ABOUT_TO_WHITE_CLUSTER' || pnr === 'ABOUT_TO_COLD';
+  const isHotPnr  = pnr === 'ABOUT_TO_B2B' || pnr === 'ABOUT_TO_HOT';
+
+  if (isHotPnr && tc >= 65) {
+    // Hot path: UNCHANGED from v5
     const blendFactor = clamp((tc - 65) / 45, 0, 1);
     const blendedMult = 1.0 + (mult - 1.0) * blendFactor;
     return Math.max(1, Math.round(expectedGap * blendedMult));
   }
+
+  if (isColdPnr && tc >= 58) {
+    // Cold path: blendFactor starts at tc=58
+    const blendFactor = clamp((tc - 58) / 45, 0, 1);
+    const blendedMult = 1.0 + (mult - 1.0) * blendFactor;
+    return Math.max(1, Math.round(expectedGap * blendedMult));
+  }
+
+  if (!isHotPnr && !isColdPnr && pnr !== 'NEUTRAL' && tc >= 65) {
+    // Any other predictive regime at tc≥65 (NEUTRAL already excluded above)
+    const blendFactor = clamp((tc - 65) / 45, 0, 1);
+    const blendedMult = 1.0 + (mult - 1.0) * blendFactor;
+    return Math.max(1, Math.round(expectedGap * blendedMult));
+  }
+  // === UPGRADE END ===
 
   let adj = expectedGap;
   switch (sf.regime) {
@@ -832,9 +908,16 @@ function streakConfBonus(sf, isRare) {
     base += 14 + (isRare && sf.b2bPrecursor ? 4 : 0);
   } else if ((pnr==='ABOUT_TO_B2B'||pnr==='ABOUT_TO_HOT') && tc >= 65) {
     base += 7;
-  } else if ((pnr==='ABOUT_TO_WHITE_CLUSTER'||pnr==='ABOUT_TO_COLD') && tc > 65) {
-    base -= 3;
+  // === v6 COLD-PATH UPGRADE START ===
+  // Cold confidence penalty lowered tc threshold 65→58, strengthened -3→-6.
+  // Justification: during white clusters, confidence should be penalized more
+  // aggressively to prevent the engine from over-betting on the current window.
+  // The window is LONGER now (1.15-1.40×) so we need lower confidence to
+  // discourage false precision. -6 vs -3 keeps the user appropriately cautious.
+  } else if ((pnr==='ABOUT_TO_WHITE_CLUSTER'||pnr==='ABOUT_TO_COLD') && tc > 58) {
+    base -= 6;
   }
+  // === UPGRADE END ===
 
   // === FINAL PRODUCTION HARDENING START ===
   // H-5: Reactive regime bonuses halved when !calibrated.

@@ -300,15 +300,21 @@ function getCalibratedAdjustment(hotScore,coldScore,calib,targetRare,sf){
   const hotRate =(hotCount >=reqMinBin)?calib.hotHitRate[hotBin] :null;
   const coldRate=(coldCount>=reqMinBin)?calib.coldHitRate[coldBin]:null;
 
-  const maxDelta =targetRare?0.13:0.26; // rare halved: 0.13
-  const sensiHot =1.8;
-  const sensiCold=1.5;
+  // Hot path: maxDelta/sensiHot unchanged.
+  const maxDeltaHot=targetRare?0.13:0.26;
+  const sensiHot=1.8;
+  // === v6 COLD-PATH & CALIBRATION UPGRADE START ===
+  // maxDeltaCold raised 0.26→0.40 (non-rare), 0.13→0.20 (rare).
+  // sensiCold raised 1.5→1.9. Cold trigger lowered 65→58.
+  const maxDeltaCold=targetRare?0.20:0.40;
+  const sensiCold=1.9;
+  // === UPGRADE END ===
 
   let calibMult=1.0,calibConfBonus=0,calibrated=false;
 
   if(hotScore>=72&&hotRate!==null){
     const upliftNorm=clamp((hotRate-calib.baseline)/Math.max(0.001,1-calib.baseline),0,1);
-    const reduction=clamp(upliftNorm*sensiHot,0,maxDelta);
+    const reduction=clamp(upliftNorm*sensiHot,0,maxDeltaHot);
     if(reduction>0.01){
       calibMult=1.0-reduction;
       calibConfBonus=upliftNorm>0.25?12:upliftNorm>0.15?8:4;
@@ -316,19 +322,24 @@ function getCalibratedAdjustment(hotScore,coldScore,calib,targetRare,sf){
     }
   }
 
-  if(coldScore>=65&&coldRate!==null&&!calibrated){
+  // === v6 COLD-PATH & CALIBRATION UPGRADE START ===
+  if(coldScore>=58&&coldRate!==null&&!calibrated){
     const noHitBaseline=1-calib.baseline;
     const upliftNorm=clamp((coldRate-noHitBaseline)/Math.max(0.001,1-noHitBaseline),0,1);
-    const extension=clamp(upliftNorm*sensiCold,0,maxDelta);
+    const extension=clamp(upliftNorm*sensiCold,0,maxDeltaCold);
     if(extension>0.01){
       calibMult=1.0+extension;
       calibConfBonus=-3;
       calibrated=true;
     }
   }
+  // === UPGRADE END ===
 
-  // H-7: Hard clamp 0.76–1.24 (±24% ≈ 0.30σ for CV=0.8).
-  calibMult=clamp(calibMult,0.76,1.24);
+  // Hot: floor 0.76 unchanged. Cold: ceiling raised 1.24→1.40.
+  // === v6 COLD-PATH & CALIBRATION UPGRADE START ===
+  calibMult=clamp(calibMult,0.76,1.40);
+  if(hotScore>=72&&calibMult>1.0)calibMult=1.0;
+  // === UPGRADE END ===
   return{calibMult,calibConfBonus,calibrated};
 }
 
@@ -482,13 +493,17 @@ function extractPredictiveStreakFeatures(rounds,targetMin,calib){
     (ld20<ld50*0.82          ?10:0)
   ),0,100);
 
+  // === v6 COLD-PATH & CALIBRATION UPGRADE START ===
+  // streakMomentum +25%: 28→35/14→17. lowDensityAccel +30%: 22→29/11→14.
+  // currentStreakLen bonus +33%: 12→16.
   const coldScore=clamp(Math.round(
-    (streakMomentum>0.45     ?28:streakMomentum>0.25?14:0)+
-    (lowDensityAccel>0.08    ?22:lowDensityAccel>0.04?11:0)+
+    (streakMomentum>0.45     ?35:streakMomentum>0.25?17:0)+
+    (lowDensityAccel>0.08    ?29:lowDensityAccel>0.04?14:0)+
     (markovProbHot<0.22      ?20:markovProbHot<0.38?10:0)+
     (ld20>ld50*1.40          ?15:ld20>ld50*1.20?7:0)+
-    (currentStreakLen>avgLowRunLen*1.3&&!currentIsHigh?12:0)
+    (currentStreakLen>avgLowRunLen*1.3&&!currentIsHigh?16:0)
   ),0,100);
+  // === UPGRADE END ===
 
   // A-2: Regime prediction — v5 thresholds and clamps (H-7, H-8)
   let predictedNextRegime='NEUTRAL',transitionConfidence=0,predictedGapMultiplier=1.0;
@@ -507,17 +522,20 @@ function extractPredictiveStreakFeatures(rounds,targetMin,calib){
     predictedNextRegime  ='ABOUT_TO_HOT';
     transitionConfidence =clamp(hotScore,62,88);
     predictedGapMultiplier=clamp(1.0-(hotScore/100)*0.20,0.80,0.93);
-  }else if(coldScore>=65&&coldScore>hotScore+15){
+  // === v6 COLD-PATH & CALIBRATION UPGRADE START ===
+  // Cold trigger 65→58, multiplier caps raised to 1.15–1.40 / 1.10–1.32.
+  }else if(coldScore>=58&&coldScore>hotScore+12){
     if(currentStreakLen>=avgLowRunLen*1.5||regime==='EXTREME_WHITE'){
       predictedNextRegime  ='ABOUT_TO_WHITE_CLUSTER';
-      transitionConfidence =clamp(coldScore,65,88);
-      predictedGapMultiplier=clamp(1.0+(coldScore/100)*0.28,1.10,1.24);
+      transitionConfidence =clamp(coldScore,58,88);
+      predictedGapMultiplier=clamp(1.0+(coldScore/100)*0.42,1.15,1.40);
     }else{
       predictedNextRegime  ='ABOUT_TO_COLD';
-      transitionConfidence =clamp(coldScore,55,82);
-      predictedGapMultiplier=clamp(1.0+(coldScore/100)*0.20,1.05,1.22);
+      transitionConfidence =clamp(coldScore,50,82);
+      predictedGapMultiplier=clamp(1.0+(coldScore/100)*0.30,1.10,1.32);
     }
   }
+  // === UPGRADE END ===
 
   // Apply calibration override
   const targetRare=calib?.targetRare??false;
@@ -528,6 +546,13 @@ function extractPredictiveStreakFeatures(rounds,targetMin,calib){
       predictedNextRegime='ABOUT_TO_HOT';
       transitionConfidence=Math.min(transitionConfidence+10,85);
     }
+    // === v6 COLD-PATH & CALIBRATION UPGRADE START ===
+    // Also promote NEUTRAL→ABOUT_TO_COLD when calibration confirms cold extension.
+    if(predictedNextRegime==='NEUTRAL'&&cal.calibMult>1.05&&coldScore>=45){
+      predictedNextRegime='ABOUT_TO_COLD';
+      transitionConfidence=Math.min(transitionConfidence+8,80);
+    }
+    // === UPGRADE END ===
   }
   const calibConfBonus=cal.calibConfBonus;
 
@@ -555,11 +580,23 @@ function extractPredictiveStreakFeatures(rounds,targetMin,calib){
 function applyStreakAdj(expectedGap,sf){
   if(!sf)return expectedGap;
   const pnr=sf.predictedNextRegime,mult=sf.predictedGapMultiplier??1.0,tc=sf.transitionConfidence??0;
-  // A-3: tc threshold raised 30→65 (eliminates weak-signal modifications)
-  if(pnr!=='NEUTRAL'&&tc>=65){
+  // === v6 COLD-PATH & CALIBRATION UPGRADE START ===
+  // Hot path: tc≥65 unchanged. Cold path: fires at tc≥58.
+  const isColdPnr=pnr==='ABOUT_TO_WHITE_CLUSTER'||pnr==='ABOUT_TO_COLD';
+  const isHotPnr =pnr==='ABOUT_TO_B2B'||pnr==='ABOUT_TO_HOT';
+  if(isHotPnr&&tc>=65){
     const blend=clamp((tc-65)/45,0,1);
     return Math.max(1,Math.round(expectedGap*(1.0+(mult-1.0)*blend)));
   }
+  if(isColdPnr&&tc>=58){
+    const blend=clamp((tc-58)/45,0,1);
+    return Math.max(1,Math.round(expectedGap*(1.0+(mult-1.0)*blend)));
+  }
+  if(!isHotPnr&&!isColdPnr&&pnr!=='NEUTRAL'&&tc>=65){
+    const blend=clamp((tc-65)/45,0,1);
+    return Math.max(1,Math.round(expectedGap*(1.0+(mult-1.0)*blend)));
+  }
+  // === UPGRADE END ===
   let adj=expectedGap;
   switch(sf.regime){
     case 'B2B':        adj=Math.round(adj*(1-sf.b2bContinuationProb*0.30));break;
@@ -594,9 +631,12 @@ function streakConfBonus(sf,isRare){
     base+=14+(isRare&&sf.b2bPrecursor?4:0);
   }else if((pnr==='ABOUT_TO_B2B'||pnr==='ABOUT_TO_HOT')&&tc>=65){
     base+=7;
-  }else if((pnr==='ABOUT_TO_WHITE_CLUSTER'||pnr==='ABOUT_TO_COLD')&&tc>65){
-    base-=3;
+  // === v6 COLD-PATH & CALIBRATION UPGRADE START ===
+  // Cold penalty strengthened -3→-6, threshold lowered 65→58.
+  }else if((pnr==='ABOUT_TO_WHITE_CLUSTER'||pnr==='ABOUT_TO_COLD')&&tc>58){
+    base-=6;
   }
+  // === UPGRADE END ===
 
   // H-5: Reactive bonuses halved when !calibrated
   const calibMult=sf.calibrated?1.0:0.5;
