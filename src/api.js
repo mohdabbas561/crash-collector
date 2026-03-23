@@ -8,7 +8,6 @@ const {
   initAccessCodes, createAccessCode, getAccessCode,
   updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,
   saveLockedPreds, getLockedPreds,
-  saveLockedPatternPreds, getLockedPatternPreds,
   saveLockedAdvPreds, getLockedAdvPreds,
   saveLockedConsensusPreds, getLockedConsensusPreds,
   initWalletStorage, saveWallet, getWallets, deleteWallet,
@@ -101,7 +100,7 @@ app.get('/health', (req,res) => res.json({ ok:true, ts:new Date().toISOString() 
 
 // ── PREDICTIONS ───────────────────────────────────────────────────────────────
 const VALID_SOURCES = [
-  'engine','pattern','consensus',
+  'engine','consensus',
 ];
 
 app.get('/predictions', rateLimit(300), async (req, res) => {
@@ -144,26 +143,11 @@ app.delete('/predictions', requireAdmin, async (req, res) => {
 app.get('/predictions-all', rateLimit(120), async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit || '500'), 2000);
-    const [consensus,
-           hlstm_xgb, htrans_lstm, htft, tft, nbeats, tcn,
-           lgbm, gru, bilstm, stacking, sha512, ng_consensus] = await Promise.all([
+    const [consensus, ng_consensus] = await Promise.all([
       getPredictions({ limit, source: 'consensus' }),
-      getPredictions({ limit, source: 'hlstm_xgb' }),
-      getPredictions({ limit, source: 'htrans_lstm' }),
-      getPredictions({ limit, source: 'htft' }),
-      getPredictions({ limit, source: 'tft' }),
-      getPredictions({ limit, source: 'nbeats' }),
-      getPredictions({ limit, source: 'tcn' }),
-      getPredictions({ limit, source: 'lgbm' }),
-      getPredictions({ limit, source: 'gru' }),
-      getPredictions({ limit, source: 'bilstm' }),
-      getPredictions({ limit, source: 'stacking' }),
-      getPredictions({ limit, source: 'sha512' }),
       getPredictions({ limit, source: 'ng_consensus' }),
     ]);
-    res.json({ ok: true, consensus,
-      hlstm_xgb, htrans_lstm, htft, tft, nbeats, tcn,
-      lgbm, gru, bilstm, stacking, sha512, ng_consensus });
+    res.json({ ok: true, consensus, ng_consensus });
   } catch(e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -192,31 +176,6 @@ app.delete('/locked', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
-// ── PATTERN LOCKED ────────────────────────────────────────────────────────────
-app.get('/locked-pattern', rateLimit(120), async (req,res) => {
-  try { res.json({ ok:true, preds: await getLockedPatternPreds() }); }
-  catch(e) { res.status(500).json({ ok:false, error:e.message }); }
-});
-
-app.post('/locked-pattern', rateLimit(120), async (req, res) => {
-  if (APP_SECRET && req.headers['x-app-secret'] !== APP_SECRET)
-    return res.status(403).json({ ok:false, error:'Forbidden' });
-  try {
-    const { preds } = req.body;
-    if (!preds || typeof preds!=='object') return res.status(400).json({ ok:false, error:'preds required' });
-    await saveLockedPatternPreds(preds);
-    res.json({ ok:true });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
-});
-
-app.delete('/locked-pattern', requireAdmin, async (req, res) => {
-  try {
-    await pool.query('DELETE FROM locked_preds_pattern');
-    require('./predictionEngine').resetEngineState();
-    res.json({ ok:true });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
-});
-
 // ── ADVANCED ENGINE LOCKED PREDS ──────────────────────────────────────────────
 app.get('/locked-adv', rateLimit(120), async (req, res) => {
   try {
@@ -232,7 +191,7 @@ app.post('/locked-adv', rateLimit(120), async (req, res) => {
     // FIX: validate model name is a known engine — reject arbitrary strings
     const VALID_ADV_MODELS = [
       'consensus',
-      'hlstm_xgb','htrans_lstm','htft','tft','nbeats','tcn','lgbm','gru','bilstm','stacking','sha512','ng_consensus',
+      'ng_consensus',
     ];
     if (!VALID_ADV_MODELS.includes(model))
       return res.status(400).json({ ok:false, error:'Unknown model' });
@@ -282,9 +241,6 @@ app.delete('/reset-locks', requireAdmin, async (req, res) => {
     await client.query('DELETE FROM locked_preds_adv');
     await client.query('DELETE FROM locked_preds_consensus');
     await client.query('DELETE FROM locked_preds');
-    await client.query('DELETE FROM locked_preds_stat');
-    // FIX: also clear pattern locks — they are engine locks, not history
-    await client.query('DELETE FROM locked_preds_pattern');
     await client.query('COMMIT');
     // Bust NG compute engine in-memory window cache so fresh windows are locked next tick
     try { require('./ngComputeEngine').resetNgWindowsOnly(); } catch(_) {}
@@ -318,8 +274,6 @@ app.delete('/reset', requireAdmin, async (req, res) => {
     await client.query('BEGIN');
     await client.query('DELETE FROM predictions');
     await client.query('DELETE FROM locked_preds');
-    await client.query('DELETE FROM locked_preds_pattern');
-    await client.query('DELETE FROM locked_preds_stat');
     await client.query('DELETE FROM locked_preds_adv');
     await client.query('DELETE FROM locked_preds_consensus');
     await client.query('COMMIT');

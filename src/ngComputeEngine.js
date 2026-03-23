@@ -1,5 +1,5 @@
 'use strict';
-// ngComputeEngine.js — Next-Gen SOTA & Hybrid Engines (11 engines + ng_consensus)
+// ngComputeEngine.js — NG Master Signal (ng_consensus)
 // ================================================================================
 // ACCURACY & CALIBRATION REBUILD — v5 (FINAL PRODUCTION)
 //
@@ -45,8 +45,7 @@ const {
 } = require('./db');
 
 const NG_ENGINE_IDS = [
-  'hlstm_xgb','htrans_lstm','htft','tft','nbeats',
-  'tcn','lgbm','gru','bilstm','stacking','sha512','ng_consensus',
+  'ng_consensus',
 ];
 
 const TARGETS = [
@@ -876,537 +875,6 @@ function effectiveRegime(sf) {
 }
 
 // =============================================================================
-// ENGINE 1: hybrid_lstm_xgb
-// H-10: calib null-guard — b2bBoost only amplifies when sf.calibrated=true
-// =============================================================================
-function runHybridLstmXgb(rounds, target, sf) {
-  const {gaps, currentGap} = computeGaps(rounds, target.min);
-  if (gaps.length < 10) return null;
-  const hrGlobal = gaps.length/rounds.length;
-
-  const DECAY=0.97; let wS=0,wG=0,w=1;
-  for(let i=gaps.length-1;i>=0;i--){wG+=gaps[i]*w;wS+=w;w*=DECAY;}
-  const ewaMean=wG/(wS||1);
-
-  const gMean=mean(gaps), gStd=stdDev(gaps)||1;
-  const recentN=Math.min(300,Math.max(10,Math.round(3/(hrGlobal||0.01))));
-  const {b:slope,r2}=olsLinear(gaps.slice(-Math.min(100,gaps.length)));
-  const overdue=clamp(currentGap/(gMean||1),0,3);
-  const cv=gStd/(gMean||1);
-
-  const pnr = effectiveRegime(sf);
-  // === FINAL PRODUCTION HARDENING START ===
-  // H-10: b2bBoost calibration amplification only when sf.calibrated=true.
-  // Without calibration, use base b2bRate only (no ×1.3/×1.6 multiplier).
-  const b2bBoost = sf ? (
-    (pnr==='ABOUT_TO_B2B' && sf.calibrated) ? sf.b2bRate*1.6 :
-    pnr==='ABOUT_TO_B2B'                    ? sf.b2bRate      :
-    pnr==='ABOUT_TO_HOT'                    ? sf.b2bRate*1.1  : sf.b2bRate
-  ) : 0;
-  // === HARDENING END ===
-  const safeWeight = sf ? (
-    (pnr==='ABOUT_TO_WHITE_CLUSTER'||pnr==='ABOUT_TO_COLD') ? Math.min(sf.lowDensity20*1.2,1) :
-    (pnr==='ABOUT_TO_B2B'||pnr==='ABOUT_TO_HOT') ? sf.lowDensity20*0.6 :
-    sf.lowDensity20
-  ) : (1-hrGlobal);
-
-  const raw=Math.max(1,Math.round(
-    ewaMean                               * 0.28 +
-    gMean                                 * 0.18 +
-    Math.max(1,gMean+slope*5)             * 0.14 +
-    gMean*Math.max(0.5,1-overdue*0.1)     * 0.12 +
-    (1/(hrGlobal||0.001))                 * 0.10 +
-    gMean*(1-clamp(b2bBoost*0.5,0,0.4))  * 0.10 +
-    gMean*safeWeight                      * 0.08
-  ));
-  const adj=applyStreakAdjustment(raw,sf,target);
-  const aw=target.maxWidth;
-  const sp=sparsePenalty(gaps.length,50);
-  const conf=clamp(Math.round((78-20*cv+overdue*4+r2*5+streakConfBonus(sf,target.rare))*sp),22,91);
-  return {...placeWindow(adj,currentGap,aw),expectedGap:adj,probW:geoProbW(hrGlobal,aw),conf};
-}
-
-// =============================================================================
-// ENGINE 2: hybrid_transformer_lstm
-// =============================================================================
-function runHybridTransformerLstm(rounds, target, sf) {
-  const {gaps,currentGap}=computeGaps(rounds,target.min);
-  if (gaps.length<15) return null;
-  const hrGlobal=gaps.length/rounds.length;
-  const gMean=mean(gaps),gStd=stdDev(gaps)||1;
-
-  const attnHead=(window)=>{
-    if (!window.length) return gMean;
-    const norm=window.map(g=>(g-gMean)/(gStd||1));
-    const scores=norm.map((v,i)=>{
-      const pos=i/Math.max(1,window.length-1);
-      return Math.exp(-(v*v)*0.5+Math.sin(pos*Math.PI)*0.3);
-    });
-    const tot=scores.reduce((a,b)=>a+b,0)||1;
-    return window.reduce((s,g,i)=>s+g*scores[i]/tot,0);
-  };
-
-  const h1=attnHead(gaps.slice(-Math.min(30, gaps.length)));
-  const h2=attnHead(gaps.slice(-Math.min(100,gaps.length)));
-  const h3=attnHead(gaps.slice(-Math.min(200,gaps.length)));
-
-  let wH1=0.45,wH2=0.35,wH3=0.20;
-  const pnr=effectiveRegime(sf);
-  if (pnr==='ABOUT_TO_B2B'||pnr==='B2B'||pnr==='ABOUT_TO_HOT'||pnr==='HOT') {
-    wH1=0.60;wH2=0.28;wH3=0.12;
-  } else if (pnr==='ABOUT_TO_WHITE_CLUSTER'||pnr==='WHITE_CLUSTER'||
-             pnr==='ABOUT_TO_COLD'||pnr==='EXTREME_WHITE') {
-    wH1=0.22;wH2=0.35;wH3=0.43;
-  }
-  const attnOut=h1*wH1+h2*wH2+h3*wH3;
-
-  const DECAY=0.88;let wS=0,wG=0,wt=1;
-  const rec=gaps.slice(-30);
-  for(let i=rec.length-1;i>=0;i--){wG+=rec[i]*wt;wS+=wt;wt*=DECAY;}
-  const lstmOut=wG/(wS||1);
-
-  const raw=Math.max(1,Math.round(attnOut*0.60+lstmOut*0.40));
-  const adj=applyStreakAdjustment(raw,sf,target);
-  const aw=target.maxWidth;
-  const sp=sparsePenalty(gaps.length,40);
-  const cv=gStd/(gMean||1);
-  const conf=clamp(Math.round((72-18*cv+streakConfBonus(sf,target.rare))*sp),22,88);
-  return {...placeWindow(adj,currentGap,aw),expectedGap:adj,probW:geoProbW(hrGlobal,aw),conf};
-}
-
-// =============================================================================
-// ENGINE 3: hybrid_tft
-// =============================================================================
-function runHybridTft(rounds, target, sf) {
-  const {gaps,currentGap}=computeGaps(rounds,target.min);
-  if (gaps.length<20) return null;
-  const gMean=mean(gaps),gStd=stdDev(gaps)||1;
-  const sorted=[...gaps].sort((a,b)=>a-b);
-  const hrGlobal=gaps.length/rounds.length;
-
-  const shortGaps=gaps.slice(-Math.min(20, gaps.length));
-  const longGaps =gaps.slice(-Math.min(100,gaps.length));
-  const sM=mean(shortGaps),sS=stdDev(shortGaps)||1;
-  const lM=mean(longGaps), lS=stdDev(longGaps) ||1;
-
-  let shortGate=1/(1+sS/(sM||1));
-  let longGate =1/(1+lS/(lM||1));
-  const pnr=effectiveRegime(sf);
-  if (pnr==='ABOUT_TO_B2B'||pnr==='B2B'||pnr==='ABOUT_TO_HOT'||pnr==='HOT') {
-    shortGate*=1.5;
-  } else if (pnr==='ABOUT_TO_WHITE_CLUSTER'||pnr==='WHITE_CLUSTER'||
-             pnr==='ABOUT_TO_COLD'||pnr==='EXTREME_WHITE') {
-    longGate *=1.5;
-  }
-  const tot=shortGate+longGate||1;
-  const shortW=shortGate/tot, longW=longGate/tot;
-
-  const shortPred=weibullSkew(sM,sM+sS*0.5);
-  const longPred =weibullSkew(pctile(sorted,0.50),pctile(sorted,0.75));
-  let raw=Math.max(1,Math.round(shortPred*shortW+longPred*longW));
-  // === FINAL PRODUCTION HARDENING START ===
-  // H-10: postClusterEarlySignal injection only when sf.calibrated=true
-  if (sf && sf.postClusterEarlySignal && sf.calibrated && sf.avgPostClusterGap!==null) {
-    raw=Math.max(1,Math.round(raw*0.6+sf.avgPostClusterGap*0.4));
-  } else if (sf && sf.regime==='WHITE_CLUSTER' && sf.avgPostClusterGap!==null) {
-    raw=Math.max(1,Math.round(raw*0.65+sf.avgPostClusterGap*0.35));
-  }
-  // === HARDENING END ===
-  const adj=applyStreakAdjustment(raw,sf,target);
-  const aw=target.maxWidth;
-  const sp=sparsePenalty(gaps.length,40);
-  const conf=clamp(Math.round((68+gaps.length*0.08-gStd/gMean*12+streakConfBonus(sf,target.rare))*sp),22,90);
-  return {...placeWindow(adj,currentGap,aw),expectedGap:adj,probW:geoProbW(hrGlobal,aw),conf};
-}
-
-// =============================================================================
-// ENGINE 4: tft_full
-// =============================================================================
-function runTftFull(rounds, target, sf) {
-  const {gaps,currentGap}=computeGaps(rounds,target.min);
-  if (gaps.length<10) return null;
-  const hrGlobal=gaps.length/rounds.length;
-  const gMean=mean(gaps),gStd=stdDev(gaps)||1;
-  const sorted=[...gaps].sort((a,b)=>a-b);
-  const staticEmb=Math.log(target.min)/Math.log(1000);
-
-  if (gaps.length<15) {
-    const fb=Math.max(1,Math.round(pctile(sorted,0.50)));
-    const adj=applyStreakAdjustment(fb,sf,target);
-    const sp=sparsePenalty(gaps.length,30);
-    return {...placeWindow(adj,currentGap,target.maxWidth),expectedGap:adj,
-            probW:geoProbW(hrGlobal,target.maxWidth),conf:clamp(Math.round(40*sp),15,55)};
-  }
-
-  const DECAY=0.88+staticEmb*0.09;let wS=0,wG=0,wt=1;
-  for(let i=gaps.length-1;i>=0;i--){wG+=gaps[i]*wt;wS+=wt;wt*=DECAY;}
-  const seqOut=wG/(wS||1);
-
-  let wQ10=0.25,wQ50=0.50,wQ90=0.25;
-  const pnr=effectiveRegime(sf);
-  if (pnr==='ABOUT_TO_B2B'||pnr==='B2B'||pnr==='ABOUT_TO_HOT'||pnr==='HOT') {
-    wQ10=0.42;wQ50=0.43;wQ90=0.15;
-  } else if (pnr==='ABOUT_TO_WHITE_CLUSTER'||pnr==='WHITE_CLUSTER'||
-             pnr==='ABOUT_TO_COLD'||pnr==='EXTREME_WHITE') {
-    wQ10=0.08;wQ50=0.38;wQ90=0.54;
-  }
-  // === FINAL PRODUCTION HARDENING START ===
-  // H-10: rare b2b quantile shift only when calibrated
-  if (target.rare && sf?.b2bPrecursor && sf?.calibrated) {
-    wQ10=Math.min(wQ10+0.08,0.55);wQ90=Math.max(wQ90-0.08,0.05);
-  }
-  // === HARDENING END ===
-  const attnOut=pctile(sorted,0.10)*wQ10+pctile(sorted,0.50)*wQ50+pctile(sorted,0.90)*wQ90;
-  const raw=Math.max(1,Math.round(seqOut*0.55+attnOut*0.45));
-  const adj=applyStreakAdjustment(raw,sf,target);
-  const aw=target.maxWidth;
-  const sp=sparsePenalty(gaps.length,40);
-  const conf=clamp(Math.round((70-gStd/gMean*16+staticEmb*6+streakConfBonus(sf,target.rare))*sp),15,92);
-  return {...placeWindow(adj,currentGap,aw),expectedGap:adj,probW:geoProbW(hrGlobal,aw),conf};
-}
-
-// =============================================================================
-// ENGINE 5: nbeats
-// =============================================================================
-function runNbeats(rounds, target, sf) {
-  const {gaps,currentGap}=computeGaps(rounds,target.min);
-  if (gaps.length<10) return null;
-  const hrGlobal=gaps.length/rounds.length;
-  const n=gaps.length,gMean=mean(gaps);
-
-  const {a,b,r2}=olsLinear(gaps);
-  const trendForecast=Math.max(1,a+b*n);
-  const residuals1=gaps.map((g,i)=>g-(a+b*i));
-  const resMean=mean(residuals1);
-  const identityForecast=gMean+resMean;
-
-  let streakForecast=identityForecast;
-  if (sf && sf.highRuns.length>=5) {
-    const {a:rA,b:rB}=olsLinear(sf.highRuns);
-    streakForecast=Math.max(1,rA+rB*sf.highRuns.length);
-  }
-
-  const pnr=effectiveRegime(sf);
-  // === FINAL PRODUCTION HARDENING START ===
-  // H-10: streakBlock weight boost only when calibrated
-  const isHotCalibrated = (pnr==='ABOUT_TO_B2B'||pnr==='ABOUT_TO_HOT') && (sf?.calibrated===true);
-  // === HARDENING END ===
-  const streakW=(1-r2)*(isHotCalibrated ? 0.55 : 0.40);
-  const identW =(1-r2)*(isHotCalibrated ? 0.45 : 0.60);
-
-  const raw=Math.max(1,Math.round(trendForecast*r2+identityForecast*identW+streakForecast*streakW));
-  const adj=applyStreakAdjustment(raw,sf,target);
-  const aw=target.maxWidth;
-  const gStd=stdDev(gaps)||1;
-  const sp=sparsePenalty(n,40);
-  const conf=clamp(Math.round((60+r2*22-gStd/gMean*10+streakConfBonus(sf,target.rare))*sp),18,90);
-  return {...placeWindow(adj,currentGap,aw),expectedGap:adj,probW:geoProbW(hrGlobal,aw),conf};
-}
-
-// =============================================================================
-// ENGINE 6: tcn
-// =============================================================================
-function runTcn(rounds, target, sf) {
-  const {gaps,currentGap}=computeGaps(rounds,target.min);
-  if (gaps.length<8) return null;
-  const hrGlobal=gaps.length/rounds.length,gMean=mean(gaps);
-
-  let signal=[...gaps];
-  for (const d of [1,2,4,8,16,32]) {
-    const out=new Array(signal.length);
-    for(let i=0;i<signal.length;i++){
-      out[i]=i-d>=0?0.50*signal[i]+0.50*signal[i-d]:signal[i];
-    }
-    for(let i=0;i<signal.length;i++) signal[i]=0.70*out[i]+0.30*gaps[i];
-  }
-  const lastK=Math.min(10,signal.length);
-  const tcnOut=mean(signal.slice(-lastK));
-
-  let streakRes=0;
-  if (sf&&sf.highRuns.length>=5) {
-    const {b:rs}=olsLinear(sf.highRuns);
-    // === FINAL PRODUCTION HARDENING START ===
-    // H-10: hotAmp only amplifies when sf.calibrated=true
-    const hotAmp = (sf.calibrated===true)
-      ? clamp((sf.hotScore||0)/100*1.2, 0.3, 0.9)
-      : 0.4;
-    // === HARDENING END ===
-    streakRes=rs*hotAmp;
-  }
-  const raw=Math.max(1,Math.round(tcnOut+streakRes));
-  const adj=applyStreakAdjustment(raw,sf,target);
-  const aw=target.maxWidth;
-  const gStd=stdDev(gaps)||1;
-  const sp=sparsePenalty(gaps.length,30);
-  const conf=clamp(Math.round((75-gStd/gMean*14+Math.min(gaps.length,300)*0.04+streakConfBonus(sf,target.rare))*sp),18,91);
-  return {...placeWindow(adj,currentGap,aw),expectedGap:adj,probW:geoProbW(hrGlobal,aw),conf};
-}
-
-// =============================================================================
-// ENGINE 7: lightgbm
-// =============================================================================
-function runLightGBM(rounds, target, sf) {
-  const {gaps,currentGap}=computeGaps(rounds,target.min);
-  if (gaps.length<8) return null;
-  const hrGlobal=gaps.length/rounds.length;
-  const gMean=mean(gaps),gStd=stdDev(gaps)||1;
-  const sorted=[...gaps].sort((a,b)=>a-b);
-  const p50=pctile(sorted,0.50),p75=pctile(sorted,0.75);
-
-  const recentN=Math.min(300,Math.max(15,Math.round(5/(hrGlobal||0.01))));
-  const hrRecent=(rounds.slice(-recentN).filter(r=>r.multiplier>=target.min).length+1)/(recentN+2);
-  const {b:slope,r2}=olsLinear(gaps.slice(-Math.min(100,gaps.length)));
-  const overdue=clamp(currentGap/(gMean||1),0,3);
-  const cv=gStd/(gMean||1);
-
-  const leaf1=p50;
-  const leaf2=gMean*(1-clamp((hrRecent-hrGlobal)/(hrGlobal||0.01),-0.3,0.3));
-  const leaf3=Math.max(1,gMean+slope*3);
-  const leaf4=overdue>1.5?gMean*0.75:gMean*1.10;
-  const leaf5=weibullSkew(p50,p75);
-  const leaf6=sf?gMean*(1-sf.b2bRate*0.4):gMean;
-  const leaf7=sf?gMean*(sf.lowDensity20>0.85?0.7:1.0):gMean;
-
-  const w1=1/(1+cv),w2=r2,w3=Math.abs(slope)<gMean*0.05?0.8:0.3;
-  const w4=overdue>1?0.9:0.4,w5=0.7;
-  // === FINAL PRODUCTION HARDENING START ===
-  // H-10: calMult only amplifies when sf.calibrated=true (strict boolean check)
-  const calMult = (sf?.calibrated===true) ? 1.5 : 1.0;
-  const hotScoreNorm  = sf ? (sf.hotScore||0)/100  : 0;
-  const coldScoreNorm = sf ? (sf.coldScore||0)/100 : 0;
-  // === HARDENING END ===
-  const w6=sf?clamp(sf.b2bRate*3*(1+hotScoreNorm*calMult),0.1,1.8):0.1;
-  const w7=sf?clamp(sf.lowDensity20*2*(1+coldScoreNorm*0.8),0.1,1.3):0.1;
-  const wS=w1+w2+w3+w4+w5+w6+w7;
-
-  const raw=Math.max(1,Math.round((leaf1*w1+leaf2*w2+leaf3*w3+leaf4*w4+leaf5*w5+leaf6*w6+leaf7*w7)/wS));
-  const adj=applyStreakAdjustment(raw,sf,target);
-  const aw=target.maxWidth;
-  const sp=sparsePenalty(gaps.length,40);
-  const conf=clamp(Math.round((72-cv*16+r2*10+overdue*2+streakConfBonus(sf,target.rare))*sp),18,92);
-  return {...placeWindow(adj,currentGap,aw),expectedGap:adj,probW:geoProbW(hrGlobal,aw),conf};
-}
-
-// =============================================================================
-// ENGINE 8: gru
-// =============================================================================
-function runGRU(rounds, target, sf) {
-  const {gaps,currentGap}=computeGaps(rounds,target.min);
-  if (gaps.length<5) return null;
-  const hrGlobal=gaps.length/rounds.length;
-  const gMean=mean(gaps),gStd=stdDev(gaps)||1;
-  const cv=gStd/(gMean||1);
-
-  const scale=Math.max(gStd,gMean*0.5);
-  const sigmoid=x=>1/(1+Math.exp(-clamp(x/scale,-8,8)));
-
-  let h=gMean;
-  const pnr=effectiveRegime(sf);
-  if (sf) {
-    // === FINAL PRODUCTION HARDENING START ===
-    // H-10: calibrated amplification (0.40) only when sf.calibrated=true
-    if      (pnr==='ABOUT_TO_B2B' && sf.calibrated===true)
-      h=gMean*(1-sf.b2bContinuationProb*0.40);
-    else if (pnr==='ABOUT_TO_B2B'||pnr==='B2B')
-      h=gMean*(1-sf.b2bContinuationProb*0.28);
-    // === HARDENING END ===
-    else if (pnr==='ABOUT_TO_HOT'||pnr==='HOT')
-      h=gMean*(1-sf.b2bContinuationProb*0.20);
-    else if (pnr==='ABOUT_TO_WHITE_CLUSTER')
-      h=gMean*1.12;
-    else if (pnr==='ABOUT_TO_COLD'||pnr==='WHITE_CLUSTER')
-      h=gMean*(sf.avgPostClusterGap!==null?sf.avgPostClusterGap/gMean:0.92);
-    else if (pnr==='EXTREME_WHITE')
-      h=gMean*0.78;
-  }
-
-  for (const g of gaps) {
-    const z=sigmoid(h-gMean);
-    const r=sigmoid(g-gMean);
-    const hc=0.5*(r*h+g);
-    h=(1-z)*hc+z*h;
-  }
-
-  const raw=Math.max(1,Math.round(h));
-  const adj=applyStreakAdjustment(raw,sf,target);
-  const aw=target.maxWidth;
-  const sp=sparsePenalty(gaps.length,30);
-  const conf=clamp(Math.round((73-cv*18+Math.min(gaps.length,400)*0.05+streakConfBonus(sf,target.rare))*sp),18,90);
-  return {...placeWindow(adj,currentGap,aw),expectedGap:adj,probW:geoProbW(hrGlobal,aw),conf};
-}
-
-// =============================================================================
-// ENGINE 9: bilstm
-// =============================================================================
-function runBiLSTM(rounds, target, sf) {
-  const {gaps,currentGap}=computeGaps(rounds,target.min);
-  if (gaps.length<8) return null;
-  const hrGlobal=gaps.length/rounds.length;
-  const gMean=mean(gaps),gStd=stdDev(gaps)||1,cv=gStd/(gMean||1);
-
-  const FD=0.97;let wS=0,wG=0,wt=1;
-  for(let i=gaps.length-1;i>=0;i--){wG+=gaps[i]*wt;wS+=wt;wt*=FD;}
-  const fwdOut=wG/(wS||1);
-
-  const BD=0.93;wS=0;wG=0;wt=1;
-  for(let i=0;i<gaps.length;i++){wG+=gaps[i]*wt;wS+=wt;wt*=BD;}
-  const bwdOut=wG/(wS||1);
-
-  let fwdW=0.60,bwdW=0.40;
-  const pnr=effectiveRegime(sf);
-  if (pnr==='ABOUT_TO_B2B'||pnr==='B2B'||pnr==='ABOUT_TO_HOT'||pnr==='HOT') {
-    fwdW=0.75;bwdW=0.25;
-  } else if (pnr==='ABOUT_TO_WHITE_CLUSTER'||pnr==='WHITE_CLUSTER'||
-             pnr==='ABOUT_TO_COLD'||pnr==='EXTREME_WHITE') {
-    fwdW=0.42;bwdW=0.58;
-  }
-  const biOut=fwdOut*fwdW+bwdOut*bwdW;
-  const overdueAdj=currentGap>gMean*1.2?biOut*0.87:biOut;
-  const raw=Math.max(1,Math.round(overdueAdj));
-  const adj=applyStreakAdjustment(raw,sf,target);
-  const aw=target.maxWidth;
-  const sp=sparsePenalty(gaps.length,35);
-  const conf=clamp(Math.round((76-cv*20+(currentGap>gMean?5:0)+streakConfBonus(sf,target.rare))*sp),18,91);
-  return {...placeWindow(adj,currentGap,aw),expectedGap:adj,probW:geoProbW(hrGlobal,aw),conf};
-}
-
-// =============================================================================
-// ENGINE 10: stacking_meta
-// tcMult: calibrated&&tc>75→1.45, calibrated&&tc>68→1.25, else 1.0
-// =============================================================================
-function runStackingMeta(rounds, target, allNgResults, sf) {
-  const {gaps,currentGap}=computeGaps(rounds,target.min);
-  if (gaps.length<5) return null;
-  const hrGlobal=gaps.length/rounds.length,gMean=mean(gaps),aw=target.maxWidth;
-
-  const sourceIds=['hlstm_xgb','htrans_lstm','htft','tft','nbeats','tcn','lgbm','gru','bilstm','sha512'];
-
-  const spec={
-    hlstm_xgb:  {b2b:1.4,cluster:1.2,neutral:1.0},
-    htrans_lstm: {b2b:1.3,cluster:1.3,neutral:1.0},
-    htft:        {b2b:1.1,cluster:1.5,neutral:1.0},
-    tft:         {b2b:1.0,cluster:1.4,neutral:1.0},
-    nbeats:      {b2b:1.2,cluster:1.2,neutral:1.0},
-    tcn:         {b2b:1.5,cluster:1.0,neutral:1.0},
-    lgbm:        {b2b:1.3,cluster:1.3,neutral:1.0},
-    gru:         {b2b:1.2,cluster:1.1,neutral:1.0},
-    bilstm:      {b2b:1.1,cluster:1.5,neutral:1.0},
-    sha512:      {b2b:1.0,cluster:1.0,neutral:1.1},
-  };
-
-  const pnr = effectiveRegime(sf);
-  const regime = (pnr==='ABOUT_TO_B2B'||pnr==='ABOUT_TO_HOT'||pnr==='B2B'||pnr==='HOT'||pnr==='HOT_AFTER_SHORT_COLD') ? 'b2b'
-    : (pnr==='ABOUT_TO_WHITE_CLUSTER'||pnr==='ABOUT_TO_COLD'||pnr==='WHITE_CLUSTER'||pnr==='EXTREME_WHITE'||pnr==='COLD') ? 'cluster'
-    : 'neutral';
-  const tc = sf?.transitionConfidence ?? 0;
-  // === FINAL PRODUCTION HARDENING START ===
-  // tcMult: only amplify when sf.calibrated===true (strict).
-  // Without empirical confirmation, regime specialisation weights stay neutral (1.0).
-  const tcMult = (sf?.calibrated===true && tc > 75) ? 1.45
-               : (sf?.calibrated===true && tc > 68) ? 1.25
-               : 1.0;
-  // === HARDENING END ===
-
-  const predictions=[],weights=[];
-  for (const eid of sourceIds) {
-    const r=allNgResults[eid]?.[target.label];
-    if (!r?.expectedGap) continue;
-    predictions.push(r.expectedGap);
-    const baseW=spec[eid]?.[regime]??1.0;
-    const specW=(regime==='neutral'?baseW:1.0+(baseW-1.0)*tcMult);
-    weights.push(specW);
-  }
-  const sorted=[...gaps].sort((a,b)=>a-b);
-  predictions.push(pctile(sorted,0.50));weights.push(0.5);
-
-  if (predictions.length<3) {
-    const eg=Math.max(1,Math.round(pctile(sorted,0.50)));
-    return {...placeWindow(eg,currentGap,aw),expectedGap:eg,probW:geoProbW(hrGlobal,aw),conf:40};
-  }
-
-  const pMean=mean(predictions),pStd=stdDev(predictions)||1;
-  const ivW=predictions.map((p,i)=>weights[i]/(Math.abs(p-pMean)+pStd));
-  const wSum=ivW.reduce((a,b)=>a+b,0)||1;
-  const eg=Math.max(1,Math.round(predictions.reduce((s,p,i)=>s+p*ivW[i]/wSum,0)));
-  const adj=applyStreakAdjustment(eg,sf,target);
-  const diversity=pStd/(pMean||1);
-  const sp=sparsePenalty(gaps.length,40);
-  const conf=clamp(Math.round((80-diversity*18+predictions.length*1.2+streakConfBonus(sf,target.rare))*sp),22,94);
-  return {...placeWindow(adj,currentGap,aw),expectedGap:adj,probW:geoProbW(hrGlobal,aw),conf};
-}
-
-// =============================================================================
-// ENGINE 11: sha512
-// =============================================================================
-function runSHA512(rounds, target, sf) {
-  if (rounds.length<30) return null;
-  const {gaps,currentGap}=computeGaps(rounds,target.min);
-  if (gaps.length<5) return null;
-  const hrGlobal=gaps.length/rounds.length;
-  const gMean=mean(gaps),gStd=stdDev(gaps)||1;
-  const sorted=[...gaps].sort((a,b)=>a-b);
-  const n=rounds.length;
-
-  const obsP=(gaps.length+1)/(n+2);
-  const trust=clamp((n-30)/270,0,1);
-
-  const p0=hrGlobal;let cusum=0,maxC=0,minC=0;
-  for(const r of rounds.slice(-300)){
-    cusum+=(r.multiplier>=target.min?1:0)-p0;
-    if(cusum>maxC)maxC=cusum;if(cusum<minC)minC=cusum;
-  }
-  const sigma=Math.sqrt(Math.max(1e-9,p0*(1-p0)*Math.min(300,n)));
-  const cusumMag=Math.max(Math.abs(maxC),Math.abs(minC))/(sigma||1);
-  const drift=cusumMag>1.65;
-
-  const bins=10,binC=new Array(bins).fill(0);
-  const gMax=sorted[sorted.length-1]||1;
-  for(const g of gaps){const b=Math.min(bins-1,Math.floor(g/gMax*bins));binC[b]++;}
-  let ent=0;
-  for(const c of binC){const p=c/gaps.length;if(p>0)ent-=p*Math.log2(p);}
-  const normEnt=ent/(Math.log2(bins)||1);
-
-  let ac1=0;
-  if (gaps.length>=10) {
-    const m=mean(gaps);let cov=0,vs=0;
-    for(let i=1;i<gaps.length;i++) cov+=(gaps[i-1]-m)*(gaps[i]-m);
-    for(const g of gaps) vs+=(g-m)**2;
-    ac1=vs>0?cov/vs:0;
-  }
-
-  // === FINAL PRODUCTION HARDENING START ===
-  // H-10: streakBias only applied when sf.calibrated===true (strict boolean)
-  let streakBias=0;
-  if (sf&&sf.highRuns&&sf.highRuns.length>=5&&sf.calibrated===true) {
-    const hb=5,hbc=new Array(hb).fill(0),hMax=Math.max(...sf.highRuns)||1;
-    for(const l of sf.highRuns){const b=Math.min(hb-1,Math.floor(l/hMax*hb));hbc[b]++;}
-    let hEnt=0;
-    for(const c of hbc){const p=c/sf.highRuns.length;if(p>0)hEnt-=p*Math.log2(p);}
-    const normHrEnt=hEnt/(Math.log2(hb)||1);
-    const hotW=(sf.hotScore??0)/100;
-    streakBias=(1-normHrEnt)*hotW*0.10;
-  }
-  // === HARDENING END ===
-  const pnr=effectiveRegime(sf);
-  // === FINAL PRODUCTION HARDENING START ===
-  const driftAligned=(pnr==='ABOUT_TO_B2B'||pnr==='ABOUT_TO_HOT')&&maxC>0&&sf?.calibrated===true;
-  // === HARDENING END ===
-  if (driftAligned&&drift) streakBias+=0.025;
-
-  const driftF=drift?clamp(cusumMag*0.07*Math.sign(maxC+minC),-0.15,0.15):0;
-  const entAdj=(1-normEnt)*0.04;
-  const acAdj=ac1<-0.15?-0.04:0;
-
-  const baseGap=Math.max(1,Math.round((1/obsP)*trust+gMean*(1-trust)));
-  const raw=Math.max(1,Math.round(baseGap*(1-driftF-entAdj-acAdj-streakBias)));
-  const adj=applyStreakAdjustment(raw,sf,target);
-  const aw=target.maxWidth;
-  const sp=sparsePenalty(gaps.length,30);
-  const conf=clamp(Math.round((55+trust*18+(drift?7:0)+normEnt*4+streakConfBonus(sf,target.rare))*sp),22,93);
-  return {...placeWindow(adj,currentGap,aw),expectedGap:adj,probW:geoProbW(obsP,aw),conf};
-}
-
-// =============================================================================
 // ROUNDS CACHE
 // =============================================================================
 async function getNgRounds() {
@@ -1507,7 +975,6 @@ async function runNgComputeEngine() {
     const streakFeatures={};
     for (const target of TARGETS) {
       try {
-        // Pass actual calibration (or CALIB_DUMMY if null) — never raw null
         streakFeatures[target.label] = extractPredictiveStreakFeatures(
           rounds, target.min, calibrations[target.label] ?? CALIB_DUMMY
         );
@@ -1517,85 +984,65 @@ async function runNgComputeEngine() {
       }
     }
 
-    const ALGO_MAP={
-      hlstm_xgb: runHybridLstmXgb, htrans_lstm:runHybridTransformerLstm,
-      htft:runHybridTft, tft:runTftFull, nbeats:runNbeats, tcn:runTcn,
-      lgbm:runLightGBM, gru:runGRU, bilstm:runBiLSTM, sha512:runSHA512,
-    };
+    // Step 3: Compute ng_consensus master signal directly
+    // ng_consensus aggregates from an empty set here (no sub-engines),
+    // so we build it from streak features directly via computeNgConsensus
     const allNgResults={};
-    for(const [eid,algo] of Object.entries(ALGO_MAP)){
-      allNgResults[eid]={};
-      for(const target of TARGETS){
-        try{
-          const r=algo(rounds,target,streakFeatures[target.label]);
-          if(r) allNgResults[eid][target.label]=r;
-        } catch(e){console.error(`[ngCompute] ${eid}/${target.label}:`,e.message);}
-      }
-    }
-
-    allNgResults['stacking']={};
-    for(const target of TARGETS){
-      try{
-        const r=runStackingMeta(rounds,target,allNgResults,streakFeatures[target.label]);
-        if(r) allNgResults['stacking'][target.label]=r;
-      } catch(e){console.error(`[ngCompute] stacking/${target.label}:`,e.message);}
-    }
-
     const ngConsensus=computeNgConsensus(allNgResults,lastRoundId,streakFeatures);
     allNgResults['ng_consensus']={};
     for(const target of TARGETS){
       const c=ngConsensus[target.label];
       if(c){
-        const baseConf=clamp(55+Math.round(c.engineCount*4),55,95);
+        const baseConf=clamp(55+Math.round((c.engineCount??0)*4),55,95);
         const finalConf=clamp(baseConf+(c.tcBonus??0),55,99);
         allNgResults['ng_consensus'][target.label]={
           low:c.lo-lastRoundId,high:c.hi-lastRoundId,
           expectedGap:Math.round((c.lo+c.hi)/2-lastRoundId),
           probW:null,conf:finalConf,
-          _meta:{engineCount:c.engineCount,engines:c.engines},
+          _meta:{engineCount:c.engineCount??0,engines:c.engines??[]},
         };
       }
     }
 
-    // Phase 1+2: resolve + lock — UNCHANGED FROM v3
-    for(const engineId of NG_ENGINE_IDS){
-      const payload={};
-      for(const target of TARGETS){
-        const win=ngWindows[engineId][target.label];
-        const fresh=allNgResults[engineId]?.[target.label];
-        if(win){
-          const{lo,hi,generation,roundWhenMade}=win;
-          const eLo=Math.max(roundWhenMade+1,lo-earlyHitTolerance(target.maxWidth));
-          const earlyHit=lo>roundWhenMade+1&&eLo<=lo-1?findHitInRange(rounds,eLo,lo-1,target.min):null;
-          if(earlyHit){
-            await saveNgOutcome(engineId,target,'early',lo,hi,earlyHit.roundId,generation);
-            delete ngWindows[engineId][target.label];
-          } else if(lastRoundId>=hi){
-            const hit=findHitInRange(rounds,lo,hi,target.min);
-            await saveNgOutcome(engineId,target,hit?'win':'loss',lo,hi,hit?.roundId??null,generation);
+    // Phase 1+2: resolve + lock ng_consensus windows
+    const engineId='ng_consensus';
+    const payload={};
+    for(const target of TARGETS){
+      const win=ngWindows[engineId][target.label];
+      const fresh=allNgResults[engineId]?.[target.label];
+      if(win){
+        const{lo,hi,generation,roundWhenMade}=win;
+        const eLo=Math.max(roundWhenMade+1,lo-earlyHitTolerance(target.maxWidth));
+        const earlyHit=lo>roundWhenMade+1&&eLo<=lo-1?findHitInRange(rounds,eLo,lo-1,target.min):null;
+        if(earlyHit){
+          await saveNgOutcome(engineId,target,'early',lo,hi,earlyHit.roundId,generation);
+          delete ngWindows[engineId][target.label];
+        } else if(lastRoundId>=hi){
+          const hit=findHitInRange(rounds,lo,hi,target.min);
+          await saveNgOutcome(engineId,target,hit?'win':'loss',lo,hi,hit?.roundId??null,generation);
+          delete ngWindows[engineId][target.label];
+        } else {
+          const hit=findHitInRange(rounds,lo,hi,target.min);
+          if(hit){
+            await saveNgOutcome(engineId,target,'win',lo,hi,hit.roundId,generation);
             delete ngWindows[engineId][target.label];
           } else {
-            const hit=findHitInRange(rounds,lo,hi,target.min);
-            if(hit){
-              await saveNgOutcome(engineId,target,'win',lo,hi,hit.roundId,generation);
-              delete ngWindows[engineId][target.label];
-            } else {
-              payload[target.label]={lo,hi,roundWhenMade,generation,eta:win.eta};
-              continue;
-            }
+            payload[target.label]={lo,hi,roundWhenMade,generation,eta:win.eta};
+            continue;
           }
         }
-        if(fresh){
-          const newLo=lastRoundId+fresh.low,newHi=lastRoundId+fresh.high;
-          const gen=(ngWindows[engineId][target.label]?.generation??0)+1;
-          const baseEta={probW:fresh.probW,conf:fresh.conf,expectedGap:fresh.expectedGap};
-          const eta=fresh._meta?{...baseEta,...fresh._meta}:baseEta;
-          ngWindows[engineId][target.label]={lo:newLo,hi:newHi,roundWhenMade:lastRoundId,generation:gen,eta};
-          payload[target.label]=ngWindows[engineId][target.label];
-        }
       }
-      if(Object.keys(payload).length) await saveLockedAdvPreds(engineId,payload);
+      if(fresh){
+        const newLo=lastRoundId+fresh.low,newHi=lastRoundId+fresh.high;
+        const gen=(ngWindows[engineId][target.label]?.generation??0)+1;
+        const baseEta={probW:fresh.probW,conf:fresh.conf,expectedGap:fresh.expectedGap};
+        const eta=fresh._meta?{...baseEta,...fresh._meta}:baseEta;
+        ngWindows[engineId][target.label]={lo:newLo,hi:newHi,roundWhenMade:lastRoundId,generation:gen,eta};
+        payload[target.label]=ngWindows[engineId][target.label];
+      }
     }
+    if(Object.keys(payload).length) await saveLockedAdvPreds(engineId,payload);
+
   } catch(e) {
     console.error('[ngCompute] Fatal:',e.message,e.stack);
   }

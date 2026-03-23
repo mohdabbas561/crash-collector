@@ -6,14 +6,14 @@
 //
 // SOLUTION: This server-side resolver runs every collector tick (8s).
 // It reads all locked adv windows from DB, scans rounds for hits, and saves
-// win/loss/early outcomes — exactly like patternEngine.js does for PTN.
+// win/loss/early outcomes — exactly like the pattern engine does.
 //
 // Architecture:
 //   Frontend (AdvancedEngines.jsx) — computes windows, POSTs to /locked-adv
 //   THIS FILE                      — resolves windows, saves to /predictions
 //   Frontend                       — reads history from /predictions
 //
-// INDEPENDENCE: This file shares ZERO code with patternEngine.js or statEngine.js.
+// INDEPENDENCE: This file shares ZERO code with other engine modules.
 // It has its own TARGETS, savedSet, rounds access, and state.
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -47,7 +47,7 @@ const TARGETS = [
 const savedSet    = new Set();
 let   initialised = false;
 
-// Local rounds cache — independent from patternEngine and statEngine caches
+// Local rounds cache — independent from other engine caches
 let cachedRounds        = [];
 let cachedRoundsLastId  = 0;
 
