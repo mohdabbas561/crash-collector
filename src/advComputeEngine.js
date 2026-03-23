@@ -503,9 +503,6 @@ async function runAdvComputeEngine(){
     }
 
     const consensus=computeConsensus(allResults,lastRoundId);
-    const algoCount = Object.keys(allResults).filter(id => Object.keys(allResults[id]).length > 0).length;
-    const consCount = Object.keys(consensus).filter(k => consensus[k] !== null).length;
-    console.log(`[advCompute] tick: ${algoCount} algos produced results, consensus has ${consCount} targets`);
     const consPayload={};
     for(const target of TARGETS){
       const c=consensus[target.label];
