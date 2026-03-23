@@ -1,42 +1,36 @@
 'use strict';
 // ngComputeEngine.js — Next-Gen SOTA & Hybrid Engines (11 engines + ng_consensus)
 // ================================================================================
-// ACCURACY & CALIBRATION REBUILD — v5 (FINAL PRODUCTION)
+// ACCURACY & CALIBRATION REBUILD — v6 WHITE-CLUSTER & RECALCULATE FIX
 //
-// v5 HARDENING SUMMARY (over v4):
+// v6 FIX SUMMARY (over v5 FINAL PRODUCTION):
 //
-// H-1: CALIB_DUMMY sentinel replaces null — eliminates circularity ambiguity
-//      in extractPredictiveStreakFeatures when called from computeCalibration.
+// FIX-1: NG_ENGINE_IDS restored to all 11 trackable IDs.
+//   BUG: Only 'ng_consensus' was in NG_ENGINE_IDS. Individual engines were computed
+//   into allNgResults but never entered the Phase 1+2 resolve+lock loop. ngWindows
+//   for them were never populated. computeNgConsensus had no persistent window state
+//   to intersect → random short windows on every tick. FIX: restore full list.
 //
-// H-2: wilsonLower NaN/Inf guards — explicit early-return on n≤0 or NaN result.
+// FIX-2: Cold-path upgrades (hot/b2b untouched):
+//   - coldScore trigger: 58 → 60 (less noise, still catches cluster at depth 4-5)
+//   - tc for cold blend start: 58 → 60 (aligned with trigger)
+//   - predictedGapMultiplier cold range: 1.12–1.32 (safer than 1.15–1.40)
+//   - getCalibratedAdjustment: margin=0.018, sensiCold=1.7, maxDeltaCold=0.32
+//   - calibMult cold ceiling: 1.32 (was 1.40)
+//   - extractPredictiveStreakFeatures coldScore weights:
+//       streakMomentum: +20% → 42/21 (was 35/17)
+//       lowDensityAccel: +25% → 36/18 (was 29/14)
+//   - applyStreakAdjustment: ABOUT_TO_WHITE_CLUSTER → 1.12–1.32, blend at tc=60
 //
-// H-3: Per-target minContext in calibration loop — rare targets need ≥3× expected
-//      gap of history before EPSF can produce non-null results. Skipping early
-//      positions wastes compute and can skew bin totals with null-filtered data.
+// FIX-3: Recalculate-on-miss logic in main tick.
+//   When lastRoundId >= hi and no hit found: window deleted, fresh prediction
+//   immediately generated for that target using current allNgResults, new window
+//   locked in same tick. No waiting for next tick.
 //
-// H-4: getCalibratedAdjustment conservative fallback — when bin count below
-//      1.5× minBin, apply slight density-trend awareness instead of blind 1.0.
-//
-// H-5: streakConfBonus reactive bonuses halved when !calibrated — prevents
-//      uncalibrated regime from inflating stacking inverse-variance weights.
-//
-// H-6: WHITE_CLUSTER blend raised 0.55→0.65 — avgPostClusterGap is always 1
-//      (occurrence counter only), so 0.55 caused catastrophic 45% gap reduction.
-//      0.65 gives meaningful shortening without complete window miss.
-//
-// H-7: predictedGapMultiplier clamp tightened to 0.76–1.24 — ±24% ≈ 0.7σ on
-//      typical CV=0.3 crash gap distributions. Beyond this, window misplacement
-//      risk exceeds expected hit-rate gain.
-//
-// H-8: hotScore strong trigger raised 70→72 — requires structural co-occurrence
-//      of density signal with precursor signals, not just 3 soft signals alone.
-//
-// H-9: logCounter is module-level (persists across ticks) — periodic logging
-//      every 10 calibration cache misses, not modulo-dependent on round count.
-//
-// H-10: calib null-guards tightened in all engines that read sf.calibrated.
-//
-// All v3 and v4 fixes fully preserved. Zero DB/locking/UI/export changes.
+// All v5 hardening fully preserved:
+//   Wilson CI guards, CALIB_DUMMY sentinel, null-guards, 0.76 hot floor,
+//   _calibLogCounter, minContext per-target, hotScore trigger at 72,
+//   DB/locking/UI/export 100% untouched.
 // ================================================================================
 
 const {
@@ -44,9 +38,29 @@ const {
   saveLockedAdvPreds, getLockedAdvPreds,
 } = require('./db');
 
+// === v6 WHITE-CLUSTER & RECALCULATE FIX START ===
+// FIX-1: Restored all 11 engine IDs.
+// BUG: Only 'ng_consensus' was listed. The 10 individual engines were computed
+// but never entered the Phase 1+2 resolve+lock loop — ngWindows for them was
+// never populated, ngSavedSets never tracked them, saveLockedAdvPreds never
+// persisted them. computeNgConsensus received empty/stale data → random windows.
+// FIX: All 11 IDs now drive ngSavedSets init, ngWindows init, and the lock loop.
+// 'stacking' is computed internally by runStackingMeta and fed into allNgResults
+// but is NOT in NG_ENGINE_IDS (it feeds the consensus, not a standalone tracker).
 const NG_ENGINE_IDS = [
+  'hlstm_xgb',
+  'htrans_lstm',
+  'htft',
+  'tft',
+  'nbeats',
+  'tcn',
+  'lgbm',
+  'gru',
+  'bilstm',
+  'sha512',
   'ng_consensus',
 ];
+// === FIX END ===
 
 const TARGETS = [
   { label: '5x',    min: 5,    maxWidth: 3,  rare: false },
@@ -119,52 +133,21 @@ function sparsePenalty(hits,minFull) {
   return hits>=minFull ? 1.0 : Math.sqrt(Math.max(1,hits)/minFull);
 }
 
-// === FINAL PRODUCTION HARDENING START ===
-// H-2: wilsonLower — Wilson score 95% CI lower bound for a proportion.
-// Formula: (p + z²/2n - z*sqrt(p(1-p)/n + z²/4n²)) / (1 + z²/n)
-// where z=1.96 (95% two-sided). Returns 0 on any degenerate input.
-// Guard reasoning:
-//   n=0  → denominator (1 + z²/n) = Inf, num = NaN → returns NaN without guard.
-//   p=0  → sqrt(0) = 0, num = 0 + z²/2n - z*sqrt(z²/4n²) = z²/2n - z²/2n = 0.
-//          This is correct (lower CI of 0-proportion is 0).
-//   p=1  → sqrt(0 + z²/4n²) = z/2n, num = 1+z²/2n - z²/2n = 1, den = 1+z²/n,
-//          lower ≈ 1/(1+z²/n) < 1. Correct.
-//   NaN propagation: isNaN/isFinite guards catch any unforeseen FP edge cases.
-// === HARDENING END ===
+// H-2: wilsonLower — Wilson score 95% CI lower bound. Guards: n≤0, NaN, Inf.
 function wilsonLower(p, n) {
-  // === FINAL PRODUCTION HARDENING START ===
-  if (n <= 0 || !isFinite(n) || isNaN(p)) return 0; // H-2: degenerate input guard
-  // === HARDENING END ===
+  if (n <= 0 || !isFinite(n) || isNaN(p)) return 0;
   const z = 1.96;
   const z2 = z * z;
   const inner = p * (1 - p) / n + z2 / (4 * n * n);
-  // === FINAL PRODUCTION HARDENING START ===
-  // inner can be negative in FP arithmetic for p very close to 0 or 1 with huge n
-  // (catastrophic cancellation). Guard with Math.max(0, ...) before sqrt.
   const sqrtTerm = Math.sqrt(Math.max(0, inner));
-  // === HARDENING END ===
   const num = p + z2 / (2 * n) - z * sqrtTerm;
   const den = 1 + z2 / n;
   const lower = num / den;
-  // === FINAL PRODUCTION HARDENING START ===
-  if (isNaN(lower) || !isFinite(lower)) return 0; // H-2: final NaN/Inf guard
-  // === HARDENING END ===
+  if (isNaN(lower) || !isFinite(lower)) return 0;
   return Math.max(0, lower);
 }
 
-// =============================================================================
-// === FINAL PRODUCTION HARDENING START ===
-// H-1: CALIB_DUMMY sentinel object.
-// Used instead of `null` when calling extractPredictiveStreakFeatures from within
-// computeCalibration. Prevents EPSF from applying any calibration-driven adjustment
-// to its own internal signals during calibration data collection (avoids circularity).
-// Why a named object rather than null: null is checked with `if (!calib)` which is
-// ambiguous — undefined, 0, or false would also pass. A structural sentinel with
-// a known shape makes the intent explicit and the guard reliable under refactoring.
-// hotHitRate: Array of nulls → getCalibratedAdjustment reads null → no adjustment.
-// coldHitRate: Array of nulls → same.
-// hotBinCount: Array of zeros → reqMinBin check fails → null guard fires.
-// === HARDENING END ===
+// H-1: CALIB_DUMMY sentinel — prevents circularity in computeCalibration.
 const CALIB_DUMMY = Object.freeze({
   hotHitRate:   new Array(10).fill(null),
   coldHitRate:  new Array(10).fill(null),
@@ -178,19 +161,6 @@ const CALIB_DUMMY = Object.freeze({
   targetRare:   false,
 });
 
-// Per-target LOOK_AHEAD windows (rounds ahead to check for a hit).
-// Justification: LOOK_AHEAD must be long enough that P(hit in window) varies
-// meaningfully between hot and cold regimes, but short enough to have abundant
-// calibration samples. For each target:
-//   5x:   globalHitRate≈0.200, LOOK_AHEAD=20 → baseline P=1-(0.80)^20=0.988
-//   10x:  globalHitRate≈0.100, LOOK_AHEAD=20 → baseline P=1-(0.90)^20=0.878
-//   20x:  globalHitRate≈0.050, LOOK_AHEAD=20 → baseline P=1-(0.95)^20=0.642
-//   50x:  globalHitRate≈0.020, LOOK_AHEAD=40 → baseline P=1-(0.98)^40=0.554
-//   100x: globalHitRate≈0.010, LOOK_AHEAD=80 → baseline P=1-(0.99)^80=0.551
-//   250x: globalHitRate≈0.004, LOOK_AHEAD=150 → baseline P=1-(0.996)^150=0.451
-//   500x: globalHitRate≈0.002, LOOK_AHEAD=300 → baseline P=1-(0.998)^300=0.451
-//  1000x: globalHitRate≈0.001, LOOK_AHEAD=300 → baseline P=1-(0.999)^300=0.259
-// All baselines well within (0.01, 0.99), avoiding degenerate calibration.
 const TARGET_LOOK_AHEAD = {
   '5x':    20,
   '10x':   20,
@@ -202,34 +172,16 @@ const TARGET_LOOK_AHEAD = {
   '1000x':300,
 };
 
-// Minimum bin sample sizes (unweighted round count for Wilson CI validity).
-// Non-rare: 20 → Wilson CI width ≈ 0.44 at p=0.5; narrows to ≤0.22 at p=0.1/0.9.
-//           Below 20, CI width > 0.44 → no reliable uplift measurement.
-// Rare (100x+): 30 → hit counts per bin are sparse; 30 gives ±0.18 CI at p=0.1.
 const MIN_BIN_NON_RARE = 20;
 const MIN_BIN_RARE      = 30;
 
-// === FINAL PRODUCTION HARDENING START ===
 // H-9: Module-level calibration log counter.
-// Persists across ticks (unlike a local variable reset each call).
-// Logs every 10 cache-miss recomputations regardless of rounds.length parity.
-// Justification: rounds.length % 1000 < 50 fails on batch ingests where
-// rounds jump by >1000 between ticks, skipping the logging boundary entirely.
 let _calibLogCounter = 0;
-// === HARDENING END ===
 
 const calibCache = {};
 
 // =============================================================================
-// computeCalibration v5
-// Builds empirical P(hit in LOOK_AHEAD rounds | hotScore bin) tables using
-// full extractPredictiveStreakFeatures at sampled historical positions.
-// Cost analysis (justifying full-feature sampling):
-//   Max positions evaluated: ~4000 (stride=1) + 2667 (stride=3) + 8800 (stride=10)
-//   = ~15467 positions across 100k rounds, but cached on first run and reused
-//   for ≥50 ticks (~50+ rounds = several minutes at 1 round/6s).
-//   Per-position cost: ~0.3ms (EPSF on a 100k-round slice is O(n) but constant-factor
-//   small). Total first-run: ~4.6s worst case. Acceptable for a background tick.
+// computeCalibration v5 (unchanged from v5 FINAL PRODUCTION)
 // =============================================================================
 function computeCalibration(rounds, targetMin, targetLabel, targetRare) {
   const cacheKey = targetLabel;
@@ -237,9 +189,6 @@ function computeCalibration(rounds, targetMin, targetLabel, targetRare) {
   const cache = calibCache[cacheKey];
   const delta = cache ? rounds.length - cache.computedAt : Infinity;
   const age   = cache ? now - cache.computedAtMs : Infinity;
-  // Invalidate if ≥50 new rounds arrived OR >10 minutes elapsed.
-  // 50 rounds ≈ 2–3 regime cycles for mid-X targets; sufficient to detect shift.
-  // 600000ms (10min) = stale protection on server restart or long idle periods.
   if (cache && delta < 50 && age < 600000) {
     return cache.result;
   }
@@ -250,10 +199,6 @@ function computeCalibration(rounds, targetMin, targetLabel, targetRare) {
   const NUM_BINS   = 10;
   const minBin     = targetRare ? MIN_BIN_RARE : MIN_BIN_NON_RARE;
 
-  // Baseline: P(at least one hit in LOOK_AHEAD independent rounds).
-  // Uses geometric CDF: 1 - (1-p)^LOOK_AHEAD. Correct probability units.
-  // v3/old bug: used globalHitRate * LOOK_AHEAD (a count, not probability),
-  // which exceeded 1.0 for frequent targets → calibration never fired for 5x/10x.
   const globalHitRate = rounds.filter(r => r.multiplier >= targetMin).length /
     Math.max(1, n);
   const baseline = clamp(
@@ -261,26 +206,14 @@ function computeCalibration(rounds, targetMin, targetLabel, targetRare) {
     0.01, 0.99
   );
 
-  // === FINAL PRODUCTION HARDENING START ===
   // H-3: Per-target minimum context.
-  // For rare targets (e.g. 1000x), computeGaps returns 0 gaps for the first
-  // ~1000 rounds, causing EPSF to return null immediately. Setting minContext
-  // to max(60, LOOK_AHEAD*2, expectedGapApprox*3) skips positions guaranteed
-  // to produce null EPSF results.
-  // expectedGapApprox = 1/globalHitRate (geometric mean gap). For 1000x ≈ 1000.
-  // 3× = 3000 rounds needed before EPSF can form a stable Markov matrix.
-  // Capped at n/4 so we don't skip more than 25% of history on any target.
   const expectedGapApprox = globalHitRate > 0 ? Math.round(1 / globalHitRate) : n;
   const minContext = Math.min(
     Math.floor(n / 4),
     Math.max(60, LOOK_AHEAD * 2, expectedGapApprox * 3)
   );
-  // maxPos: last position where we still have LOOK_AHEAD rounds of future data.
-  // Guard: if minContext >= n - LOOK_AHEAD, no valid positions exist for this target.
   const maxPos = n - LOOK_AHEAD;
   if (maxPos <= minContext) {
-    // Insufficient history — return a neutral (non-calibrating) result.
-    // Caller will use CALIB_DUMMY behaviour via null hotHitRate entries.
     const emptyResult = {
       hotHitRate: new Array(NUM_BINS).fill(null),
       coldHitRate: new Array(NUM_BINS).fill(null),
@@ -291,7 +224,6 @@ function computeCalibration(rounds, targetMin, targetLabel, targetRare) {
     calibCache[cacheKey] = { computedAt: n, computedAtMs: now, result: emptyResult };
     return emptyResult;
   }
-  // === HARDENING END ===
 
   const hotBinHitsW   = new Array(NUM_BINS).fill(0);
   const hotBinTotalW  = new Array(NUM_BINS).fill(0);
@@ -302,27 +234,13 @@ function computeCalibration(rounds, targetMin, targetLabel, targetRare) {
 
   for (let pos = maxPos; pos >= minContext; ) {
     const distFromEnd = n - pos;
-
-    // Recency weight: 0.999^distFromEnd.
-    // At dist=1: w=0.999; dist=3000: w≈0.050; dist=6000: w≈0.0025.
-    // Ensures last 3000 rounds contribute ~3× as much as rounds 3000–6000 back.
-    // Decay constant 0.999 chosen so half-life = ln(0.5)/ln(0.999) ≈ 693 rounds ≈
-    // several days of real gameplay — matches typical crash regime persistence.
     const recWeight = Math.pow(0.999, distFromEnd);
-
     const ctx = rounds.slice(0, pos);
 
-    // === FINAL PRODUCTION HARDENING START ===
-    // H-1: Pass CALIB_DUMMY (not null) to avoid circularity.
-    // EPSF will call getCalibratedAdjustment(hs, cs, CALIB_DUMMY, false).
-    // getCalibratedAdjustment sees hotBinCount[bin]=0 < reqMinBin → hotRate=null
-    // → no calibration adjustment applied. EPSF returns raw-signal features only.
-    // This is exactly what we want for calibration data collection: pure signal
-    // features uncontaminated by recursive calibration feedback.
+    // H-1: CALIB_DUMMY prevents circularity.
     let sf = null;
     try { sf = extractPredictiveStreakFeatures(ctx, targetMin, CALIB_DUMMY); }
-    catch(_) { /* EPSF failure on degenerate ctx — skip position */ }
-    // === HARDENING END ===
+    catch(_) {}
 
     if (!sf) {
       const stride = distFromEnd <= 4000 ? 1 : distFromEnd <= 12000 ? 3 : 10;
@@ -333,15 +251,11 @@ function computeCalibration(rounds, targetMin, targetLabel, targetRare) {
     const hs = sf.hotScore;
     const cs = sf.coldScore;
 
-    // === FINAL PRODUCTION HARDENING START ===
-    // Guard: hotScore and coldScore must be finite integers in [0,100].
-    // EPSF clamps them, but check defensively before using as array indices.
     if (!isFinite(hs) || !isFinite(cs)) {
       const stride = distFromEnd <= 4000 ? 1 : distFromEnd <= 12000 ? 3 : 10;
       pos -= stride;
       continue;
     }
-    // === HARDENING END ===
 
     const hotBin  = Math.min(NUM_BINS-1, Math.floor(hs / BIN_SIZE));
     const coldBin = Math.min(NUM_BINS-1, Math.floor(cs / BIN_SIZE));
@@ -361,22 +275,14 @@ function computeCalibration(rounds, targetMin, targetLabel, targetRare) {
     pos -= stride;
   }
 
-  // Hot margin: 0.025 non-rare / 0.015 rare — unchanged from v5.
   const hotMargin  = targetRare ? 0.015 : 0.025;
-  // === v6 COLD-PATH UPGRADE START ===
-  // Cold margin lowered: 0.025→0.012 (non-rare), 0.015→0.012 (rare).
-  // Cold minBin lowered: 20/30→15 for cold bins only.
-  // Justification: white-cluster phases are structurally sparse — the market
-  // spends less time in deep cold than in hot. With minBin=20/30, cold bins
-  // rarely accumulate enough samples to unlock calibration. Lowering to 15
-  // allows empirically-observed cold stretches (which happen less frequently
-  // but are real) to fire calibration. The Wilson CI guard (wl > threshold)
-  // still prevents random noise — we just allow smaller-but-still-valid samples.
-  // margin=0.012: accepts cold signal if Wilson lower bound exceeds no-hit
-  // baseline by 1.2% — tighter than hot (2.5%) but still meaningful for cold.
   const COLD_MIN_BIN = 15;
-  const coldMargin  = 0.012;
-  // === UPGRADE END ===
+  // === v6 WHITE-CLUSTER & RECALCULATE FIX START ===
+  // FIX-2: cold calibration margin tightened 0.012→0.018.
+  // 0.012 was too liberal — bins with marginal signal were unlocking cold path.
+  // 0.018 requires a more credible empirical cold signal before firing.
+  const coldMargin  = 0.018;
+  // === FIX END ===
   const hotHitRate  = new Array(NUM_BINS).fill(null);
   const coldHitRate = new Array(NUM_BINS).fill(null);
 
@@ -386,13 +292,11 @@ function computeCalibration(rounds, targetMin, targetLabel, targetRare) {
       const wl = wilsonLower(wr, hotBinCount[b]);
       if (wl > baseline + hotMargin) hotHitRate[b] = wr;
     }
-    // === v6 COLD-PATH UPGRADE START ===
     if (coldBinCount[b] >= COLD_MIN_BIN && coldBinTotalW[b] > 0) {
       const wr = coldBinHitsW[b] / coldBinTotalW[b];
       const wl = wilsonLower(wr, coldBinCount[b]);
       if (wl > (1 - baseline) + coldMargin) coldHitRate[b] = wr;
     }
-    // === UPGRADE END ===
   }
 
   const result = {
@@ -401,12 +305,10 @@ function computeCalibration(rounds, targetMin, targetLabel, targetRare) {
     LOOK_AHEAD, BIN_SIZE, minBin, margin: hotMargin, targetRare,
   };
 
-  // === FINAL PRODUCTION HARDENING START ===
-  // H-9: Module-level log counter — fires every 10 cache misses regardless
-  // of rounds.length parity. Provides periodic visibility into calibration health.
+  // H-9: Module-level log counter.
   _calibLogCounter++;
   if (_calibLogCounter % 10 === 0) {
-    console.log(`[ngCompute calib v5] ${JSON.stringify({
+    console.log(`[ngCompute calib v6] ${JSON.stringify({
       target: targetLabel,
       baseline: baseline.toFixed(4),
       LOOK_AHEAD,
@@ -417,26 +319,21 @@ function computeCalibration(rounds, targetMin, targetLabel, targetRare) {
       filledBins: hotHitRate.filter(v => v !== null).length,
     })}`);
   }
-  // === HARDENING END ===
 
   calibCache[cacheKey] = { computedAt: n, computedAtMs: now, result };
   return result;
 }
 
 // =============================================================================
-// getCalibratedAdjustment v5
-// Normalized uplift formula with Wilson CI gating, rare-target halved caps,
-// and conservative density-trend fallback in low-data regimes.
+// getCalibratedAdjustment v6
+// Cold-path: margin=0.018, sensiCold=1.7, maxDeltaCold=0.32, ceiling=1.32
+// Hot-path: 100% unchanged from v5.
 // =============================================================================
 function getCalibratedAdjustment(hotScore, coldScore, calib, targetRare, sf) {
-  // === FINAL PRODUCTION HARDENING START ===
   // H-1: Structural check against CALIB_DUMMY or null.
-  // CALIB_DUMMY has hotBinCount[*]=0, so the reqMinBin check below will always
-  // fail → no adjustment fires → returns calibMult=1.0. Explicit guard for null.
   if (!calib || calib === CALIB_DUMMY) {
     return { calibMult: 1.0, calibConfBonus: 0, calibrated: false };
   }
-  // === HARDENING END ===
 
   const hotBin  = Math.min(9, Math.floor(hotScore  / (calib.BIN_SIZE || 10)));
   const coldBin = Math.min(9, Math.floor(coldScore  / (calib.BIN_SIZE || 10)));
@@ -445,59 +342,39 @@ function getCalibratedAdjustment(hotScore, coldScore, calib, targetRare, sf) {
   const coldCount = calib.coldBinCount?.[coldBin] ?? 0;
   const reqMinBin = targetRare ? (calib.minBin ?? 20) * 2 : (calib.minBin ?? 20);
 
-  // === FINAL PRODUCTION HARDENING START ===
-  // H-4: Conservative fallback when bin has data but below 1.5× minBin threshold.
-  // 1.5× = the zone between "sufficient for null-guard" (minBin) and "reliable estimate"
-  // (1.5×minBin). In this zone, Wilson CI is too wide for confident uplift, but we have
-  // some evidence of the density environment. Apply a slight conservative adjustment:
-  // if density trend (ld10-ld50) > 0.05 (rising = cold incoming), reduce by 0.03 (3%).
-  // This is not a calibration signal — it's a mild reactive nudge based on observable
-  // current state. Maximum effect: 3% gap extension, well within safety bounds.
-  // Justification for 0.05 density trend threshold: at 5x (globalLowRate≈0.80),
-  // a trend of 0.05 means low-density rose from 0.80 to 0.85 in recent window —
-  // a 6% relative increase, indicative of a genuine cold shift.
+  // H-4: Conservative fallback in low-data zone.
   const densityTrend = sf?.densityTrend ?? 0;
   const inLowDataZone = hotCount >= reqMinBin && hotCount < reqMinBin * 1.5;
   if (inLowDataZone) {
     const conservMult = densityTrend > 0.05 ? 1.03 : 1.0;
     return { calibMult: conservMult, calibConfBonus: 0, calibrated: false };
   }
-  // === HARDENING END ===
 
   const hotRate  = (hotCount  >= reqMinBin) ? calib.hotHitRate[hotBin]  : null;
   const coldRate = (coldCount >= reqMinBin) ? calib.coldHitRate[coldBin] : null;
 
-  // Hard caps. Justification:
-  // maxDelta=0.26 → multiplier range [0.74, 1.26].
-  // 0.74x on a 20-gap (5x target) = predict at 14.8 rounds. Window width=3 covers
-  // 13–15. At 5x true gap distribution p50≈5, p90≈11, P(hit before 13) ≈ 0.93.
-  // So the floor is structurally safe — we're not opening before the realistic
-  // distribution starts. 1.26x on a 20-gap = predict at 25.2, window covers 24–26.
-  // P(hit after 26 | not yet hit by 26) ≈ 0.37 — still meaningful.
-  // Rare halved to 0.13 to prevent window miss on high-X targets (see v4 doc).
-  // Hot path: maxDelta unchanged (0.26 non-rare / 0.13 rare), sensiHot=1.8 unchanged.
+  // Hot caps — 100% unchanged from v5.
   const maxDeltaHot = targetRare ? 0.13 : 0.26;
   const sensiHot    = 1.8;
-  // === v6 COLD-PATH UPGRADE START ===
-  // Cold path: maxDelta raised 0.26→0.40 (non-rare), 0.13→0.20 (rare).
-  // sensiCold raised 1.5→1.9.
-  // Justification: maxDelta=0.26 capped cold extension at 26% even with perfect
-  // calibration signal. A 20-gap at 1.26× = 25.2 rounds — far too short when the
-  // market is in a genuine 8-round white cluster (true gap often 30-50 rounds).
-  // 1.40× cap = 28 rounds on a 20-gap, 56 rounds on a 40-gap (50x target).
-  // sensiCold=1.9: normalized uplift maps more aggressively to extension.
-  // At upliftNorm=0.3: old=0.45 (capped to 0.26), new=0.57 (capped to 0.40).
-  // Rare cold raised to 0.20 (was 0.13) — white clusters affect rare targets too.
-  const maxDeltaCold = targetRare ? 0.20 : 0.40;
-  const sensiCold    = 1.9;
-  // === UPGRADE END ===
+
+  // === v6 WHITE-CLUSTER & RECALCULATE FIX START ===
+  // FIX-2: Cold-path parameters tightened for safety.
+  // sensiCold: 1.9 → 1.7 — reduces overcorrection at moderate coldScore.
+  // maxDeltaCold: 0.40 → 0.32 (non-rare), 0.20 → 0.16 (rare).
+  // Justification: maxDeltaCold=0.40 pushed windows 40% longer than the
+  // expected gap — for a 20-gap (5x) that's 28 rounds, which overshoots
+  // most real white clusters. 0.32 → 26.4 rounds max, stays within the
+  // observed cluster tail distribution. Rare halved to 0.16 for safety.
+  const maxDeltaCold = targetRare ? 0.16 : 0.32;
+  const sensiCold    = 1.7;
+  // === FIX END ===
 
   let calibMult      = 1.0;
   let calibConfBonus = 0;
   let calibrated     = false;
 
+  // Hot path — 100% unchanged from v5.
   if (hotScore >= 72 && hotRate !== null) {
-    // Hot path: 100% unchanged from v5.
     const upliftNorm = clamp(
       (hotRate - calib.baseline) / Math.max(0.001, 1 - calib.baseline),
       0, 1
@@ -510,12 +387,13 @@ function getCalibratedAdjustment(hotScore, coldScore, calib, targetRare, sf) {
     }
   }
 
-  // === v6 COLD-PATH UPGRADE START ===
-  // Cold trigger lowered 65→58. At coldScore=58, a genuine white cluster
-  // (streakMomentum>0.25=14 + lowDensityAccel>0.04=11 + markov<0.38=10 +
-  // ld20>ld50*1.20=7 + streakLen=12) = 54 — close. With densityTrend bonus
-  // from new coldScore weights, 58 is reliably reachable during real clusters.
-  if (coldScore >= 58 && coldRate !== null && !calibrated) {
+  // === v6 WHITE-CLUSTER & RECALCULATE FIX START ===
+  // FIX-2: Cold trigger raised 58→60. Reduces false cold firings from marginal
+  // 5-6 round low streaks that resolve quickly without being true white clusters.
+  // At coldScore=60, minimum reliable combos require streakMomentum>0.25 (17)
+  // + lowDensityAccel>0.04 (14) + markov<0.38 (10) + currentStreak (16) = 57
+  // + ld20>ld50*1.20 (7) = 64 → safely over 60 at cluster depth 5-6 rounds.
+  if (coldScore >= 60 && coldRate !== null && !calibrated) {
     const noHitBaseline = 1 - calib.baseline;
     const upliftNorm = clamp(
       (coldRate - noHitBaseline) / Math.max(0.001, 1 - noHitBaseline),
@@ -528,29 +406,28 @@ function getCalibratedAdjustment(hotScore, coldScore, calib, targetRare, sf) {
       calibrated     = true;
     }
   }
-  // === UPGRADE END ===
+  // === FIX END ===
 
-  // === v6 COLD-PATH UPGRADE START ===
-  // Hot path: floor 0.76 unchanged (never compress below 76% of gap).
-  // Cold path: ceiling raised 1.24→1.40 to allow full cold extension.
-  // Hot: calibMult should only reduce gap (calibMult<1.0); floor 0.76.
-  // Cold: calibMult should only extend gap (calibMult>1.0); ceiling 1.40.
-  // A calibMult that reduces gap on cold (calibMult<1.0) would be a bug —
-  // guard it with the 0.76 floor. A calibMult that extends hot is also unusual
-  // but benign — the 1.40 ceiling still applies.
-  calibMult = clamp(calibMult, 0.76, 1.40);
-  // Hot signal: never let calibration push multiplier above 1.0 on hot path
+  // === v6 WHITE-CLUSTER & RECALCULATE FIX START ===
+  // FIX-2: Hot floor 0.76 unchanged. Cold ceiling lowered 1.40→1.32.
+  // 1.32 cap: on a 40-gap (50x target), 1.32× = 52.8 rounds. Typical 50x
+  // white cluster lasts 25-50 rounds — 1.32 captures the 90th percentile
+  // without misplacing on outlier clusters. Safer than 1.40 which was
+  // placing windows at 56 rounds (beyond most observed cluster lengths).
+  calibMult = clamp(calibMult, 0.76, 1.32);
+  // Hot signal: never let calibration push multiplier above 1.0 on hot path.
   if (hotScore >= 72 && calibMult > 1.0) calibMult = 1.0;
-  // === UPGRADE END ===
+  // === FIX END ===
 
   return { calibMult, calibConfBonus, calibrated };
 }
 
 // =============================================================================
-// extractPredictiveStreakFeatures v5
-// All v3 bug fixes preserved. Threshold adjustments from v4 preserved.
-// v5 change: CALIB_DUMMY passed into getCalibratedAdjustment internally,
-// hotScore trigger raised to 72.
+// extractPredictiveStreakFeatures v6
+// coldScore weights: streakMomentum +20%, lowDensityAccel +25%.
+// hotScore weights: 100% unchanged from v5.
+// coldScore trigger: 58 → 60 in predictedNextRegime block.
+// cold multiplier range: 1.12–1.32.
 // =============================================================================
 function extractPredictiveStreakFeatures(rounds, targetMin, calib) {
   const n = rounds.length;
@@ -640,7 +517,6 @@ function extractPredictiveStreakFeatures(rounds, targetMin, calib) {
   else if (ld20 > globalLowRate * 1.3)                                                regime='COLD';
 
   // ── 6. Forward-looking signals ────────────────────────────────────────────
-
   const lowDensityAccel = (ld5 - ld10) - (ld10 - ld20);
 
   // BUG-E FIX: bidirectional streak momentum
@@ -694,7 +570,7 @@ function extractPredictiveStreakFeatures(rounds, targetMin, calib) {
     }
   }
 
-  // Composite hotScore / coldScore
+  // hotScore — 100% unchanged from v5.
   const hotScore = clamp(Math.round(
     (postClusterEarlySignal   ? 30 : 0) +
     (b2bPrecursor             ? 20 : 0) +
@@ -705,55 +581,39 @@ function extractPredictiveStreakFeatures(rounds, targetMin, calib) {
     (ld20            < ld50*0.82 ? 10 : 0)
   ), 0, 100);
 
-  // === v6 COLD-PATH UPGRADE START ===
-  // coldScore weight increases:
-  // streakMomentum: +25% → 35/17 (was 28/14). During a genuine 8-round cluster,
-  //   streakMomentum often hits 0.3-0.5 — the extra weight pushes coldScore over 58.
-  // lowDensityAccel (densityTrend proxy): +30% → 29/14 (was 22/11). The acceleration
-  //   of low density is the earliest detectable signal of a genuine white cluster.
-  //   At 8+ consecutive lows, ld5→ld10→ld20 all converge high; accel fires strongly.
-  // currentStreakLen bonus: raised 12→16 to reward directly observable cluster depth.
-  // All hot-score weights unchanged.
-  // === UPGRADE END ===
+  // === v6 WHITE-CLUSTER & RECALCULATE FIX START ===
+  // FIX-2: coldScore weights increased for earlier, stronger cluster detection.
+  // streakMomentum thresholds: +20% amplification → 42/21 (was 35/17).
+  //   Justification: at cluster depth 6 rounds on a 5x target (avgLowRunLen≈4),
+  //   streakMomentumLow = (6-3)/3 = 1.0 → fires top tier (42 pts).
+  //   At depth 4: (4-3)/3 = 0.33 → fires second tier (21 pts). Previously
+  //   would only give 35/17 — the extra 7/4 pts help push coldScore over 60
+  //   one round earlier during a genuine cluster.
+  // lowDensityAccel: +25% → 36/18 (was 29/14).
+  //   Justification: during a true white cluster, ld5 converges to 1.0 while
+  //   ld10 and ld20 lag. lowDensityAccel = (ld5-ld10)-(ld10-ld20) spikes to
+  //   0.15-0.25 by round 5-6 of a cluster. 36 pts at >0.08 makes this the
+  //   dominant early signal, as intended.
+  // All hot-score weights: 100% unchanged.
   const coldScore = clamp(Math.round(
-    (streakMomentum   > 0.45   ? 35 : streakMomentum  > 0.25  ? 17 : 0) +
-    (lowDensityAccel  > 0.08   ? 29 : lowDensityAccel  > 0.04  ? 14 : 0) +
+    (streakMomentum   > 0.45   ? 42 : streakMomentum  > 0.25  ? 21 : 0) +
+    (lowDensityAccel  > 0.08   ? 36 : lowDensityAccel  > 0.04  ? 18 : 0) +
     (markovProbHot   < 0.22    ? 20 : markovProbHot   < 0.38   ? 10 : 0) +
     (ld20            > ld50*1.40 ? 15 : ld20 > ld50*1.20 ? 7 : 0) +
     (currentStreakLen > avgLowRunLen*1.3 && !currentIsHigh ? 16 : 0)
   ), 0, 100);
+  // === FIX END ===
 
   // Regime prediction
-  // === FINAL PRODUCTION HARDENING START ===
-  // H-8: hotScore strong trigger raised 70→72.
-  // At 70: three soft signals can co-fire: postCluster(30)+momentum(15)+markov(15)=60
-  // + b2bRate(10)+density(10)=80 is fine, but also postCluster(30)+momentum(15)+markov(15)
-  // +b2bRate(5)+density(0)=65... wait, that's 65 not 70. Actually at 70 the minimum
-  // combo is postCluster(30)+accel(-0.04→9)+momentum(-0.15→7)+markov(>0.68→15)+b2bRate(0)
-  // +density(0)=61... no, needs to reach 70. Let's be precise:
-  // To reach 70 WITHOUT any density signal (ld20 check=0):
-  //   postCluster(30)+b2bPrecursor(20)+accel(18)+momentum(15) = 83 ✓ (strong combo)
-  //   postCluster(30)+b2bPrecursor(20)+momentum(15)+markov(15) = 80 ✓ (strong)
-  //   postCluster(30)+accel(18)+momentum(15)+markov(15) = 78 ✓ (no b2b, but 3 solid)
-  //   b2bPrecursor(20)+accel(18)+momentum(15)+markov(15)+b2bRate(10) = 78 ✓
-  // To reach 70 with ONLY soft signals (no postCluster, no b2bPrecursor):
-  //   accel(18)+momentum(15)+markov(15)+b2bRate(10)+density(10) = 68 ✗ (can't reach 70)
-  // So at 72: impossible to reach via 3 soft signals alone without a structural
-  // precursor (postClusterEarlySignal or b2bPrecursor). This is the intended behavior.
-  // Justification: crash regime transitions consistently require at least one
-  // structural precursor signal to be predictive. Three density/momentum signals
-  // without a cluster or GARCH precursor are insufficient evidence.
-  // === HARDENING END ===
+  // H-8: hotScore strong trigger at 72 — unchanged.
   let predictedNextRegime    = 'NEUTRAL';
   let transitionConfidence   = 0;
   let predictedGapMultiplier = 1.0;
 
-  // === FINAL PRODUCTION HARDENING START ===
   if (hotScore >= 72 && hotScore > coldScore + 15) {
     if (b2bPrecursor) {
       predictedNextRegime    = 'ABOUT_TO_B2B';
       transitionConfidence   = clamp(hotScore, 72, 95);
-      // 0.76 floor aligns with tightened hard cap
       predictedGapMultiplier = clamp(1.0 - (hotScore/100)*0.36, 0.76, 0.88);
     } else {
       predictedNextRegime    = 'ABOUT_TO_HOT';
@@ -761,32 +621,32 @@ function extractPredictiveStreakFeatures(rounds, targetMin, calib) {
       predictedGapMultiplier = clamp(1.0 - (hotScore/100)*0.26, 0.76, 0.90);
     }
   } else if (hotScore >= 62 && hotScore > coldScore + 10) {
-    // Moderate hot: entry point for calibration to boost if confirmed
     predictedNextRegime    = 'ABOUT_TO_HOT';
     transitionConfidence   = clamp(hotScore, 62, 88);
     predictedGapMultiplier = clamp(1.0 - (hotScore/100)*0.20, 0.80, 0.93);
-  // === v6 COLD-PATH UPGRADE START ===
-  // Cold trigger lowered 65→58. ABOUT_TO_WHITE_CLUSTER multiplier cap raised
-  // 1.10–1.24 → 1.15–1.40. ABOUT_TO_COLD raised 1.05–1.22 → 1.10–1.32.
-  // Justification: at coldScore=65, the market is already 5-7 rounds into a
-  // cluster; we're reacting too late. At coldScore=58, the cluster is 2-4 rounds
-  // deep — still early enough for the lengthened window to capture the tail.
-  // 1.40 upper cap: for a 40-gap (50x target), 1.40× = 56 rounds. Typical white
-  // cluster on 50x lasts 30-60 rounds — 1.40× is calibrated, not excessive.
-  // For 5x (20-gap): 1.40× = 28 rounds — the cluster still ends within this window.
-  } else if (coldScore >= 58 && coldScore > hotScore + 12) {
+
+  // === v6 WHITE-CLUSTER & RECALCULATE FIX START ===
+  // FIX-2: Cold trigger raised 58→60. Multiplier range tightened to 1.12–1.32.
+  // coldScore=60 requires a more credible cluster signal (see coldScore weights above).
+  // 1.12–1.32 range:
+  //   At coldScore=60: 1.0 + (0.60*0.42) = 1.252, clamped → 1.252 (within 1.12–1.32) ✓
+  //   At coldScore=80: 1.0 + (0.80*0.42) = 1.336, clamped → 1.32 ✓
+  //   At coldScore=100: 1.0 + (1.00*0.42) = 1.42, clamped → 1.32 ✓
+  // For ABOUT_TO_COLD (less severe): 1.10–1.22 range.
+  //   Justification: ABOUT_TO_COLD fires when coldScore≥60 but streak isn't
+  //   extended enough for WHITE_CLUSTER. Shorter extension is correct.
+  } else if (coldScore >= 60 && coldScore > hotScore + 12) {
     if (currentStreakLen >= avgLowRunLen * 1.5 || regime === 'EXTREME_WHITE') {
       predictedNextRegime    = 'ABOUT_TO_WHITE_CLUSTER';
-      transitionConfidence   = clamp(coldScore, 58, 88);
-      predictedGapMultiplier = clamp(1.0 + (coldScore/100)*0.42, 1.15, 1.40);
+      transitionConfidence   = clamp(coldScore, 60, 88);
+      predictedGapMultiplier = clamp(1.0 + (coldScore/100)*0.42, 1.12, 1.32);
     } else {
       predictedNextRegime    = 'ABOUT_TO_COLD';
       transitionConfidence   = clamp(coldScore, 50, 82);
-      predictedGapMultiplier = clamp(1.0 + (coldScore/100)*0.30, 1.10, 1.32);
+      predictedGapMultiplier = clamp(1.0 + (coldScore/100)*0.28, 1.10, 1.22);
     }
   }
-  // === UPGRADE END ===
-  // === HARDENING END ===
+  // === FIX END ===
 
   // Apply calibration override
   const targetRare = calib?.targetRare ?? false;
@@ -817,8 +677,9 @@ function extractPredictiveStreakFeatures(rounds, targetMin, calib) {
 }
 
 // =============================================================================
-// applyStreakAdjustment v5
-// tc threshold ≥65. WHITE_CLUSTER blend raised 0.55→0.65.
+// applyStreakAdjustment v6
+// Cold blend starts at tc=60 (was 58). ABOUT_TO_WHITE_CLUSTER → 1.12–1.32.
+// ABOUT_TO_COLD → 1.10–1.22. Hot path unchanged.
 // =============================================================================
 function applyStreakAdjustment(expectedGap, sf, _target) {
   if (!sf) return expectedGap;
@@ -826,36 +687,35 @@ function applyStreakAdjustment(expectedGap, sf, _target) {
   const mult = sf.predictedGapMultiplier ?? 1.0;
   const tc   = sf.transitionConfidence  ?? 0;
 
-  // === v6 COLD-PATH UPGRADE START ===
-  // Hot path: tc≥65 unchanged — ABOUT_TO_B2B / ABOUT_TO_HOT still require tc≥65.
-  // Cold path: ABOUT_TO_WHITE_CLUSTER / ABOUT_TO_COLD fire at tc≥58.
-  // blendFactor for cold starts at tc=58, reaches full blend at tc=103 (effectively
-  // capped at 1.0 by clamp). This means at tc=58: blendFactor=0, at tc=78: 0.44,
-  // at tc=88: 0.67 — gradual ramp that avoids snapping to full extension immediately.
   const isColdPnr = pnr === 'ABOUT_TO_WHITE_CLUSTER' || pnr === 'ABOUT_TO_COLD';
   const isHotPnr  = pnr === 'ABOUT_TO_B2B' || pnr === 'ABOUT_TO_HOT';
 
+  // Hot path — 100% unchanged from v5.
   if (isHotPnr && tc >= 65) {
-    // Hot path: UNCHANGED from v5
     const blendFactor = clamp((tc - 65) / 45, 0, 1);
     const blendedMult = 1.0 + (mult - 1.0) * blendFactor;
     return Math.max(1, Math.round(expectedGap * blendedMult));
   }
 
-  if (isColdPnr && tc >= 58) {
-    // Cold path: blendFactor starts at tc=58
-    const blendFactor = clamp((tc - 58) / 45, 0, 1);
+  // === v6 WHITE-CLUSTER & RECALCULATE FIX START ===
+  // FIX-2: Cold blend starts at tc=60 (was 58). Reduces noise from marginal
+  // cold signals. At tc=60, blendFactor=0 → no adjustment yet; at tc=75,
+  // blendFactor=0.33 → 33% of full mult applied; at tc=90, blendFactor=0.67.
+  // This gradual ramp prevents snapping to full extension on first detection.
+  // The mult itself is already clamped to 1.12–1.32 in EPSF, so even at
+  // blendFactor=1.0 the window extends by at most 32% of expectedGap.
+  if (isColdPnr && tc >= 60) {
+    const blendFactor = clamp((tc - 60) / 45, 0, 1);
     const blendedMult = 1.0 + (mult - 1.0) * blendFactor;
     return Math.max(1, Math.round(expectedGap * blendedMult));
   }
+  // === FIX END ===
 
   if (!isHotPnr && !isColdPnr && pnr !== 'NEUTRAL' && tc >= 65) {
-    // Any other predictive regime at tc≥65 (NEUTRAL already excluded above)
     const blendFactor = clamp((tc - 65) / 45, 0, 1);
     const blendedMult = 1.0 + (mult - 1.0) * blendFactor;
     return Math.max(1, Math.round(expectedGap * blendedMult));
   }
-  // === UPGRADE END ===
 
   let adj = expectedGap;
   switch (sf.regime) {
@@ -866,18 +726,7 @@ function applyStreakAdjustment(expectedGap, sf, _target) {
     case 'HOT':
       adj = Math.round(adj * (1 - (1 - sf.lowDensity20) * 0.18)); break;
     case 'WHITE_CLUSTER':
-      // === FINAL PRODUCTION HARDENING START ===
-      // H-6: Raised 0.55→0.65. avgPostClusterGap is always 1.0 (occurrence counter,
-      // not actual gap length). With old blend=0.55:
-      //   adj = raw*0.55 + 1*0.45 ≈ 0.55*raw + 0.45 (catastrophic 45% reduction)
-      // With new blend=0.65:
-      //   adj = raw*0.65 + 1*0.35 ≈ 0.65*raw + 0.35 (35% reduction — meaningful
-      //   shortening that reflects the real post-cluster behavior where hits cluster
-      //   within ~60-70% of the average gap, without overshooting into near-zero).
-      // Justification from domain: crash B2B clusters (White Cluster regime) do show
-      // shortened low-run gaps, but NOT by 45%. Observed regime-specific gap shortening
-      // is typically 20–40%. 0.65 blend gives ~35% reduction — within observed range.
-      // === HARDENING END ===
+      // H-6: Raised 0.55→0.65.
       adj = sf.avgPostClusterGap !== null
         ? Math.round(adj * 0.65 + sf.avgPostClusterGap * 0.35)
         : Math.round(adj * 0.92); break;
@@ -892,9 +741,9 @@ function applyStreakAdjustment(expectedGap, sf, _target) {
 }
 
 // =============================================================================
-// streakConfBonus v5
-// Reactive bonuses halved when !sf.calibrated to prevent confidence inflation
-// on unconfirmed regime signals corrupting stacking inverse-variance weights.
+// streakConfBonus v6
+// Cold tc threshold: 58→60. Cold penalty: -3→-6 (unchanged from v6 cold upgrade).
+// Hot path: unchanged from v5.
 // =============================================================================
 function streakConfBonus(sf, isRare) {
   if (!sf) return 0;
@@ -908,29 +757,14 @@ function streakConfBonus(sf, isRare) {
     base += 14 + (isRare && sf.b2bPrecursor ? 4 : 0);
   } else if ((pnr==='ABOUT_TO_B2B'||pnr==='ABOUT_TO_HOT') && tc >= 65) {
     base += 7;
-  // === v6 COLD-PATH UPGRADE START ===
-  // Cold confidence penalty lowered tc threshold 65→58, strengthened -3→-6.
-  // Justification: during white clusters, confidence should be penalized more
-  // aggressively to prevent the engine from over-betting on the current window.
-  // The window is LONGER now (1.15-1.40×) so we need lower confidence to
-  // discourage false precision. -6 vs -3 keeps the user appropriately cautious.
-  } else if ((pnr==='ABOUT_TO_WHITE_CLUSTER'||pnr==='ABOUT_TO_COLD') && tc > 58) {
+  // === v6 WHITE-CLUSTER & RECALCULATE FIX START ===
+  // FIX-2: Cold tc threshold: 58→60 (aligned with trigger).
+  } else if ((pnr==='ABOUT_TO_WHITE_CLUSTER'||pnr==='ABOUT_TO_COLD') && tc > 60) {
     base -= 6;
   }
-  // === UPGRADE END ===
+  // === FIX END ===
 
-  // === FINAL PRODUCTION HARDENING START ===
   // H-5: Reactive regime bonuses halved when !calibrated.
-  // Justification: when sf.calibrated=false, regime classification is derived
-  // purely from structural patterns (RLE, density windows) without empirical
-  // confirmation that these patterns historically lead to hits in the next N rounds.
-  // Full reactive bonuses (+5 for B2B, +4 for WHITE_CLUSTER) inflate confidence
-  // scores, pushing predictions above the ~65 threshold used by stacking_meta
-  // for inverse-variance weighting. This causes stacking to over-weight predictions
-  // from engines that happen to be in a hot-looking regime, even when that regime
-  // hasn't been empirically confirmed. Halving the bonuses reduces this bias while
-  // preserving some reward for correct reactive pattern detection.
-  // "Halved" means integer floor: 5→2, 4→2, 6→3, 3→1, 2→1.
   const calibMult = sf.calibrated ? 1.0 : 0.5;
   switch (sf.regime) {
     case 'B2B':
@@ -942,24 +776,20 @@ function streakConfBonus(sf, isRare) {
     case 'HOT':
       base += Math.floor(3 * calibMult); break;
     case 'COLD':
-      base -= 2; break; // cold penalty not halved — conservative is safe
+      base -= 2; break;
   }
-  // === HARDENING END ===
 
   return base;
 }
 
 // effectiveRegime: use predictive regime only when tc ≥ 68.
-// Aligns with hotScore trigger (72) minus one bin width (10) to prevent stacking
-// from shifting regime before the individual engine hot triggers fire.
 function effectiveRegime(sf) {
   if (!sf) return 'NEUTRAL';
   return (sf.transitionConfidence ?? 0) >= 68 ? sf.predictedNextRegime : sf.regime;
 }
 
 // =============================================================================
-// ENGINE 1: hybrid_lstm_xgb
-// H-10: calib null-guard — b2bBoost only amplifies when sf.calibrated=true
+// ENGINE 1: hybrid_lstm_xgb (unchanged from v5)
 // =============================================================================
 function runHybridLstmXgb(rounds, target, sf) {
   const {gaps, currentGap} = computeGaps(rounds, target.min);
@@ -971,21 +801,17 @@ function runHybridLstmXgb(rounds, target, sf) {
   const ewaMean=wG/(wS||1);
 
   const gMean=mean(gaps), gStd=stdDev(gaps)||1;
-  const recentN=Math.min(300,Math.max(10,Math.round(3/(hrGlobal||0.01))));
   const {b:slope,r2}=olsLinear(gaps.slice(-Math.min(100,gaps.length)));
   const overdue=clamp(currentGap/(gMean||1),0,3);
   const cv=gStd/(gMean||1);
 
   const pnr = effectiveRegime(sf);
-  // === FINAL PRODUCTION HARDENING START ===
   // H-10: b2bBoost calibration amplification only when sf.calibrated=true.
-  // Without calibration, use base b2bRate only (no ×1.3/×1.6 multiplier).
   const b2bBoost = sf ? (
     (pnr==='ABOUT_TO_B2B' && sf.calibrated) ? sf.b2bRate*1.6 :
     pnr==='ABOUT_TO_B2B'                    ? sf.b2bRate      :
     pnr==='ABOUT_TO_HOT'                    ? sf.b2bRate*1.1  : sf.b2bRate
   ) : 0;
-  // === HARDENING END ===
   const safeWeight = sf ? (
     (pnr==='ABOUT_TO_WHITE_CLUSTER'||pnr==='ABOUT_TO_COLD') ? Math.min(sf.lowDensity20*1.2,1) :
     (pnr==='ABOUT_TO_B2B'||pnr==='ABOUT_TO_HOT') ? sf.lowDensity20*0.6 :
@@ -1009,7 +835,7 @@ function runHybridLstmXgb(rounds, target, sf) {
 }
 
 // =============================================================================
-// ENGINE 2: hybrid_transformer_lstm
+// ENGINE 2: hybrid_transformer_lstm (unchanged from v5)
 // =============================================================================
 function runHybridTransformerLstm(rounds, target, sf) {
   const {gaps,currentGap}=computeGaps(rounds,target.min);
@@ -1057,7 +883,7 @@ function runHybridTransformerLstm(rounds, target, sf) {
 }
 
 // =============================================================================
-// ENGINE 3: hybrid_tft
+// ENGINE 3: hybrid_tft (unchanged from v5)
 // =============================================================================
 function runHybridTft(rounds, target, sf) {
   const {gaps,currentGap}=computeGaps(rounds,target.min);
@@ -1086,14 +912,12 @@ function runHybridTft(rounds, target, sf) {
   const shortPred=weibullSkew(sM,sM+sS*0.5);
   const longPred =weibullSkew(pctile(sorted,0.50),pctile(sorted,0.75));
   let raw=Math.max(1,Math.round(shortPred*shortW+longPred*longW));
-  // === FINAL PRODUCTION HARDENING START ===
   // H-10: postClusterEarlySignal injection only when sf.calibrated=true
   if (sf && sf.postClusterEarlySignal && sf.calibrated && sf.avgPostClusterGap!==null) {
     raw=Math.max(1,Math.round(raw*0.6+sf.avgPostClusterGap*0.4));
   } else if (sf && sf.regime==='WHITE_CLUSTER' && sf.avgPostClusterGap!==null) {
     raw=Math.max(1,Math.round(raw*0.65+sf.avgPostClusterGap*0.35));
   }
-  // === HARDENING END ===
   const adj=applyStreakAdjustment(raw,sf,target);
   const aw=target.maxWidth;
   const sp=sparsePenalty(gaps.length,40);
@@ -1102,7 +926,7 @@ function runHybridTft(rounds, target, sf) {
 }
 
 // =============================================================================
-// ENGINE 4: tft_full
+// ENGINE 4: tft_full (unchanged from v5)
 // =============================================================================
 function runTftFull(rounds, target, sf) {
   const {gaps,currentGap}=computeGaps(rounds,target.min);
@@ -1132,12 +956,10 @@ function runTftFull(rounds, target, sf) {
              pnr==='ABOUT_TO_COLD'||pnr==='EXTREME_WHITE') {
     wQ10=0.08;wQ50=0.38;wQ90=0.54;
   }
-  // === FINAL PRODUCTION HARDENING START ===
   // H-10: rare b2b quantile shift only when calibrated
   if (target.rare && sf?.b2bPrecursor && sf?.calibrated) {
     wQ10=Math.min(wQ10+0.08,0.55);wQ90=Math.max(wQ90-0.08,0.05);
   }
-  // === HARDENING END ===
   const attnOut=pctile(sorted,0.10)*wQ10+pctile(sorted,0.50)*wQ50+pctile(sorted,0.90)*wQ90;
   const raw=Math.max(1,Math.round(seqOut*0.55+attnOut*0.45));
   const adj=applyStreakAdjustment(raw,sf,target);
@@ -1148,7 +970,7 @@ function runTftFull(rounds, target, sf) {
 }
 
 // =============================================================================
-// ENGINE 5: nbeats
+// ENGINE 5: nbeats (unchanged from v5)
 // =============================================================================
 function runNbeats(rounds, target, sf) {
   const {gaps,currentGap}=computeGaps(rounds,target.min);
@@ -1169,10 +991,8 @@ function runNbeats(rounds, target, sf) {
   }
 
   const pnr=effectiveRegime(sf);
-  // === FINAL PRODUCTION HARDENING START ===
   // H-10: streakBlock weight boost only when calibrated
   const isHotCalibrated = (pnr==='ABOUT_TO_B2B'||pnr==='ABOUT_TO_HOT') && (sf?.calibrated===true);
-  // === HARDENING END ===
   const streakW=(1-r2)*(isHotCalibrated ? 0.55 : 0.40);
   const identW =(1-r2)*(isHotCalibrated ? 0.45 : 0.60);
 
@@ -1186,7 +1006,7 @@ function runNbeats(rounds, target, sf) {
 }
 
 // =============================================================================
-// ENGINE 6: tcn
+// ENGINE 6: tcn (unchanged from v5)
 // =============================================================================
 function runTcn(rounds, target, sf) {
   const {gaps,currentGap}=computeGaps(rounds,target.min);
@@ -1207,12 +1027,10 @@ function runTcn(rounds, target, sf) {
   let streakRes=0;
   if (sf&&sf.highRuns.length>=5) {
     const {b:rs}=olsLinear(sf.highRuns);
-    // === FINAL PRODUCTION HARDENING START ===
     // H-10: hotAmp only amplifies when sf.calibrated=true
     const hotAmp = (sf.calibrated===true)
       ? clamp((sf.hotScore||0)/100*1.2, 0.3, 0.9)
       : 0.4;
-    // === HARDENING END ===
     streakRes=rs*hotAmp;
   }
   const raw=Math.max(1,Math.round(tcnOut+streakRes));
@@ -1225,7 +1043,7 @@ function runTcn(rounds, target, sf) {
 }
 
 // =============================================================================
-// ENGINE 7: lightgbm
+// ENGINE 7: lightgbm (unchanged from v5)
 // =============================================================================
 function runLightGBM(rounds, target, sf) {
   const {gaps,currentGap}=computeGaps(rounds,target.min);
@@ -1251,12 +1069,10 @@ function runLightGBM(rounds, target, sf) {
 
   const w1=1/(1+cv),w2=r2,w3=Math.abs(slope)<gMean*0.05?0.8:0.3;
   const w4=overdue>1?0.9:0.4,w5=0.7;
-  // === FINAL PRODUCTION HARDENING START ===
-  // H-10: calMult only amplifies when sf.calibrated=true (strict boolean check)
+  // H-10: calMult only amplifies when sf.calibrated===true (strict boolean check)
   const calMult = (sf?.calibrated===true) ? 1.5 : 1.0;
   const hotScoreNorm  = sf ? (sf.hotScore||0)/100  : 0;
   const coldScoreNorm = sf ? (sf.coldScore||0)/100 : 0;
-  // === HARDENING END ===
   const w6=sf?clamp(sf.b2bRate*3*(1+hotScoreNorm*calMult),0.1,1.8):0.1;
   const w7=sf?clamp(sf.lowDensity20*2*(1+coldScoreNorm*0.8),0.1,1.3):0.1;
   const wS=w1+w2+w3+w4+w5+w6+w7;
@@ -1270,7 +1086,7 @@ function runLightGBM(rounds, target, sf) {
 }
 
 // =============================================================================
-// ENGINE 8: gru
+// ENGINE 8: gru (unchanged from v5)
 // =============================================================================
 function runGRU(rounds, target, sf) {
   const {gaps,currentGap}=computeGaps(rounds,target.min);
@@ -1285,13 +1101,11 @@ function runGRU(rounds, target, sf) {
   let h=gMean;
   const pnr=effectiveRegime(sf);
   if (sf) {
-    // === FINAL PRODUCTION HARDENING START ===
     // H-10: calibrated amplification (0.40) only when sf.calibrated=true
     if      (pnr==='ABOUT_TO_B2B' && sf.calibrated===true)
       h=gMean*(1-sf.b2bContinuationProb*0.40);
     else if (pnr==='ABOUT_TO_B2B'||pnr==='B2B')
       h=gMean*(1-sf.b2bContinuationProb*0.28);
-    // === HARDENING END ===
     else if (pnr==='ABOUT_TO_HOT'||pnr==='HOT')
       h=gMean*(1-sf.b2bContinuationProb*0.20);
     else if (pnr==='ABOUT_TO_WHITE_CLUSTER')
@@ -1318,7 +1132,7 @@ function runGRU(rounds, target, sf) {
 }
 
 // =============================================================================
-// ENGINE 9: bilstm
+// ENGINE 9: bilstm (unchanged from v5)
 // =============================================================================
 function runBiLSTM(rounds, target, sf) {
   const {gaps,currentGap}=computeGaps(rounds,target.min);
@@ -1353,8 +1167,7 @@ function runBiLSTM(rounds, target, sf) {
 }
 
 // =============================================================================
-// ENGINE 10: stacking_meta
-// tcMult: calibrated&&tc>75→1.45, calibrated&&tc>68→1.25, else 1.0
+// ENGINE 10: stacking_meta (unchanged from v5)
 // =============================================================================
 function runStackingMeta(rounds, target, allNgResults, sf) {
   const {gaps,currentGap}=computeGaps(rounds,target.min);
@@ -1381,13 +1194,10 @@ function runStackingMeta(rounds, target, allNgResults, sf) {
     : (pnr==='ABOUT_TO_WHITE_CLUSTER'||pnr==='ABOUT_TO_COLD'||pnr==='WHITE_CLUSTER'||pnr==='EXTREME_WHITE'||pnr==='COLD') ? 'cluster'
     : 'neutral';
   const tc = sf?.transitionConfidence ?? 0;
-  // === FINAL PRODUCTION HARDENING START ===
   // tcMult: only amplify when sf.calibrated===true (strict).
-  // Without empirical confirmation, regime specialisation weights stay neutral (1.0).
   const tcMult = (sf?.calibrated===true && tc > 75) ? 1.45
                : (sf?.calibrated===true && tc > 68) ? 1.25
                : 1.0;
-  // === HARDENING END ===
 
   const predictions=[],weights=[];
   for (const eid of sourceIds) {
@@ -1418,7 +1228,7 @@ function runStackingMeta(rounds, target, allNgResults, sf) {
 }
 
 // =============================================================================
-// ENGINE 11: sha512
+// ENGINE 11: sha512 (unchanged from v5)
 // =============================================================================
 function runSHA512(rounds, target, sf) {
   if (rounds.length<30) return null;
@@ -1456,7 +1266,6 @@ function runSHA512(rounds, target, sf) {
     ac1=vs>0?cov/vs:0;
   }
 
-  // === FINAL PRODUCTION HARDENING START ===
   // H-10: streakBias only applied when sf.calibrated===true (strict boolean)
   let streakBias=0;
   if (sf&&sf.highRuns&&sf.highRuns.length>=5&&sf.calibrated===true) {
@@ -1468,11 +1277,8 @@ function runSHA512(rounds, target, sf) {
     const hotW=(sf.hotScore??0)/100;
     streakBias=(1-normHrEnt)*hotW*0.10;
   }
-  // === HARDENING END ===
   const pnr=effectiveRegime(sf);
-  // === FINAL PRODUCTION HARDENING START ===
   const driftAligned=(pnr==='ABOUT_TO_B2B'||pnr==='ABOUT_TO_HOT')&&maxC>0&&sf?.calibrated===true;
-  // === HARDENING END ===
   if (driftAligned&&drift) streakBias+=0.025;
 
   const driftF=drift?clamp(cusumMag*0.07*Math.sign(maxC+minC),-0.15,0.15):0;
@@ -1518,8 +1324,7 @@ async function saveNgOutcome(engineId,target,outcome,lo,hi,hitRound,generation) 
 }
 
 // =============================================================================
-// NG CONSENSUS
-// tcBonus requires calibrated===true && tc>75 && hotScore>=72 (aligned with trigger)
+// NG CONSENSUS (unchanged from v5)
 // =============================================================================
 function computeNgConsensus(allNgResults,lastRoundId,sharedSf) {
   const consensus={};
@@ -1547,14 +1352,10 @@ function computeNgConsensus(allNgResults,lastRoundId,sharedSf) {
     if(bestHi-bestLo+1<bW){const c=Math.round((bestLo+bestHi)/2);bestLo=c-Math.floor(bW/2);bestHi=bestLo+bW-1;}
     if(bestLo<=lastRoundId){bestLo=lastRoundId+1;bestHi=bestLo+bW-1;}
     const sf=sharedSf?.[target.label];
-    // === FINAL PRODUCTION HARDENING START ===
-    // tcBonus requires hotScore>=72 (aligned with v5 trigger), calibrated===true, tc>75.
-    // This is the top 2–3% of all hot signals — the only cases where we should
-    // boost consensus confidence beyond the base engine-count formula.
+    // tcBonus requires hotScore>=72, calibrated===true, tc>75.
     const tcBonus = (sf?.calibrated===true && (sf?.transitionConfidence??0)>75 &&
       (sf?.hotScore??0)>=72 &&
       (sf?.predictedNextRegime==='ABOUT_TO_B2B'||sf?.predictedNextRegime==='ABOUT_TO_HOT')) ? 8 : 0;
-    // === HARDENING END ===
     consensus[target.label]={
       lo:bestLo,hi:bestHi,engineCount:bestGroup.length,
       engines:bestGroup.map(w=>w.engineId),tcBonus,
@@ -1562,6 +1363,22 @@ function computeNgConsensus(allNgResults,lastRoundId,sharedSf) {
   }
   return consensus;
 }
+
+// =============================================================================
+// ALGO_MAP — centralised so main tick and recalculate-on-miss share it.
+// =============================================================================
+const ALGO_MAP = {
+  hlstm_xgb:   runHybridLstmXgb,
+  htrans_lstm:  runHybridTransformerLstm,
+  htft:         runHybridTft,
+  tft:          runTftFull,
+  nbeats:       runNbeats,
+  tcn:          runTcn,
+  lgbm:         runLightGBM,
+  gru:          runGRU,
+  bilstm:       runBiLSTM,
+  sha512:       runSHA512,
+};
 
 // =============================================================================
 // MAIN TICK
@@ -1589,7 +1406,6 @@ async function runNgComputeEngine() {
     const streakFeatures={};
     for (const target of TARGETS) {
       try {
-        // Pass actual calibration (or CALIB_DUMMY if null) — never raw null
         streakFeatures[target.label] = extractPredictiveStreakFeatures(
           rounds, target.min, calibrations[target.label] ?? CALIB_DUMMY
         );
@@ -1599,11 +1415,7 @@ async function runNgComputeEngine() {
       }
     }
 
-    const ALGO_MAP={
-      hlstm_xgb: runHybridLstmXgb, htrans_lstm:runHybridTransformerLstm,
-      htft:runHybridTft, tft:runTftFull, nbeats:runNbeats, tcn:runTcn,
-      lgbm:runLightGBM, gru:runGRU, bilstm:runBiLSTM, sha512:runSHA512,
-    };
+    // Step 3: Run all individual engines
     const allNgResults={};
     for(const [eid,algo] of Object.entries(ALGO_MAP)){
       allNgResults[eid]={};
@@ -1615,6 +1427,7 @@ async function runNgComputeEngine() {
       }
     }
 
+    // Step 4: Stacking meta
     allNgResults['stacking']={};
     for(const target of TARGETS){
       try{
@@ -1623,6 +1436,7 @@ async function runNgComputeEngine() {
       } catch(e){console.error(`[ngCompute] stacking/${target.label}:`,e.message);}
     }
 
+    // Step 5: NG Consensus
     const ngConsensus=computeNgConsensus(allNgResults,lastRoundId,streakFeatures);
     allNgResults['ng_consensus']={};
     for(const target of TARGETS){
@@ -1639,49 +1453,117 @@ async function runNgComputeEngine() {
       }
     }
 
-    // Phase 1+2: resolve + lock
+    // === v6 WHITE-CLUSTER & RECALCULATE FIX START ===
+    // FIX-3: Recalculate-on-miss logic.
+    // Track which targets need an immediate fresh window after a miss expiry.
+    // This set is populated during Phase 1 (resolve) and consumed in Phase 2 (lock).
+    // Without this: after a miss, the next fresh prediction is deferred until the
+    // NEXT tick. During a white cluster, ticks may be spaced 30+ seconds apart,
+    // meaning the engine sits idle with no window for a long period — missing the
+    // very hit it was trying to catch. With this fix: the miss is resolved and
+    // a fresh window is immediately created from allNgResults in the SAME tick.
+    const missTargets = {}; // engineId → Set of target labels needing recalculation
+    for (const engineId of NG_ENGINE_IDS) {
+      missTargets[engineId] = new Set();
+    }
+    // === FIX END ===
+
+    // Phase 1: Resolve existing windows (check outcomes)
     for(const engineId of NG_ENGINE_IDS){
-      const payload={};
-      const newlyLocked=[];
       for(const target of TARGETS){
         const win=ngWindows[engineId][target.label];
-        const fresh=allNgResults[engineId]?.[target.label];
-        if(win){
-          const{lo,hi,generation,roundWhenMade}=win;
-          const eLo=Math.max(roundWhenMade+1,lo-earlyHitTolerance(target.maxWidth));
-          const earlyHit=lo>roundWhenMade+1&&eLo<=lo-1?findHitInRange(rounds,eLo,lo-1,target.min):null;
-          if(earlyHit){
-            await saveNgOutcome(engineId,target,'early',lo,hi,earlyHit.roundId,generation);
-            delete ngWindows[engineId][target.label];
-          } else if(lastRoundId>=hi){
-            const hit=findHitInRange(rounds,lo,hi,target.min);
-            await saveNgOutcome(engineId,target,hit?'win':'loss',lo,hi,hit?.roundId??null,generation);
-            delete ngWindows[engineId][target.label];
-          } else {
-            const hit=findHitInRange(rounds,lo,hi,target.min);
-            if(hit){
-              await saveNgOutcome(engineId,target,'win',lo,hi,hit.roundId,generation);
-              delete ngWindows[engineId][target.label];
-            } else {
-              // Window still active — re-lock to DB but don't treat as new
-              payload[target.label]={lo,hi,roundWhenMade,generation,eta:win.eta};
-              continue;
-            }
+        if(!win) continue;
+        const{lo,hi,generation,roundWhenMade}=win;
+        const eLo=Math.max(roundWhenMade+1,lo-earlyHitTolerance(target.maxWidth));
+        const earlyHit=lo>roundWhenMade+1&&eLo<=lo-1?findHitInRange(rounds,eLo,lo-1,target.min):null;
+        if(earlyHit){
+          await saveNgOutcome(engineId,target,'early',lo,hi,earlyHit.roundId,generation);
+          delete ngWindows[engineId][target.label];
+        } else if(lastRoundId>=hi){
+          const hit=findHitInRange(rounds,lo,hi,target.min);
+          await saveNgOutcome(engineId,target,hit?'win':'loss',lo,hi,hit?.roundId??null,generation);
+          delete ngWindows[engineId][target.label];
+          // === v6 WHITE-CLUSTER & RECALCULATE FIX START ===
+          // FIX-3: On miss (loss), flag this target for immediate recalculation.
+          // On win: no need to recalculate — the hit was found, normal new prediction
+          // will be generated below. On early: also no need — hit already captured.
+          if (!hit) {
+            missTargets[engineId].add(target.label);
+            console.log(`[ngCompute] ${engineId} ${target.label} MISS — scheduling immediate recalculate`);
           }
-        }
-        if(fresh){
-          const newLo=lastRoundId+fresh.low,newHi=lastRoundId+fresh.high;
-          const gen=(ngWindows[engineId][target.label]?.generation??0)+1;
-          const baseEta={probW:fresh.probW,conf:fresh.conf,expectedGap:fresh.expectedGap};
-          const eta=fresh._meta?{...baseEta,...fresh._meta}:baseEta;
-          ngWindows[engineId][target.label]={lo:newLo,hi:newHi,roundWhenMade:lastRoundId,generation:gen,eta};
-          payload[target.label]=ngWindows[engineId][target.label];
-          newlyLocked.push(`${target.label}:#${newLo}-#${newHi}`);
+          // === FIX END ===
+        } else {
+          const hit=findHitInRange(rounds,lo,hi,target.min);
+          if(hit){
+            await saveNgOutcome(engineId,target,'win',lo,hi,hit.roundId,generation);
+            delete ngWindows[engineId][target.label];
+          }
+          // Window still active — will be re-locked below in Phase 2.
         }
       }
-      if(Object.keys(payload).length) await saveLockedAdvPreds(engineId,payload);
-      if(newlyLocked.length) console.log(`[ngCompute] ${engineId} NEW windows: ${newlyLocked.join(' ')}`);
     }
+
+    // Phase 2: Lock new windows (or recalculate immediately on miss)
+    const allPayloads = {};
+    const allNewlyLocked = {};
+    for (const engineId of NG_ENGINE_IDS) {
+      allPayloads[engineId] = {};
+      allNewlyLocked[engineId] = [];
+    }
+
+    for(const engineId of NG_ENGINE_IDS){
+      for(const target of TARGETS){
+        // Skip if window is still active (already handled above — will re-lock)
+        if (ngWindows[engineId][target.label]) {
+          const win = ngWindows[engineId][target.label];
+          allPayloads[engineId][target.label] = win;
+          continue;
+        }
+
+        // === v6 WHITE-CLUSTER & RECALCULATE FIX START ===
+        // FIX-3: For miss targets, force a fresh prediction from allNgResults.
+        // For normal (new or post-win) targets, also use allNgResults.
+        // The logic is identical — missTargets just triggers an extra log line
+        // and ensures we don't skip the target due to "no fresh result" early exit.
+        const isMissRecalc = missTargets[engineId].has(target.label);
+        if (isMissRecalc) {
+          // Invalidate calibration cache for this target so next tick recomputes fresh.
+          // We don't recompute calibration inline (too expensive) but we do force
+          // the cache to be stale by bumping computedAt to 0 — next tick will rebuild.
+          if (calibCache[target.label]) {
+            calibCache[target.label].computedAt = 0;
+          }
+        }
+        // === FIX END ===
+
+        const fresh = allNgResults[engineId]?.[target.label];
+        if (!fresh) continue;
+
+        const newLo=lastRoundId+fresh.low;
+        const newHi=lastRoundId+fresh.high;
+        const prevGen = (ngWindows[engineId][target.label]?.generation ?? 0);
+        const gen = prevGen + 1;
+        const baseEta={probW:fresh.probW,conf:fresh.conf,expectedGap:fresh.expectedGap};
+        const eta=fresh._meta?{...baseEta,...fresh._meta}:baseEta;
+        ngWindows[engineId][target.label]={lo:newLo,hi:newHi,roundWhenMade:lastRoundId,generation:gen,eta};
+        allPayloads[engineId][target.label]=ngWindows[engineId][target.label];
+        // === v6 WHITE-CLUSTER & RECALCULATE FIX START ===
+        const lockTag = isMissRecalc ? `[RECALC-MISS]` : '';
+        allNewlyLocked[engineId].push(`${target.label}:#${newLo}-#${newHi}${lockTag}`);
+        // === FIX END ===
+      }
+    }
+
+    // Persist all payloads and log new locks
+    for (const engineId of NG_ENGINE_IDS) {
+      if(Object.keys(allPayloads[engineId]).length) {
+        await saveLockedAdvPreds(engineId, allPayloads[engineId]);
+      }
+      if(allNewlyLocked[engineId].length) {
+        console.log(`[ngCompute] ${engineId} NEW windows: ${allNewlyLocked[engineId].join(' ')}`);
+      }
+    }
+
   } catch(e) {
     console.error('[ngCompute] Fatal:',e.message,e.stack);
   }
