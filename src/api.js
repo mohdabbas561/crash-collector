@@ -4,12 +4,8 @@ const cors       = require('cors');
 const {
   pool,
   getRounds, getStats, getStorageStats,
-  savePrediction, getPredictions, clearPredictions,
   initAccessCodes, createAccessCode, getAccessCode,
   updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,
-  saveLockedPreds, getLockedPreds,
-  saveLockedAdvPreds, getLockedAdvPreds,
-  saveLockedConsensusPreds, getLockedConsensusPreds,
   initWalletStorage, saveWallet, getWallets, deleteWallet,
 } = require('./db');
 
@@ -38,8 +34,6 @@ app.use((req, res, next) => {
 });
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
-// FIX: use a fixed-size LRU-style map (max 10k entries) to prevent unbounded
-// memory growth. Cleanup interval now 60s instead of 300s.
 const rateLimits  = new Map();
 const RL_MAX_KEYS = 10000;
 
@@ -51,7 +45,6 @@ function rateLimit(maxPerMin) {
     const win = rateLimits.get(key) || { count: 0, reset: now + 60000 };
     if (now > win.reset) { win.count = 0; win.reset = now + 60000; }
     win.count++;
-    // FIX: evict oldest entry when map is at capacity to prevent unbounded growth
     if (!rateLimits.has(key) && rateLimits.size >= RL_MAX_KEYS) {
       rateLimits.delete(rateLimits.keys().next().value);
     }
@@ -60,7 +53,6 @@ function rateLimit(maxPerMin) {
     next();
   };
 }
-// FIX: cleanup every 60s, not 300s — tighter memory bound
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of rateLimits) if (now > v.reset) rateLimits.delete(k);
@@ -80,8 +72,6 @@ function getIP(req) {
   return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.headers['x-real-ip'] || req.socket?.remoteAddress || 'unknown';
 }
 
-const APP_SECRET = process.env.APP_SECRET || process.env.ADMIN_SECRET;
-
 // ── ROUNDS ────────────────────────────────────────────────────────────────────
 app.get('/rounds', rateLimit(60), async (req, res) => {
   try {
@@ -97,197 +87,6 @@ app.get('/rounds', rateLimit(60), async (req, res) => {
 app.get('/stats',         rateLimit(30), async (req,res) => { try { res.json({ ok:true, ...(await getStats()) }); } catch(e) { res.status(500).json({ ok:false, error:e.message }); } });
 app.get('/storage-stats', rateLimit(20), async (req,res) => { try { res.json({ ok:true, ...(await getStorageStats()) }); } catch(e) { res.status(500).json({ ok:false, error:e.message }); } });
 app.get('/health', (req,res) => res.json({ ok:true, ts:new Date().toISOString() }));
-
-// ── PREDICTIONS ───────────────────────────────────────────────────────────────
-const VALID_SOURCES = [
-  'engine','consensus',
-];
-
-app.get('/predictions', rateLimit(300), async (req, res) => {
-  try {
-    const limit  = Math.min(parseInt(req.query.limit||'500'), 5000);
-    const source = VALID_SOURCES.includes(req.query.source) ? req.query.source : null;
-    const rows   = await getPredictions({ limit, target: req.query.target||null, source });
-    res.json({ ok:true, count:rows.length, predictions:rows });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
-});
-
-app.post('/predictions', rateLimit(600), async (req, res) => {
-  try {
-    const { target, minMult, outcome, lo, hi, hitRound, generation, source } = req.body;
-    if (!target || !outcome || lo==null || hi==null)
-      return res.status(400).json({ ok:false, error:'Missing required fields' });
-    if (!['win','loss','early','retry-win','retry-loss'].includes(outcome))
-      return res.status(400).json({ ok:false, error:'Invalid outcome' });
-    if (typeof lo!=='number' || typeof hi!=='number' || hi<lo || !isFinite(lo) || !isFinite(hi))
-      return res.status(400).json({ ok:false, error:'Invalid window' });
-    // FIX: reject zero-width windows (lo===hi) — they represent no prediction
-    if (lo === hi)
-      return res.status(400).json({ ok:false, error:'Zero-width window' });
-    const validSource = VALID_SOURCES.includes(source) ? source : 'engine';
-    await savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation, source:validSource });
-    res.json({ ok:true });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
-});
-
-app.delete('/predictions', requireAdmin, async (req, res) => {
-  try {
-    await clearPredictions();
-    require('./predictionEngine').resetEngineState();
-    console.log('[api] predictions cleared + engine reset');
-    res.json({ ok:true });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
-});
-
-// ── Batch history — no cache, always fresh from DB ───────────────────────────
-app.get('/predictions-all', rateLimit(120), async (req, res) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit || '500'), 2000);
-    const [consensus, ng_consensus] = await Promise.all([
-      getPredictions({ limit, source: 'consensus' }),
-      getPredictions({ limit, source: 'ng_consensus' }),
-    ]);
-    res.json({ ok: true, consensus, ng_consensus });
-  } catch(e) { res.status(500).json({ ok: false, error: e.message }); }
-});
-
-// ── ENGINE LOCKED ─────────────────────────────────────────────────────────────
-app.get('/locked', rateLimit(120), async (req,res) => {
-  try { res.json({ ok:true, preds: await getLockedPreds() }); }
-  catch(e) { res.status(500).json({ ok:false, error:e.message }); }
-});
-
-app.post('/locked', rateLimit(120), async (req, res) => {
-  if (APP_SECRET && req.headers['x-app-secret'] !== APP_SECRET)
-    return res.status(403).json({ ok:false, error:'Forbidden' });
-  try {
-    const { preds } = req.body;
-    if (!preds || typeof preds!=='object') return res.status(400).json({ ok:false, error:'preds required' });
-    await saveLockedPreds(preds);
-    res.json({ ok:true });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
-});
-
-app.delete('/locked', requireAdmin, async (req, res) => {
-  try {
-    await pool.query('DELETE FROM locked_preds');
-    require('./predictionEngine').resetEngineState();
-    res.json({ ok:true });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
-});
-
-// ── ADVANCED ENGINE LOCKED PREDS ──────────────────────────────────────────────
-app.get('/locked-adv', rateLimit(120), async (req, res) => {
-  try {
-    res.json({ ok: true, preds: await getLockedAdvPreds() });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
-});
-
-app.post('/locked-adv', rateLimit(120), async (req, res) => {
-  try {
-    const { model, preds } = req.body;
-    if (!model || !preds || typeof preds !== 'object')
-      return res.status(400).json({ ok:false, error:'model and preds required' });
-    // FIX: validate model name is a known engine — reject arbitrary strings
-    const VALID_ADV_MODELS = [
-      'consensus',
-      'ng_consensus',
-    ];
-    if (!VALID_ADV_MODELS.includes(model))
-      return res.status(400).json({ ok:false, error:'Unknown model' });
-    await saveLockedAdvPreds(model, preds);
-    try { require('./advResolutionEngine').bustLockedCache(); } catch(_) {}
-    res.json({ ok:true });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
-});
-
-app.delete('/locked-adv', requireAdmin, async (req, res) => {
-  try {
-    await pool.query('DELETE FROM locked_preds_adv');
-    res.json({ ok:true });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
-});
-
-// ── CONSENSUS MASTER SIGNAL LOCKED PREDS ─────────────────────────────────────
-app.get('/locked-consensus', rateLimit(120), async (req, res) => {
-  try {
-    res.json({ ok: true, preds: await getLockedConsensusPreds() });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
-});
-
-app.post('/locked-consensus', rateLimit(120), async (req, res) => {
-  try {
-    const { preds } = req.body;
-    if (!preds || typeof preds !== 'object')
-      return res.status(400).json({ ok:false, error:'preds required' });
-    await saveLockedConsensusPreds(preds);
-    try { require('./advResolutionEngine').bustLockedCache(); } catch(_) {}
-    res.json({ ok:true });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
-});
-
-app.delete('/locked-consensus', requireAdmin, async (req, res) => {
-  try {
-    await pool.query('DELETE FROM locked_preds_consensus');
-    res.json({ ok:true });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
-});
-
-// ── RESET ENGINE LOCKS ONLY ───────────────────────────────────────────────────
-app.delete('/reset-locks', requireAdmin, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    await client.query('DELETE FROM locked_preds_adv');
-    await client.query('DELETE FROM locked_preds_consensus');
-    await client.query('DELETE FROM locked_preds');
-    await client.query('COMMIT');
-    // Bust NG compute engine in-memory window cache so fresh windows are locked next tick
-    try { require('./ngComputeEngine').resetNgWindowsOnly(); } catch(_) {}
-    try { require('./advResolutionEngine').bustLockedCache(); } catch(_) {}
-    console.log('[api] /reset-locks — all locked windows cleared, predictions + rounds intact');
-    res.json({ ok: true, message: 'Engine locks cleared — predictions and rounds preserved' });
-  } catch(e) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ ok: false, error: e.message });
-  } finally {
-    client.release();
-  }
-});
-
-// ── CLEAR HISTORY ONLY ────────────────────────────────────────────────────────
-app.delete('/clear-history', requireAdmin, async (req, res) => {
-  try {
-    await pool.query('DELETE FROM predictions');
-    // FIX: also reset advResolution savedSet so server re-resolves all
-    // existing locked windows after history is cleared
-    require('./predictionEngine').resetEngineState();
-    console.log('[api] /clear-history — predictions cleared, engine savedSets reset');
-    res.json({ ok:true, message:'Prediction history cleared' });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
-});
-
-// ── FULL RESET ────────────────────────────────────────────────────────────────
-app.delete('/reset', requireAdmin, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    await client.query('DELETE FROM predictions');
-    await client.query('DELETE FROM locked_preds');
-    await client.query('DELETE FROM locked_preds_adv');
-    await client.query('DELETE FROM locked_preds_consensus');
-    await client.query('COMMIT');
-    require('./predictionEngine').resetEngineState();
-    try { require('./advResolutionEngine').bustLockedCache(); } catch(_) {}
-    console.log('[api] /reset — all prediction data cleared including adv engines + consensus');
-    res.json({ ok:true, message:'All prediction data cleared and engine reset' });
-  } catch(e) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ ok:false, error:e.message });
-  } finally {
-    client.release();
-  }
-});
 
 // ── ACCESS CODES ──────────────────────────────────────────────────────────────
 app.post('/access/verify', rateLimit(20), async (req, res) => {
