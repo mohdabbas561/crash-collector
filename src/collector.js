@@ -1,13 +1,12 @@
 'use strict';
-// collector.js — polls DCF API every 8s, saves new rounds, runs engine.
+// collector.js — polls DCF API every 8s, saves new rounds.
 // FIX: incremental fetch limit raised to 5000 (was 500) — prevents stale
-//      engine data when server catches up after an offline gap.
+//      data when server catches up after an offline gap.
 // FIX: lastSeenRoundId is now seeded from DB at startup, not from the API
 //      fetch — ensures gap-fill starts from the correct point.
 
 const fetch = require('node-fetch');
 const { saveRounds, getRounds } = require('./db');
-const { runPredictionEngine }   = require('./predictionEngine');
 
 const API_URL     = 'https://api.dealer.degencoinflip.com/v1/game/2/room/1/rounds?limit=100';
 const POLL_MS     = 20000;
@@ -65,7 +64,6 @@ async function poll() {
       }
     }
     consecutiveErrors = 0;
-    await runPredictionEngine();
   } catch (err) {
     consecutiveErrors++;
     console.error(`[${new Date().toISOString()}] Poll error (${consecutiveErrors}): ${err.message}`);
@@ -151,8 +149,6 @@ async function startCollector() {
   } catch (e) {
     console.error('Collector: initial fetch failed:', e.message);
   }
-
-  await runPredictionEngine();
 
   const tick = async () => {
     await poll();
