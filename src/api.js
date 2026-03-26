@@ -1,6 +1,7 @@
 'use strict';
 const express    = require('express');
 const cors       = require('cors');
+const { buildPredictionReport } = require('./predictionEngine');
 const {
   pool,
   getRounds, getStats, getStorageStats,
@@ -87,6 +88,22 @@ app.get('/rounds', rateLimit(60), async (req, res) => {
 app.get('/stats',         rateLimit(30), async (req,res) => { try { res.json({ ok:true, ...(await getStats()) }); } catch(e) { res.status(500).json({ ok:false, error:e.message }); } });
 app.get('/storage-stats', rateLimit(20), async (req,res) => { try { res.json({ ok:true, ...(await getStorageStats()) }); } catch(e) { res.status(500).json({ ok:false, error:e.message }); } });
 app.get('/health', (req,res) => res.json({ ok:true, ts:new Date().toISOString() }));
+
+// prediction engine (history + clusters + pattern matching)
+app.get('/predict', rateLimit(20), async (req, res) => {
+  try {
+    const requestedLimit = parseInt(req.query.limit || '25000', 10);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(Math.max(requestedLimit, 1000), 100000)
+      : 25000;
+
+    const rounds = await getRounds({ limit, order: 'ASC' });
+    const report = buildPredictionReport(rounds);
+    res.json({ ok: true, ...report });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 // ── ACCESS CODES ──────────────────────────────────────────────────────────────
 app.post('/access/verify', rateLimit(20), async (req, res) => {
