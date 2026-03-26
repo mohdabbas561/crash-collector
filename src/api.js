@@ -116,12 +116,20 @@ app.get('/predict/locked', rateLimit(20), async (req, res) => {
       ? Math.min(Math.max(requestedLimit, 2000), 100000)
       : 100000;
 
-    const [rounds, locked] = await Promise.all([
+    const historyTargetRaw = String(req.query.historyTarget || '').trim();
+    const historyTarget = historyTargetRaw
+      ? (historyTargetRaw.toLowerCase().endsWith('x') ? historyTargetRaw.toLowerCase() : `${historyTargetRaw.toLowerCase()}x`)
+      : null;
+
+    const [rounds, locked, historyForCalibration] = await Promise.all([
       getRounds({ limit, order: 'ASC' }),
       getLockedConsensusPreds(),
+      getPredictions({ limit: 600, source: 'range_lock_v1' }),
     ]);
 
-    const engine = computeLockedRangePredictions(rounds, locked);
+    const engine = computeLockedRangePredictions(rounds, locked, {
+      historyRows: historyForCalibration,
+    });
 
     if (Object.keys(engine.locksToSave || {}).length) {
       await saveLockedConsensusPreds(engine.locksToSave);
@@ -142,12 +150,7 @@ app.get('/predict/locked', rateLimit(20), async (req, res) => {
         });
       }
     }
-
-    const historyTargetRaw = String(req.query.historyTarget || '').trim();
-    const historyTarget = historyTargetRaw
-      ? (historyTargetRaw.toLowerCase().endsWith('x') ? historyTargetRaw.toLowerCase() : `${historyTargetRaw.toLowerCase()}x`)
-      : null;
-
+    
     const fullHistory = await getPredictions({ limit: 600, source: 'range_lock_v1' });
     const history = historyTarget
       ? fullHistory.filter(h => String(h.target || '').toLowerCase() === historyTarget)

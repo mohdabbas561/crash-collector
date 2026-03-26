@@ -331,7 +331,7 @@ function hazardEta(target, currentState, stats, pressure) {
   };
 }
 
-function buildWindow(pre, target, currentIdx) {
+function buildWindow(pre, target, currentIdx, calibration = null) {
   const currentRound = pre.rounds[currentIdx].roundId;
   const currentState = pre.stateAt(currentIdx, target);
   const neighbors = collectNeighbors(pre, target, currentIdx, currentState);
@@ -375,7 +375,10 @@ function buildWindow(pre, target, currentIdx) {
   centerFactor *= 1 - (0.1 * clamp(currentState.trend, -0.8, 0.8));
   centerFactor = clamp(centerFactor, 0.68, 1.35);
 
-  const centerAhead = Math.max(1, Math.round(blendCenter * centerFactor));
+  let centerAhead = Math.max(1, Math.round(blendCenter * centerFactor));
+  if (calibration && Number.isFinite(calibration.shift) && calibration.sample >= 5) {
+    centerAhead = Math.max(1, Math.round(centerAhead * (1 + calibration.shift)));
+  }
   const windowSpan = WINDOW_SPAN[target] || 10;
   const halfLeft = Math.floor((windowSpan - 1) / 2);
   const maxLoAhead = Math.max(1, (MAX_AHEAD[target] || 3000) - windowSpan + 1);
@@ -435,6 +438,8 @@ function buildWindow(pre, target, currentIdx) {
           : reg === 'compression'
             ? 'Compression regime detected; fixed window centered later from ensemble ETA.'
             : 'Fixed window centered from neighbor-pattern + hazard + trend ensemble.',
+      calibrationShift: roundNum(calibration?.shift || 0, 4),
+      calibrationSample: Number(calibration?.sample || 0),
     },
     confidence: roundNum(confidence, 4),
   };
@@ -475,6 +480,54 @@ function normalizeLockInput(input) {
   };
 }
 
+function buildCalibrationMap(historyRows) {
+  const out = {};
+  for (const target of TARGETS) {
+    const label = `${target}x`;
+    const rows = (historyRows || [])
+      .filter(r => String(r.target || '').toLowerCase() === label)
+      .slice(0, 80);
+
+    if (!rows.length) {
+      out[target] = { shift: 0, sample: 0 };
+      continue;
+    }
+
+    let weightedWin = 0;
+    let weightedLoss = 0;
+    let weightedEarly = 0;
+    let totalW = 0;
+
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const w = 1 + ((rows.length - i) / rows.length); // newer rows get slightly higher weight
+      totalW += w;
+      if (row.outcome === 'win') weightedWin += w;
+      else if (row.outcome === 'loss') weightedLoss += w;
+      else if (row.outcome === 'early') weightedEarly += w;
+    }
+
+    const denom = weightedWin + weightedLoss;
+    const winRate = denom > 0 ? weightedWin / denom : 0.5;
+    const earlyRate = totalW > 0 ? weightedEarly / totalW : 0;
+    const sampleFactor = clamp(rows.length / 24, 0, 1);
+
+    // Negative shift => earlier window. Positive shift => later window.
+    let shift = 0;
+    shift += -0.34 * earlyRate;           // early means we were late, shift earlier
+    shift += (0.5 - winRate) * 0.2;       // lower win nudges timing
+    shift = clamp(shift * sampleFactor, -0.3, 0.3);
+
+    out[target] = {
+      shift: roundNum(shift, 4),
+      sample: rows.length,
+      winRate: roundNum(winRate, 4),
+      earlyRate: roundNum(earlyRate, 4),
+    };
+  }
+  return out;
+}
+
 function buildUiTarget(target, lock, status, currentRound, previousOutcome = null) {
   const loAhead = Math.max(1, Number(lock.lo) - currentRound);
   const hiAhead = Math.max(loAhead, Number(lock.hi) - currentRound);
@@ -506,8 +559,9 @@ function buildUiTarget(target, lock, status, currentRound, previousOutcome = nul
   };
 }
 
-function computeLockedRangePredictions(rounds, existingLocksRaw = {}) {
+function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = {}) {
   const pre = preprocess(rounds || []);
+  const calibration = buildCalibrationMap(options.historyRows || []);
   if (pre.n < 800) {
     return {
       model: 'range-lock-v2',
@@ -517,6 +571,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}) {
       locksToSave: {},
       resolvedHistory: [],
       summary: { pending: 0, windowOpen: 0, relocked: 0, sampleSize: pre.n },
+      calibration,
       settings: { windowSpan: WINDOW_SPAN },
       warning: 'Need at least 800 rounds before reliable range locks.',
     };
@@ -561,7 +616,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}) {
         });
       }
 
-      const nextLock = buildWindow(pre, target, currentIdx);
+      const nextLock = buildWindow(pre, target, currentIdx, calibration[target]);
       const generation = existing ? Number(existing.generation || 1) + 1 : 1;
       lockToUse = {
         lo: nextLock.lo,
@@ -600,6 +655,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}) {
     targets: targetsOut,
     locksToSave,
     resolvedHistory,
+    calibration,
     settings: { windowSpan: WINDOW_SPAN },
     summary: {
       pending: pendingCount,
