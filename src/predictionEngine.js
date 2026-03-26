@@ -520,9 +520,245 @@ function probabilityFromDistribution(dist, threshold) {
   return clamp(p, 0, 1);
 }
 
+function quantile(sorted, q) {
+  if (!sorted.length) return 0;
+  const qq = clamp(q, 0, 1);
+  const idx = (sorted.length - 1) * qq;
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  if (lo === hi) return sorted[lo];
+  const w = idx - lo;
+  return sorted[lo] * (1 - w) + sorted[hi] * w;
+}
+
+function estimateQuantileFromDistribution(dist, q) {
+  const qq = clamp(q, 0, 0.9999);
+  let running = 0;
+  for (let i = 0; i < BUCKETS.length; i++) {
+    const p = dist[i];
+    if (qq <= running + p || i === BUCKETS.length - 1) {
+      const b = BUCKETS[i];
+      const local = p > 0 ? clamp((qq - running) / p, 0, 1) : 0.5;
+      if (!Number.isFinite(b.max)) {
+        return b.min * (1 + (local * 1.5));
+      }
+      return b.min + ((b.max - b.min) * local);
+    }
+    running += p;
+  }
+  return BUCKETS[BUCKETS.length - 1].min;
+}
+
+function computeTrendContext(rounds) {
+  const logs = rounds.map(r => toLog(r.multiplier));
+  const last24 = logs.slice(-24);
+  const prev24 = logs.slice(-48, -24);
+  const last80 = logs.slice(-80);
+  const prev80 = logs.slice(-160, -80);
+  const shortTrend = mean(last24) - mean(prev24.length ? prev24 : logs.slice(0, Math.max(1, logs.length - 24)));
+  const longTrend = mean(last80) - mean(prev80.length ? prev80 : logs.slice(0, Math.max(1, logs.length - 80)));
+  const trendScore = clamp(((shortTrend * 0.65) + (longTrend * 0.35)) / 0.28, -1, 1);
+
+  const volRecent = stddev(last24);
+  const volBase = stddev(logs.slice(-200));
+  const volRatio = volBase > 0 ? volRecent / volBase : 1;
+  const volatilityScore = clamp((volRatio - 0.85) / 0.75, 0, 1.5);
+
+  let regime = 'balanced';
+  if (trendScore <= -0.4 && volRatio <= 1) regime = 'compression';
+  else if (trendScore >= 0.35 && volRatio >= 1.05) regime = 'expansion';
+  else if (volRatio >= 1.2) regime = 'chaotic';
+  else if (trendScore <= -0.2) regime = 'soft-down';
+  else if (trendScore >= 0.2) regime = 'soft-up';
+
+  return { trendScore, volRatio, volatilityScore, regime };
+}
+
+function buildGapProfile(rounds, threshold) {
+  const hitIndexes = [];
+  for (let i = 0; i < rounds.length; i++) {
+    if (rounds[i].multiplier >= threshold) hitIndexes.push(i);
+  }
+
+  const gaps = [];
+  for (let i = 1; i < hitIndexes.length; i++) gaps.push(hitIndexes[i] - hitIndexes[i - 1]);
+  const sorted = [...gaps].sort((a, b) => a - b);
+  const q75 = sorted.length ? quantile(sorted, 0.75) : 0;
+  const q90 = sorted.length ? quantile(sorted, 0.9) : 0;
+  const avg = sorted.length ? mean(sorted) : 0;
+  const sd = sorted.length ? stddev(sorted, avg) : 0;
+  const currentGap = roundsSinceHit(rounds, rounds.length - 1, threshold);
+
+  const softDen = Math.max(2, (q90 - q75) + 1);
+  const hardDen = Math.max(3, (q90 * 0.35) + 2);
+  const soft = clamp((currentGap - q75) / softDen, 0, 1);
+  const hard = clamp((currentGap - q90) / hardDen, 0, 1);
+  const z = sd > 0 ? (currentGap - avg) / sd : 0;
+
+  return {
+    threshold,
+    currentGap,
+    q75: roundNum(q75, 2),
+    q90: roundNum(q90, 2),
+    avg: roundNum(avg, 2),
+    z: roundNum(z, 3),
+    soft: roundNum(soft, 4),
+    hard: roundNum(hard, 4),
+  };
+}
+
+function buildGapPressure(rounds) {
+  const out = {};
+  for (const t of THRESHOLDS) out[t] = buildGapProfile(rounds, t);
+  return out;
+}
+
+function applyGapAndRegimeAdjustments(baseDist, trend, gaps) {
+  const g2 = gaps[2] || {};
+  const g5 = gaps[5] || {};
+  const g10 = gaps[10] || {};
+  const g25 = gaps[25] || {};
+  const g50 = gaps[50] || {};
+
+  const boosts = new Array(BUCKETS.length).fill(0);
+  boosts[1] += (0.06 * (g2.soft || 0)) + (0.11 * (g2.hard || 0));
+  boosts[2] += (0.08 * (g5.soft || 0)) + (0.17 * (g5.hard || 0)) + (0.03 * (g2.soft || 0));
+  boosts[3] += (0.11 * (g10.soft || 0)) + (0.23 * (g10.hard || 0)) + (0.05 * (g5.soft || 0));
+  boosts[4] += (0.14 * (g25.soft || 0)) + (0.28 * (g25.hard || 0)) + (0.08 * (g50.soft || 0)) + (0.2 * (g50.hard || 0));
+
+  const totalSoft = (g2.soft || 0) + (g5.soft || 0) + (g10.soft || 0) + (g25.soft || 0) + (g50.soft || 0);
+  const totalHard = (g2.hard || 0) + (g5.hard || 0) + (g10.hard || 0) + (g25.hard || 0) + (g50.hard || 0);
+  boosts[0] -= (0.03 * totalSoft) + (0.06 * totalHard);
+
+  if (trend.trendScore > 0) {
+    boosts[2] += 0.05 * trend.trendScore;
+    boosts[3] += 0.08 * trend.trendScore;
+    boosts[4] += 0.1 * trend.trendScore;
+    boosts[0] -= 0.06 * trend.trendScore;
+  } else if (trend.trendScore < 0) {
+    const down = -trend.trendScore;
+    boosts[0] += 0.08 * down;
+    boosts[1] += 0.05 * down;
+    boosts[3] -= 0.04 * down;
+    boosts[4] -= 0.05 * down;
+  }
+
+  const volBoost = clamp((trend.volatilityScore - 0.35) / 0.9, 0, 1);
+  boosts[3] += 0.05 * volBoost;
+  boosts[4] += 0.08 * volBoost;
+
+  const adjusted = baseDist.map((p, i) => p * clamp(1 + boosts[i], 0.08, 2.8));
+  return {
+    adjustedDistribution: normalizeDistribution(adjusted),
+    bucketBoosts: boosts.map(v => roundNum(v, 4)),
+  };
+}
+
+function pickTargetFromCandidates(dist, candidates, mode) {
+  let best = {
+    target: candidates[0],
+    hitChance: 0,
+    edge: -1,
+    score: -1,
+  };
+
+  for (const target of candidates) {
+    const hitChance = probabilityFromDistribution(dist, target);
+    const edge = (hitChance * target) - 1;
+    let score = 0;
+    if (mode === 'safe') {
+      score = (hitChance ** 1.7) * (target ** 0.35) + (edge * 0.2);
+    } else if (mode === 'aggressive') {
+      score = (hitChance * target) * (1 + ((1 - hitChance) * 0.85)) + (edge * 0.6) + (target >= 5 ? 0.08 : 0);
+    } else {
+      score = (hitChance * target) * (0.75 + (0.25 * hitChance)) + (edge * 0.4);
+    }
+    if (score > best.score) best = { target, hitChance, edge, score };
+  }
+  return best;
+}
+
+function buildCashoutPlan(dist, predictedBucket, confidence, gaps) {
+  const p2 = probabilityFromDistribution(dist, 2);
+  const hard10 = gaps[10]?.hard || 0;
+  const hard25 = gaps[25]?.hard || 0;
+  const bullish = predictedBucket.id === 'mid' || predictedBucket.id === 'high' || predictedBucket.id === 'moon' || hard10 > 0.45 || hard25 > 0.3;
+  const bearish = predictedBucket.id === 'micro' && confidence >= 0.62 && p2 < 0.52;
+
+  let safeCandidates = [1.2, 1.25, 1.3, 1.35, 1.4, 1.5, 1.6];
+  let balancedCandidates = [1.5, 1.6, 1.8, 2, 2.2, 2.5, 3];
+  let aggressiveCandidates = [2, 2.5, 3, 4, 5, 7, 10];
+
+  if (bullish) {
+    safeCandidates = [1.4, 1.5, 1.6, 1.8, 2, 2.2];
+    balancedCandidates = [2, 2.2, 2.5, 3, 4, 5];
+    aggressiveCandidates = [3, 4, 5, 7, 10, 15];
+  }
+
+  const safe = pickTargetFromCandidates(dist, safeCandidates, 'safe');
+  const balanced = pickTargetFromCandidates(dist, balancedCandidates, 'balanced');
+  const aggressive = pickTargetFromCandidates(dist, aggressiveCandidates, 'aggressive');
+
+  let recommended = balanced;
+  let recommendedLabel = 'BALANCED';
+  let reason = 'Best risk/reward for current regime.';
+
+  if (bearish && safe.hitChance >= 0.62) {
+    recommended = safe;
+    recommendedLabel = 'SAFE';
+    reason = 'Micro-pressure is high; protect capital with a tighter exit.';
+  } else if (bullish && aggressive.hitChance >= 0.2 && aggressive.score > (balanced.score * 1.08)) {
+    recommended = aggressive;
+    recommendedLabel = 'AGGRESSIVE';
+    reason = 'Expansion pressure detected from hard gaps and trend.';
+  } else if (safe.score > (balanced.score * 1.14) && confidence > 0.7) {
+    recommended = safe;
+    recommendedLabel = 'SAFE';
+    reason = 'High confidence with compressed regime favors safer extraction.';
+  }
+
+  const pad = recommended.target <= 1.5
+    ? 0.08
+    : recommended.target <= 3
+      ? 0.18
+      : recommended.target <= 6
+        ? 0.36
+        : recommended.target * 0.12;
+
+  const toItem = (x) => ({
+    target: roundNum(x.target, 2),
+    hitChance: roundNum(x.hitChance, 4),
+    edge: roundNum(x.edge, 4),
+  });
+
+  return {
+    safe: toItem(safe),
+    balanced: toItem(balanced),
+    aggressive: toItem(aggressive),
+    recommended: toItem(recommended),
+    recommendedLabel,
+    zoneLow: roundNum(Math.max(1.05, recommended.target - pad), 2),
+    zoneHigh: roundNum(recommended.target + pad, 2),
+    reason,
+  };
+}
+
 function buildSignals(context) {
   const out = [];
-  const { lowStreak, highStreak, gap10, gap25, patternCount, clusterRegime, topBucket } = context;
+  const {
+    lowStreak,
+    highStreak,
+    patternCount,
+    clusterRegime,
+    topBucket,
+    trendRegime,
+    gapPressure,
+    recommendedCashout,
+  } = context;
+
+  const g10 = gapPressure[10];
+  const g25 = gapPressure[25];
+  const g50 = gapPressure[50];
 
   if (lowStreak >= 5) {
     out.push(`Low streak is ${lowStreak} rounds; rebound pressure usually increases after long micro runs.`);
@@ -530,11 +766,14 @@ function buildSignals(context) {
   if (highStreak >= 2) {
     out.push(`Back-to-back high multipliers (${highStreak}) detected; volatility regime is elevated.`);
   }
-  if (gap10 >= 10) {
-    out.push(`10x gap is stretched at ${gap10} rounds; this historically lifts medium/high bucket odds.`);
+  if (g10 && (g10.soft > 0 || g10.hard > 0)) {
+    out.push(`10x gap ${g10.currentGap} rounds | soft ${roundNum(g10.soft * 100, 1)}% | hard ${roundNum(g10.hard * 100, 1)}% pressure.`);
   }
-  if (gap25 >= 30) {
-    out.push(`25x has been absent for ${gap25} rounds; tail risk is suppressed but can snap sharply.`);
+  if (g25 && (g25.soft > 0 || g25.hard > 0)) {
+    out.push(`25x gap ${g25.currentGap} rounds | soft ${roundNum(g25.soft * 100, 1)}% | hard ${roundNum(g25.hard * 100, 1)}% pressure.`);
+  }
+  if (g50 && g50.hard > 0.2) {
+    out.push(`50x hard-gap pressure active (${roundNum(g50.hard * 100, 1)}%), tail spikes can appear abruptly.`);
   }
   if (patternCount >= 60) {
     out.push(`Pattern engine found ${patternCount} close historical analogs, improving signal stability.`);
@@ -542,7 +781,10 @@ function buildSignals(context) {
     out.push(`Pattern analog count is ${patternCount}; confidence depends more on cluster and baseline structure.`);
   }
 
-  out.push(`Current regime is ${clusterRegime}; blended model is leaning ${topBucket.label} (${topBucket.min}x+).`);
+  out.push(`Regime: cluster=${clusterRegime}, trend=${trendRegime}; model leans ${topBucket.label} (${topBucket.min}x+).`);
+  if (recommendedCashout) {
+    out.push(`Recommended ${recommendedCashout.recommendedLabel} cashout near ${recommendedCashout.recommended.target.toFixed(2)}x (${recommendedCashout.reason})`);
+  }
   return out.slice(0, 6);
 }
 
@@ -559,12 +801,23 @@ function computeReport(rounds) {
   if (cleanRounds.length < 200) {
     const uniform = normalizeDistribution(new Array(BUCKETS.length).fill(1));
     const asOfRound = cleanRounds[cleanRounds.length - 1]?.roundId || null;
+    const fallbackCashout = {
+      safe: { target: 1.3, hitChance: 0.7, edge: -0.09 },
+      balanced: { target: 1.8, hitChance: 0.45, edge: -0.19 },
+      aggressive: { target: 3, hitChance: 0.25, edge: -0.25 },
+      recommended: { target: 1.8, hitChance: 0.45, edge: -0.19 },
+      recommendedLabel: 'BALANCED',
+      zoneLow: 1.62,
+      zoneHigh: 1.98,
+      reason: 'Insufficient training depth, using neutral fallback.',
+    };
     return {
-      model: 'cluster-pattern-hybrid-v1',
+      model: 'cluster-pattern-hybrid-v2',
       generatedAt: new Date().toISOString(),
       asOfRound,
       sampleSize: cleanRounds.length,
       expectedMultiplier: roundNum(mean(cleanRounds.map(r => r.multiplier)), 4),
+      expectedMedian: roundNum(mean(cleanRounds.map(r => r.multiplier)), 4),
       predictedBucket: {
         ...BUCKETS[0],
         probability: roundNum(1 / BUCKETS.length, 4),
@@ -583,6 +836,7 @@ function computeReport(rounds) {
       diagnostics: {
         message: 'Not enough data for cluster-pattern modeling yet (need at least 200 rounds).',
       },
+      cashoutPlan: fallbackCashout,
       similarPatterns: [],
       signals: ['Insufficient history. Continue collecting rounds to activate full engine.'],
     };
@@ -658,6 +912,14 @@ function computeReport(rounds) {
     baselineDist: baselineStats.bucketDistribution,
   });
 
+  const trendContext = computeTrendContext(cleanRounds);
+  const gapPressure = buildGapPressure(cleanRounds);
+  const { adjustedDistribution: finalBucketDist, bucketBoosts } = applyGapAndRegimeAdjustments(
+    blendedBucketDist,
+    trendContext,
+    gapPressure
+  );
+
   const expectedFromBuckets = (dist) => {
     let out = 0;
     for (let i = 0; i < BUCKETS.length; i++) {
@@ -666,17 +928,28 @@ function computeReport(rounds) {
     return out;
   };
 
-  const expectedMultiplier =
+  const rawExpectedMultiplier =
     (weights.cluster * currentClusterStats.meanNextMultiplier) +
     (weights.pattern * (patternStats.meanNextMultiplier || expectedFromBuckets(patternStats.bucketDistribution))) +
     (weights.markov * expectedFromBuckets(markov.distribution)) +
     (weights.baseline * baselineStats.meanNextMultiplier);
 
-  const topBucketIdx = blendedBucketDist.reduce((best, p, i, arr) => (p > arr[best] ? i : best), 0);
+  const expectedMedian = estimateQuantileFromDistribution(finalBucketDist, 0.5);
+  const expectedP75 = estimateQuantileFromDistribution(finalBucketDist, 0.75);
+  const expectedP90 = estimateQuantileFromDistribution(finalBucketDist, 0.9);
+  const distExpectedMean = expectedFromBuckets(finalBucketDist);
+  const expectedMultiplier = expectedMedian;
+
+  const topBucketIdx = finalBucketDist.reduce((best, p, i, arr) => (p > arr[best] ? i : best), 0);
   const topBucket = BUCKETS[topBucketIdx];
-  const maxProb = blendedBucketDist[topBucketIdx];
-  const sharpness = 1 - entropy(blendedBucketDist);
+  const maxProb = finalBucketDist[topBucketIdx];
+  const sharpness = 1 - entropy(finalBucketDist);
   const evidence = clamp((currentClusterStats.count + patternStats.count + markov.support) / 1600, 0, 1);
+  const pressureEvidence = clamp(
+    ((gapPressure[10]?.soft || 0) + (gapPressure[10]?.hard || 0) + (gapPressure[25]?.soft || 0) + (gapPressure[25]?.hard || 0)) / 2,
+    0,
+    1
+  );
   const alignment = clamp(
     (
       cosineSimilarity(currentClusterStats.bucketDistribution, patternStats.bucketDistribution) +
@@ -687,16 +960,18 @@ function computeReport(rounds) {
     1
   );
   const confidence = clamp(
-    0.15 + (0.45 * maxProb) + (0.2 * sharpness) + (0.1 * evidence) + (0.1 * alignment),
+    0.15 + (0.42 * maxProb) + (0.18 * sharpness) + (0.1 * evidence) + (0.08 * alignment) + (0.07 * pressureEvidence),
     0.05,
     0.97
   );
   const confidenceBand = confidence >= 0.78 ? 'high' : confidence >= 0.6 ? 'medium' : 'low';
 
   const targetProbabilities = THRESHOLDS.map((threshold) => {
-    const gapNow = roundsSinceHit(cleanRounds, cleanRounds.length - 1, threshold);
-    const p1FromDist = probabilityFromDistribution(blendedBucketDist, threshold);
+    const g = gapPressure[threshold] || { currentGap: 0, soft: 0, hard: 0 };
+    const gapNow = g.currentGap;
+    const p1FromDist = probabilityFromDistribution(finalBucketDist, threshold);
     const markovP1 = probabilityFromDistribution(markov.distribution, threshold);
+    const pressureBoost = (0.08 * g.soft) + (0.16 * g.hard);
 
     const byHorizon = {};
     for (const h of HORIZONS) {
@@ -704,8 +979,7 @@ function computeReport(rounds) {
       const patternP = patternStats.thresholdProbabilities[threshold][h];
       const baselineP = baselineStats.thresholdProbabilities[threshold][h];
       const markovPh = clamp(1 - ((1 - markovP1) ** h), 0, 1);
-
-      byHorizon[h] = clamp(
+      const modelBlend = clamp(
         (weights.cluster * clusterP) +
         (weights.pattern * patternP) +
         (weights.markov * markovPh) +
@@ -713,6 +987,13 @@ function computeReport(rounds) {
         0,
         1
       );
+
+      if (h === 1) {
+        byHorizon[h] = clamp((0.6 * modelBlend) + (0.4 * p1FromDist) + (pressureBoost * 0.28), 0, 1);
+      } else {
+        const implied = clamp(1 - ((1 - byHorizon[1]) ** h), 0, 1);
+        byHorizon[h] = clamp((0.72 * modelBlend) + (0.28 * implied) + (pressureBoost * (h === 3 ? 0.35 : 0.42)), 0, 1);
+      }
     }
 
     const expectedGap = p1FromDist > 0.0001 ? roundNum(1 / p1FromDist, 2) : null;
@@ -720,9 +1001,11 @@ function computeReport(rounds) {
       target: threshold,
       gapNow,
       p1: roundNum(byHorizon[1], 4),
-      p3: roundNum(byHorizon[3], 4),
-      p5: roundNum(byHorizon[5], 4),
+      p3: roundNum(Math.max(byHorizon[3], byHorizon[1]), 4),
+      p5: roundNum(Math.max(byHorizon[5], byHorizon[3], byHorizon[1]), 4),
       expectedGap,
+      softGapPressure: roundNum(g.soft, 4),
+      hardGapPressure: roundNum(g.hard, 4),
     };
   });
 
@@ -733,13 +1016,16 @@ function computeReport(rounds) {
   else if (clusterMean < 10) clusterRegime = 'mid-volatility';
   else clusterRegime = 'expansion';
 
+  const cashoutPlan = buildCashoutPlan(finalBucketDist, topBucket, confidence, gapPressure);
+
   const signals = buildSignals({
     lowStreak: streakLength(cleanRounds, cleanRounds.length - 1, m => m < 2),
     highStreak: streakLength(cleanRounds, cleanRounds.length - 1, m => m >= 10),
-    gap10: roundsSinceHit(cleanRounds, cleanRounds.length - 1, 10),
-    gap25: roundsSinceHit(cleanRounds, cleanRounds.length - 1, 25),
     patternCount: patternStats.count,
     clusterRegime,
+    trendRegime: trendContext.regime,
+    gapPressure,
+    recommendedCashout: cashoutPlan,
     topBucket,
   });
 
@@ -754,11 +1040,14 @@ function computeReport(rounds) {
   }));
 
   return {
-    model: 'cluster-pattern-hybrid-v1',
+    model: 'cluster-pattern-hybrid-v2',
     generatedAt: new Date().toISOString(),
     asOfRound: cleanRounds[cleanRounds.length - 1].roundId,
     sampleSize: cleanRounds.length,
     expectedMultiplier: roundNum(expectedMultiplier, 4),
+    expectedMedian: roundNum(expectedMedian, 4),
+    expectedP75: roundNum(expectedP75, 4),
+    expectedP90: roundNum(expectedP90, 4),
     predictedBucket: {
       ...topBucket,
       probability: roundNum(maxProb, 4),
@@ -767,9 +1056,10 @@ function computeReport(rounds) {
     },
     bucketProbabilities: BUCKETS.map((bucket, i) => ({
       ...bucket,
-      probability: roundNum(blendedBucketDist[i], 4),
+      probability: roundNum(finalBucketDist[i], 4),
     })),
     targetProbabilities,
+    cashoutPlan,
     diagnostics: {
       training: {
         samples: samples.length,
@@ -789,6 +1079,11 @@ function computeReport(rounds) {
         support: Math.round(currentClusterStats.count),
         meanNextMultiplier: roundNum(clusterMean, 4),
       },
+      trend: {
+        regime: trendContext.regime,
+        trendScore: roundNum(trendContext.trendScore, 4),
+        volatilityRatio: roundNum(trendContext.volRatio, 4),
+      },
       pattern: {
         matches: patternStats.count,
         avgSimilarity: roundNum(patternStats.avgSimilarity, 4),
@@ -797,6 +1092,22 @@ function computeReport(rounds) {
         mode: markov.mode,
         support: markov.support,
       },
+      expected: {
+        central: roundNum(expectedMultiplier, 4),
+        median: roundNum(expectedMedian, 4),
+        p75: roundNum(expectedP75, 4),
+        p90: roundNum(expectedP90, 4),
+        meanFromDistribution: roundNum(distExpectedMean, 4),
+        meanFromEnsemble: roundNum(rawExpectedMultiplier, 4),
+      },
+      gapPressure: Object.fromEntries(
+        THRESHOLDS.map((t) => [t, {
+          gap: gapPressure[t]?.currentGap ?? 0,
+          soft: roundNum(gapPressure[t]?.soft ?? 0, 4),
+          hard: roundNum(gapPressure[t]?.hard ?? 0, 4),
+        }])
+      ),
+      bucketBoosts,
     },
     similarPatterns,
     signals,
