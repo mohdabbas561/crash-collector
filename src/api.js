@@ -2,9 +2,12 @@
 const express    = require('express');
 const cors       = require('cors');
 const { buildPredictionReport } = require('./predictionEngine');
+const { computeLockedRangePredictions } = require('./lockedRangeEngine');
 const {
   pool,
   getRounds, getStats, getStorageStats,
+  getPredictions, savePrediction,
+  getLockedConsensusPreds, saveLockedConsensusPreds,
   initAccessCodes, createAccessCode, getAccessCode,
   updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,
   initWalletStorage, saveWallet, getWallets, deleteWallet,
@@ -100,6 +103,60 @@ app.get('/predict', rateLimit(20), async (req, res) => {
     const rounds = await getRounds({ limit, order: 'ASC' });
     const report = buildPredictionReport(rounds);
     res.json({ ok: true, ...report });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// locked target windows (5x..1000x) persisted in DB
+app.get('/predict/locked', rateLimit(20), async (req, res) => {
+  try {
+    const requestedLimit = parseInt(req.query.limit || '100000', 10);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(Math.max(requestedLimit, 2000), 100000)
+      : 100000;
+
+    const [rounds, locked] = await Promise.all([
+      getRounds({ limit, order: 'ASC' }),
+      getLockedConsensusPreds(),
+    ]);
+
+    const engine = computeLockedRangePredictions(rounds, locked);
+
+    if (Object.keys(engine.locksToSave || {}).length) {
+      await saveLockedConsensusPreds(engine.locksToSave);
+    }
+
+    if (Array.isArray(engine.resolvedHistory) && engine.resolvedHistory.length) {
+      for (const row of engine.resolvedHistory) {
+        await savePrediction({
+          target: row.target,
+          minMult: row.minMult,
+          outcome: row.outcome,
+          lo: row.lo,
+          hi: row.hi,
+          hitRound: row.hitRound,
+          generation: row.generation || 1,
+          source: 'range_lock_v1',
+          probW: null,
+        });
+      }
+    }
+
+    const history = await getPredictions({ limit: 300, source: 'range_lock_v1' });
+    const summaryFromHistory = history.reduce((acc, h) => {
+      if (h.outcome === 'win') acc.win++;
+      else if (h.outcome === 'early') acc.early++;
+      else if (h.outcome === 'loss') acc.loss++;
+      return acc;
+    }, { win: 0, early: 0, loss: 0 });
+
+    res.json({
+      ok: true,
+      ...engine,
+      history,
+      historySummary: summaryFromHistory,
+    });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
