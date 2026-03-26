@@ -1,6 +1,15 @@
 'use strict';
 
 const TARGETS = [5, 10, 20, 50, 100, 500, 1000];
+const WINDOW_SPAN = {
+  5: 3,
+  10: 6,
+  20: 10,
+  50: 17,
+  100: 25,
+  500: 50,
+  1000: 60,
+};
 const MAX_AHEAD = {
   5: 220,
   10: 360,
@@ -289,6 +298,39 @@ function gapPressure(currentGap, stats) {
   return { soft, hard };
 }
 
+function hazardEta(target, currentState, stats, pressure) {
+  const meanGap = Math.max(2, Number(stats.mean || stats.q50 || 2));
+  const baseP = clamp(1 / meanGap, 0.00008, 0.45);
+
+  let factor = 1;
+  factor *= 1 + (0.38 * pressure.soft) + (0.75 * pressure.hard);
+
+  if (currentState.regime === 'expansion') factor *= target >= 20 ? 1.16 : 1.1;
+  if (currentState.regime === 'compression') factor *= target >= 20 ? 0.84 : 0.9;
+  if (currentState.regime === 'chaotic') factor *= target >= 50 ? 1.07 : 1.03;
+  if (currentState.regime === 'soft-up') factor *= 1.04;
+  if (currentState.regime === 'soft-down') factor *= 0.96;
+
+  factor *= 1 + (0.18 * clamp(currentState.trend, -0.6, 0.6));
+  factor = clamp(factor, 0.35, 2.2);
+
+  const p = clamp(baseP * factor, 0.00005, 0.62);
+  const q = 1 - p;
+
+  const stepFor = (quantileTarget) => {
+    if (p >= 0.999) return 1;
+    const raw = Math.log(1 - quantileTarget) / Math.log(Math.max(0.000001, q));
+    return Math.max(1, raw);
+  };
+
+  return {
+    pHit1: roundNum(p, 6),
+    q20: roundNum(stepFor(0.2), 3),
+    q50: roundNum(stepFor(0.5), 3),
+    q80: roundNum(stepFor(0.8), 3),
+  };
+}
+
 function buildWindow(pre, target, currentIdx) {
   const currentRound = pre.rounds[currentIdx].roundId;
   const currentState = pre.stateAt(currentIdx, target);
@@ -307,34 +349,53 @@ function buildWindow(pre, target, currentIdx) {
     q80 = Math.max(q50 + 1, stats.q90 || (q50 + 3));
   }
 
-  const reg = currentState.regime;
-  let factor = 1;
-  factor *= 1 - (0.18 * pressure.hard) - (0.07 * pressure.soft);
-  if (reg === 'expansion') factor *= target >= 20 ? 0.88 : 0.92;
-  if (reg === 'compression') factor *= target >= 20 ? 1.12 : 1.06;
-  if (reg === 'chaotic') factor *= target >= 50 ? 0.94 : 1.02;
-  factor = clamp(factor, 0.72, 1.28);
-
-  q20 *= factor;
-  q50 *= factor;
-  q80 *= factor;
-
   const sumW = neighbors.reduce((s, n) => s + n.weight, 0);
   const sumW2 = neighbors.reduce((s, n) => s + (n.weight * n.weight), 0);
   const effN = sumW2 > 0 ? (sumW * sumW) / sumW2 : 0;
   const uncertainty = clamp((18 - Math.min(18, effN)) / 18, 0, 1);
-  const widthPad = 1 + (0.5 * uncertainty);
 
-  let loAhead = Math.max(1, Math.round(q20 * (1 - 0.08 * uncertainty)));
-  let hiAhead = Math.max(loAhead + 1, Math.round(q80 * widthPad));
-  hiAhead = Math.min(hiAhead, MAX_AHEAD[target] || 3000);
-  loAhead = Math.min(loAhead, hiAhead);
+  const hazard = hazardEta(target, currentState, stats, pressure);
+
+  const neighborWeight = clamp(0.35 + (0.45 * clamp(effN / 9, 0, 1)), 0.35, 0.8);
+  const hazardWeight = clamp(0.28 + (0.17 * uncertainty), 0.18, 0.5);
+  const priorWeight = clamp(1 - neighborWeight - hazardWeight, 0.05, 0.25);
+
+  const priorCenter = Math.max(1, stats.q50 || stats.q75 || hazard.q50 || q50 || 2);
+  const blendCenter =
+    (neighborWeight * q50) +
+    (hazardWeight * hazard.q50) +
+    (priorWeight * priorCenter);
+
+  const reg = currentState.regime;
+  let centerFactor = 1;
+  centerFactor *= 1 - (0.16 * pressure.hard) - (0.08 * pressure.soft);
+  if (reg === 'expansion') centerFactor *= target >= 20 ? 0.9 : 0.94;
+  if (reg === 'compression') centerFactor *= target >= 20 ? 1.1 : 1.05;
+  if (reg === 'chaotic') centerFactor *= target >= 50 ? 0.94 : 0.98;
+  centerFactor *= 1 - (0.1 * clamp(currentState.trend, -0.8, 0.8));
+  centerFactor = clamp(centerFactor, 0.68, 1.35);
+
+  const centerAhead = Math.max(1, Math.round(blendCenter * centerFactor));
+  const windowSpan = WINDOW_SPAN[target] || 10;
+  const halfLeft = Math.floor((windowSpan - 1) / 2);
+  const maxLoAhead = Math.max(1, (MAX_AHEAD[target] || 3000) - windowSpan + 1);
+
+  let loAhead = Math.max(1, centerAhead - halfLeft);
+  loAhead = Math.min(loAhead, maxLoAhead);
+  const hiAhead = loAhead + windowSpan - 1;
+
+  const engineAgreement = clamp(
+    1 - (Math.abs(q50 - hazard.q50) / Math.max(2, q50 + hazard.q50)),
+    0,
+    1
+  );
 
   const confidence = clamp(
-    0.25 +
+    0.2 +
     (0.35 * (1 - uncertainty)) +
     (0.2 * Math.min(1, neighbors.length / (target <= 20 ? 300 : 180))) +
-    (0.2 * ((pressure.soft + pressure.hard) * 0.5)),
+    (0.17 * ((pressure.soft + pressure.hard) * 0.5)) +
+    (0.08 * engineAgreement),
     0.08,
     0.95
   );
@@ -348,9 +409,17 @@ function buildWindow(pre, target, currentIdx) {
       q20: roundNum(q20, 2),
       q50: roundNum(q50, 2),
       q80: roundNum(q80, 2),
+      hazardQ20: roundNum(hazard.q20, 2),
+      hazardQ50: roundNum(hazard.q50, 2),
+      hazardQ80: roundNum(hazard.q80, 2),
+      pHit1: roundNum(hazard.pHit1, 6),
+      blendCenter: roundNum(blendCenter, 2),
+      centerAhead: roundNum(centerAhead, 2),
+      windowSpan,
       neighbors: neighbors.length,
       effN: roundNum(effN, 2),
       uncertainty: roundNum(uncertainty, 4),
+      engineAgreement: roundNum(engineAgreement, 4),
       regime: reg,
       currentGap: gapNow,
       historicalGapMean: stats.mean || 0,
@@ -360,12 +429,12 @@ function buildWindow(pre, target, currentIdx) {
       hardGapPressure: roundNum(pressure.hard, 4),
       confidence: roundNum(confidence, 4),
       reason: pressure.hard > 0.45
-        ? 'Hard-gap pressure detected from historical gap extremes.'
+        ? 'Hard-gap pressure active; center shifted earlier with fixed short window.'
         : reg === 'expansion'
-          ? 'Expansion regime increases upper-tail arrival odds.'
+          ? 'Expansion regime detected; fixed window centered using ensemble ETA.'
           : reg === 'compression'
-            ? 'Compression regime tends to delay high thresholds.'
-            : 'Window based on nearest historical state-cluster analogs.',
+            ? 'Compression regime detected; fixed window centered later from ensemble ETA.'
+            : 'Fixed window centered from neighbor-pattern + hazard + trend ensemble.',
     },
     confidence: roundNum(confidence, 4),
   };
@@ -376,16 +445,20 @@ function evaluateLock(lock, target, pre, currentRound) {
   const roundWhenMade = Number(lock.roundWhenMade || lock.round_when_made || 0);
   const lo = Number(lock.lo);
   const hi = Number(lock.hi);
-  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi < lo) return { resolved: true, outcome: 'loss', hitRound: null };
+  if (!Number.isFinite(roundWhenMade) || !Number.isFinite(lo) || !Number.isFinite(hi) || hi < lo || lo <= roundWhenMade) {
+    return { resolved: true, outcome: 'loss', hitRound: null };
+  }
 
   const hits = pre.hitRoundIds[target] || [];
-  const earlyHit = findFirstInRange(hits, roundWhenMade + 1, lo - 1);
-  if (earlyHit != null) return { resolved: true, outcome: 'early', hitRound: earlyHit };
+  const firstHitAfterMade = findFirstInRange(hits, roundWhenMade + 1, currentRound);
 
-  const winHit = findFirstInRange(hits, lo, hi);
-  if (winHit != null) return { resolved: true, outcome: 'win', hitRound: winHit };
+  if (firstHitAfterMade != null) {
+    if (firstHitAfterMade < lo) return { resolved: true, outcome: 'early', hitRound: firstHitAfterMade };
+    if (firstHitAfterMade <= hi) return { resolved: true, outcome: 'win', hitRound: firstHitAfterMade };
+  }
 
-  if (currentRound > hi) return { resolved: true, outcome: 'loss', hitRound: null };
+  // Window is inclusive. If current round reached/ended hi without a hit, it is a miss now.
+  if (currentRound >= hi) return { resolved: true, outcome: 'loss', hitRound: null };
 
   if (currentRound < lo) return { resolved: false, status: 'pending' };
   return { resolved: false, status: 'window-open' };
@@ -418,6 +491,7 @@ function buildUiTarget(target, lock, status, currentRound, previousOutcome = nul
       hi: Number(lock.hi),
       aheadLo: loAhead,
       aheadHi: hiAhead,
+      span: Math.max(1, (Number(lock.hi) - Number(lock.lo) + 1)),
       roundsUntilWindow,
       roundsLeftInWindow,
     },
@@ -436,13 +510,14 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}) {
   const pre = preprocess(rounds || []);
   if (pre.n < 800) {
     return {
-      model: 'range-lock-v1',
+      model: 'range-lock-v2',
       generatedAt: new Date().toISOString(),
       asOfRound: pre.rounds[pre.n - 1]?.roundId || null,
       targets: [],
       locksToSave: {},
       resolvedHistory: [],
       summary: { pending: 0, windowOpen: 0, relocked: 0, sampleSize: pre.n },
+      settings: { windowSpan: WINDOW_SPAN },
       warning: 'Need at least 800 rounds before reliable range locks.',
     };
   }
@@ -518,13 +593,14 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}) {
   targetsOut.sort((a, b) => a.target - b.target);
 
   return {
-    model: 'range-lock-v1',
+    model: 'range-lock-v2',
     generatedAt: new Date().toISOString(),
     asOfRound: currentRound,
     sampleSize: pre.n,
     targets: targetsOut,
     locksToSave,
     resolvedHistory,
+    settings: { windowSpan: WINDOW_SPAN },
     summary: {
       pending: pendingCount,
       windowOpen: openCount,
