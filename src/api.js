@@ -143,19 +143,42 @@ app.get('/predict/locked', rateLimit(20), async (req, res) => {
       }
     }
 
-    const history = await getPredictions({ limit: 300, source: 'range_lock_v1' });
-    const summaryFromHistory = history.reduce((acc, h) => {
-      if (h.outcome === 'win') acc.win++;
-      else if (h.outcome === 'early') acc.early++;
-      else if (h.outcome === 'loss') acc.loss++;
-      return acc;
-    }, { win: 0, early: 0, loss: 0 });
+    const historyTargetRaw = String(req.query.historyTarget || '').trim();
+    const historyTarget = historyTargetRaw
+      ? (historyTargetRaw.toLowerCase().endsWith('x') ? historyTargetRaw.toLowerCase() : `${historyTargetRaw.toLowerCase()}x`)
+      : null;
+
+    const fullHistory = await getPredictions({ limit: 600, source: 'range_lock_v1' });
+    const history = historyTarget
+      ? fullHistory.filter(h => String(h.target || '').toLowerCase() === historyTarget)
+      : fullHistory;
+
+    const summarize = (rows) => {
+      const out = rows.reduce((acc, h) => {
+        if (h.outcome === 'win') acc.win++;
+        else if (h.outcome === 'early') acc.early++;
+        else if (h.outcome === 'loss') acc.loss++;
+        return acc;
+      }, { win: 0, early: 0, loss: 0, total: rows.length });
+      const base = out.win + out.loss;
+      out.accuracy = base > 0 ? Number((out.win / base).toFixed(4)) : null;
+      return out;
+    };
+
+    const summaryFromHistory = summarize(history);
+
+    const byTarget = {};
+    for (const t of ['5x', '10x', '20x', '50x', '100x', '500x', '1000x']) {
+      byTarget[t] = summarize(fullHistory.filter(h => String(h.target || '').toLowerCase() === t));
+    }
 
     res.json({
       ok: true,
       ...engine,
       history,
       historySummary: summaryFromHistory,
+      historyByTarget: byTarget,
+      historyFilter: historyTarget || 'all',
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
