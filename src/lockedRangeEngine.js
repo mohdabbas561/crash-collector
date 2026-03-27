@@ -532,6 +532,23 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
     -0.8,
     0.8
   );
+  const interGaps = Array.isArray(stats.interGaps) ? stats.interGaps : [];
+  let pGap1 = 0;
+  let pGap2 = 0;
+  let pGap3 = 0;
+  if (interGaps.length) {
+    let c1 = 0;
+    let c2 = 0;
+    let c3 = 0;
+    for (const g of interGaps) {
+      if (g <= 1) c1++;
+      if (g <= 2) c2++;
+      if (g <= 3) c3++;
+    }
+    pGap1 = c1 / interGaps.length;
+    pGap2 = c2 / interGaps.length;
+    pGap3 = c3 / interGaps.length;
+  }
   const spread = Math.max(1, q80 - q20);
   const windowSpan = Math.max(1, Number(WINDOW_SPAN_PRIOR[target] || 3));
 
@@ -547,6 +564,12 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
     const quickPull = clamp((quickSignal - 0.08) / 0.62, 0, 1);
     const mix = 0.72 * quickPull;
     centerAhead = ((1 - mix) * centerAhead) + (mix * quickAnchor);
+  }
+
+  if (gapNow <= 1 && (pGap2 > 0.03 || pGap3 > 0.08)) {
+    const b2bStrength = clamp((0.62 * pGap2) + (0.38 * pGap3), 0, 0.82);
+    const b2bAnchor = Math.max(1, (0.74 * neighQ20) + (0.26 * 1.2));
+    centerAhead = ((1 - b2bStrength) * centerAhead) + (b2bStrength * b2bAnchor);
   }
 
   centerAhead = Math.max(1, centerAhead);
@@ -619,6 +642,9 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
       softGapPressure: roundNum(pressure.soft, 4),
       hardGapPressure: roundNum(pressure.hard, 4),
       quickHitSignal: roundNum(quickSignal, 4),
+      pGapLe1: roundNum(pGap1, 4),
+      pGapLe2: roundNum(pGap2, 4),
+      pGapLe3: roundNum(pGap3, 4),
       confidence: roundNum(confidence, 4),
       reason: currentState.regime === 'white'
         ? 'White cluster detected; center shifted using real outcome calibration (fixed target span).'
@@ -718,7 +744,8 @@ function buildCalibrationMap(historyRows, pre) {
 
       const span = Math.max(1, (hi - lo + 1));
       const center = lo + ((span - 1) * 0.5);
-      const recency = 1 + ((rows.length - i) / rows.length);
+      const recencyRatio = (rows.length - i) / Math.max(1, rows.length);
+      const recency = 1 + (2 * (recencyRatio ** 2));
       let err = 0;
       let directional = false;
 
