@@ -380,19 +380,29 @@ function hazardEta(target, currentState, stats, pressure) {
 }
 
 // === v7 SUPERVISED LEARNING & ADAPTIVE UPGRADE START ===
-// Justification: detect persistent white clusters and adjust timing/width to reduce late windows.
-function whiteClusterSeverity(pre, currentState, target) {
+// Justification: detect persistent white clusters with gap gating so post-hit b2b windows are not delayed too much.
+function whiteClusterSeverity(pre, currentState, target, currentIdx = null) {
+  const idx = Number.isFinite(currentIdx) ? currentIdx : (pre.n - 1);
   const p = pre.whiteProfile || {};
+  const targetStats = pre.gapStats?.[target] || {};
   const lowQ85 = Number(p.lowQ85 || 0);
   const lowQ95 = Number(p.lowQ95 || lowQ85 + 1);
   const under2Q85 = Number(p.under2Q85 || 0);
   const under2Q95 = Number(p.under2Q95 || Math.max(under2Q85 + 0.01, 0.01));
+  const gapQ50 = Number(targetStats.q50 || targetStats.mean || 1);
+  const gapQ90 = Number(targetStats.q90 || Math.max(gapQ50 + 1, 2));
 
   const sLow = clamp((currentState.lowStreak - lowQ85) / Math.max(1, lowQ95 - lowQ85), 0, 1);
   const sRate = clamp((currentState.under2Rate - under2Q85) / Math.max(0.001, under2Q95 - under2Q85), 0, 1);
+  const lookback = clamp(Math.round((p.under2Window || 32) * 1.2), 18, 180);
+  const recentUnder2 = rangeMean(pre.prefUnder2, idx - lookback + 1, idx);
+  const sPersist = clamp((recentUnder2 - under2Q85) / Math.max(0.001, under2Q95 - under2Q85), 0, 1);
   const sTrend = currentState.trend < 0 ? clamp((-currentState.trend) / 0.08, 0, 1) : 0;
+  const gapGate = clamp((currentState.gapT - gapQ50) / Math.max(1, gapQ90 - gapQ50), 0, 1);
+  const regimeGate = currentState.regime === 'white' ? 1 : (currentState.regime === 'compression' ? 0.6 : 0.4);
   const targetScale = clamp(Math.log(Math.max(2, target)) / Math.log(1000), 0.25, 1);
-  return clamp(((sLow + sRate + sTrend) / 3) * targetScale, 0, 1);
+  const base = (0.33 * sLow) + (0.25 * sRate) + (0.2 * sPersist) + (0.22 * sTrend);
+  return clamp(base * regimeGate * targetScale * (0.05 + (0.95 * gapGate)), 0, 1);
 }
 // === UPGRADE END ===
 
@@ -459,6 +469,38 @@ function learnBlendWeights(pre, target, currentIdx, stats) {
 }
 // === UPGRADE END ===
 
+// === v7 SUPERVISED LEARNING & ADAPTIVE UPGRADE START ===
+// Justification: explicit b2b/quick-hit detection to avoid late windows after fresh hits.
+function quickHitSignal(neighbors, hazard, currentGap, stats) {
+  if (!neighbors.length) {
+    const h2 = clamp(1 - ((1 - clamp(hazard.pHit1 || 0, 0, 1)) ** 2), 0, 1);
+    return clamp(h2, 0, 1);
+  }
+
+  let totalW = 0;
+  let wLe1 = 0;
+  let wLe2 = 0;
+  let wLe3 = 0;
+  for (const n of neighbors) {
+    totalW += n.weight;
+    if (n.value <= 1.5) wLe1 += n.weight;
+    if (n.value <= 2.5) wLe2 += n.weight;
+    if (n.value <= 3.5) wLe3 += n.weight;
+  }
+
+  const pLe1 = totalW > 0 ? (wLe1 / totalW) : 0;
+  const pLe2 = totalW > 0 ? (wLe2 / totalW) : 0;
+  const pLe3 = totalW > 0 ? (wLe3 / totalW) : 0;
+  const h2 = clamp(1 - ((1 - clamp(hazard.pHit1 || 0, 0, 1)) ** 2), 0, 1);
+  const baseQuick = clamp((0.42 * pLe1) + (0.28 * pLe2) + (0.12 * pLe3) + (0.18 * h2), 0, 1);
+
+  const q25 = Number(stats.q25 || stats.q10 || 1);
+  const q50 = Number(stats.q50 || stats.mean || q25 + 1);
+  const freshnessBoost = currentGap <= q25 ? 1 : (currentGap <= q50 ? 0.72 : 0.45);
+  return clamp(baseQuick * freshnessBoost, 0, 1);
+}
+// === UPGRADE END ===
+
 function buildWindow(pre, target, currentIdx, calibration = null) {
   // === v7 SUPERVISED LEARNING & ADAPTIVE UPGRADE START ===
   // Justification: adaptive window center/span from blended predictors + white-cluster + calibration feedback.
@@ -483,14 +525,30 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
   const q50 = (blend.neighbor * neighQ50) + (blend.hazard * hazard.q50) + (blend.prior * priorQ50);
   const q80 = (blend.neighbor * neighQ80) + (blend.hazard * hazard.q80) + (blend.prior * priorQ80);
 
-  const whiteSeverity = whiteClusterSeverity(pre, currentState, target);
+  const whiteSeverity = whiteClusterSeverity(pre, currentState, target, currentIdx);
+  const quickSignal = quickHitSignal(neighbors, hazard, gapNow, stats);
+  const earlyDominance = clamp(
+    Number(calibration?.earlyRate || 0) - Number(calibration?.lossRate || 0),
+    -0.8,
+    0.8
+  );
   const spread = Math.max(1, q80 - q20);
   const windowSpan = Math.max(1, Number(WINDOW_SPAN_PRIOR[target] || 3));
 
   let centerAhead = q50;
   centerAhead *= 1 + Number(calibration?.shift || 0);
-  centerAhead *= 1 + (whiteSeverity * 0.55);
-  centerAhead *= 1 - (pressure.hard * 0.18);
+  centerAhead *= 1 - (0.58 * Math.max(0, earlyDominance));
+  centerAhead *= 1 + (0.42 * Math.max(0, -earlyDominance));
+  centerAhead *= 1 + (whiteSeverity * 0.34);
+  centerAhead *= 1 - (pressure.hard * 0.24);
+
+  if (quickSignal > 0) {
+    const quickAnchor = Math.max(1, (0.68 * neighQ20) + (0.32 * hazard.q20));
+    const quickPull = clamp((quickSignal - 0.08) / 0.62, 0, 1);
+    const mix = 0.72 * quickPull;
+    centerAhead = ((1 - mix) * centerAhead) + (mix * quickAnchor);
+  }
+
   centerAhead = Math.max(1, centerAhead);
 
   const skewDen = Math.max(0.000001, q80 - q20);
@@ -560,6 +618,7 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
       historicalQ90: stats.q90 || 0,
       softGapPressure: roundNum(pressure.soft, 4),
       hardGapPressure: roundNum(pressure.hard, 4),
+      quickHitSignal: roundNum(quickSignal, 4),
       confidence: roundNum(confidence, 4),
       reason: currentState.regime === 'white'
         ? 'White cluster detected; center shifted using real outcome calibration (fixed target span).'
@@ -569,6 +628,8 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
       calibrationDirectional: Number(calibration?.directionalSamples || 0),
       calibrationError: roundNum(calibration?.meanNormError || 0, 4),
       calibrationWinRate: roundNum(calibration?.winRate || 0, 4),
+      calibrationEarlyRate: roundNum(calibration?.earlyRate || 0, 4),
+      calibrationLossRate: roundNum(calibration?.lossRate || 0, 4),
       calibrationWilsonLow: roundNum(calibration?.wilsonLow || 0.5, 4),
       calibrationSpanMultiplier: 1,
     },
@@ -703,8 +764,10 @@ function buildCalibrationMap(historyRows, pre) {
     const meanNormErr = weightedMean(errItems);
     const absNormErr = weightedMean(absErrItems);
     const wb = wilsonBounds(winCount, lossCount);
-    const sampleFactor = clamp(rows.length / 28, 0, 1);
-    const shift = clamp(meanNormErr * sampleFactor, -0.42, 0.42);
+    const sampleFactor = clamp(rows.length / 26, 0, 1);
+    const directionalBias = clamp((lossRate - earlyRate), -1, 1);
+    const blendedShift = (0.62 * meanNormErr) + (0.38 * directionalBias);
+    const shift = clamp(blendedShift * sampleFactor, -0.72, 0.72);
     const spanMultiplier = clamp((1 + absNormErr) * (1 + (earlyRate * 0.45)), 0.75, 2.9);
     const confidenceScale = clamp((wb.low + wb.mid) * 0.5, 0.1, 1);
 
