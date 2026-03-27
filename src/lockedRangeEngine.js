@@ -484,15 +484,8 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
   const q80 = (blend.neighbor * neighQ80) + (blend.hazard * hazard.q80) + (blend.prior * priorQ80);
 
   const whiteSeverity = whiteClusterSeverity(pre, currentState, target);
-  const interSorted = [...(stats.interGaps || [])].sort((a, b) => a - b);
   const spread = Math.max(1, q80 - q20);
-  const baseSpan = Math.max(2, spread + 1);
-  const dataSpan = Math.max(2, (quantile(interSorted, 0.65) - quantile(interSorted, 0.3) + 1));
-  const calSpan = Number(calibration?.spanMultiplier || 1);
-  const minSpan = Math.max(2, Math.round(quantile(interSorted, 0.1) || WINDOW_SPAN_PRIOR[target] || 3));
-  const maxSpan = Math.max(minSpan + 1, Math.round(quantile(interSorted, 0.85) || ((WINDOW_SPAN_PRIOR[target] || 8) * 2.4)));
-  let windowSpan = ((baseSpan + dataSpan) * 0.5) * calSpan * (1 + (whiteSeverity * 0.65));
-  windowSpan = clamp(Math.round(windowSpan), minSpan, maxSpan);
+  const windowSpan = Math.max(1, Number(WINDOW_SPAN_PRIOR[target] || 3));
 
   let centerAhead = q50;
   centerAhead *= 1 + Number(calibration?.shift || 0);
@@ -569,15 +562,15 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
       hardGapPressure: roundNum(pressure.hard, 4),
       confidence: roundNum(confidence, 4),
       reason: currentState.regime === 'white'
-        ? 'White cluster detected; window widened/shifted using real outcome calibration.'
-        : 'Adaptive blend (neighbor + hazard + prior) weighted from backtested real errors.',
+        ? 'White cluster detected; center shifted using real outcome calibration (fixed target span).'
+        : 'Adaptive blend (neighbor + hazard + prior) weighted from backtested real errors (fixed target span).',
       calibrationShift: roundNum(calibration?.shift || 0, 4),
       calibrationSample: Number(calibration?.sample || 0),
       calibrationDirectional: Number(calibration?.directionalSamples || 0),
       calibrationError: roundNum(calibration?.meanNormError || 0, 4),
       calibrationWinRate: roundNum(calibration?.winRate || 0, 4),
       calibrationWilsonLow: roundNum(calibration?.wilsonLow || 0.5, 4),
-      calibrationSpanMultiplier: roundNum(calibration?.spanMultiplier || 1, 4),
+      calibrationSpanMultiplier: 1,
     },
     confidence: roundNum(confidence, 4),
   };
@@ -796,12 +789,15 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
     const key = String(target);
     const existing = normalizeLockInput(existingLocksRaw[key]);
     const evalResult = evaluateLock(existing, target, pre, currentRound);
+    const fixedSpan = Math.max(1, Number(WINDOW_SPAN_PRIOR[target] || 3));
+    const existingSpan = existing ? Math.max(1, (Number(existing.hi) - Number(existing.lo) + 1)) : null;
+    const spanMismatch = Boolean(existing && Number.isFinite(existingSpan) && existingSpan !== fixedSpan);
 
     let lockToUse = existing;
     let status = 'pending';
     let previousOutcome = null;
 
-    if (!existing || evalResult.resolved) {
+    if (!existing || evalResult.resolved || spanMismatch) {
       if (existing && evalResult.resolved) {
         previousOutcome = {
           outcome: evalResult.outcome,
@@ -863,8 +859,9 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
     resolvedHistory,
     calibration,
     settings: {
-      windowSpan: Object.fromEntries(targetsOut.map(t => [t.target, t.window.span])),
+      windowSpan: WINDOW_SPAN_PRIOR,
       adaptive: true,
+      fixedWindowSpan: true,
     },
     summary: {
       pending: pendingCount,
