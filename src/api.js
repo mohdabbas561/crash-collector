@@ -135,6 +135,7 @@ app.get('/predict/locked', rateLimit(20), async (req, res) => {
       await saveLockedConsensusPreds(engine.locksToSave);
     }
 
+    let savedResolvedCount = 0;
     if (Array.isArray(engine.resolvedHistory) && engine.resolvedHistory.length) {
       for (const row of engine.resolvedHistory) {
         await savePrediction({
@@ -148,6 +149,7 @@ app.get('/predict/locked', rateLimit(20), async (req, res) => {
           source: 'range_lock_v1',
           probW: null,
         });
+        savedResolvedCount++;
       }
     }
     
@@ -182,6 +184,8 @@ app.get('/predict/locked', rateLimit(20), async (req, res) => {
       historySummary: summaryFromHistory,
       historyByTarget: byTarget,
       historyFilter: historyTarget || 'all',
+      historyStorage: 'postgres',
+      savedResolvedCount,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
