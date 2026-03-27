@@ -124,7 +124,7 @@ app.get('/predict/locked', rateLimit(20), async (req, res) => {
     const [rounds, locked, historyForCalibration] = await Promise.all([
       getRounds({ limit, order: 'ASC' }),
       getLockedConsensusPreds(),
-      getPredictions({ limit: 600, source: 'range_lock_v1' }),
+      getPredictions({ limit: 3000, source: 'range_lock_v1' }),
     ]);
 
     const engine = computeLockedRangePredictions(rounds, locked, {
@@ -147,13 +147,13 @@ app.get('/predict/locked', rateLimit(20), async (req, res) => {
           hitRound: row.hitRound,
           generation: row.generation || 1,
           source: 'range_lock_v1',
-          probW: null,
+          probW: row.confidence ?? null,
         });
         savedResolvedCount++;
       }
     }
     
-    const fullHistory = await getPredictions({ limit: 600, source: 'range_lock_v1' });
+    const fullHistory = await getPredictions({ limit: 1200, source: 'range_lock_v1' });
     const history = historyTarget
       ? fullHistory.filter(h => String(h.target || '').toLowerCase() === historyTarget)
       : fullHistory;
@@ -193,23 +193,27 @@ app.get('/predict/locked', rateLimit(20), async (req, res) => {
 });
 
 // ── ACCESS CODES ──────────────────────────────────────────────────────────────
-app.delete('/clear-history', requireAdmin, rateLimit(10), async (req, res) => {
+const clearHistoryHandler = async (req, res) => {
   try {
     const result = await clearPredictions();
     res.json({ ok: true, ...result });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
-});
+};
+app.delete('/clear-history', requireAdmin, rateLimit(10), clearHistoryHandler);
+app.post('/clear-history', requireAdmin, rateLimit(10), clearHistoryHandler);
 
-app.delete('/clear-locks', requireAdmin, rateLimit(10), async (req, res) => {
+const clearLocksHandler = async (req, res) => {
   try {
     const result = await clearAllLocks();
     res.json({ ok: true, ...result });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
-});
+};
+app.delete('/clear-locks', requireAdmin, rateLimit(10), clearLocksHandler);
+app.post('/clear-locks', requireAdmin, rateLimit(10), clearLocksHandler);
 
 app.post('/access/verify', rateLimit(20), async (req, res) => {
   try {

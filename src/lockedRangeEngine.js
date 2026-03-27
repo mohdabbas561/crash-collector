@@ -1,7 +1,7 @@
 'use strict';
 
 const TARGETS = [5, 10, 20, 50, 100, 500, 1000];
-const WINDOW_SPAN = {
+const WINDOW_SPAN_PRIOR = {
   5: 3,
   10: 6,
   20: 10,
@@ -9,15 +9,6 @@ const WINDOW_SPAN = {
   100: 25,
   500: 50,
   1000: 60,
-};
-const MAX_AHEAD = {
-  5: 220,
-  10: 360,
-  20: 560,
-  50: 1100,
-  100: 2200,
-  500: 7000,
-  1000: 12000,
 };
 
 function clamp(v, lo, hi) {
@@ -64,6 +55,32 @@ function weightedQuantile(items, q) {
     if ((acc / total) >= qq) return item.value;
   }
   return sorted[sorted.length - 1].value;
+}
+
+function weightedMean(items) {
+  if (!items.length) return 0;
+  let num = 0;
+  let den = 0;
+  for (const item of items) {
+    num += item.value * item.weight;
+    den += item.weight;
+  }
+  return den > 0 ? (num / den) : 0;
+}
+
+function wilsonBounds(wins, losses, z = 1.96) {
+  const n = wins + losses;
+  if (!n) return { low: 0, mid: 0.5, high: 1 };
+  const p = wins / n;
+  const z2 = z * z;
+  const denom = 1 + (z2 / n);
+  const center = (p + (z2 / (2 * n))) / denom;
+  const margin = (z / denom) * Math.sqrt((p * (1 - p) / n) + (z2 / (4 * n * n)));
+  return {
+    low: clamp(center - margin, 0, 1),
+    mid: clamp(center, 0, 1),
+    high: clamp(center + margin, 0, 1),
+  };
 }
 
 function safeLog(v) {
@@ -131,6 +148,8 @@ function preprocess(rounds) {
   const prefLog = buildPrefix(logs);
   const sqLogs = logs.map(v => v * v);
   const prefSq = buildPrefix(sqLogs);
+  const under2Flags = cleanRounds.map(r => (r.multiplier < 2 ? 1 : 0));
+  const prefUnder2 = buildPrefix(under2Flags);
 
   const lowStreak = new Array(n).fill(0);
   const highStreak = new Array(n).fill(0);
@@ -138,6 +157,21 @@ function preprocess(rounds) {
     lowStreak[i] = cleanRounds[i].multiplier < 2 ? 1 + (i > 0 ? lowStreak[i - 1] : 0) : 0;
     highStreak[i] = cleanRounds[i].multiplier >= 10 ? 1 + (i > 0 ? highStreak[i - 1] : 0) : 0;
   }
+
+  const streakSorted = [...lowStreak].sort((a, b) => a - b);
+  const under2Window = clamp(Math.round(Math.sqrt(Math.max(1, n)) + 8), 16, 120);
+  const under2Rates = [];
+  for (let i = under2Window - 1; i < n; i++) {
+    under2Rates.push(rangeMean(prefUnder2, i - under2Window + 1, i));
+  }
+  const under2Sorted = [...under2Rates].sort((a, b) => a - b);
+  const whiteProfile = {
+    lowQ85: quantile(streakSorted, 0.85),
+    lowQ95: quantile(streakSorted, 0.95),
+    under2Q85: quantile(under2Sorted, 0.85),
+    under2Q95: quantile(under2Sorted, 0.95),
+    under2Window,
+  };
 
   const gapMaps = {};
   const nextHitMaps = {};
@@ -172,11 +206,17 @@ function preprocess(rounds) {
     nextHitMaps[target] = nextHit;
     hitRoundIds[target] = hits;
     gapStats[target] = {
+      count: sorted.length,
       mean: roundNum(avg, 3),
       sd: roundNum(sd, 3),
+      q10: roundNum(sorted.length ? quantile(sorted, 0.1) : 0, 3),
+      q25: roundNum(sorted.length ? quantile(sorted, 0.25) : 0, 3),
       q50: roundNum(sorted.length ? quantile(sorted, 0.5) : 0, 3),
       q75: roundNum(sorted.length ? quantile(sorted, 0.75) : 0, 3),
       q90: roundNum(sorted.length ? quantile(sorted, 0.9) : 0, 3),
+      q95: roundNum(sorted.length ? quantile(sorted, 0.95) : 0, 3),
+      q99: roundNum(sorted.length ? quantile(sorted, 0.99) : 0, 3),
+      interGaps,
     };
   }
 
@@ -200,13 +240,16 @@ function preprocess(rounds) {
     const volNow = rangeStd(idx - 29, idx);
     const volBase = rangeStd(idx - 159, idx - 30) || 1;
     const volRatio = volNow / volBase;
+    const under2Rate = rangeMean(prefUnder2, idx - whiteProfile.under2Window + 1, idx);
+    const lowNow = lowStreak[clamp(idx, 0, n - 1)];
     let regime = 'balanced';
-    if (trend <= -0.04 && volRatio <= 1.02) regime = 'compression';
+    if (lowNow >= whiteProfile.lowQ85 && under2Rate >= whiteProfile.under2Q85 && trend <= 0.01) regime = 'white';
+    else if (trend <= -0.04 && volRatio <= 1.02) regime = 'compression';
     else if (trend >= 0.035 && volRatio >= 1.02) regime = 'expansion';
     else if (volRatio >= 1.18) regime = 'chaotic';
     else if (trend <= -0.02) regime = 'soft-down';
     else if (trend >= 0.02) regime = 'soft-up';
-    return { trend, volRatio, regime };
+    return { trend, volRatio, regime, under2Rate };
   }
 
   function stateAt(idx, target) {
@@ -223,6 +266,7 @@ function preprocess(rounds) {
       trend: tr.trend,
       volRatio: tr.volRatio,
       regime: tr.regime,
+      under2Rate: tr.under2Rate,
       lowStreak: lowStreak[idx],
       highStreak: highStreak[idx],
       seq,
@@ -232,10 +276,12 @@ function preprocess(rounds) {
   return {
     rounds: cleanRounds,
     n,
+    prefUnder2,
     gapMaps,
     nextHitMaps,
     hitRoundIds,
     gapStats,
+    whiteProfile,
     stateAt,
   };
 }
@@ -250,6 +296,7 @@ function stateDistance(a, b, target) {
   if (target >= 100) d += 0.35 * Math.abs(Math.log1p(a.gap100) - Math.log1p(b.gap100));
   d += 2.9 * Math.abs(a.trend - b.trend);
   d += 1.5 * Math.abs(a.volRatio - b.volRatio);
+  d += 0.9 * Math.abs(a.under2Rate - b.under2Rate);
   d += 0.06 * Math.abs(a.lowStreak - b.lowStreak);
   d += 0.05 * Math.abs(a.highStreak - b.highStreak);
 
@@ -265,7 +312,8 @@ function stateDistance(a, b, target) {
 function collectNeighbors(pre, target, currentIdx, currentState) {
   const nextMap = pre.nextHitMaps[target];
   const items = [];
-  const maxAhead = MAX_AHEAD[target] || 2000;
+  const stats = pre.gapStats[target] || {};
+  const maxAhead = Math.max(12, Math.round((stats.q99 || stats.q95 || stats.q90 || stats.mean || 12) * 6));
   const start = 120;
   for (let idx = start; idx < currentIdx; idx++) {
     const nextIdx = nextMap[idx];
@@ -284,7 +332,7 @@ function collectNeighbors(pre, target, currentIdx, currentState) {
   }
 
   items.sort((a, b) => b.weight - a.weight);
-  const keep = target <= 20 ? 700 : target <= 100 ? 520 : 360;
+  const keep = clamp(Math.round(Math.sqrt(Math.max(1, currentIdx)) * 6), 80, 850);
   return items.slice(0, keep);
 }
 
@@ -331,76 +379,151 @@ function hazardEta(target, currentState, stats, pressure) {
   };
 }
 
+// === v7 SUPERVISED LEARNING & ADAPTIVE UPGRADE START ===
+// Justification: detect persistent white clusters and adjust timing/width to reduce late windows.
+function whiteClusterSeverity(pre, currentState, target) {
+  const p = pre.whiteProfile || {};
+  const lowQ85 = Number(p.lowQ85 || 0);
+  const lowQ95 = Number(p.lowQ95 || lowQ85 + 1);
+  const under2Q85 = Number(p.under2Q85 || 0);
+  const under2Q95 = Number(p.under2Q95 || Math.max(under2Q85 + 0.01, 0.01));
+
+  const sLow = clamp((currentState.lowStreak - lowQ85) / Math.max(1, lowQ95 - lowQ85), 0, 1);
+  const sRate = clamp((currentState.under2Rate - under2Q85) / Math.max(0.001, under2Q95 - under2Q85), 0, 1);
+  const sTrend = currentState.trend < 0 ? clamp((-currentState.trend) / 0.08, 0, 1) : 0;
+  const targetScale = clamp(Math.log(Math.max(2, target)) / Math.log(1000), 0.25, 1);
+  return clamp(((sLow + sRate + sTrend) / 3) * targetScale, 0, 1);
+}
+// === UPGRADE END ===
+
+// === v7 SUPERVISED LEARNING & ADAPTIVE UPGRADE START ===
+// Justification: learn model blend weights from real historical prediction errors (no fixed blend bias).
+function learnBlendWeights(pre, target, currentIdx, stats) {
+  const evalCount = clamp(Math.round(Math.sqrt(Math.max(1, currentIdx)) * 2.5), 45, 180);
+  const fromIdx = Math.max(140, currentIdx - (evalCount * 2));
+  const step = Math.max(1, Math.floor((currentIdx - fromIdx) / Math.max(1, evalCount)));
+  let errNeighbor = 0;
+  let errHazard = 0;
+  let errPrior = 0;
+  let samples = 0;
+
+  for (let idx = fromIdx; idx < currentIdx; idx += step) {
+    const nextIdx = pre.nextHitMaps[target][idx];
+    if (nextIdx == null || nextIdx <= idx) continue;
+    const actualAhead = nextIdx - idx;
+    const state = pre.stateAt(idx, target);
+    const neighbors = collectNeighbors(pre, target, idx, state);
+    const pressure = gapPressure(pre.gapMaps[target][idx], stats);
+    const hazard = hazardEta(target, state, stats, pressure);
+
+    const nPred = neighbors.length ? weightedQuantile(neighbors, 0.5) : Math.max(1, stats.q50 || stats.mean || 2);
+    const hPred = Math.max(1, hazard.q50 || stats.q50 || stats.mean || 2);
+    const pPred = Math.max(1, stats.q50 || stats.mean || 2);
+
+    const a = Math.log1p(actualAhead);
+    errNeighbor += Math.abs(a - Math.log1p(nPred));
+    errHazard += Math.abs(a - Math.log1p(hPred));
+    errPrior += Math.abs(a - Math.log1p(pPred));
+    samples++;
+  }
+
+  if (!samples) {
+    return {
+      neighbor: 0.45,
+      hazard: 0.35,
+      prior: 0.2,
+      samples: 0,
+      errors: { neighbor: 0, hazard: 0, prior: 0 },
+    };
+  }
+
+  const eN = errNeighbor / samples;
+  const eH = errHazard / samples;
+  const eP = errPrior / samples;
+  const invN = 1 / Math.max(1e-6, eN);
+  const invH = 1 / Math.max(1e-6, eH);
+  const invP = 1 / Math.max(1e-6, eP);
+  const sumInv = invN + invH + invP;
+
+  return {
+    neighbor: invN / sumInv,
+    hazard: invH / sumInv,
+    prior: invP / sumInv,
+    samples,
+    errors: {
+      neighbor: roundNum(eN, 6),
+      hazard: roundNum(eH, 6),
+      prior: roundNum(eP, 6),
+    },
+  };
+}
+// === UPGRADE END ===
+
 function buildWindow(pre, target, currentIdx, calibration = null) {
+  // === v7 SUPERVISED LEARNING & ADAPTIVE UPGRADE START ===
+  // Justification: adaptive window center/span from blended predictors + white-cluster + calibration feedback.
   const currentRound = pre.rounds[currentIdx].roundId;
   const currentState = pre.stateAt(currentIdx, target);
-  const neighbors = collectNeighbors(pre, target, currentIdx, currentState);
-  const stats = pre.gapStats[target] || { mean: 0, q50: 0, q75: 0, q90: 0 };
+  const stats = pre.gapStats[target] || { mean: 0, q50: 0, q75: 0, q90: 0, interGaps: [] };
   const gapNow = pre.gapMaps[target][currentIdx];
   const pressure = gapPressure(gapNow, stats);
-
-  let q20 = weightedQuantile(neighbors, 0.2);
-  let q50 = weightedQuantile(neighbors, 0.5);
-  let q80 = weightedQuantile(neighbors, 0.8);
-
-  if (!neighbors.length) {
-    q20 = Math.max(1, stats.q50 || 2);
-    q50 = Math.max(q20 + 1, stats.q75 || (q20 + 2));
-    q80 = Math.max(q50 + 1, stats.q90 || (q50 + 3));
-  }
-
-  const sumW = neighbors.reduce((s, n) => s + n.weight, 0);
-  const sumW2 = neighbors.reduce((s, n) => s + (n.weight * n.weight), 0);
-  const effN = sumW2 > 0 ? (sumW * sumW) / sumW2 : 0;
-  const uncertainty = clamp((18 - Math.min(18, effN)) / 18, 0, 1);
-
   const hazard = hazardEta(target, currentState, stats, pressure);
+  const neighbors = collectNeighbors(pre, target, currentIdx, currentState);
+  const blend = learnBlendWeights(pre, target, currentIdx, stats);
 
-  const neighborWeight = clamp(0.35 + (0.45 * clamp(effN / 9, 0, 1)), 0.35, 0.8);
-  const hazardWeight = clamp(0.28 + (0.17 * uncertainty), 0.18, 0.5);
-  const priorWeight = clamp(1 - neighborWeight - hazardWeight, 0.05, 0.25);
+  const priorQ20 = Math.max(1, stats.q25 || stats.q10 || stats.q50 || 2);
+  const priorQ50 = Math.max(1, stats.q50 || stats.mean || hazard.q50 || 2);
+  const priorQ80 = Math.max(priorQ50 + 1, stats.q75 || stats.q90 || hazard.q80 || (priorQ50 + 2));
 
-  const priorCenter = Math.max(1, stats.q50 || stats.q75 || hazard.q50 || q50 || 2);
-  const blendCenter =
-    (neighborWeight * q50) +
-    (hazardWeight * hazard.q50) +
-    (priorWeight * priorCenter);
+  const neighQ20 = neighbors.length ? weightedQuantile(neighbors, 0.2) : priorQ20;
+  const neighQ50 = neighbors.length ? weightedQuantile(neighbors, 0.5) : priorQ50;
+  const neighQ80 = neighbors.length ? weightedQuantile(neighbors, 0.8) : priorQ80;
 
-  const reg = currentState.regime;
-  let centerFactor = 1;
-  centerFactor *= 1 - (0.16 * pressure.hard) - (0.08 * pressure.soft);
-  if (reg === 'expansion') centerFactor *= target >= 20 ? 0.9 : 0.94;
-  if (reg === 'compression') centerFactor *= target >= 20 ? 1.1 : 1.05;
-  if (reg === 'chaotic') centerFactor *= target >= 50 ? 0.94 : 0.98;
-  centerFactor *= 1 - (0.1 * clamp(currentState.trend, -0.8, 0.8));
-  centerFactor = clamp(centerFactor, 0.68, 1.35);
+  const q20 = (blend.neighbor * neighQ20) + (blend.hazard * hazard.q20) + (blend.prior * priorQ20);
+  const q50 = (blend.neighbor * neighQ50) + (blend.hazard * hazard.q50) + (blend.prior * priorQ50);
+  const q80 = (blend.neighbor * neighQ80) + (blend.hazard * hazard.q80) + (blend.prior * priorQ80);
 
-  let centerAhead = Math.max(1, Math.round(blendCenter * centerFactor));
-  if (calibration && Number.isFinite(calibration.shift) && calibration.sample >= 5) {
-    centerAhead = Math.max(1, Math.round(centerAhead * (1 + calibration.shift)));
-  }
-  const windowSpan = WINDOW_SPAN[target] || 10;
-  const halfLeft = Math.floor((windowSpan - 1) / 2);
-  const maxLoAhead = Math.max(1, (MAX_AHEAD[target] || 3000) - windowSpan + 1);
+  const whiteSeverity = whiteClusterSeverity(pre, currentState, target);
+  const interSorted = [...(stats.interGaps || [])].sort((a, b) => a - b);
+  const spread = Math.max(1, q80 - q20);
+  const baseSpan = Math.max(2, spread + 1);
+  const dataSpan = Math.max(2, (quantile(interSorted, 0.65) - quantile(interSorted, 0.3) + 1));
+  const calSpan = Number(calibration?.spanMultiplier || 1);
+  const minSpan = Math.max(2, Math.round(quantile(interSorted, 0.1) || WINDOW_SPAN_PRIOR[target] || 3));
+  const maxSpan = Math.max(minSpan + 1, Math.round(quantile(interSorted, 0.85) || ((WINDOW_SPAN_PRIOR[target] || 8) * 2.4)));
+  let windowSpan = ((baseSpan + dataSpan) * 0.5) * calSpan * (1 + (whiteSeverity * 0.65));
+  windowSpan = clamp(Math.round(windowSpan), minSpan, maxSpan);
 
-  let loAhead = Math.max(1, centerAhead - halfLeft);
-  loAhead = Math.min(loAhead, maxLoAhead);
+  let centerAhead = q50;
+  centerAhead *= 1 + Number(calibration?.shift || 0);
+  centerAhead *= 1 + (whiteSeverity * 0.55);
+  centerAhead *= 1 - (pressure.hard * 0.18);
+  centerAhead = Math.max(1, centerAhead);
+
+  const skewDen = Math.max(0.000001, q80 - q20);
+  const leftSkew = clamp((q50 - q20) / skewDen, 0.1, 0.9);
+  const halfLeft = Math.round((windowSpan - 1) * leftSkew);
+
+  const dynamicMaxAhead = Math.max(
+    windowSpan + 1,
+    Math.round((stats.q99 || stats.q95 || stats.q90 || stats.mean || 20) * 6)
+  );
+  let loAhead = Math.max(1, Math.round(centerAhead) - halfLeft);
+  loAhead = Math.min(loAhead, Math.max(1, dynamicMaxAhead - windowSpan + 1));
   const hiAhead = loAhead + windowSpan - 1;
 
-  const engineAgreement = clamp(
-    1 - (Math.abs(q50 - hazard.q50) / Math.max(2, q50 + hazard.q50)),
-    0,
-    1
-  );
-
+  const componentCenters = [neighQ50, hazard.q50, priorQ50].map(v => Math.log1p(Math.max(1, v)));
+  const engineAgreement = clamp(1 / (1 + stddev(componentCenters)), 0, 1);
+  const support = clamp(neighbors.length / Math.max(20, Math.sqrt(Math.max(1, pre.n)) * 3), 0, 1);
+  const uncertainty = clamp(1 - (spread / Math.max(2, q80 + q20)), 0, 1);
+  const calibScale = clamp(Number(calibration?.confidenceScale || 0.5), 0.1, 1);
   const confidence = clamp(
-    0.2 +
-    (0.35 * (1 - uncertainty)) +
-    (0.2 * Math.min(1, neighbors.length / (target <= 20 ? 300 : 180))) +
-    (0.17 * ((pressure.soft + pressure.hard) * 0.5)) +
-    (0.08 * engineAgreement),
-    0.08,
-    0.95
+    (0.38 * engineAgreement) +
+    (0.24 * support) +
+    (0.22 * uncertainty) +
+    (0.16 * calibScale),
+    0.04,
+    0.98
   );
 
   return {
@@ -412,37 +535,53 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
       q20: roundNum(q20, 2),
       q50: roundNum(q50, 2),
       q80: roundNum(q80, 2),
+      neighQ20: roundNum(neighQ20, 2),
+      neighQ50: roundNum(neighQ50, 2),
+      neighQ80: roundNum(neighQ80, 2),
       hazardQ20: roundNum(hazard.q20, 2),
       hazardQ50: roundNum(hazard.q50, 2),
       hazardQ80: roundNum(hazard.q80, 2),
       pHit1: roundNum(hazard.pHit1, 6),
-      blendCenter: roundNum(blendCenter, 2),
+      priorQ20: roundNum(priorQ20, 2),
+      priorQ50: roundNum(priorQ50, 2),
+      priorQ80: roundNum(priorQ80, 2),
+      blendCenter: roundNum(centerAhead, 2),
       centerAhead: roundNum(centerAhead, 2),
       windowSpan,
       neighbors: neighbors.length,
-      effN: roundNum(effN, 2),
-      uncertainty: roundNum(uncertainty, 4),
+      blendSamples: Number(blend.samples || 0),
+      blendErrors: blend.errors || null,
+      blend: {
+        neighbor: roundNum(blend.neighbor, 4),
+        hazard: roundNum(blend.hazard, 4),
+        prior: roundNum(blend.prior, 4),
+      },
+      uncertainty: roundNum(1 - uncertainty, 4),
       engineAgreement: roundNum(engineAgreement, 4),
-      regime: reg,
+      regime: currentState.regime,
       currentGap: gapNow,
+      under2Rate: roundNum(currentState.under2Rate || 0, 4),
+      whiteClusterSeverity: roundNum(whiteSeverity, 4),
       historicalGapMean: stats.mean || 0,
       historicalQ75: stats.q75 || 0,
       historicalQ90: stats.q90 || 0,
       softGapPressure: roundNum(pressure.soft, 4),
       hardGapPressure: roundNum(pressure.hard, 4),
       confidence: roundNum(confidence, 4),
-      reason: pressure.hard > 0.45
-        ? 'Hard-gap pressure active; center shifted earlier with fixed short window.'
-        : reg === 'expansion'
-          ? 'Expansion regime detected; fixed window centered using ensemble ETA.'
-          : reg === 'compression'
-            ? 'Compression regime detected; fixed window centered later from ensemble ETA.'
-            : 'Fixed window centered from neighbor-pattern + hazard + trend ensemble.',
+      reason: currentState.regime === 'white'
+        ? 'White cluster detected; window widened/shifted using real outcome calibration.'
+        : 'Adaptive blend (neighbor + hazard + prior) weighted from backtested real errors.',
       calibrationShift: roundNum(calibration?.shift || 0, 4),
       calibrationSample: Number(calibration?.sample || 0),
+      calibrationDirectional: Number(calibration?.directionalSamples || 0),
+      calibrationError: roundNum(calibration?.meanNormError || 0, 4),
+      calibrationWinRate: roundNum(calibration?.winRate || 0, 4),
+      calibrationWilsonLow: roundNum(calibration?.wilsonLow || 0.5, 4),
+      calibrationSpanMultiplier: roundNum(calibration?.spanMultiplier || 1, 4),
     },
     confidence: roundNum(confidence, 4),
   };
+  // === UPGRADE END ===
 }
 
 function evaluateLock(lock, target, pre, currentRound) {
@@ -480,52 +619,118 @@ function normalizeLockInput(input) {
   };
 }
 
-function buildCalibrationMap(historyRows) {
+function buildCalibrationMap(historyRows, pre) {
+  // === v7 SUPERVISED LEARNING & ADAPTIVE UPGRADE START ===
+  // Justification: derive timing-shift, span multiplier, and confidence scale from real win/loss/early outcomes.
   const out = {};
   for (const target of TARGETS) {
     const label = `${target}x`;
     const rows = (historyRows || [])
       .filter(r => String(r.target || '').toLowerCase() === label)
-      .slice(0, 80);
+      .slice(0, 320);
 
     if (!rows.length) {
-      out[target] = { shift: 0, sample: 0 };
+      out[target] = {
+        shift: 0,
+        spanMultiplier: 1,
+        sample: 0,
+        directionalSamples: 0,
+        meanNormError: 0,
+        absNormError: 0,
+        winRate: 0.5,
+        earlyRate: 0,
+        lossRate: 0,
+        wilsonLow: 0.5,
+        confidenceScale: 0.5,
+      };
       continue;
     }
 
-    let weightedWin = 0;
-    let weightedLoss = 0;
-    let weightedEarly = 0;
-    let totalW = 0;
+    const hits = pre?.hitRoundIds?.[target] || [];
+    let winCount = 0;
+    let lossCount = 0;
+    let earlyCount = 0;
+    const errItems = [];
+    const absErrItems = [];
+    let directionalSamples = 0;
 
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
-      const w = 1 + ((rows.length - i) / rows.length); // newer rows get slightly higher weight
-      totalW += w;
-      if (row.outcome === 'win') weightedWin += w;
-      else if (row.outcome === 'loss') weightedLoss += w;
-      else if (row.outcome === 'early') weightedEarly += w;
+      const lo = Number(row.lo);
+      const hi = Number(row.hi);
+      const hitRound = Number(row.hitRound);
+      const outcome = String(row.outcome || '').toLowerCase();
+      if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi < lo) continue;
+
+      const span = Math.max(1, (hi - lo + 1));
+      const center = lo + ((span - 1) * 0.5);
+      const recency = 1 + ((rows.length - i) / rows.length);
+      let err = 0;
+      let directional = false;
+
+      if (outcome === 'early') {
+        earlyCount++;
+        if (Number.isFinite(hitRound)) {
+          err = (hitRound - lo) / span;
+          directional = true;
+        }
+      } else if (outcome === 'loss') {
+        lossCount++;
+        const searchCap = hi + Math.max(span * 12, 100);
+        const nextHitAfterHi = findFirstInRange(hits, hi + 1, searchCap);
+        if (nextHitAfterHi != null) {
+          err = (nextHitAfterHi - hi) / span;
+        } else {
+          err = 1;
+        }
+        directional = true;
+      } else if (outcome === 'win') {
+        winCount++;
+        if (Number.isFinite(hitRound)) {
+          err = (hitRound - center) / span;
+          directional = true;
+        }
+      } else {
+        continue;
+      }
+
+      if (directional) {
+        const normErr = clamp(err, -3, 3);
+        errItems.push({ value: normErr, weight: recency });
+        absErrItems.push({ value: Math.abs(normErr), weight: recency });
+        directionalSamples++;
+      }
     }
 
-    const denom = weightedWin + weightedLoss;
-    const winRate = denom > 0 ? weightedWin / denom : 0.5;
-    const earlyRate = totalW > 0 ? weightedEarly / totalW : 0;
-    const sampleFactor = clamp(rows.length / 24, 0, 1);
-
-    // Negative shift => earlier window. Positive shift => later window.
-    let shift = 0;
-    shift += -0.34 * earlyRate;           // early means we were late, shift earlier
-    shift += (0.5 - winRate) * 0.2;       // lower win nudges timing
-    shift = clamp(shift * sampleFactor, -0.3, 0.3);
+    const total = winCount + lossCount + earlyCount;
+    const denom = winCount + lossCount;
+    const winRate = denom > 0 ? (winCount / denom) : 0.5;
+    const earlyRate = total > 0 ? (earlyCount / total) : 0;
+    const lossRate = total > 0 ? (lossCount / total) : 0;
+    const meanNormErr = weightedMean(errItems);
+    const absNormErr = weightedMean(absErrItems);
+    const wb = wilsonBounds(winCount, lossCount);
+    const sampleFactor = clamp(rows.length / 28, 0, 1);
+    const shift = clamp(meanNormErr * sampleFactor, -0.42, 0.42);
+    const spanMultiplier = clamp((1 + absNormErr) * (1 + (earlyRate * 0.45)), 0.75, 2.9);
+    const confidenceScale = clamp((wb.low + wb.mid) * 0.5, 0.1, 1);
 
     out[target] = {
       shift: roundNum(shift, 4),
+      spanMultiplier: roundNum(spanMultiplier, 4),
       sample: rows.length,
+      directionalSamples,
       winRate: roundNum(winRate, 4),
       earlyRate: roundNum(earlyRate, 4),
+      lossRate: roundNum(lossRate, 4),
+      meanNormError: roundNum(meanNormErr, 4),
+      absNormError: roundNum(absNormErr, 4),
+      wilsonLow: roundNum(wb.low, 4),
+      confidenceScale: roundNum(confidenceScale, 4),
     };
   }
   return out;
+  // === UPGRADE END ===
 }
 
 function buildUiTarget(target, lock, status, currentRound, previousOutcome = null) {
@@ -561,10 +766,10 @@ function buildUiTarget(target, lock, status, currentRound, previousOutcome = nul
 
 function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = {}) {
   const pre = preprocess(rounds || []);
-  const calibration = buildCalibrationMap(options.historyRows || []);
+  const calibration = buildCalibrationMap(options.historyRows || [], pre);
   if (pre.n < 800) {
     return {
-      model: 'range-lock-v2',
+      model: 'range-lock-v7-adaptive',
       generatedAt: new Date().toISOString(),
       asOfRound: pre.rounds[pre.n - 1]?.roundId || null,
       targets: [],
@@ -572,7 +777,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       resolvedHistory: [],
       summary: { pending: 0, windowOpen: 0, relocked: 0, sampleSize: pre.n },
       calibration,
-      settings: { windowSpan: WINDOW_SPAN },
+      settings: { windowSpan: WINDOW_SPAN_PRIOR, adaptive: true },
       warning: 'Need at least 800 rounds before reliable range locks.',
     };
   }
@@ -613,6 +818,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
           hi: existing.hi,
           hitRound: evalResult.hitRound,
           generation: existing.generation,
+          confidence: Number(existing?.eta?.confidence ?? null),
         });
       }
 
@@ -648,7 +854,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
   targetsOut.sort((a, b) => a.target - b.target);
 
   return {
-    model: 'range-lock-v2',
+    model: 'range-lock-v7-adaptive',
     generatedAt: new Date().toISOString(),
     asOfRound: currentRound,
     sampleSize: pre.n,
@@ -656,7 +862,10 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
     locksToSave,
     resolvedHistory,
     calibration,
-    settings: { windowSpan: WINDOW_SPAN },
+    settings: {
+      windowSpan: Object.fromEntries(targetsOut.map(t => [t.target, t.window.span])),
+      adaptive: true,
+    },
     summary: {
       pending: pendingCount,
       windowOpen: openCount,

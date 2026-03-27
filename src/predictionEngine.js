@@ -10,7 +10,7 @@ const BUCKETS = [
 
 const THRESHOLDS = [2, 5, 10, 25, 50];
 const HORIZONS = [1, 3, 5];
-const CACHE_TTL_MS = 12000;
+const CACHE_TTL_MS = 0;
 
 const cache = {
   key: null,
@@ -252,6 +252,30 @@ function runKMeans(vectors, k, maxIter = 12) {
   return { centroids, assignments, counts };
 }
 
+// === v7 SUPERVISED LEARNING & ADAPTIVE UPGRADE START ===
+// Justification: choose cluster count from data complexity (BIC-like criterion), not fixed formula.
+function chooseAdaptiveK(vectors) {
+  if (!vectors.length) return 0;
+  if (vectors.length < 160) return clamp(Math.round(Math.sqrt(vectors.length / 10)), 3, 5);
+  const dim = vectors[0].length || 1;
+  const maxK = clamp(Math.round(Math.sqrt(vectors.length / 10)), 4, 12);
+  let best = { k: 4, bic: Number.POSITIVE_INFINITY };
+
+  for (let k = 4; k <= maxK; k++) {
+    const km = runKMeans(vectors, k, 8);
+    let sse = 0;
+    for (let i = 0; i < vectors.length; i++) {
+      const c = km.assignments[i];
+      sse += squaredDistance(vectors[i], km.centroids[c]);
+    }
+    const mse = Math.max(1e-9, sse / Math.max(1, vectors.length));
+    const bic = (vectors.length * Math.log(mse)) + (k * dim * Math.log(vectors.length));
+    if (bic < best.bic) best = { k, bic };
+  }
+  return best.k;
+}
+// === UPGRADE END ===
+
 function nearestCentroidIndex(feature, centroids) {
   let best = 0;
   let bestDist = Number.POSITIVE_INFINITY;
@@ -331,7 +355,7 @@ function findPatternMatches(rounds, patternWindow) {
   const logs = rounds.map(r => toLog(r.multiplier));
   const currentTokens = tokens.slice(n - patternWindow);
   const currentLogs = logs.slice(n - patternWindow);
-  const matches = [];
+  const rawMatches = [];
 
   const maxEndIdx = Math.min(n - maxH - 1, n - patternWindow - 1);
   for (let endIdx = patternWindow - 1; endIdx <= maxEndIdx; endIdx++) {
@@ -339,7 +363,6 @@ function findPatternMatches(rounds, patternWindow) {
     const candidateTokens = tokens.slice(start, endIdx + 1);
     const candidateLogs = logs.slice(start, endIdx + 1);
     const similarity = patternSimilarity(currentTokens, currentLogs, candidateTokens, candidateLogs);
-    if (similarity < 0.57) continue;
 
     const futureMax = {};
     for (const h of HORIZONS) {
@@ -351,7 +374,7 @@ function findPatternMatches(rounds, patternWindow) {
     }
 
     const nextMult = rounds[endIdx + 1].multiplier;
-    matches.push({
+    rawMatches.push({
       startRoundId: rounds[start].roundId,
       endRoundId: rounds[endIdx].roundId,
       nextRoundId: rounds[endIdx + 1].roundId,
@@ -362,8 +385,13 @@ function findPatternMatches(rounds, patternWindow) {
     });
   }
 
-  matches.sort((a, b) => b.similarity - a.similarity);
-  return matches.slice(0, 220);
+  if (!rawMatches.length) return [];
+  const simSorted = rawMatches.map(m => m.similarity).sort((a, b) => a - b);
+  const dynCutoff = quantile(simSorted, 0.82);
+  return rawMatches
+    .filter(m => m.similarity >= dynCutoff)
+    .sort((a, b) => b.similarity - a.similarity)
+    .slice(0, 260);
 }
 
 function aggregatePatternStats(matches) {
@@ -465,28 +493,22 @@ function cosineSimilarity(a, b) {
   return dot / (Math.sqrt(aa) * Math.sqrt(bb));
 }
 
-function blendWeights({ clusterSupport, patternSupport, markovSupport }) {
-  let cluster = clusterSupport > 0 ? clamp(clusterSupport / 1300, 0.12, 0.45) : 0;
-  let pattern = patternSupport > 0 ? clamp(patternSupport / 230, 0.1, 0.5) : 0;
-  let markov = markovSupport > 0 ? clamp(markovSupport / 900, 0.05, 0.24) : 0;
-  let baseline = 1 - (cluster + pattern + markov);
-
-  if (baseline < 0.1) {
-    const scale = (1 - 0.1) / Math.max(0.0001, cluster + pattern + markov);
-    cluster *= scale;
-    pattern *= scale;
-    markov *= scale;
-    baseline = 0.1;
-  }
-
-  const total = cluster + pattern + markov + baseline;
+// === v7 SUPERVISED LEARNING & ADAPTIVE UPGRADE START ===
+// Justification: blend weights become evidence-driven from support + entropy, avoiding static bias.
+function blendWeights({ clusterStats, patternStats, markovStats, baselineStats }) {
+  const qCluster = Math.max(0.000001, (1 - entropy(clusterStats.bucketDistribution)) * Math.log1p(clusterStats.count || 0));
+  const qPattern = Math.max(0.000001, (1 - entropy(patternStats.bucketDistribution)) * Math.log1p(patternStats.count || 0) * Math.max(0.05, patternStats.avgSimilarity || 0.2));
+  const qMarkov = Math.max(0.000001, (1 - entropy(markovStats.distribution)) * Math.log1p(markovStats.support || 0));
+  const qBaseline = Math.max(0.000001, 1 - entropy(baselineStats.bucketDistribution));
+  const total = qCluster + qPattern + qMarkov + qBaseline;
   return {
-    cluster: cluster / total,
-    pattern: pattern / total,
-    markov: markov / total,
-    baseline: baseline / total,
+    cluster: qCluster / total,
+    pattern: qPattern / total,
+    markov: qMarkov / total,
+    baseline: qBaseline / total,
   };
 }
+// === UPGRADE END ===
 
 function blendDistribution({ weights, clusterDist, patternDist, markovDist, baselineDist }) {
   const out = new Array(BUCKETS.length).fill(0);
@@ -812,7 +834,7 @@ function computeReport(rounds) {
       reason: 'Insufficient training depth, using neutral fallback.',
     };
     return {
-      model: 'cluster-pattern-hybrid-v2',
+      model: 'cluster-pattern-hybrid-v7',
       generatedAt: new Date().toISOString(),
       asOfRound,
       sampleSize: cleanRounds.length,
@@ -874,7 +896,7 @@ function computeReport(rounds) {
   const featureStats = computeFeatureStats(featureRows);
   for (const s of samples) s.featureNorm = normalizeFeature(s.featureRaw, featureStats);
 
-  const k = clamp(Math.round(Math.sqrt(samples.length / 260)), 4, 8);
+  const k = chooseAdaptiveK(samples.map(s => s.featureNorm));
   const { centroids, assignments } = runKMeans(samples.map(s => s.featureNorm), k, 12);
 
   const clusterAccumulators = Array.from({ length: k }, () => createAccumulator());
@@ -899,9 +921,10 @@ function computeReport(rounds) {
 
   const markov = buildMarkovModel(cleanRounds);
   const weights = blendWeights({
-    clusterSupport: currentClusterStats.count,
-    patternSupport: patternStats.count,
-    markovSupport: markov.support,
+    clusterStats: currentClusterStats,
+    patternStats,
+    markovStats: markov,
+    baselineStats,
   });
 
   const blendedBucketDist = blendDistribution({
@@ -914,11 +937,35 @@ function computeReport(rounds) {
 
   const trendContext = computeTrendContext(cleanRounds);
   const gapPressure = buildGapPressure(cleanRounds);
-  const { adjustedDistribution: finalBucketDist, bucketBoosts } = applyGapAndRegimeAdjustments(
+  const gapAdjusted = applyGapAndRegimeAdjustments(
     blendedBucketDist,
     trendContext,
     gapPressure
   );
+  let finalBucketDist = gapAdjusted.adjustedDistribution;
+  const bucketBoosts = gapAdjusted.bucketBoosts;
+
+  // === v7 SUPERVISED LEARNING & ADAPTIVE UPGRADE START ===
+  // Justification: reduce false bullish calls in prolonged white clusters.
+  const lowStreakNow = streakLength(cleanRounds, cleanRounds.length - 1, m => m < 2);
+  const lowStreakHistory = [];
+  for (let i = 0; i < cleanRounds.length; i++) {
+    lowStreakHistory.push(streakLength(cleanRounds, i, m => m < 2, 300));
+  }
+  const lowSorted = [...lowStreakHistory].sort((a, b) => a - b);
+  const lowQ85 = quantile(lowSorted, 0.85);
+  const lowQ95 = quantile(lowSorted, 0.95);
+  const whiteSeverity = clamp((lowStreakNow - lowQ85) / Math.max(1, lowQ95 - lowQ85), 0, 1);
+  if (whiteSeverity > 0) {
+    const adjusted = [...finalBucketDist];
+    const boost = 0.18 * whiteSeverity;
+    adjusted[0] *= (1 + boost);
+    adjusted[1] *= (1 + (boost * 0.55));
+    adjusted[3] *= (1 - (boost * 0.35));
+    adjusted[4] *= (1 - (boost * 0.5));
+    finalBucketDist = normalizeDistribution(adjusted);
+  }
+  // === UPGRADE END ===
 
   const expectedFromBuckets = (dist) => {
     let out = 0;
@@ -1040,7 +1087,7 @@ function computeReport(rounds) {
   }));
 
   return {
-    model: 'cluster-pattern-hybrid-v2',
+    model: 'cluster-pattern-hybrid-v7',
     generatedAt: new Date().toISOString(),
     asOfRound: cleanRounds[cleanRounds.length - 1].roundId,
     sampleSize: cleanRounds.length,
@@ -1083,6 +1130,7 @@ function computeReport(rounds) {
         regime: trendContext.regime,
         trendScore: roundNum(trendContext.trendScore, 4),
         volatilityRatio: roundNum(trendContext.volRatio, 4),
+        whiteClusterSeverity: roundNum(whiteSeverity, 4),
       },
       pattern: {
         matches: patternStats.count,
