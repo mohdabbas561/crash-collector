@@ -120,6 +120,51 @@ function rangeMean(pref, lo, hi) {
   return (pref[r] - pref[l]) / len;
 }
 
+// === v7 SUPERVISED LEARNING & ADAPTIVE UPGRADE START ===
+// Justification: learn empirical hazard P(hit next | current gap) from real history to catch b2b + regime transitions.
+function buildHazardCurve(gaps, rounds, target, maxGapBucket) {
+  const maxGap = clamp(Math.round(maxGapBucket || 180), 20, 600);
+  const obs = new Array(maxGap + 1).fill(0);
+  const hits = new Array(maxGap + 1).fill(0);
+
+  let totalObs = 0;
+  let totalHits = 0;
+  for (let i = 0; i < gaps.length - 1; i++) {
+    const g = clamp(Math.round(gaps[i] || 0), 0, maxGap);
+    obs[g] += 1;
+    totalObs += 1;
+    if (rounds[i + 1].multiplier >= target) {
+      hits[g] += 1;
+      totalHits += 1;
+    }
+  }
+
+  const globalP = totalObs > 0 ? (totalHits / totalObs) : 0;
+  const hazard = new Array(maxGap + 1).fill(clamp(globalP, 0.000001, 0.95));
+
+  for (let g = 0; g <= maxGap; g++) {
+    let o = 0;
+    let h = 0;
+    for (let d = -2; d <= 2; d++) {
+      const k = g + d;
+      if (k < 0 || k > maxGap) continue;
+      const w = d === 0 ? 1.8 : (Math.abs(d) === 1 ? 1.1 : 0.6);
+      o += obs[k] * w;
+      h += hits[k] * w;
+    }
+    const alpha = 8;
+    hazard[g] = clamp((h + (alpha * globalP)) / Math.max(1e-6, o + alpha), 0.000001, 0.95);
+  }
+
+  return {
+    hazard,
+    maxGap,
+    globalP: clamp(globalP, 0.000001, 0.95),
+    totalObs,
+  };
+}
+// === UPGRADE END ===
+
 function preprocess(rounds) {
   const cleanRounds = rounds
     .map(r => ({
@@ -201,6 +246,11 @@ function preprocess(rounds) {
     const sorted = [...interGaps].sort((a, b) => a - b);
     const avg = sorted.length ? mean(sorted) : 0;
     const sd = sorted.length ? stddev(sorted, avg) : 0;
+    const hazardMaxGap = Math.max(
+      24,
+      Math.round((sorted.length ? quantile(sorted, 0.99) : Math.max(12, avg || 12)) * 2.2 + 8)
+    );
+    const hazardCurve = buildHazardCurve(gap, cleanRounds, target, hazardMaxGap);
 
     gapMaps[target] = gap;
     nextHitMaps[target] = nextHit;
@@ -217,6 +267,10 @@ function preprocess(rounds) {
       q95: roundNum(sorted.length ? quantile(sorted, 0.95) : 0, 3),
       q99: roundNum(sorted.length ? quantile(sorted, 0.99) : 0, 3),
       interGaps,
+      hazardByGap: hazardCurve.hazard,
+      hazardGlobal: roundNum(hazardCurve.globalP, 6),
+      hazardMaxGap: hazardCurve.maxGap,
+      hazardSample: Number(hazardCurve.totalObs || 0),
     };
   }
 
@@ -332,7 +386,7 @@ function collectNeighbors(pre, target, currentIdx, currentState) {
   }
 
   items.sort((a, b) => b.weight - a.weight);
-  const keep = clamp(Math.round(Math.sqrt(Math.max(1, currentIdx)) * 6), 80, 850);
+  const keep = clamp(Math.round(Math.sqrt(Math.max(1, currentIdx)) * 8.5), 120, 1400);
   return items.slice(0, keep);
 }
 
@@ -348,7 +402,21 @@ function gapPressure(currentGap, stats) {
 
 function hazardEta(target, currentState, stats, pressure) {
   const meanGap = Math.max(2, Number(stats.mean || stats.q50 || 2));
-  const baseP = clamp(1 / meanGap, 0.00008, 0.45);
+  const baseFromMean = clamp(1 / meanGap, 0.00008, 0.45);
+
+  const hazardByGap = Array.isArray(stats.hazardByGap) ? stats.hazardByGap : null;
+  const hazardMaxGap = Number(stats.hazardMaxGap || 0);
+  const gapIdx = clamp(Math.round(currentState.gapT || 0), 0, Math.max(0, hazardMaxGap));
+  const pGap = (hazardByGap && hazardByGap.length) ? Number(hazardByGap[gapIdx]) : NaN;
+  const pPrev = (hazardByGap && hazardByGap.length) ? Number(hazardByGap[Math.max(0, gapIdx - 1)]) : NaN;
+  const pNext = (hazardByGap && hazardByGap.length) ? Number(hazardByGap[Math.min(hazardByGap.length - 1, gapIdx + 1)]) : NaN;
+  const localHazard = Number.isFinite(pGap)
+    ? clamp((0.2 * (Number.isFinite(pPrev) ? pPrev : pGap)) + (0.6 * pGap) + (0.2 * (Number.isFinite(pNext) ? pNext : pGap)), 0.00005, 0.95)
+    : NaN;
+
+  const baseP = Number.isFinite(localHazard)
+    ? clamp((0.72 * localHazard) + (0.28 * baseFromMean), 0.00005, 0.62)
+    : baseFromMean;
 
   let factor = 1;
   factor *= 1 + (0.38 * pressure.soft) + (0.75 * pressure.hard);
@@ -358,6 +426,11 @@ function hazardEta(target, currentState, stats, pressure) {
   if (currentState.regime === 'chaotic') factor *= target >= 50 ? 1.07 : 1.03;
   if (currentState.regime === 'soft-up') factor *= 1.04;
   if (currentState.regime === 'soft-down') factor *= 0.96;
+
+  if (Number.isFinite(localHazard) && Number.isFinite(pPrev)) {
+    const hazardSlope = clamp((localHazard - pPrev) * 5.5, -0.45, 0.55);
+    factor *= 1 + hazardSlope;
+  }
 
   factor *= 1 + (0.18 * clamp(currentState.trend, -0.6, 0.6));
   factor = clamp(factor, 0.35, 2.2);
