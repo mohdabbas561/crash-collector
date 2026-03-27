@@ -6,7 +6,7 @@ const { computeLockedRangePredictions } = require('./lockedRangeEngine');
 const {
   pool,
   getRounds, getStats, getStorageStats,
-  getPredictions, savePrediction,
+  getPredictions, savePrediction, clearPredictions, clearAllLocks,
   getLockedConsensusPreds, saveLockedConsensusPreds,
   initAccessCodes, createAccessCode, getAccessCode,
   updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,
@@ -193,6 +193,24 @@ app.get('/predict/locked', rateLimit(20), async (req, res) => {
 });
 
 // ── ACCESS CODES ──────────────────────────────────────────────────────────────
+app.delete('/clear-history', requireAdmin, rateLimit(10), async (req, res) => {
+  try {
+    const result = await clearPredictions();
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.delete('/clear-locks', requireAdmin, rateLimit(10), async (req, res) => {
+  try {
+    const result = await clearAllLocks();
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.post('/access/verify', rateLimit(20), async (req, res) => {
   try {
     const { code } = req.body;

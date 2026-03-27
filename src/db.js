@@ -295,7 +295,29 @@ async function getStats() {
 }
 
 async function clearPredictions() {
-  await pool.query(`DELETE FROM predictions`);
+  const res = await pool.query(`DELETE FROM predictions`);
+  return { predictionsCleared: res.rowCount || 0 };
+}
+
+async function clearAllLocks() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const consensusRes = await client.query(`DELETE FROM locked_preds_consensus`);
+    const advRes = await client.query(`DELETE FROM locked_preds_adv`);
+    const engineRes = await client.query(`DELETE FROM locked_preds`);
+    await client.query('COMMIT');
+    return {
+      consensusLocksCleared: consensusRes.rowCount || 0,
+      advLocksCleared: advRes.rowCount || 0,
+      engineLocksCleared: engineRes.rowCount || 0,
+    };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 // ── WALLET STORAGE ────────────────────────────────────────────────────────────
@@ -574,7 +596,7 @@ module.exports = {
   saveLockedAdvPreds, getLockedAdvPreds,
   saveLockedConsensusPreds, getLockedConsensusPreds,
   initWalletStorage, saveWallet, getWallets, deleteWallet,
-  savePrediction, getPredictions, clearPredictions,
+  savePrediction, getPredictions, clearPredictions, clearAllLocks,
   initAccessCodes, createAccessCode, getAccessCode,
   updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,
 };
