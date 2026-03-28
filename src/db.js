@@ -302,6 +302,11 @@ async function getLatestRoundId() {
   return res.rows[0]?.round_id ? Number(res.rows[0].round_id) : null;
 }
 
+async function getRoundCount() {
+  const res = await pool.query(`SELECT COUNT(*)::BIGINT AS total FROM rounds`);
+  return Number(res.rows[0]?.total || 0);
+}
+
 async function clearPredictions() {
   const res = await pool.query(`DELETE FROM predictions`);
   return { predictionsCleared: res.rowCount || 0 };
@@ -586,7 +591,7 @@ async function getLockedConsensusPreds() {
 module.exports = {
   pool,
   initDB, saveRounds, getRounds, getStorageStats, getStats,
-  getLatestRoundId,
+  getLatestRoundId, getRoundCount,
   saveLockedPreds, getLockedPreds,
   saveLockedAdvPreds, getLockedAdvPreds,
   saveLockedConsensusPreds, getLockedConsensusPreds,
