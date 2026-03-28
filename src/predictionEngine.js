@@ -10,7 +10,7 @@ const BUCKETS = [
 
 const THRESHOLDS = [2, 5, 10, 25, 50];
 const HORIZONS = [1, 3, 5];
-const CACHE_TTL_MS = 0;
+const CACHE_TTL_MS = 15000;
 
 const cache = {
   key: null,

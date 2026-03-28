@@ -76,8 +76,24 @@ function getIP(req) {
   return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.headers['x-real-ip'] || req.socket?.remoteAddress || 'unknown';
 }
 
-const PREDICT_CACHE_TTL_MS = 15000;
-const LOCKED_CACHE_TTL_MS = 15000;
+function toPositiveInt(value, fallback) {
+  const n = Number.parseInt(value, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function clampInt(value, min, max, fallback) {
+  const n = Number.parseInt(value, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(Math.max(n, min), max);
+}
+
+const PREDICT_DEFAULT_LIMIT = toPositiveInt(process.env.PREDICT_DEFAULT_LIMIT, 12000);
+const PREDICT_MAX_LIMIT = Math.max(PREDICT_DEFAULT_LIMIT, toPositiveInt(process.env.PREDICT_MAX_LIMIT, 25000));
+const LOCKED_DEFAULT_LIMIT = toPositiveInt(process.env.LOCKED_DEFAULT_LIMIT, 15000);
+const LOCKED_MAX_LIMIT = Math.max(LOCKED_DEFAULT_LIMIT, toPositiveInt(process.env.LOCKED_MAX_LIMIT, 25000));
+const PREDICT_CACHE_TTL_MS = toPositiveInt(process.env.PREDICT_CACHE_TTL_MS, 15000);
+const LOCKED_CACHE_TTL_MS = toPositiveInt(process.env.LOCKED_CACHE_TTL_MS, 15000);
+
 const predictCache = {
   asOfRound: null,
   limit: null,
@@ -90,16 +106,20 @@ const lockedCache = {
   createdAt: 0,
   basePayload: null,
 };
+let predictComputeInFlight = null;
+let lockedComputeInFlight = null;
 
 function invalidatePredictionCaches() {
   predictCache.asOfRound = null;
   predictCache.limit = null;
   predictCache.createdAt = 0;
   predictCache.payload = null;
+  predictComputeInFlight = null;
   lockedCache.asOfRound = null;
   lockedCache.limit = null;
   lockedCache.createdAt = 0;
   lockedCache.basePayload = null;
+  lockedComputeInFlight = null;
 }
 
 function normalizeHistoryTarget(raw) {
@@ -172,10 +192,7 @@ app.get('/health', (req,res) => res.json({ ok:true, ts:new Date().toISOString() 
 
 app.get('/predict', rateLimit(20), async (req, res) => {
   try {
-    const requestedLimit = parseInt(req.query.limit || '25000', 10);
-    const limit = Number.isFinite(requestedLimit)
-      ? Math.min(Math.max(requestedLimit, 1000), 60000)
-      : 25000;
+    const limit = clampInt(req.query.limit, 1000, PREDICT_MAX_LIMIT, PREDICT_DEFAULT_LIMIT);
 
     const latestRound = await getLatestRoundId();
     const cacheFresh = (
@@ -189,14 +206,36 @@ app.get('/predict', rateLimit(20), async (req, res) => {
       return res.json(predictCache.payload);
     }
 
-    const rounds = await getRounds({ limit, order: 'ASC' });
-    const report = buildPredictionReport(rounds);
-    const payload = { ok: true, ...report };
-    predictCache.asOfRound = report?.asOfRound ?? latestRound ?? null;
-    predictCache.limit = limit;
-    predictCache.createdAt = Date.now();
-    predictCache.payload = payload;
-    res.json(payload);
+    const sameInFlight = (
+      predictComputeInFlight &&
+      predictComputeInFlight.latestRound === latestRound &&
+      predictComputeInFlight.limit === limit
+    );
+    if (sameInFlight) {
+      const payload = await predictComputeInFlight.promise;
+      return res.json(payload);
+    }
+
+    const promise = (async () => {
+      const rounds = await getRounds({ limit, order: 'DESC' });
+      const report = buildPredictionReport(rounds);
+      const payload = { ok: true, ...report };
+      predictCache.asOfRound = report?.asOfRound ?? latestRound ?? null;
+      predictCache.limit = limit;
+      predictCache.createdAt = Date.now();
+      predictCache.payload = payload;
+      return payload;
+    })();
+
+    predictComputeInFlight = { latestRound, limit, promise };
+    try {
+      const payload = await promise;
+      return res.json(payload);
+    } finally {
+      if (predictComputeInFlight?.promise === promise) {
+        predictComputeInFlight = null;
+      }
+    }
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -204,10 +243,7 @@ app.get('/predict', rateLimit(20), async (req, res) => {
 
 app.get('/predict/locked', rateLimit(20), async (req, res) => {
   try {
-    const requestedLimit = parseInt(req.query.limit || '60000', 10);
-    const limit = Number.isFinite(requestedLimit)
-      ? Math.min(Math.max(requestedLimit, 2000), 60000)
-      : 60000;
+    const limit = clampInt(req.query.limit, 2000, LOCKED_MAX_LIMIT, LOCKED_DEFAULT_LIMIT);
     const historyTarget = normalizeHistoryTarget(req.query.historyTarget);
 
     const latestRound = await getLatestRoundId();
@@ -223,57 +259,79 @@ app.get('/predict/locked', rateLimit(20), async (req, res) => {
       return res.json(withHistoryFilter(lockedCache.basePayload, historyTarget));
     }
 
-    const [rounds, locked, historyRows] = await Promise.all([
-      getRounds({ limit, order: 'ASC' }),
-      getLockedConsensusPreds(),
-      getPredictions({ limit: 3000, source: 'range_lock_v1' }),
-    ]);
-
-    const engine = computeLockedRangePredictions(rounds, locked, { historyRows });
-
-    if (Object.keys(engine.locksToSave || {}).length && locksNeedSave(locked, engine.locksToSave)) {
-      await saveLockedConsensusPreds(engine.locksToSave);
+    const sameInFlight = (
+      lockedComputeInFlight &&
+      lockedComputeInFlight.latestRound === latestRound &&
+      lockedComputeInFlight.limit === limit
+    );
+    if (sameInFlight) {
+      const basePayload = await lockedComputeInFlight.promise;
+      return res.json(withHistoryFilter(basePayload, historyTarget));
     }
 
-    let savedResolvedCount = 0;
-    if (Array.isArray(engine.resolvedHistory) && engine.resolvedHistory.length) {
-      await Promise.all(engine.resolvedHistory.map((row) => savePrediction({
-        target: row.target,
-        minMult: row.minMult,
-        outcome: row.outcome,
-        lo: row.lo,
-        hi: row.hi,
-        hitRound: row.hitRound,
-        generation: row.generation || 1,
-        source: 'range_lock_v1',
-        probW: row.confidence ?? null,
-      })));
-      savedResolvedCount = engine.resolvedHistory.length;
+    const promise = (async () => {
+      const [rounds, locked, historyRows] = await Promise.all([
+        getRounds({ limit, order: 'DESC' }),
+        getLockedConsensusPreds(),
+        getPredictions({ limit: 3000, source: 'range_lock_v1' }),
+      ]);
+
+      const engine = computeLockedRangePredictions(rounds, locked, { historyRows });
+
+      if (Object.keys(engine.locksToSave || {}).length && locksNeedSave(locked, engine.locksToSave)) {
+        await saveLockedConsensusPreds(engine.locksToSave);
+      }
+
+      let savedResolvedCount = 0;
+      if (Array.isArray(engine.resolvedHistory) && engine.resolvedHistory.length) {
+        await Promise.all(engine.resolvedHistory.map((row) => savePrediction({
+          target: row.target,
+          minMult: row.minMult,
+          outcome: row.outcome,
+          lo: row.lo,
+          hi: row.hi,
+          hitRound: row.hitRound,
+          generation: row.generation || 1,
+          source: 'range_lock_v1',
+          probW: row.confidence ?? null,
+        })));
+        savedResolvedCount = engine.resolvedHistory.length;
+      }
+
+      const fullHistory = savedResolvedCount > 0
+        ? await getPredictions({ limit: 1200, source: 'range_lock_v1' })
+        : historyRows.slice(0, 1200);
+
+      const byTarget = {};
+      for (const t of ['5x', '10x', '20x', '50x', '100x', '500x', '1000x']) {
+        byTarget[t] = summarizeHistory(fullHistory.filter(h => String(h.target || '').toLowerCase() === t));
+      }
+
+      const basePayload = {
+        ok: true,
+        ...engine,
+        historyAll: fullHistory,
+        historyByTarget: byTarget,
+        historyStorage: 'postgres',
+        savedResolvedCount,
+      };
+
+      lockedCache.asOfRound = engine?.asOfRound ?? latestRound ?? null;
+      lockedCache.limit = limit;
+      lockedCache.createdAt = Date.now();
+      lockedCache.basePayload = basePayload;
+      return basePayload;
+    })();
+
+    lockedComputeInFlight = { latestRound, limit, promise };
+    try {
+      const basePayload = await promise;
+      return res.json(withHistoryFilter(basePayload, historyTarget));
+    } finally {
+      if (lockedComputeInFlight?.promise === promise) {
+        lockedComputeInFlight = null;
+      }
     }
-
-    const fullHistory = savedResolvedCount > 0
-      ? await getPredictions({ limit: 1200, source: 'range_lock_v1' })
-      : historyRows.slice(0, 1200);
-
-    const byTarget = {};
-    for (const t of ['5x', '10x', '20x', '50x', '100x', '500x', '1000x']) {
-      byTarget[t] = summarizeHistory(fullHistory.filter(h => String(h.target || '').toLowerCase() === t));
-    }
-
-    const basePayload = {
-      ok: true,
-      ...engine,
-      historyAll: fullHistory,
-      historyByTarget: byTarget,
-      historyStorage: 'postgres',
-      savedResolvedCount,
-    };
-    lockedCache.asOfRound = engine?.asOfRound ?? latestRound ?? null;
-    lockedCache.limit = limit;
-    lockedCache.createdAt = Date.now();
-    lockedCache.basePayload = basePayload;
-
-    res.json(withHistoryFilter(basePayload, historyTarget));
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }

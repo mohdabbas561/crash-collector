@@ -169,21 +169,31 @@ async function getRounds({ limit = 1000, offset = 0, from = null, to = null, ord
   if (to)   { conditions.push(`created_at <= $${idx++}`); params.push(new Date(to)); }
   if (minRoundId) { conditions.push(`round_id >= $${idx++}`); params.push(minRoundId); }
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-  params.push(limit, offset);
   const sortDir = order === 'DESC' ? 'DESC' : 'ASC';
-  const res = await pool.query(
-    `SELECT round_id, multiplier, timestamp, created_at
-     FROM rounds ${where}
-     ORDER BY round_id ${sortDir}
-     LIMIT $${idx++} OFFSET $${idx++}`,
-    params
-  );
+  params.push(limit, offset);
+  const limitParam = `$${idx++}`;
+  const offsetParam = `$${idx++}`;
+
+  const sql = sortDir === 'DESC'
+    ? `SELECT round_id, multiplier, timestamp, created_at
+       FROM (
+         SELECT round_id, multiplier, timestamp, created_at
+         FROM rounds ${where}
+         ORDER BY round_id DESC
+         LIMIT ${limitParam} OFFSET ${offsetParam}
+       ) recent
+       ORDER BY round_id ASC`
+    : `SELECT round_id, multiplier, timestamp, created_at
+       FROM rounds ${where}
+       ORDER BY round_id ASC
+       LIMIT ${limitParam} OFFSET ${offsetParam}`;
+
+  const res = await pool.query(sql, params);
   const rows = res.rows.map(row => ({
     roundId   : Number(row.round_id),
     multiplier: parseFloat(row.multiplier),
     timestamp : row.timestamp ? Number(row.timestamp) : Number(new Date(row.created_at)),
   }));
-  if (order === 'DESC') rows.sort((a, b) => a.roundId - b.roundId);
   return rows;
 }
 
