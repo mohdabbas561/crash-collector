@@ -737,6 +737,22 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
   // === UPGRADE END ===
 }
 
+function enforceNextWindowStart(nextLock, fixedSpan, minLo) {
+  const lock = { ...nextLock };
+  const span = Math.max(1, Number(fixedSpan) || 1);
+  const minStart = Math.max(1, Number(minLo) || 1);
+  if (!Number.isFinite(lock.lo) || !Number.isFinite(lock.hi)) return lock;
+  if (lock.lo >= minStart) return lock;
+  lock.lo = minStart;
+  lock.hi = minStart + span - 1;
+  lock.eta = {
+    ...(lock.eta || {}),
+    nonOverlapAdjusted: true,
+    minAllowedLo: minStart,
+  };
+  return lock;
+}
+
 function evaluateLock(lock, target, pre, currentRound) {
   if (!lock) return { resolved: false, status: 'missing' };
   const roundWhenMade = Number(lock.roundWhenMade || lock.round_when_made || 0);
@@ -982,13 +998,21 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       }
 
       const nextLock = buildWindow(pre, target, currentIdx, calibration[target]);
+      const minNextLo = (
+        existing &&
+        evalResult.resolved &&
+        evalResult.outcome !== 'early'
+      )
+        ? Math.max(currentRound + 1, Number(existing.hi || 0) + 1)
+        : (currentRound + 1);
+      const adjustedNext = enforceNextWindowStart(nextLock, fixedSpan, minNextLo);
       const generation = existing ? Number(existing.generation || 1) + 1 : 1;
       lockToUse = {
-        lo: nextLock.lo,
-        hi: nextLock.hi,
-        roundWhenMade: nextLock.roundWhenMade,
+        lo: adjustedNext.lo,
+        hi: adjustedNext.hi,
+        roundWhenMade: adjustedNext.roundWhenMade,
         generation,
-        eta: nextLock.eta,
+        eta: adjustedNext.eta,
       };
       status = 'locked';
       relockedCount++;
