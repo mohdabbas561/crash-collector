@@ -306,23 +306,89 @@ function preprocess(rounds) {
     return { trend, volRatio, regime, under2Rate };
   }
 
+  const trendByIdx = new Array(n).fill(0);
+  const volRatioByIdx = new Array(n).fill(1);
+  const regimeByIdx = new Array(n).fill('balanced');
+  const under2RateByIdx = new Array(n).fill(0);
+  for (let i = 0; i < n; i++) {
+    const tr = trendRegimeAt(i);
+    trendByIdx[i] = tr.trend;
+    volRatioByIdx[i] = tr.volRatio;
+    regimeByIdx[i] = tr.regime;
+    under2RateByIdx[i] = tr.under2Rate;
+  }
+
+  for (const target of TARGETS) {
+    const stat = gapStats[target] || {};
+    const inter = Array.isArray(stat.interGaps) ? stat.interGaps : [];
+    const totalInter = inter.length;
+    const recentSpan = clamp(Math.round(Math.sqrt(Math.max(1, n)) * 9), 120, 3000);
+    const recentInter = inter.slice(Math.max(0, totalInter - recentSpan));
+
+    const calcQuick = (arr) => {
+      if (!arr.length) return { le1: 0, le2: 0, le3: 0 };
+      let c1 = 0;
+      let c2 = 0;
+      let c3 = 0;
+      for (const g of arr) {
+        if (g <= 1) c1++;
+        if (g <= 2) c2++;
+        if (g <= 3) c3++;
+      }
+      return {
+        le1: c1 / arr.length,
+        le2: c2 / arr.length,
+        le3: c3 / arr.length,
+      };
+    };
+
+    const byRegime = {};
+    for (let i = 0; i < n - 1; i++) {
+      const reg = regimeByIdx[i] || 'balanced';
+      const bucket = byRegime[reg] || { obs: 0, h1: 0, h2: 0, h3: 0 };
+      bucket.obs += 1;
+      if (cleanRounds[i + 1].multiplier >= target) bucket.h1 += 1;
+      if (i + 2 < n && (cleanRounds[i + 1].multiplier >= target || cleanRounds[i + 2].multiplier >= target)) bucket.h2 += 1;
+      if (i + 3 < n && (cleanRounds[i + 1].multiplier >= target || cleanRounds[i + 2].multiplier >= target || cleanRounds[i + 3].multiplier >= target)) bucket.h3 += 1;
+      byRegime[reg] = bucket;
+    }
+
+    const byRegimeOut = {};
+    for (const [reg, b] of Object.entries(byRegime)) {
+      const obs = Math.max(1, b.obs);
+      byRegimeOut[reg] = {
+        obs: b.obs,
+        p1: b.h1 / obs,
+        p2: b.h2 / obs,
+        p3: b.h3 / obs,
+      };
+    }
+
+    stat.quick = {
+      global: calcQuick(inter),
+      recent: calcQuick(recentInter),
+      byRegime: byRegimeOut,
+    };
+    gapStats[target] = stat;
+  }
+
   function stateAt(idx, target) {
     const seq = [];
     for (let i = idx - 7; i <= idx; i++) seq.push(tokens[clamp(i, 0, n - 1)]);
-    const tr = trendRegimeAt(idx);
+    const ii = clamp(idx, 0, n - 1);
     return {
-      gapT: gapMaps[target][idx],
-      gap5: gapMaps[5][idx],
-      gap10: gapMaps[10][idx],
-      gap20: gapMaps[20][idx],
-      gap50: gapMaps[50][idx],
-      gap100: gapMaps[100][idx],
-      trend: tr.trend,
-      volRatio: tr.volRatio,
-      regime: tr.regime,
-      under2Rate: tr.under2Rate,
-      lowStreak: lowStreak[idx],
-      highStreak: highStreak[idx],
+      gapT: gapMaps[target][ii],
+      gap5: gapMaps[5][ii],
+      gap10: gapMaps[10][ii],
+      gap20: gapMaps[20][ii],
+      gap50: gapMaps[50][ii],
+      gap100: gapMaps[100][ii],
+      trend: trendByIdx[ii],
+      volRatio: volRatioByIdx[ii],
+      regime: regimeByIdx[ii],
+      under2Rate: under2RateByIdx[ii],
+      lowStreak: lowStreak[ii],
+      highStreak: highStreak[ii],
       seq,
     };
   }
@@ -336,6 +402,10 @@ function preprocess(rounds) {
     hitRoundIds,
     gapStats,
     whiteProfile,
+    trendByIdx,
+    volRatioByIdx,
+    regimeByIdx,
+    under2RateByIdx,
     stateAt,
   };
 }
@@ -363,13 +433,19 @@ function stateDistance(a, b, target) {
   return d;
 }
 
-function collectNeighbors(pre, target, currentIdx, currentState) {
+function collectNeighbors(pre, target, currentIdx, currentState, options = {}) {
   const nextMap = pre.nextHitMaps[target];
   const items = [];
   const stats = pre.gapStats[target] || {};
   const maxAhead = Math.max(12, Math.round((stats.q99 || stats.q95 || stats.q90 || stats.mean || 12) * 6));
-  const start = 120;
-  for (let idx = start; idx < currentIdx; idx++) {
+  const baseLookback = target >= 500 ? 300000 : (target >= 100 ? 220000 : 170000);
+  const maxLookback = Math.max(1200, Number(options.maxLookback || baseLookback));
+  const start = Math.max(120, currentIdx - maxLookback);
+  const rawSpan = Math.max(1, currentIdx - start);
+  const maxScan = Math.max(3000, Number(options.maxScan || 70000));
+  const stride = Math.max(1, Math.floor(rawSpan / maxScan));
+
+  for (let idx = start; idx < currentIdx; idx += stride) {
     const nextIdx = nextMap[idx];
     if (nextIdx == null) continue;
     const ttn = nextIdx - idx;
@@ -386,7 +462,9 @@ function collectNeighbors(pre, target, currentIdx, currentState) {
   }
 
   items.sort((a, b) => b.weight - a.weight);
-  const keep = clamp(Math.round(Math.sqrt(Math.max(1, currentIdx)) * 8.5), 120, 1400);
+  const keepMin = Math.max(80, Number(options.keepMin || 140));
+  const keepMax = Math.max(keepMin, Number(options.keepMax || 1700));
+  const keep = clamp(Math.round(Math.sqrt(Math.max(1, currentIdx)) * 8.5), keepMin, keepMax);
   return items.slice(0, keep);
 }
 
@@ -495,7 +573,12 @@ function learnBlendWeights(pre, target, currentIdx, stats) {
     if (nextIdx == null || nextIdx <= idx) continue;
     const actualAhead = nextIdx - idx;
     const state = pre.stateAt(idx, target);
-    const neighbors = collectNeighbors(pre, target, idx, state);
+    const neighbors = collectNeighbors(pre, target, idx, state, {
+      maxLookback: target >= 100 ? 140000 : 100000,
+      maxScan: 24000,
+      keepMin: 100,
+      keepMax: 900,
+    });
     const pressure = gapPressure(pre.gapMaps[target][idx], stats);
     const hazard = hazardEta(target, state, stats, pressure);
 
@@ -574,6 +657,76 @@ function quickHitSignal(neighbors, hazard, currentGap, stats) {
 }
 // === UPGRADE END ===
 
+function betaMean(success, total, priorMean = 0.12, strength = 14) {
+  const a = Math.max(0.0001, priorMean * strength);
+  const b = Math.max(0.0001, (1 - priorMean) * strength);
+  return (success + a) / Math.max(0.0001, total + a + b);
+}
+
+function empiricalQuickHitSignal(stats, currentState, currentGap, hazard) {
+  const quick = stats?.quick || {};
+  const g = quick.global || { le1: 0, le2: 0, le3: 0 };
+  const r = quick.recent || g;
+  const byRegime = quick.byRegime || {};
+  const reg = byRegime[currentState?.regime || 'balanced'] || null;
+  const regObs = Number(reg?.obs || 0);
+  const regWeight = clamp(regObs / 220, 0, 1);
+
+  const baseLe1 = (0.4 * (g.le1 || 0)) + (0.6 * (r.le1 || 0));
+  const baseLe2 = (0.38 * (g.le2 || 0)) + (0.62 * (r.le2 || 0));
+  const baseLe3 = (0.36 * (g.le3 || 0)) + (0.64 * (r.le3 || 0));
+
+  const regP1 = reg ? betaMean((reg.p1 || 0) * regObs, regObs, baseLe1, 18) : baseLe1;
+  const regP2 = reg ? betaMean((reg.p2 || 0) * regObs, regObs, baseLe2, 18) : baseLe2;
+  const regP3 = reg ? betaMean((reg.p3 || 0) * regObs, regObs, baseLe3, 18) : baseLe3;
+
+  const le1 = ((1 - regWeight) * baseLe1) + (regWeight * regP1);
+  const le2 = ((1 - regWeight) * baseLe2) + (regWeight * regP2);
+  const le3 = ((1 - regWeight) * baseLe3) + (regWeight * regP3);
+
+  const q25 = Number(stats?.q25 || stats?.q10 || 1);
+  const q50 = Number(stats?.q50 || stats?.mean || q25 + 1);
+  const freshness = currentGap <= q25 ? 1 : (currentGap <= q50 ? 0.75 : 0.42);
+  const h2 = clamp(1 - ((1 - clamp(hazard.pHit1 || 0, 0, 1)) ** 2), 0, 1);
+  const score = clamp(((0.36 * le1) + (0.31 * le2) + (0.15 * le3) + (0.18 * h2)) * freshness, 0, 1);
+
+  return {
+    score,
+    le1: clamp(le1, 0, 1),
+    le2: clamp(le2, 0, 1),
+    le3: clamp(le3, 0, 1),
+    regimeObs: regObs,
+  };
+}
+
+function whiteReleaseSignal(pre, currentState, target, currentIdx) {
+  const idx = clamp(currentIdx, 0, Math.max(0, pre.n - 1));
+  const white = whiteClusterSeverity(pre, currentState, target, idx);
+  if (white <= 0) return 0;
+
+  const start = Math.max(0, idx - 11);
+  const recent = pre.rounds.slice(start, idx + 1).map(r => safeLog(r.multiplier));
+  if (recent.length < 6) return clamp(white * 0.35, 0, 1);
+
+  const last3 = mean(recent.slice(-3));
+  const prev3 = mean(recent.slice(-6, -3));
+  const rebound = clamp((last3 - prev3) / 0.42, 0, 1);
+  const trendTail = clamp((currentState.trend + 0.03) / 0.12, 0, 1);
+  const volSupport = clamp((currentState.volRatio - 0.92) / 0.55, 0, 1);
+  const targetScale = target <= 10 ? 1 : (target <= 50 ? 0.78 : 0.58);
+
+  return clamp(white * ((0.34 * rebound) + (0.38 * trendTail) + (0.28 * volSupport)) * targetScale, 0, 1);
+}
+
+function hardGapImpulse(stats, pressure, target, currentGap) {
+  const q95 = Number(stats?.q95 || stats?.q90 || stats?.q75 || 1);
+  const q99 = Number(stats?.q99 || Math.max(q95 + 2, 2));
+  const tailAge = clamp((currentGap - q95) / Math.max(1, q99 - q95 + 1), 0, 1);
+  const base = clamp((0.58 * (pressure.hard || 0)) + (0.27 * (pressure.soft || 0)) + (0.3 * tailAge), 0, 1);
+  const targetScale = target >= 100 ? 1 : (target >= 20 ? 0.9 : 0.78);
+  return clamp(base * targetScale, 0, 1);
+}
+
 function buildWindow(pre, target, currentIdx, calibration = null) {
   // === v7 SUPERVISED LEARNING & ADAPTIVE UPGRADE START ===
   // Justification: adaptive window center/span from blended predictors + white-cluster + calibration feedback.
@@ -583,7 +736,12 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
   const gapNow = pre.gapMaps[target][currentIdx];
   const pressure = gapPressure(gapNow, stats);
   const hazard = hazardEta(target, currentState, stats, pressure);
-  const neighbors = collectNeighbors(pre, target, currentIdx, currentState);
+  const neighbors = collectNeighbors(pre, target, currentIdx, currentState, {
+    maxLookback: target >= 500 ? 320000 : (target >= 100 ? 240000 : 190000),
+    maxScan: 80000,
+    keepMin: 150,
+    keepMax: 1900,
+  });
   const blend = learnBlendWeights(pre, target, currentIdx, stats);
 
   const priorQ20 = Math.max(1, stats.q25 || stats.q10 || stats.q50 || 2);
@@ -599,7 +757,11 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
   const q80 = (blend.neighbor * neighQ80) + (blend.hazard * hazard.q80) + (blend.prior * priorQ80);
 
   const whiteSeverity = whiteClusterSeverity(pre, currentState, target, currentIdx);
-  const quickSignal = quickHitSignal(neighbors, hazard, gapNow, stats);
+  const quickRaw = quickHitSignal(neighbors, hazard, gapNow, stats);
+  const quickEmpirical = empiricalQuickHitSignal(stats, currentState, gapNow, hazard);
+  const quickSignal = clamp((0.68 * quickRaw) + (0.32 * quickEmpirical.score), 0, 1);
+  const whiteRelease = whiteReleaseSignal(pre, currentState, target, currentIdx);
+  const hardImpulse = hardGapImpulse(stats, pressure, target, gapNow);
   const earlyDominance = clamp(
     Number(calibration?.earlyRate || 0) - Number(calibration?.lossRate || 0),
     -0.8,
@@ -629,7 +791,11 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
   centerAhead *= 1 + Number(calibration?.shift || 0);
   centerAhead *= 1 - (0.58 * Math.max(0, earlyDominance));
   centerAhead *= 1 + (0.42 * Math.max(0, -earlyDominance));
-  centerAhead *= 1 + (whiteSeverity * 0.34);
+  const whiteDrift = target <= 10
+    ? (-0.14 * whiteSeverity)
+    : (target <= 50 ? (0.08 * whiteSeverity) : (0.22 * whiteSeverity));
+  centerAhead *= 1 + whiteDrift;
+  centerAhead *= 1 - (whiteRelease * (target <= 20 ? 0.36 : 0.22));
   centerAhead *= 1 - (pressure.hard * 0.24);
 
   if (quickSignal > 0) {
@@ -637,6 +803,12 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
     const quickPull = clamp((quickSignal - 0.08) / 0.62, 0, 1);
     const mix = 0.72 * quickPull;
     centerAhead = ((1 - mix) * centerAhead) + (mix * quickAnchor);
+  }
+
+  if (hardImpulse > 0) {
+    const hardAnchor = Math.max(1, (0.62 * q20) + (0.38 * hazard.q20));
+    const mix = 0.58 * hardImpulse;
+    centerAhead = ((1 - mix) * centerAhead) + (mix * hardAnchor);
   }
 
   if (gapNow <= 1 && (pGap2 > 0.03 || pGap3 > 0.08)) {
@@ -664,11 +836,17 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
   const support = clamp(neighbors.length / Math.max(20, Math.sqrt(Math.max(1, pre.n)) * 3), 0, 1);
   const uncertainty = clamp(1 - (spread / Math.max(2, q80 + q20)), 0, 1);
   const calibScale = clamp(Number(calibration?.confidenceScale || 0.5), 0.1, 1);
+  const regimeEvidence = clamp((quickEmpirical.regimeObs || 0) / 220, 0, 1);
+  const consensus = clamp(1 - Math.abs(quickRaw - quickEmpirical.score), 0, 1);
+  const blendBalance = clamp(1 - Math.abs(blend.neighbor - blend.hazard), 0, 1);
   const confidence = clamp(
     (0.38 * engineAgreement) +
-    (0.24 * support) +
-    (0.22 * uncertainty) +
-    (0.16 * calibScale),
+    (0.2 * support) +
+    (0.16 * uncertainty) +
+    (0.14 * calibScale) +
+    (0.06 * regimeEvidence) +
+    (0.03 * consensus) +
+    (0.03 * blendBalance),
     0.04,
     0.98
   );
@@ -715,13 +893,21 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
       softGapPressure: roundNum(pressure.soft, 4),
       hardGapPressure: roundNum(pressure.hard, 4),
       quickHitSignal: roundNum(quickSignal, 4),
+      quickHitRaw: roundNum(quickRaw, 4),
+      quickHitEmpirical: roundNum(quickEmpirical.score, 4),
+      quickEmpiricalP1: roundNum(quickEmpirical.le1, 4),
+      quickEmpiricalP2: roundNum(quickEmpirical.le2, 4),
+      quickEmpiricalP3: roundNum(quickEmpirical.le3, 4),
+      quickEmpiricalRegimeObs: Number(quickEmpirical.regimeObs || 0),
       pGapLe1: roundNum(pGap1, 4),
       pGapLe2: roundNum(pGap2, 4),
       pGapLe3: roundNum(pGap3, 4),
+      whiteReleaseSignal: roundNum(whiteRelease, 4),
+      hardGapImpulse: roundNum(hardImpulse, 4),
       confidence: roundNum(confidence, 4),
       reason: currentState.regime === 'white'
-        ? 'White cluster detected; center shifted using real outcome calibration (fixed target span).'
-        : 'Adaptive blend (neighbor + hazard + prior) weighted from backtested real errors (fixed target span).',
+        ? 'White-cluster regime: release + empirical quick-hit gating + adaptive blend.'
+        : 'Adaptive blend (neighbor + hazard + prior) with empirical quick-hit/regime gating.',
       calibrationShift: roundNum(calibration?.shift || 0, 4),
       calibrationSample: Number(calibration?.sample || 0),
       calibrationDirectional: Number(calibration?.directionalSamples || 0),
@@ -941,7 +1127,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
   const calibration = buildCalibrationMap(options.historyRows || [], pre);
   if (pre.n < 800) {
     return {
-      model: 'range-lock-v7-adaptive',
+      model: 'range-lock-v8-hyper',
       generatedAt: new Date().toISOString(),
       asOfRound: pre.rounds[pre.n - 1]?.roundId || null,
       targets: [],
@@ -1037,7 +1223,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
   targetsOut.sort((a, b) => a.target - b.target);
 
   return {
-    model: 'range-lock-v7-adaptive',
+    model: 'range-lock-v8-hyper',
     generatedAt: new Date().toISOString(),
     asOfRound: currentRound,
     sampleSize: pre.n,
@@ -1049,6 +1235,9 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       windowSpan: WINDOW_SPAN_PRIOR,
       adaptive: true,
       fixedWindowSpan: true,
+      regimeAwareQuickHit: true,
+      whiteReleaseModel: true,
+      hardGapImpulse: true,
     },
     summary: {
       pending: pendingCount,

@@ -676,6 +676,68 @@ function applyGapAndRegimeAdjustments(baseDist, trend, gaps) {
   };
 }
 
+function betaMean(success, total, priorMean = 0.12, strength = 14) {
+  const a = Math.max(0.0001, priorMean * strength);
+  const b = Math.max(0.0001, (1 - priorMean) * strength);
+  return (success + a) / Math.max(0.0001, total + a + b);
+}
+
+function computeB2BSignal(rounds, threshold = 5) {
+  if (!rounds.length) return { score: 0, immediate: 0, near: 0, sample: 0 };
+  const n = rounds.length;
+  const lookback = clamp(Math.round(Math.sqrt(n) * 18), 400, 20000);
+  const start = Math.max(1, n - lookback);
+
+  let obsPairs = 0;
+  let hitPairs = 0;
+  let prevHit = rounds[start - 1]?.multiplier >= threshold;
+  for (let i = start; i < n; i++) {
+    const hit = rounds[i].multiplier >= threshold;
+    if (prevHit) {
+      obsPairs++;
+      if (hit) hitPairs++;
+    }
+    prevHit = hit;
+  }
+
+  let totalGaps = 0;
+  let gapLe1 = 0;
+  let gapLe2 = 0;
+  let lastHit = null;
+  for (let i = start; i < n; i++) {
+    if (rounds[i].multiplier < threshold) continue;
+    if (lastHit != null) {
+      const g = i - lastHit;
+      totalGaps++;
+      if (g <= 1) gapLe1++;
+      if (g <= 2) gapLe2++;
+    }
+    lastHit = i;
+  }
+
+  const immediate = betaMean(hitPairs, obsPairs, 0.11, 12);
+  const near = betaMean(gapLe2, totalGaps, 0.22, 14);
+  const score = clamp((0.58 * immediate) + (0.42 * near), 0, 1);
+  return {
+    score,
+    immediate,
+    near,
+    sample: Math.max(obsPairs, totalGaps),
+  };
+}
+
+function computeWhiteReleaseSignal(rounds, whiteSeverity) {
+  if (whiteSeverity <= 0 || rounds.length < 12) return 0;
+  const logs = rounds.map(r => toLog(r.multiplier));
+  const last3 = mean(logs.slice(-3));
+  const prev3 = mean(logs.slice(-6, -3));
+  const last8 = mean(logs.slice(-8));
+  const prev8 = mean(logs.slice(-16, -8));
+  const reboundShort = clamp((last3 - prev3) / 0.4, 0, 1);
+  const reboundLong = clamp((last8 - prev8) / 0.22, 0, 1);
+  return clamp(whiteSeverity * ((0.58 * reboundShort) + (0.42 * reboundLong)), 0, 1);
+}
+
 function pickTargetFromCandidates(dist, candidates, mode) {
   let best = {
     target: candidates[0],
@@ -834,7 +896,7 @@ function computeReport(rounds) {
       reason: 'Insufficient training depth, using neutral fallback.',
     };
     return {
-      model: 'cluster-pattern-hybrid-v7',
+      model: 'cluster-pattern-hybrid-v8',
       generatedAt: new Date().toISOString(),
       asOfRound,
       sampleSize: cleanRounds.length,
@@ -967,6 +1029,28 @@ function computeReport(rounds) {
   }
   // === UPGRADE END ===
 
+  const b2b5 = computeB2BSignal(cleanRounds, 5);
+  const b2b10 = computeB2BSignal(cleanRounds, 10);
+  const b2bStrength = clamp((0.62 * b2b5.score) + (0.38 * b2b10.score), 0, 1);
+  if (b2bStrength > 0) {
+    const adjusted = [...finalBucketDist];
+    adjusted[2] *= (1 + (0.24 * b2bStrength));
+    adjusted[3] *= (1 + (0.15 * b2bStrength));
+    adjusted[4] *= (1 + (0.09 * b2bStrength));
+    adjusted[0] *= (1 - (0.2 * b2bStrength));
+    finalBucketDist = normalizeDistribution(adjusted);
+  }
+
+  const whiteRelease = computeWhiteReleaseSignal(cleanRounds, whiteSeverity);
+  if (whiteRelease > 0) {
+    const adjusted = [...finalBucketDist];
+    adjusted[1] *= (1 + (0.18 * whiteRelease));
+    adjusted[2] *= (1 + (0.22 * whiteRelease));
+    adjusted[3] *= (1 + (0.14 * whiteRelease));
+    adjusted[0] *= (1 - (0.22 * whiteRelease));
+    finalBucketDist = normalizeDistribution(adjusted);
+  }
+
   const expectedFromBuckets = (dist) => {
     let out = 0;
     for (let i = 0; i < BUCKETS.length; i++) {
@@ -1007,7 +1091,7 @@ function computeReport(rounds) {
     1
   );
   const confidence = clamp(
-    0.15 + (0.42 * maxProb) + (0.18 * sharpness) + (0.1 * evidence) + (0.08 * alignment) + (0.07 * pressureEvidence),
+    0.15 + (0.38 * maxProb) + (0.16 * sharpness) + (0.1 * evidence) + (0.08 * alignment) + (0.07 * pressureEvidence) + (0.04 * b2bStrength) + (0.02 * whiteRelease),
     0.05,
     0.97
   );
@@ -1087,7 +1171,7 @@ function computeReport(rounds) {
   }));
 
   return {
-    model: 'cluster-pattern-hybrid-v7',
+    model: 'cluster-pattern-hybrid-v8',
     generatedAt: new Date().toISOString(),
     asOfRound: cleanRounds[cleanRounds.length - 1].roundId,
     sampleSize: cleanRounds.length,
@@ -1131,6 +1215,22 @@ function computeReport(rounds) {
         trendScore: roundNum(trendContext.trendScore, 4),
         volatilityRatio: roundNum(trendContext.volRatio, 4),
         whiteClusterSeverity: roundNum(whiteSeverity, 4),
+        whiteReleaseSignal: roundNum(whiteRelease, 4),
+      },
+      b2b: {
+        combined: roundNum(b2bStrength, 4),
+        for5x: {
+          score: roundNum(b2b5.score, 4),
+          immediate: roundNum(b2b5.immediate, 4),
+          near: roundNum(b2b5.near, 4),
+          sample: Number(b2b5.sample || 0),
+        },
+        for10x: {
+          score: roundNum(b2b10.score, 4),
+          immediate: roundNum(b2b10.immediate, 4),
+          near: roundNum(b2b10.near, 4),
+          sample: Number(b2b10.sample || 0),
+        },
       },
       pattern: {
         matches: patternStats.count,
