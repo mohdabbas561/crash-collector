@@ -5,6 +5,7 @@ const { buildPredictionReport } = require('./predictionEngine');
 const { computeLockedRangePredictions } = require('./lockedRangeEngine');
 const {
   pool,
+  getLatestRoundId,
   getRounds, getStats, getStorageStats,
   getPredictions, savePrediction, clearPredictions, clearAllLocks,
   getLockedConsensusPreds, saveLockedConsensusPreds,
@@ -37,7 +38,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// ── Rate limiting ─────────────────────────────────────────────────────────────
 const rateLimits  = new Map();
 const RL_MAX_KEYS = 10000;
 
@@ -76,7 +76,85 @@ function getIP(req) {
   return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.headers['x-real-ip'] || req.socket?.remoteAddress || 'unknown';
 }
 
-// ── ROUNDS ────────────────────────────────────────────────────────────────────
+const PREDICT_CACHE_TTL_MS = 15000;
+const LOCKED_CACHE_TTL_MS = 15000;
+const predictCache = {
+  asOfRound: null,
+  limit: null,
+  createdAt: 0,
+  payload: null,
+};
+const lockedCache = {
+  asOfRound: null,
+  limit: null,
+  createdAt: 0,
+  basePayload: null,
+};
+
+function invalidatePredictionCaches() {
+  predictCache.asOfRound = null;
+  predictCache.limit = null;
+  predictCache.createdAt = 0;
+  predictCache.payload = null;
+  lockedCache.asOfRound = null;
+  lockedCache.limit = null;
+  lockedCache.createdAt = 0;
+  lockedCache.basePayload = null;
+}
+
+function normalizeHistoryTarget(raw) {
+  const v = String(raw || '').trim().toLowerCase();
+  if (!v) return null;
+  return v.endsWith('x') ? v : `${v}x`;
+}
+
+function summarizeHistory(rows) {
+  const out = (rows || []).reduce((acc, h) => {
+    if (h.outcome === 'win') acc.win++;
+    else if (h.outcome === 'early') acc.early++;
+    else if (h.outcome === 'loss') acc.loss++;
+    return acc;
+  }, { win: 0, early: 0, loss: 0, total: (rows || []).length });
+  const base = out.win + out.loss;
+  out.accuracy = base > 0 ? Number((out.win / base).toFixed(4)) : null;
+  return out;
+}
+
+function sameLock(a, b) {
+  if (!a || !b) return false;
+  return (
+    Number(a.lo) === Number(b.lo) &&
+    Number(a.hi) === Number(b.hi) &&
+    Number(a.roundWhenMade ?? a.round_when_made) === Number(b.roundWhenMade ?? b.round_when_made) &&
+    Number(a.generation || 1) === Number(b.generation || 1)
+  );
+}
+
+function locksNeedSave(existing, next) {
+  const keys = new Set([
+    ...Object.keys(existing || {}),
+    ...Object.keys(next || {}),
+  ]);
+  for (const k of keys) {
+    if (!sameLock(existing?.[k], next?.[k])) return true;
+  }
+  return false;
+}
+
+function withHistoryFilter(basePayload, historyTarget) {
+  const allRows = basePayload?.historyAll || [];
+  const { historyAll, ...rest } = basePayload || {};
+  const filtered = historyTarget
+    ? allRows.filter(h => String(h.target || '').toLowerCase() === historyTarget)
+    : allRows;
+  return {
+    ...rest,
+    history: filtered,
+    historySummary: summarizeHistory(filtered),
+    historyFilter: historyTarget || 'all',
+  };
+}
+
 app.get('/rounds', rateLimit(60), async (req, res) => {
   try {
     const limit      = Math.min(parseInt(req.query.limit  || '1000'), 100000);
@@ -92,110 +170,119 @@ app.get('/stats',         rateLimit(30), async (req,res) => { try { res.json({ o
 app.get('/storage-stats', rateLimit(20), async (req,res) => { try { res.json({ ok:true, ...(await getStorageStats()) }); } catch(e) { res.status(500).json({ ok:false, error:e.message }); } });
 app.get('/health', (req,res) => res.json({ ok:true, ts:new Date().toISOString() }));
 
-// prediction engine (history + clusters + pattern matching)
 app.get('/predict', rateLimit(20), async (req, res) => {
   try {
     const requestedLimit = parseInt(req.query.limit || '25000', 10);
     const limit = Number.isFinite(requestedLimit)
-      ? Math.min(Math.max(requestedLimit, 1000), 100000)
+      ? Math.min(Math.max(requestedLimit, 1000), 60000)
       : 25000;
+
+    const latestRound = await getLatestRoundId();
+    const cacheFresh = (
+      predictCache.payload &&
+      predictCache.asOfRound != null &&
+      predictCache.asOfRound === latestRound &&
+      predictCache.limit === limit &&
+      (Date.now() - predictCache.createdAt) < PREDICT_CACHE_TTL_MS
+    );
+    if (cacheFresh) {
+      return res.json(predictCache.payload);
+    }
 
     const rounds = await getRounds({ limit, order: 'ASC' });
     const report = buildPredictionReport(rounds);
-    res.json({ ok: true, ...report });
+    const payload = { ok: true, ...report };
+    predictCache.asOfRound = report?.asOfRound ?? latestRound ?? null;
+    predictCache.limit = limit;
+    predictCache.createdAt = Date.now();
+    predictCache.payload = payload;
+    res.json(payload);
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// locked target windows (5x..1000x) persisted in DB
 app.get('/predict/locked', rateLimit(20), async (req, res) => {
   try {
-    const requestedLimit = parseInt(req.query.limit || '100000', 10);
+    const requestedLimit = parseInt(req.query.limit || '60000', 10);
     const limit = Number.isFinite(requestedLimit)
-      ? Math.min(Math.max(requestedLimit, 2000), 100000)
-      : 100000;
+      ? Math.min(Math.max(requestedLimit, 2000), 60000)
+      : 60000;
+    const historyTarget = normalizeHistoryTarget(req.query.historyTarget);
 
-    const historyTargetRaw = String(req.query.historyTarget || '').trim();
-    const historyTarget = historyTargetRaw
-      ? (historyTargetRaw.toLowerCase().endsWith('x') ? historyTargetRaw.toLowerCase() : `${historyTargetRaw.toLowerCase()}x`)
-      : null;
+    const latestRound = await getLatestRoundId();
+    const cacheFresh = (
+      lockedCache.basePayload &&
+      lockedCache.asOfRound != null &&
+      lockedCache.asOfRound === latestRound &&
+      lockedCache.limit === limit &&
+      (Date.now() - lockedCache.createdAt) < LOCKED_CACHE_TTL_MS
+    );
 
-    const [rounds, locked, historyForCalibration] = await Promise.all([
+    if (cacheFresh) {
+      return res.json(withHistoryFilter(lockedCache.basePayload, historyTarget));
+    }
+
+    const [rounds, locked, historyRows] = await Promise.all([
       getRounds({ limit, order: 'ASC' }),
       getLockedConsensusPreds(),
       getPredictions({ limit: 3000, source: 'range_lock_v1' }),
     ]);
 
-    const engine = computeLockedRangePredictions(rounds, locked, {
-      historyRows: historyForCalibration,
-    });
+    const engine = computeLockedRangePredictions(rounds, locked, { historyRows });
 
-    if (Object.keys(engine.locksToSave || {}).length) {
+    if (Object.keys(engine.locksToSave || {}).length && locksNeedSave(locked, engine.locksToSave)) {
       await saveLockedConsensusPreds(engine.locksToSave);
     }
 
     let savedResolvedCount = 0;
     if (Array.isArray(engine.resolvedHistory) && engine.resolvedHistory.length) {
-      for (const row of engine.resolvedHistory) {
-        await savePrediction({
-          target: row.target,
-          minMult: row.minMult,
-          outcome: row.outcome,
-          lo: row.lo,
-          hi: row.hi,
-          hitRound: row.hitRound,
-          generation: row.generation || 1,
-          source: 'range_lock_v1',
-          probW: row.confidence ?? null,
-        });
-        savedResolvedCount++;
-      }
+      await Promise.all(engine.resolvedHistory.map((row) => savePrediction({
+        target: row.target,
+        minMult: row.minMult,
+        outcome: row.outcome,
+        lo: row.lo,
+        hi: row.hi,
+        hitRound: row.hitRound,
+        generation: row.generation || 1,
+        source: 'range_lock_v1',
+        probW: row.confidence ?? null,
+      })));
+      savedResolvedCount = engine.resolvedHistory.length;
     }
-    
-    const fullHistory = await getPredictions({ limit: 1200, source: 'range_lock_v1' });
-    const history = historyTarget
-      ? fullHistory.filter(h => String(h.target || '').toLowerCase() === historyTarget)
-      : fullHistory;
 
-    const summarize = (rows) => {
-      const out = rows.reduce((acc, h) => {
-        if (h.outcome === 'win') acc.win++;
-        else if (h.outcome === 'early') acc.early++;
-        else if (h.outcome === 'loss') acc.loss++;
-        return acc;
-      }, { win: 0, early: 0, loss: 0, total: rows.length });
-      const base = out.win + out.loss;
-      out.accuracy = base > 0 ? Number((out.win / base).toFixed(4)) : null;
-      return out;
-    };
-
-    const summaryFromHistory = summarize(history);
+    const fullHistory = savedResolvedCount > 0
+      ? await getPredictions({ limit: 1200, source: 'range_lock_v1' })
+      : historyRows.slice(0, 1200);
 
     const byTarget = {};
     for (const t of ['5x', '10x', '20x', '50x', '100x', '500x', '1000x']) {
-      byTarget[t] = summarize(fullHistory.filter(h => String(h.target || '').toLowerCase() === t));
+      byTarget[t] = summarizeHistory(fullHistory.filter(h => String(h.target || '').toLowerCase() === t));
     }
 
-    res.json({
+    const basePayload = {
       ok: true,
       ...engine,
-      history,
-      historySummary: summaryFromHistory,
+      historyAll: fullHistory,
       historyByTarget: byTarget,
-      historyFilter: historyTarget || 'all',
       historyStorage: 'postgres',
       savedResolvedCount,
-    });
+    };
+    lockedCache.asOfRound = engine?.asOfRound ?? latestRound ?? null;
+    lockedCache.limit = limit;
+    lockedCache.createdAt = Date.now();
+    lockedCache.basePayload = basePayload;
+
+    res.json(withHistoryFilter(basePayload, historyTarget));
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// ── ACCESS CODES ──────────────────────────────────────────────────────────────
 const clearHistoryHandler = async (req, res) => {
   try {
     const result = await clearPredictions();
+    invalidatePredictionCaches();
     res.json({ ok: true, ...result });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -207,6 +294,7 @@ app.post('/clear-history', requireAdmin, rateLimit(10), clearHistoryHandler);
 const clearLocksHandler = async (req, res) => {
   try {
     const result = await clearAllLocks();
+    invalidatePredictionCaches();
     res.json({ ok: true, ...result });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -247,7 +335,6 @@ app.delete('/access/:id', requireAdmin, rateLimit(10), async (req,res) => {
   catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
-// ── WALLETS ───────────────────────────────────────────────────────────────────
 app.get('/wallets', requireAdmin, rateLimit(20), async (req,res) => {
   try { res.json({ ok:true, wallets: await getWallets() }); }
   catch(e) { res.status(500).json({ ok:false, error:e.message }); }

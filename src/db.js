@@ -84,10 +84,6 @@ async function initDB() {
   `).catch(() => {});
 }
 
-// ── savePrediction ─────────────────────────────────────────────────────────────
-// ON CONFLICT: updates outcome + hit_round so a retry/early→win upgrade works.
-// The unique constraint (source, target, window_lo, window_hi) is the single
-// dedup guard — safe under concurrent requests from multiple browser tabs.
 async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation, source = 'engine', probW = null }) {
   // FIX: validate inputs before hitting the DB — reject nonsense windows early
   if (!target || !outcome || lo == null || hi == null) throw new Error('savePrediction: missing required fields');
@@ -140,9 +136,6 @@ async function getPredictions({ limit = 500, target = null, source = null } = {}
   }));
 }
 
-// ── saveRounds ─────────────────────────────────────────────────────────────────
-// Batch upsert. ON CONFLICT DO NOTHING is the dedup guard for rounds.
-// FIX: chunk large batches to stay under postgres parameter limit (65535 params).
 const ROUND_BATCH_CHUNK = 1000; // 3 params per row → 3000 params max per chunk
 
 async function saveRounds(rounds) {
@@ -294,6 +287,11 @@ async function getStats() {
   };
 }
 
+async function getLatestRoundId() {
+  const res = await pool.query(`SELECT round_id FROM rounds ORDER BY round_id DESC LIMIT 1`);
+  return res.rows[0]?.round_id ? Number(res.rows[0].round_id) : null;
+}
+
 async function clearPredictions() {
   const res = await pool.query(`DELETE FROM predictions`);
   return { predictionsCleared: res.rowCount || 0 };
@@ -320,7 +318,6 @@ async function clearAllLocks() {
   }
 }
 
-// ── WALLET STORAGE ────────────────────────────────────────────────────────────
 async function initWalletStorage() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS saved_wallets (
@@ -353,10 +350,7 @@ async function deleteWallet(id) {
   await pool.query(`DELETE FROM saved_wallets WHERE id = $1`, [id]);
 }
 
-// ── ACCESS CODES + ALL LOCKED PRED TABLES ────────────────────────────────────
 async function initAccessCodes() {
-
-  // ── Consensus (Master Signal) locked preds ────────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS locked_preds_consensus (
       target          VARCHAR(10) PRIMARY KEY,
@@ -369,7 +363,6 @@ async function initAccessCodes() {
     );
   `).catch(() => {});
 
-  // ── Advanced engine locked preds (lstm/xgb/rf/ols/cat/hardgap/...) ─────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS locked_preds_adv (
       model           VARCHAR(20) NOT NULL,
@@ -384,7 +377,6 @@ async function initAccessCodes() {
     );
   `).catch(() => {});
 
-  // ── Engine locked preds ───────────────────────────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS locked_preds (
       target          VARCHAR(10) PRIMARY KEY,
@@ -398,9 +390,6 @@ async function initAccessCodes() {
     );
   `).catch(() => {});
 
-
-
-  // ── Access codes ──────────────────────────────────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS access_codes (
       id          SERIAL PRIMARY KEY,
@@ -453,7 +442,6 @@ async function deleteAccessCode(id) {
   await pool.query(`DELETE FROM access_codes WHERE id = $1`, [id]);
 }
 
-// ── Engine locked preds ───────────────────────────────────────────────────────
 async function saveLockedPreds(preds) {
   const entries = Object.entries(preds);
   if (!entries.length) return;
@@ -497,9 +485,6 @@ async function getLockedPreds() {
   return out;
 }
 
-
-
-// ── Advanced engine locked preds ──────────────────────────────────────────────
 async function saveLockedAdvPreds(modelId, preds) {
   const entries = Object.entries(preds);
   if (!entries.length) return;
@@ -547,7 +532,6 @@ async function getLockedAdvPreds() {
   return out;
 }
 
-// ── Consensus locked preds ────────────────────────────────────────────────────
 async function saveLockedConsensusPreds(preds) {
   const entries = Object.entries(preds);
   if (!entries.length) return;
@@ -592,6 +576,7 @@ async function getLockedConsensusPreds() {
 module.exports = {
   pool,
   initDB, saveRounds, getRounds, getStorageStats, getStats,
+  getLatestRoundId,
   saveLockedPreds, getLockedPreds,
   saveLockedAdvPreds, getLockedAdvPreds,
   saveLockedConsensusPreds, getLockedConsensusPreds,
