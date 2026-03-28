@@ -197,9 +197,11 @@ function preprocess(rounds) {
   const prefUnder2 = buildPrefix(under2Flags);
 
   const lowStreak = new Array(n).fill(0);
+  const whiteStreak = new Array(n).fill(0);
   const highStreak = new Array(n).fill(0);
   for (let i = 0; i < n; i++) {
     lowStreak[i] = cleanRounds[i].multiplier < 2 ? 1 + (i > 0 ? lowStreak[i - 1] : 0) : 0;
+    whiteStreak[i] = cleanRounds[i].multiplier < 3 ? 1 + (i > 0 ? whiteStreak[i - 1] : 0) : 0;
     highStreak[i] = cleanRounds[i].multiplier >= 10 ? 1 + (i > 0 ? highStreak[i - 1] : 0) : 0;
   }
 
@@ -388,6 +390,7 @@ function preprocess(rounds) {
       regime: regimeByIdx[ii],
       under2Rate: under2RateByIdx[ii],
       lowStreak: lowStreak[ii],
+      whiteStreak: whiteStreak[ii],
       highStreak: highStreak[ii],
       seq,
     };
@@ -406,6 +409,7 @@ function preprocess(rounds) {
     volRatioByIdx,
     regimeByIdx,
     under2RateByIdx,
+    whiteStreak,
     stateAt,
   };
 }
@@ -422,6 +426,7 @@ function stateDistance(a, b, target) {
   d += 1.5 * Math.abs(a.volRatio - b.volRatio);
   d += 0.9 * Math.abs(a.under2Rate - b.under2Rate);
   d += 0.06 * Math.abs(a.lowStreak - b.lowStreak);
+  d += 0.05 * Math.abs(a.whiteStreak - b.whiteStreak);
   d += 0.05 * Math.abs(a.highStreak - b.highStreak);
 
   let seqMismatch = 0;
@@ -1144,44 +1149,308 @@ function buildUiTarget(target, lock, status, currentRound, previousOutcome = nul
   };
 }
 
-function buildAlertSummary(targetsOut) {
-  const rows = (targetsOut || []).map((t) => ({
-    target: Number(t.target || 0),
-    targetLabel: t.targetLabel || `${t.target}x`,
-    quickHit: Number(t?.signals?.quickHit || 0),
-    whiteClusterSeverity: Number(t?.signals?.whiteClusterSeverity || 0),
-    whiteReleaseSignal: Number(t?.signals?.whiteReleaseSignal || 0),
-    hardGapImpulse: Number(t?.signals?.hardGapImpulse || 0),
-    aheadLo: Number(t?.window?.aheadLo || 0),
-    aheadHi: Number(t?.window?.aheadHi || 0),
-    confidence: Number(t?.confidence || 0),
-  }));
+function sequenceLogDistance(rounds, idxA, idxB, len = 8) {
+  if (!rounds?.length) return 0;
+  let dist = 0;
+  let weightTotal = 0;
+  for (let i = 0; i < len; i++) {
+    const a = rounds[clamp(idxA - i, 0, rounds.length - 1)];
+    const b = rounds[clamp(idxB - i, 0, rounds.length - 1)];
+    const la = safeLog(a?.multiplier || 1);
+    const lb = safeLog(b?.multiplier || 1);
+    const w = 1 + (((len - i) / len) * 1.9);
+    dist += w * Math.abs(la - lb);
+    weightTotal += w;
+  }
+  return weightTotal > 0 ? (dist / weightTotal) : 0;
+}
 
-  const b2bByTarget = rows
+function evalWhiteFuture(rounds, startIdx, endIdx) {
+  const s = clamp(startIdx, 0, Math.max(0, rounds.length - 1));
+  const e = clamp(endIdx, s, Math.max(0, rounds.length - 1));
+  let whiteCount = 0;
+  let run = 0;
+  let maxRun = 0;
+  let firstClusterAhead = null;
+  let reboundSoon = false;
+
+  for (let i = s; i <= e; i++) {
+    const m = Number(rounds[i]?.multiplier || 0);
+    if (i <= (s + 2) && m >= 5) reboundSoon = true;
+    if (m < 3) {
+      whiteCount++;
+      run++;
+      if (run > maxRun) maxRun = run;
+      if (run >= 3 && firstClusterAhead == null) firstClusterAhead = (i - s + 1);
+    } else {
+      run = 0;
+    }
+  }
+
+  const clusterSoon = maxRun >= 3 || whiteCount >= 3;
+  return {
+    clusterSoon,
+    reboundSoon,
+    firstClusterAhead,
+    whiteCount,
+    maxRun,
+  };
+}
+
+function buildIndependentB2BTargetAlert(pre, target, currentIdx) {
+  const rounds = pre.rounds || [];
+  const n = Number(pre.n || rounds.length || 0);
+  if (!n || currentIdx < 40) {
+    return {
+      target,
+      targetLabel: `${target}x`,
+      probability: 0,
+      p1: 0,
+      p2: 0,
+      p3: 0,
+      p5: 0,
+      aheadLo: 1,
+      aheadHi: 5,
+      evidence: 0,
+      samples: 0,
+    };
+  }
+
+  const stats = pre.gapStats?.[target] || {};
+  const nextMap = pre.nextHitMaps?.[target] || [];
+  const currentState = pre.stateAt(currentIdx, target);
+  const horizonMax = target >= 500 ? 16 : (target >= 100 ? 14 : 12);
+  const start = Math.max(120, currentIdx - (target >= 500 ? 260000 : 210000));
+  const rawSpan = Math.max(1, currentIdx - start);
+  const maxScan = target >= 500 ? 80000 : 70000;
+  const stride = Math.max(1, Math.floor(rawSpan / maxScan));
+
+  let totalW = 0;
+  let w1 = 0;
+  let w2 = 0;
+  let w3 = 0;
+  let w5 = 0;
+  const hitAheads = [];
+
+  for (let idx = start; idx < currentIdx - 1; idx += stride) {
+    const st = pre.stateAt(idx, target);
+    let dist = stateDistance(currentState, st, target);
+    dist += 0.18 * sequenceLogDistance(rounds, currentIdx, idx, 8);
+
+    const megaCur = rounds[currentIdx]?.multiplier >= 100 ? 1 : 0;
+    const megaPrevCur = rounds[Math.max(0, currentIdx - 1)]?.multiplier >= 100 ? 1 : 0;
+    const megaHist = rounds[idx]?.multiplier >= 100 ? 1 : 0;
+    const megaPrevHist = rounds[Math.max(0, idx - 1)]?.multiplier >= 100 ? 1 : 0;
+    if (megaCur !== megaHist) dist += 0.28;
+    if (megaPrevCur !== megaPrevHist) dist += 0.2;
+
+    const recency = 0.42 + (0.58 * ((idx + 1) / Math.max(1, currentIdx)) ** 1.25);
+    const regimeBoost = st.regime === currentState.regime ? 1.12 : 1;
+    const weight = Math.exp(-dist * 0.82) * recency * regimeBoost;
+    if (weight < 0.001) continue;
+
+    totalW += weight;
+    const nextIdx = nextMap[idx];
+    const ahead = nextIdx == null ? Number.POSITIVE_INFINITY : (nextIdx - idx);
+    if (ahead <= 1) w1 += weight;
+    if (ahead <= 2) w2 += weight;
+    if (ahead <= 3) w3 += weight;
+    if (ahead <= 5) w5 += weight;
+    if (ahead > 0 && ahead <= horizonMax) hitAheads.push({ value: ahead, weight });
+  }
+
+  const inter = Array.isArray(stats.interGaps) ? stats.interGaps : [];
+  let c1 = 0;
+  let c2 = 0;
+  let c3 = 0;
+  let c5 = 0;
+  for (const g of inter) {
+    if (g <= 1) c1++;
+    if (g <= 2) c2++;
+    if (g <= 3) c3++;
+    if (g <= 5) c5++;
+  }
+  const interDen = Math.max(1, inter.length);
+  const prior1 = clamp(c1 / interDen, 0.0005, 0.95);
+  const prior2 = clamp(c2 / interDen, prior1, 0.97);
+  const prior3 = clamp(c3 / interDen, prior2, 0.98);
+  const prior5 = clamp(c5 / interDen, prior3, 0.995);
+
+  const alpha = totalW >= 26 ? 6 : 10;
+  let p1 = (w1 + (alpha * prior1)) / Math.max(0.0001, totalW + alpha);
+  let p2 = (w2 + (alpha * prior2)) / Math.max(0.0001, totalW + alpha);
+  let p3 = (w3 + (alpha * prior3)) / Math.max(0.0001, totalW + alpha);
+  let p5 = (w5 + (alpha * prior5)) / Math.max(0.0001, totalW + alpha);
+  p1 = clamp(p1, 0, 1);
+  p2 = clamp(Math.max(p2, p1), 0, 1);
+  p3 = clamp(Math.max(p3, p2), 0, 1);
+  p5 = clamp(Math.max(p5, p3), 0, 1);
+
+  let aheadLo = 1;
+  let aheadHi = 5;
+  if (hitAheads.length >= 5) {
+    aheadLo = clamp(Math.round(weightedQuantile(hitAheads, 0.2)), 1, horizonMax);
+    aheadHi = clamp(Math.round(weightedQuantile(hitAheads, 0.65)), aheadLo, horizonMax);
+  } else {
+    const center = p1 >= 0.18 ? 1 : (p3 >= 0.3 ? 2 : 3);
+    aheadLo = center;
+    aheadHi = clamp(center + 2, aheadLo, horizonMax);
+  }
+
+  const evidence = clamp(totalW / Math.max(22, Math.sqrt(Math.max(1, n)) * 2.4), 0, 1);
+  return {
+    target,
+    targetLabel: `${target}x`,
+    probability: roundNum(p3, 6),
+    p1: roundNum(p1, 6),
+    p2: roundNum(p2, 6),
+    p3: roundNum(p3, 6),
+    p5: roundNum(p5, 6),
+    aheadLo,
+    aheadHi,
+    evidence: roundNum(evidence, 4),
+    samples: Math.round(totalW),
+  };
+}
+
+function buildIndependentWhiteClusterAlert(pre, currentIdx) {
+  const rounds = pre.rounds || [];
+  const n = Number(pre.n || rounds.length || 0);
+  if (!n || currentIdx < 30) {
+    return {
+      risk: 0,
+      release: 0,
+      currentRun: 0,
+      aheadLo: 1,
+      aheadHi: 5,
+      samples: 0,
+      whiteRate: 0,
+    };
+  }
+
+  const horizon = 5;
+  const start = Math.max(80, currentIdx - 220000);
+  const rawSpan = Math.max(1, currentIdx - start);
+  const maxScan = 70000;
+  const stride = Math.max(1, Math.floor(rawSpan / maxScan));
+  const currentRun = Number(pre.whiteStreak?.[currentIdx] || 0);
+
+  let totalW = 0;
+  let eventW = 0;
+  let releaseW = 0;
+  let contTotalW = 0;
+  let contEventW = 0;
+  const eventAheads = [];
+
+  const whiteTotal = rounds.reduce((acc, r) => acc + (Number(r.multiplier) < 3 ? 1 : 0), 0);
+  const whiteRate = whiteTotal / Math.max(1, n);
+  const curTrend = Number(pre.trendByIdx?.[currentIdx] || 0);
+  const curVol = Number(pre.volRatioByIdx?.[currentIdx] || 1);
+  const curUnder2 = Number(pre.under2RateByIdx?.[currentIdx] || 0);
+  const curRegime = String(pre.regimeByIdx?.[currentIdx] || 'balanced');
+  const megaCur = rounds[currentIdx]?.multiplier >= 100 ? 1 : 0;
+  const megaPrevCur = rounds[Math.max(0, currentIdx - 1)]?.multiplier >= 100 ? 1 : 0;
+
+  for (let idx = start; idx < currentIdx - horizon - 1; idx += stride) {
+    let dist = 0;
+    dist += 2.4 * Math.abs(curTrend - Number(pre.trendByIdx?.[idx] || 0));
+    dist += 1.35 * Math.abs(curVol - Number(pre.volRatioByIdx?.[idx] || 1));
+    dist += 0.95 * Math.abs(curUnder2 - Number(pre.under2RateByIdx?.[idx] || 0));
+    dist += 0.08 * Math.abs(currentRun - Number(pre.whiteStreak?.[idx] || 0));
+    dist += 0.2 * sequenceLogDistance(rounds, currentIdx, idx, 8);
+
+    const megaHist = rounds[idx]?.multiplier >= 100 ? 1 : 0;
+    const megaPrevHist = rounds[Math.max(0, idx - 1)]?.multiplier >= 100 ? 1 : 0;
+    if (megaCur !== megaHist) dist += 0.35;
+    if (megaPrevCur !== megaPrevHist) dist += 0.25;
+
+    const recency = 0.4 + (0.6 * ((idx + 1) / Math.max(1, currentIdx)) ** 1.2);
+    const regimeBoost = (String(pre.regimeByIdx?.[idx] || 'balanced') === curRegime) ? 1.1 : 1;
+    const weight = Math.exp(-dist * 0.9) * recency * regimeBoost;
+    if (weight < 0.001) continue;
+
+    totalW += weight;
+    const future = evalWhiteFuture(rounds, idx + 1, idx + horizon);
+    if (future.clusterSoon) {
+      eventW += weight;
+      if (future.firstClusterAhead != null) {
+        eventAheads.push({ value: future.firstClusterAhead, weight });
+      }
+    }
+    if (future.reboundSoon) releaseW += weight;
+    if (Number(pre.whiteStreak?.[idx] || 0) >= 3) {
+      contTotalW += weight;
+      if (future.clusterSoon) contEventW += weight;
+    }
+  }
+
+  let priorEvent = clamp(whiteRate * 1.9, 0.02, 0.9);
+  if (currentRun >= 3) {
+    priorEvent = Math.max(priorEvent, clamp(0.56 + (0.09 * Math.min(4, currentRun - 3)), 0.56, 0.92));
+  }
+  const priorRelease = clamp((1 - priorEvent) * 0.75, 0.03, 0.95);
+  const alpha = totalW >= 26 ? 6 : 10;
+
+  let risk = (eventW + (alpha * priorEvent)) / Math.max(0.0001, totalW + alpha);
+  if (currentRun >= 3 && contTotalW > 0) {
+    const contRisk = (contEventW + (6 * priorEvent)) / Math.max(0.0001, contTotalW + 6);
+    risk = Math.max(risk, contRisk);
+  }
+  risk = clamp(risk, 0, 1);
+  const release = clamp((releaseW + (alpha * priorRelease)) / Math.max(0.0001, totalW + alpha), 0, 1);
+
+  let aheadLo = 1;
+  let aheadHi = 5;
+  if (eventAheads.length >= 5) {
+    aheadLo = clamp(Math.round(weightedQuantile(eventAheads, 0.2)), 1, 5);
+    aheadHi = clamp(Math.round(weightedQuantile(eventAheads, 0.75)), aheadLo, 5);
+  } else if (currentRun >= 3) {
+    aheadLo = 1;
+    aheadHi = 3;
+  }
+
+  return {
+    risk: roundNum(risk, 6),
+    release: roundNum(release, 6),
+    currentRun,
+    aheadLo,
+    aheadHi,
+    samples: Math.round(totalW),
+    whiteRate: roundNum(whiteRate, 6),
+  };
+}
+
+function buildAlertSummary(pre, currentIdx, targetsOut) {
+  const byTargetUi = {};
+  for (const row of (targetsOut || [])) byTargetUi[Number(row.target)] = row;
+
+  const b2bByTarget = TARGETS.map((target) => {
+    const calc = buildIndependentB2BTargetAlert(pre, target, currentIdx);
+    const ui = byTargetUi[target];
+    return {
+      target,
+      targetLabel: `${target}x`,
+      probability: roundNum(calc.probability, 6),
+      p1: roundNum(calc.p1, 6),
+      p2: roundNum(calc.p2, 6),
+      p3: roundNum(calc.p3, 6),
+      p5: roundNum(calc.p5, 6),
+      aheadLo: calc.aheadLo,
+      aheadHi: calc.aheadHi,
+      evidence: roundNum(calc.evidence, 4),
+      samples: Number(calc.samples || 0),
+      confidence: roundNum(Number(ui?.confidence || 0), 4),
+      source: 'historical_pattern_context',
+    };
+  });
+
+  const topB2B = b2bByTarget
     .slice()
-    .sort((a, b) => a.target - b.target)
-    .map((r) => ({
-      target: r.target,
-      targetLabel: r.targetLabel,
-      probability: roundNum(r.quickHit, 6),
-      aheadLo: r.aheadLo,
-      aheadHi: r.aheadHi,
-      confidence: roundNum(r.confidence, 4),
-    }));
+    .sort((a, b) => b.probability - a.probability)[0] || null;
 
-  const topB2B = rows
-    .slice()
-    .sort((a, b) => b.quickHit - a.quickHit)[0] || null;
-
-  const lowTargets = rows.filter(r => r.target > 0 && r.target <= 10);
-  const whiteRisk = lowTargets.length
-    ? Math.max(...lowTargets.map(r => r.whiteClusterSeverity))
-    : 0;
-  const whiteRelease = rows.length
-    ? Math.max(...rows.map(r => r.whiteReleaseSignal))
-    : 0;
-  const hardGapRisk = rows.length
-    ? Math.max(...rows.map(r => r.hardGapImpulse))
+  const white = buildIndependentWhiteClusterAlert(pre, currentIdx);
+  const hardGapRisk = (targetsOut || []).length
+    ? Math.max(...targetsOut.map(t => Number(t?.signals?.hardGapImpulse || 0)))
     : 0;
 
   return {
@@ -1192,13 +1461,19 @@ function buildAlertSummary(targetsOut) {
       ? {
         target: topB2B.target,
         targetLabel: topB2B.targetLabel,
-        probability: roundNum(topB2B.quickHit, 6),
+        probability: roundNum(topB2B.probability, 6),
         aheadLo: topB2B.aheadLo,
         aheadHi: topB2B.aheadHi,
+        source: topB2B.source,
       }
       : null,
-    whiteClusterRisk: roundNum(whiteRisk, 6),
-    whiteReleaseSignal: roundNum(whiteRelease, 6),
+    whiteClusterRisk: roundNum(white.risk, 6),
+    whiteReleaseSignal: roundNum(white.release, 6),
+    whiteCurrentRun: Number(white.currentRun || 0),
+    whiteAheadLo: Number(white.aheadLo || 1),
+    whiteAheadHi: Number(white.aheadHi || 5),
+    whiteSamples: Number(white.samples || 0),
+    whiteBaseRate: roundNum(white.whiteRate, 6),
     hardGapRisk: roundNum(hardGapRisk, 6),
   };
 }
@@ -1320,7 +1595,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       whiteReleaseModel: true,
       hardGapImpulse: true,
     },
-    alertSummary: buildAlertSummary(targetsOut),
+    alertSummary: buildAlertSummary(pre, currentIdx, targetsOut),
     summary: {
       pending: pendingCount,
       windowOpen: openCount,
