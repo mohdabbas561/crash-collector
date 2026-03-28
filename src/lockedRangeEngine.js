@@ -1619,12 +1619,36 @@ function buildAlertSummary(pre, currentIdx, targetsOut) {
     }
     const blendFactor = (1 - targetWhiteBlend) + (targetWhiteBlend * ratioAdj);
     const effectiveProbability = clamp(rawProbability * blendFactor, 0, 1);
+    const baseRef = clamp(Number(adj.baseP3 || 0), 0, 1);
+    const lift = clamp(effectiveProbability / Math.max(0.02, baseRef || 0.02), 0, 4);
+    const gain = clamp(effectiveProbability - baseRef, -1, 1);
+    const liftNorm = clamp((lift - 1) / 1.3, 0, 1);
+    const gainNorm = clamp(gain / 0.2, 0, 1);
+    const sampleNorm = clamp(Number(calc.samples || 0) / (target >= 100 ? 20 : 28), 0, 1);
+    const evidenceNorm = clamp(Number(calc.evidence || 0), 0, 1);
+    let actionScore = (
+      (0.36 * effectiveProbability) +
+      (0.27 * liftNorm) +
+      (0.18 * gainNorm) +
+      (0.09 * sampleNorm) +
+      (0.1 * evidenceNorm)
+    );
+    if (target === 5) {
+      actionScore -= 0.05 * (1 - clamp((lift - 1) / 0.7, 0, 1));
+    }
+    if (target >= 50) {
+      actionScore += 0.04 * clamp(Number(calc.highChainScore || 0), 0, 1);
+    }
+    actionScore = clamp(actionScore, 0, 1);
     return {
       target,
       targetLabel: `${target}x`,
       probability: roundNum(effectiveProbability, 6),
       effectiveProbability: roundNum(effectiveProbability, 6),
       rawProbability: roundNum(rawProbability, 6),
+      actionScore: roundNum(actionScore, 6),
+      lift: roundNum(lift, 6),
+      gain: roundNum(gain, 6),
       p1: roundNum(calc.p1, 6),
       p2: roundNum(calc.p2, 6),
       p3: roundNum(calc.p3, 6),
@@ -1646,7 +1670,21 @@ function buildAlertSummary(pre, currentIdx, targetsOut) {
     };
   });
 
-  const topB2B = b2bByTarget
+  const byAction = b2bByTarget
+    .slice()
+    .sort((a, b) => b.actionScore - a.actionScore);
+  let topB2B = byAction[0] || null;
+  const topNon5Action = byAction.find((row) => Number(row.target) !== 5) || null;
+  if (topB2B?.target === 5 && topNon5Action) {
+    const closeScore = topNon5Action.actionScore >= (topB2B.actionScore - 0.035);
+    const non5Actionable = (
+      topNon5Action.effectiveProbability >= 0.1 ||
+      topNon5Action.highChainActive ||
+      topNon5Action.lift >= 1.28
+    );
+    if (closeScore && non5Actionable) topB2B = topNon5Action;
+  }
+  const topB2BByProbability = b2bByTarget
     .slice()
     .sort((a, b) => b.effectiveProbability - a.effectiveProbability)[0] || null;
   const topB2BRaw = b2bByTarget
@@ -1660,7 +1698,7 @@ function buildAlertSummary(pre, currentIdx, targetsOut) {
     .filter((row) => Number(row.target) >= 50)
     .slice()
     .sort((a, b) => b.rawProbability - a.rawProbability)[0] || null;
-  const suppressionTarget = Number(topB2BRaw?.target || topB2B?.target || 0);
+  const suppressionTarget = Number(topB2BRaw?.target || topB2BByProbability?.target || 0);
   const suppressionEligible = suppressionTarget > 0 && suppressionTarget <= 20;
   const b2bSuppressedByWhite = (
     suppressionEligible &&
@@ -1692,6 +1730,9 @@ function buildAlertSummary(pre, currentIdx, targetsOut) {
         probability: roundNum(topB2B.effectiveProbability, 6),
         effectiveProbability: roundNum(topB2B.effectiveProbability, 6),
         rawProbability: roundNum(topB2B.rawProbability, 6),
+        actionScore: roundNum(topB2B.actionScore, 6),
+        lift: roundNum(topB2B.lift, 6),
+        gain: roundNum(topB2B.gain, 6),
         aheadLo: topB2B.aheadLo,
         aheadHi: topB2B.aheadHi,
         whiteContextRatio: roundNum(topB2B.whiteContextRatio, 6),
