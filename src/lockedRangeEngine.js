@@ -1420,17 +1420,104 @@ function buildIndependentWhiteClusterAlert(pre, currentIdx) {
   };
 }
 
+function buildWhiteContextB2BAdjusters(pre, currentIdx) {
+  const rounds = pre.rounds || [];
+  const n = Number(pre.n || rounds.length || 0);
+  const out = {};
+  for (const target of TARGETS) {
+    out[target] = { ratio: 1, condP3: 0, baseP3: 0, sample: 0 };
+  }
+  if (!n || currentIdx < 50) return out;
+
+  const curRun = Number(pre.whiteStreak?.[currentIdx] || 0);
+  const curUnder2 = Number(pre.under2RateByIdx?.[currentIdx] || 0);
+  const curTrend = Number(pre.trendByIdx?.[currentIdx] || 0);
+  const curRegime = String(pre.regimeByIdx?.[currentIdx] || 'balanced');
+  const start = Math.max(80, currentIdx - 220000);
+  const rawSpan = Math.max(1, currentIdx - start);
+  const maxScan = 70000;
+  const stride = Math.max(1, Math.floor(rawSpan / maxScan));
+
+  const totals = {};
+  const hits = {};
+  for (const target of TARGETS) {
+    totals[target] = 0;
+    hits[target] = 0;
+  }
+
+  for (let idx = start; idx < currentIdx - 3; idx += stride) {
+    let dist = 0;
+    dist += 0.42 * Math.abs(curRun - Number(pre.whiteStreak?.[idx] || 0));
+    dist += 1.5 * Math.abs(curUnder2 - Number(pre.under2RateByIdx?.[idx] || 0));
+    dist += 1.15 * Math.abs(curTrend - Number(pre.trendByIdx?.[idx] || 0));
+    if (String(pre.regimeByIdx?.[idx] || 'balanced') !== curRegime) dist += 0.55;
+    dist += 0.16 * sequenceLogDistance(rounds, currentIdx, idx, 6);
+
+    const recency = 0.45 + (0.55 * ((idx + 1) / Math.max(1, currentIdx)) ** 1.18);
+    const weight = Math.exp(-dist * 0.92) * recency;
+    if (weight < 0.001) continue;
+
+    for (const target of TARGETS) {
+      totals[target] += weight;
+      const nextIdx = pre.nextHitMaps?.[target]?.[idx];
+      const ahead = nextIdx == null ? Number.POSITIVE_INFINITY : (nextIdx - idx);
+      if (ahead > 0 && ahead <= 3) hits[target] += weight;
+    }
+  }
+
+  for (const target of TARGETS) {
+    const totalW = Math.max(0, Number(totals[target] || 0));
+    const condP3 = totalW > 0 ? (hits[target] / totalW) : 0;
+    let baseP3 = Number(pre.gapStats?.[target]?.quick?.global?.le3 || 0);
+    if (!(baseP3 > 0)) {
+      const inter = Array.isArray(pre.gapStats?.[target]?.interGaps)
+        ? pre.gapStats[target].interGaps
+        : [];
+      if (inter.length) {
+        let c3 = 0;
+        for (const g of inter) if (g <= 3) c3++;
+        baseP3 = c3 / inter.length;
+      }
+    }
+    baseP3 = clamp(Number(baseP3 || 0), 0, 1);
+    const ratio = clamp(condP3 / Math.max(0.02, baseP3), 0.2, 1.45);
+    out[target] = {
+      ratio: roundNum(ratio, 6),
+      condP3: roundNum(condP3, 6),
+      baseP3: roundNum(baseP3, 6),
+      sample: Math.round(totalW),
+    };
+  }
+
+  return out;
+}
+
 function buildAlertSummary(pre, currentIdx, targetsOut) {
   const byTargetUi = {};
   for (const row of (targetsOut || [])) byTargetUi[Number(row.target)] = row;
 
+  const white = buildIndependentWhiteClusterAlert(pre, currentIdx);
+  const contextAdjusters = buildWhiteContextB2BAdjusters(pre, currentIdx);
+  const whitePressure = clamp(
+    (white.risk * 1.02) - (white.release * 0.86) + (white.currentRun >= 3 ? 0.14 : 0),
+    0,
+    1
+  );
+  const whiteBlend = clamp(0.18 + (0.82 * whitePressure), 0, 1);
+
   const b2bByTarget = TARGETS.map((target) => {
     const calc = buildIndependentB2BTargetAlert(pre, target, currentIdx);
     const ui = byTargetUi[target];
+    const adj = contextAdjusters[target] || { ratio: 1, condP3: 0, baseP3: 0, sample: 0 };
+    const rawProbability = clamp(Number(calc.probability || 0), 0, 1);
+    const blendFactor = (1 - whiteBlend) + (whiteBlend * clamp(Number(adj.ratio || 1), 0.2, 1.45));
+    const effectiveProbability = clamp(rawProbability * blendFactor, 0, 1);
     return {
       target,
       targetLabel: `${target}x`,
-      probability: roundNum(calc.probability, 6),
+      probability: roundNum(effectiveProbability, 6),
+      effectiveProbability: roundNum(effectiveProbability, 6),
+      rawProbability: roundNum(rawProbability, 6),
       p1: roundNum(calc.p1, 6),
       p2: roundNum(calc.p2, 6),
       p3: roundNum(calc.p3, 6),
@@ -1439,6 +1526,10 @@ function buildAlertSummary(pre, currentIdx, targetsOut) {
       aheadHi: calc.aheadHi,
       evidence: roundNum(calc.evidence, 4),
       samples: Number(calc.samples || 0),
+      whiteContextRatio: roundNum(adj.ratio, 6),
+      whiteContextP3: roundNum(adj.condP3, 6),
+      baseP3: roundNum(adj.baseP3, 6),
+      whiteContextSample: Number(adj.sample || 0),
       confidence: roundNum(Number(ui?.confidence || 0), 4),
       source: 'historical_pattern_context',
     };
@@ -1446,9 +1537,22 @@ function buildAlertSummary(pre, currentIdx, targetsOut) {
 
   const topB2B = b2bByTarget
     .slice()
-    .sort((a, b) => b.probability - a.probability)[0] || null;
-
-  const white = buildIndependentWhiteClusterAlert(pre, currentIdx);
+    .sort((a, b) => b.effectiveProbability - a.effectiveProbability)[0] || null;
+  const topB2BRaw = b2bByTarget
+    .slice()
+    .sort((a, b) => b.rawProbability - a.rawProbability)[0] || null;
+  const b2bSuppressedByWhite = (
+    whitePressure >= 0.55 &&
+    (topB2BRaw?.rawProbability || 0) > (topB2B?.effectiveProbability || 0) + 0.08
+  );
+  let dominantSignal = 'neutral';
+  if (b2bSuppressedByWhite || whitePressure >= 0.58 || (white.currentRun >= 3 && white.risk >= 0.52)) {
+    dominantSignal = 'white_cluster';
+  } else if ((topB2B?.effectiveProbability || 0) >= 0.32) {
+    dominantSignal = 'b2b';
+  } else if (white.risk >= 0.34) {
+    dominantSignal = 'white_watch';
+  }
   const hardGapRisk = (targetsOut || []).length
     ? Math.max(...targetsOut.map(t => Number(t?.signals?.hardGapImpulse || 0)))
     : 0;
@@ -1461,12 +1565,27 @@ function buildAlertSummary(pre, currentIdx, targetsOut) {
       ? {
         target: topB2B.target,
         targetLabel: topB2B.targetLabel,
-        probability: roundNum(topB2B.probability, 6),
+        probability: roundNum(topB2B.effectiveProbability, 6),
+        effectiveProbability: roundNum(topB2B.effectiveProbability, 6),
+        rawProbability: roundNum(topB2B.rawProbability, 6),
         aheadLo: topB2B.aheadLo,
         aheadHi: topB2B.aheadHi,
+        whiteContextRatio: roundNum(topB2B.whiteContextRatio, 6),
         source: topB2B.source,
       }
       : null,
+    topB2BRaw: topB2BRaw
+      ? {
+        target: topB2BRaw.target,
+        targetLabel: topB2BRaw.targetLabel,
+        probability: roundNum(topB2BRaw.rawProbability, 6),
+        aheadLo: topB2BRaw.aheadLo,
+        aheadHi: topB2BRaw.aheadHi,
+      }
+      : null,
+    dominantSignal,
+    whitePressure: roundNum(whitePressure, 6),
+    b2bSuppressedByWhite,
     whiteClusterRisk: roundNum(white.risk, 6),
     whiteReleaseSignal: roundNum(white.release, 6),
     whiteCurrentRun: Number(white.currentRun || 0),
