@@ -1197,6 +1197,88 @@ function evalWhiteFuture(rounds, startIdx, endIdx) {
   };
 }
 
+function buildHighTargetChainSignal(pre, target, currentIdx) {
+  if (target < 50) {
+    return { active: false, p1: 0, p3: 0, score: 0, samples: 0 };
+  }
+  const rounds = pre.rounds || [];
+  const n = Number(pre.n || rounds.length || 0);
+  if (!n || currentIdx < 20) {
+    return { active: false, p1: 0, p3: 0, score: 0, samples: 0 };
+  }
+
+  const nextMap = pre.nextHitMaps?.[target] || [];
+  const cur = Number(rounds[currentIdx]?.multiplier || 0);
+  const prev1 = Number(rounds[Math.max(0, currentIdx - 1)]?.multiplier || 0);
+  const prev2 = Number(rounds[Math.max(0, currentIdx - 2)]?.multiplier || 0);
+  const curPeak2 = Math.max(cur, prev1);
+  const curPeak3 = Math.max(curPeak2, prev2);
+  const anchor = target >= 500
+    ? Math.max(120, target * 0.35)
+    : (target >= 100 ? Math.max(50, target * 0.42) : Math.max(18, target * 0.48));
+  const active = curPeak2 >= anchor;
+  const curSuper = curPeak2 >= target ? 1 : 0;
+  const curTail = (
+    safeLog(cur) +
+    safeLog(prev1 || cur) +
+    safeLog(prev2 || prev1 || cur)
+  ) / 3;
+
+  const start = Math.max(80, currentIdx - (target >= 500 ? 250000 : 210000));
+  const rawSpan = Math.max(1, currentIdx - start);
+  const maxScan = target >= 500 ? 70000 : 65000;
+  const stride = Math.max(1, Math.floor(rawSpan / maxScan));
+
+  let totalW = 0;
+  let hit1 = 0;
+  let hit3 = 0;
+  for (let idx = start; idx < currentIdx - 3; idx += stride) {
+    const h0 = Number(rounds[idx]?.multiplier || 0);
+    const h1 = Number(rounds[Math.max(0, idx - 1)]?.multiplier || 0);
+    const h2 = Number(rounds[Math.max(0, idx - 2)]?.multiplier || 0);
+    const histPeak2 = Math.max(h0, h1);
+    const histPeak3 = Math.max(histPeak2, h2);
+    const histSuper = histPeak2 >= target ? 1 : 0;
+    const histHot = histPeak2 >= anchor ? 1 : 0;
+    const curHot = active ? 1 : 0;
+    const histTail = (safeLog(h0) + safeLog(h1 || h0) + safeLog(h2 || h1 || h0)) / 3;
+
+    let dist = 0;
+    dist += 0.9 * Math.abs(curHot - histHot);
+    dist += 0.7 * Math.abs(curSuper - histSuper);
+    dist += 0.42 * Math.abs(Math.log1p(curPeak3) - Math.log1p(histPeak3));
+    dist += 1.25 * Math.abs(curTail - histTail);
+    dist += 0.14 * sequenceLogDistance(rounds, currentIdx, idx, 6);
+
+    const recency = 0.45 + (0.55 * ((idx + 1) / Math.max(1, currentIdx)) ** 1.16);
+    const hotBoost = histHot ? 1.12 : 0.95;
+    const weight = Math.exp(-dist * 0.92) * recency * hotBoost;
+    if (weight < 0.001) continue;
+
+    totalW += weight;
+    const nextIdx = nextMap[idx];
+    const ahead = nextIdx == null ? Number.POSITIVE_INFINITY : (nextIdx - idx);
+    if (ahead > 0 && ahead <= 1) hit1 += weight;
+    if (ahead > 0 && ahead <= 3) hit3 += weight;
+  }
+
+  const quick = pre.gapStats?.[target]?.quick?.global || {};
+  const baseP1 = clamp(Number(quick.le1 || 0), 0.0005, 0.95);
+  const baseP3 = clamp(Number(quick.le3 || 0), baseP1, 0.98);
+  const alpha = totalW >= 22 ? 6 : 10;
+  const p1 = clamp((hit1 + (alpha * baseP1)) / Math.max(0.0001, totalW + alpha), 0, 1);
+  const p3 = clamp((hit3 + (alpha * baseP3)) / Math.max(0.0001, totalW + alpha), p1, 1);
+  const score = clamp((0.42 * p1) + (0.58 * p3), 0, 1);
+
+  return {
+    active,
+    p1: roundNum(p1, 6),
+    p3: roundNum(p3, 6),
+    score: roundNum(score, 6),
+    samples: Math.round(totalW),
+  };
+}
+
 function buildIndependentB2BTargetAlert(pre, target, currentIdx) {
   const rounds = pre.rounds || [];
   const n = Number(pre.n || rounds.length || 0);
@@ -1286,6 +1368,17 @@ function buildIndependentB2BTargetAlert(pre, target, currentIdx) {
   p3 = clamp(Math.max(p3, p2), 0, 1);
   p5 = clamp(Math.max(p5, p3), 0, 1);
 
+  const highChain = buildHighTargetChainSignal(pre, target, currentIdx);
+  if (highChain.active && target >= 50) {
+    const chainBlend = clamp((Number(highChain.samples || 0) / (target >= 500 ? 38 : 52)), 0, 1) * 0.62;
+    const chainP1 = clamp(Number(highChain.p1 || 0), 0, 1);
+    const chainP3 = clamp(Number(highChain.p3 || 0), chainP1, 1);
+    p1 = clamp(((1 - chainBlend) * p1) + (chainBlend * chainP1), 0, 1);
+    p2 = clamp(Math.max(p1, ((1 - chainBlend) * p2) + (chainBlend * Math.max(chainP1, chainP3 * 0.82))), 0, 1);
+    p3 = clamp(Math.max(p2, ((1 - chainBlend) * p3) + (chainBlend * chainP3)), 0, 1);
+    p5 = clamp(Math.max(p3, ((1 - (chainBlend * 0.5)) * p5) + ((chainBlend * 0.5) * Math.max(chainP3, p3))), 0, 1);
+  }
+
   let aheadLo = 1;
   let aheadHi = 5;
   if (hitAheads.length >= 5) {
@@ -1295,6 +1388,10 @@ function buildIndependentB2BTargetAlert(pre, target, currentIdx) {
     const center = p1 >= 0.18 ? 1 : (p3 >= 0.3 ? 2 : 3);
     aheadLo = center;
     aheadHi = clamp(center + 2, aheadLo, horizonMax);
+  }
+  if (highChain.active && Number(highChain.p1 || 0) >= 0.2 && target >= 50) {
+    aheadLo = 1;
+    aheadHi = Math.min(aheadHi, 3);
   }
 
   const evidence = clamp(totalW / Math.max(22, Math.sqrt(Math.max(1, n)) * 2.4), 0, 1);
@@ -1310,6 +1407,10 @@ function buildIndependentB2BTargetAlert(pre, target, currentIdx) {
     aheadHi,
     evidence: roundNum(evidence, 4),
     samples: Math.round(totalW),
+    highChainActive: Boolean(highChain.active),
+    highChainScore: roundNum(highChain.score, 6),
+    highChainP3: roundNum(highChain.p3, 6),
+    highChainSamples: Number(highChain.samples || 0),
   };
 }
 
@@ -1510,7 +1611,13 @@ function buildAlertSummary(pre, currentIdx, targetsOut) {
     const ui = byTargetUi[target];
     const adj = contextAdjusters[target] || { ratio: 1, condP3: 0, baseP3: 0, sample: 0 };
     const rawProbability = clamp(Number(calc.probability || 0), 0, 1);
-    const blendFactor = (1 - whiteBlend) + (whiteBlend * clamp(Number(adj.ratio || 1), 0.2, 1.45));
+    const isHighTarget = target >= 50;
+    const targetWhiteBlend = isHighTarget ? (whiteBlend * 0.42) : whiteBlend;
+    let ratioAdj = clamp(Number(adj.ratio || 1), isHighTarget ? 0.58 : 0.2, isHighTarget ? 1.6 : 1.45);
+    if (calc.highChainActive) {
+      ratioAdj = Math.max(ratioAdj, clamp(0.82 + (0.55 * Number(calc.highChainScore || 0)), 0.82, 1.4));
+    }
+    const blendFactor = (1 - targetWhiteBlend) + (targetWhiteBlend * ratioAdj);
     const effectiveProbability = clamp(rawProbability * blendFactor, 0, 1);
     return {
       target,
@@ -1530,6 +1637,10 @@ function buildAlertSummary(pre, currentIdx, targetsOut) {
       whiteContextP3: roundNum(adj.condP3, 6),
       baseP3: roundNum(adj.baseP3, 6),
       whiteContextSample: Number(adj.sample || 0),
+      highChainActive: Boolean(calc.highChainActive),
+      highChainScore: roundNum(calc.highChainScore, 6),
+      highChainP3: roundNum(calc.highChainP3, 6),
+      highChainSamples: Number(calc.highChainSamples || 0),
       confidence: roundNum(Number(ui?.confidence || 0), 4),
       source: 'historical_pattern_context',
     };
@@ -1541,12 +1652,25 @@ function buildAlertSummary(pre, currentIdx, targetsOut) {
   const topB2BRaw = b2bByTarget
     .slice()
     .sort((a, b) => b.rawProbability - a.rawProbability)[0] || null;
+  const topB2BHigh = b2bByTarget
+    .filter((row) => Number(row.target) >= 50)
+    .slice()
+    .sort((a, b) => b.effectiveProbability - a.effectiveProbability)[0] || null;
+  const topB2BHighRaw = b2bByTarget
+    .filter((row) => Number(row.target) >= 50)
+    .slice()
+    .sort((a, b) => b.rawProbability - a.rawProbability)[0] || null;
+  const suppressionTarget = Number(topB2BRaw?.target || topB2B?.target || 0);
+  const suppressionEligible = suppressionTarget > 0 && suppressionTarget <= 20;
   const b2bSuppressedByWhite = (
+    suppressionEligible &&
     whitePressure >= 0.55 &&
     (topB2BRaw?.rawProbability || 0) > (topB2B?.effectiveProbability || 0) + 0.08
   );
   let dominantSignal = 'neutral';
-  if (b2bSuppressedByWhite || whitePressure >= 0.58 || (white.currentRun >= 3 && white.risk >= 0.52)) {
+  if ((topB2BHigh?.effectiveProbability || 0) >= 0.2 && (topB2BHighRaw?.rawProbability || 0) >= 0.18) {
+    dominantSignal = 'b2b_spike';
+  } else if (b2bSuppressedByWhite || whitePressure >= 0.58 || (white.currentRun >= 3 && white.risk >= 0.52)) {
     dominantSignal = 'white_cluster';
   } else if ((topB2B?.effectiveProbability || 0) >= 0.32) {
     dominantSignal = 'b2b';
@@ -1583,9 +1707,21 @@ function buildAlertSummary(pre, currentIdx, targetsOut) {
         aheadHi: topB2BRaw.aheadHi,
       }
       : null,
+    topB2BHigh: topB2BHigh
+      ? {
+        target: topB2BHigh.target,
+        targetLabel: topB2BHigh.targetLabel,
+        probability: roundNum(topB2BHigh.effectiveProbability, 6),
+        effectiveProbability: roundNum(topB2BHigh.effectiveProbability, 6),
+        rawProbability: roundNum(topB2BHigh.rawProbability, 6),
+        aheadLo: topB2BHigh.aheadLo,
+        aheadHi: topB2BHigh.aheadHi,
+      }
+      : null,
     dominantSignal,
     whitePressure: roundNum(whitePressure, 6),
     b2bSuppressedByWhite,
+    highB2BPressure: roundNum(topB2BHigh?.effectiveProbability || 0, 6),
     whiteClusterRisk: roundNum(white.risk, 6),
     whiteReleaseSignal: roundNum(white.release, 6),
     whiteCurrentRun: Number(white.currentRun || 0),

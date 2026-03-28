@@ -726,6 +726,59 @@ function computeB2BSignal(rounds, threshold = 5) {
   };
 }
 
+function computeHighChainSignal(rounds, threshold = 50) {
+  if (!rounds.length) return { score: 0, p1: 0, p3: 0, sample: 0, active: false };
+  const n = rounds.length;
+  if (n < 24) return { score: 0, p1: 0, p3: 0, sample: 0, active: false };
+
+  const lookback = clamp(Math.round(Math.sqrt(n) * 22), 600, 24000);
+  const start = Math.max(2, n - lookback);
+  const anchor = threshold >= 100 ? Math.max(50, threshold * 0.45) : Math.max(20, threshold * 0.5);
+  const curPeak2 = Math.max(
+    Number(rounds[n - 1]?.multiplier || 0),
+    Number(rounds[n - 2]?.multiplier || 0)
+  );
+  const active = curPeak2 >= anchor;
+  const curTail = mean([
+    toLog(rounds[n - 1]?.multiplier || 1),
+    toLog(rounds[n - 2]?.multiplier || 1),
+    toLog(rounds[n - 3]?.multiplier || 1),
+  ]);
+
+  let totalW = 0;
+  let hit1 = 0;
+  let hit3 = 0;
+  for (let i = start; i < n - 4; i++) {
+    const h0 = Number(rounds[i]?.multiplier || 0);
+    const h1 = Number(rounds[i - 1]?.multiplier || 0);
+    const histPeak2 = Math.max(h0, h1);
+    const histHot = histPeak2 >= anchor;
+    const curHot = active;
+    if (histHot !== curHot) continue;
+
+    const histTail = mean([toLog(h0 || 1), toLog(h1 || 1), toLog(rounds[i - 2]?.multiplier || 1)]);
+    const dist = Math.abs(curTail - histTail);
+    const recency = 0.42 + (0.58 * ((i + 1) / Math.max(1, n - 1)) ** 1.2);
+    const weight = Math.exp(-dist * 1.05) * recency * (histHot ? 1.1 : 1);
+    if (weight < 0.001) continue;
+
+    totalW += weight;
+    const n1 = Number(rounds[i + 1]?.multiplier || 0);
+    const n2 = Number(rounds[i + 2]?.multiplier || 0);
+    const n3 = Number(rounds[i + 3]?.multiplier || 0);
+    if (n1 >= threshold) hit1 += weight;
+    if (n1 >= threshold || n2 >= threshold || n3 >= threshold) hit3 += weight;
+  }
+
+  const baseP1 = clamp(rounds.filter(r => Number(r.multiplier) >= threshold).length / Math.max(1, n), 0.0005, 0.9);
+  const baseP3 = clamp(1 - ((1 - baseP1) ** 3), baseP1, 0.98);
+  const alpha = totalW >= 24 ? 6 : 10;
+  const p1 = clamp((hit1 + (alpha * baseP1)) / Math.max(0.0001, totalW + alpha), 0, 1);
+  const p3 = clamp((hit3 + (alpha * baseP3)) / Math.max(0.0001, totalW + alpha), p1, 1);
+  const score = clamp((0.4 * p1) + (0.6 * p3), 0, 1);
+  return { score, p1, p3, sample: Math.round(totalW), active };
+}
+
 function computeWhiteReleaseSignal(rounds, whiteSeverity) {
   if (whiteSeverity <= 0 || rounds.length < 12) return 0;
   const logs = rounds.map(r => toLog(r.multiplier));
@@ -1031,6 +1084,10 @@ function computeReport(rounds) {
 
   const b2b5 = computeB2BSignal(cleanRounds, 5);
   const b2b10 = computeB2BSignal(cleanRounds, 10);
+  const b2b50 = computeB2BSignal(cleanRounds, 50);
+  const b2b100 = computeB2BSignal(cleanRounds, 100);
+  const highChain50 = computeHighChainSignal(cleanRounds, 50);
+  const highChain100 = computeHighChainSignal(cleanRounds, 100);
   const b2bStrength = clamp((0.62 * b2b5.score) + (0.38 * b2b10.score), 0, 1);
   if (b2bStrength > 0) {
     const adjusted = [...finalBucketDist];
@@ -1038,6 +1095,21 @@ function computeReport(rounds) {
     adjusted[3] *= (1 + (0.15 * b2bStrength));
     adjusted[4] *= (1 + (0.09 * b2bStrength));
     adjusted[0] *= (1 - (0.2 * b2bStrength));
+    finalBucketDist = normalizeDistribution(adjusted);
+  }
+  const highB2BStrength = clamp(
+    (0.45 * b2b50.score) +
+    (0.3 * b2b100.score) +
+    (0.15 * highChain50.score) +
+    (0.1 * highChain100.score),
+    0,
+    1
+  );
+  if (highB2BStrength > 0) {
+    const adjusted = [...finalBucketDist];
+    adjusted[3] *= (1 + (0.1 * highB2BStrength));
+    adjusted[4] *= (1 + (0.24 * highB2BStrength));
+    adjusted[0] *= (1 - (0.08 * highB2BStrength));
     finalBucketDist = normalizeDistribution(adjusted);
   }
 
@@ -1091,7 +1163,7 @@ function computeReport(rounds) {
     1
   );
   const confidence = clamp(
-    0.15 + (0.38 * maxProb) + (0.16 * sharpness) + (0.1 * evidence) + (0.08 * alignment) + (0.07 * pressureEvidence) + (0.04 * b2bStrength) + (0.02 * whiteRelease),
+    0.15 + (0.38 * maxProb) + (0.16 * sharpness) + (0.1 * evidence) + (0.08 * alignment) + (0.07 * pressureEvidence) + (0.04 * b2bStrength) + (0.03 * highB2BStrength) + (0.02 * whiteRelease),
     0.05,
     0.97
   );
@@ -1125,6 +1197,14 @@ function computeReport(rounds) {
         const implied = clamp(1 - ((1 - byHorizon[1]) ** h), 0, 1);
         byHorizon[h] = clamp((0.72 * modelBlend) + (0.28 * implied) + (pressureBoost * (h === 3 ? 0.35 : 0.42)), 0, 1);
       }
+    }
+    if (threshold === 25 || threshold === 50) {
+      const chain = threshold === 50
+        ? clamp((0.7 * highChain50.score) + (0.3 * highChain100.score), 0, 1)
+        : clamp((0.65 * highChain50.score) + (0.35 * highChain100.score), 0, 1);
+      byHorizon[1] = clamp(byHorizon[1] + (0.1 * chain), 0, 1);
+      byHorizon[3] = clamp(byHorizon[3] + (0.18 * chain), byHorizon[1], 1);
+      byHorizon[5] = clamp(byHorizon[5] + (0.22 * chain), byHorizon[3], 1);
     }
 
     const expectedGap = p1FromDist > 0.0001 ? roundNum(1 / p1FromDist, 2) : null;
@@ -1219,6 +1299,7 @@ function computeReport(rounds) {
       },
       b2b: {
         combined: roundNum(b2bStrength, 4),
+        highCombined: roundNum(highB2BStrength, 4),
         for5x: {
           score: roundNum(b2b5.score, 4),
           immediate: roundNum(b2b5.immediate, 4),
@@ -1230,6 +1311,32 @@ function computeReport(rounds) {
           immediate: roundNum(b2b10.immediate, 4),
           near: roundNum(b2b10.near, 4),
           sample: Number(b2b10.sample || 0),
+        },
+        for50x: {
+          score: roundNum(b2b50.score, 4),
+          immediate: roundNum(b2b50.immediate, 4),
+          near: roundNum(b2b50.near, 4),
+          sample: Number(b2b50.sample || 0),
+        },
+        for100x: {
+          score: roundNum(b2b100.score, 4),
+          immediate: roundNum(b2b100.immediate, 4),
+          near: roundNum(b2b100.near, 4),
+          sample: Number(b2b100.sample || 0),
+        },
+        chain50x: {
+          score: roundNum(highChain50.score, 4),
+          p1: roundNum(highChain50.p1, 4),
+          p3: roundNum(highChain50.p3, 4),
+          sample: Number(highChain50.sample || 0),
+          active: Boolean(highChain50.active),
+        },
+        chain100x: {
+          score: roundNum(highChain100.score, 4),
+          p1: roundNum(highChain100.p1, 4),
+          p3: roundNum(highChain100.p3, 4),
+          sample: Number(highChain100.sample || 0),
+          active: Boolean(highChain100.active),
         },
       },
       pattern: {
