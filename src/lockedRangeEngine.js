@@ -1117,8 +1117,89 @@ function buildUiTarget(target, lock, status, currentRound, previousOutcome = nul
     currentGap: Number(lock.eta?.currentGap || 0),
     softGapPressure: roundNum(lock.eta?.softGapPressure || 0, 4),
     hardGapPressure: roundNum(lock.eta?.hardGapPressure || 0, 4),
+    signals: {
+      quickHit: roundNum(
+        lock.eta?.quickHitEmpirical ??
+        lock.eta?.quickHitSignal ??
+        lock.eta?.pHit1 ??
+        0,
+        6
+      ),
+      pHit1: roundNum(lock.eta?.pHit1 || 0, 6),
+      quickHitRaw: roundNum(lock.eta?.quickHitRaw || 0, 6),
+      quickHitEmpirical: roundNum(lock.eta?.quickHitEmpirical || 0, 6),
+      quickEmpiricalP1: roundNum(lock.eta?.quickEmpiricalP1 || 0, 6),
+      quickEmpiricalP2: roundNum(lock.eta?.quickEmpiricalP2 || 0, 6),
+      quickEmpiricalP3: roundNum(lock.eta?.quickEmpiricalP3 || 0, 6),
+      quickEmpiricalRegimeObs: Number(lock.eta?.quickEmpiricalRegimeObs || 0),
+      whiteClusterSeverity: roundNum(lock.eta?.whiteClusterSeverity || 0, 6),
+      whiteReleaseSignal: roundNum(lock.eta?.whiteReleaseSignal || 0, 6),
+      hardGapImpulse: roundNum(lock.eta?.hardGapImpulse || 0, 6),
+      pGapLe1: roundNum(lock.eta?.pGapLe1 || 0, 6),
+      pGapLe2: roundNum(lock.eta?.pGapLe2 || 0, 6),
+      pGapLe3: roundNum(lock.eta?.pGapLe3 || 0, 6),
+    },
     reason: lock.eta?.reason || 'Range locked from historical cluster-pattern analogs.',
     previousOutcome,
+  };
+}
+
+function buildAlertSummary(targetsOut) {
+  const rows = (targetsOut || []).map((t) => ({
+    target: Number(t.target || 0),
+    targetLabel: t.targetLabel || `${t.target}x`,
+    quickHit: Number(t?.signals?.quickHit || 0),
+    whiteClusterSeverity: Number(t?.signals?.whiteClusterSeverity || 0),
+    whiteReleaseSignal: Number(t?.signals?.whiteReleaseSignal || 0),
+    hardGapImpulse: Number(t?.signals?.hardGapImpulse || 0),
+    aheadLo: Number(t?.window?.aheadLo || 0),
+    aheadHi: Number(t?.window?.aheadHi || 0),
+    confidence: Number(t?.confidence || 0),
+  }));
+
+  const b2bByTarget = rows
+    .slice()
+    .sort((a, b) => a.target - b.target)
+    .map((r) => ({
+      target: r.target,
+      targetLabel: r.targetLabel,
+      probability: roundNum(r.quickHit, 6),
+      aheadLo: r.aheadLo,
+      aheadHi: r.aheadHi,
+      confidence: roundNum(r.confidence, 4),
+    }));
+
+  const topB2B = rows
+    .slice()
+    .sort((a, b) => b.quickHit - a.quickHit)[0] || null;
+
+  const lowTargets = rows.filter(r => r.target > 0 && r.target <= 10);
+  const whiteRisk = lowTargets.length
+    ? Math.max(...lowTargets.map(r => r.whiteClusterSeverity))
+    : 0;
+  const whiteRelease = rows.length
+    ? Math.max(...rows.map(r => r.whiteReleaseSignal))
+    : 0;
+  const hardGapRisk = rows.length
+    ? Math.max(...rows.map(r => r.hardGapImpulse))
+    : 0;
+
+  return {
+    source: 'range-lock-v8-hyper',
+    generatedAt: new Date().toISOString(),
+    b2bByTarget,
+    topB2B: topB2B
+      ? {
+        target: topB2B.target,
+        targetLabel: topB2B.targetLabel,
+        probability: roundNum(topB2B.quickHit, 6),
+        aheadLo: topB2B.aheadLo,
+        aheadHi: topB2B.aheadHi,
+      }
+      : null,
+    whiteClusterRisk: roundNum(whiteRisk, 6),
+    whiteReleaseSignal: roundNum(whiteRelease, 6),
+    hardGapRisk: roundNum(hardGapRisk, 6),
   };
 }
 
@@ -1239,6 +1320,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       whiteReleaseModel: true,
       hardGapImpulse: true,
     },
+    alertSummary: buildAlertSummary(targetsOut),
     summary: {
       pending: pendingCount,
       windowOpen: openCount,
