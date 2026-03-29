@@ -10,6 +10,15 @@ const WINDOW_SPAN_PRIOR = {
   500: 50,
   1000: 60,
 };
+const WINDOW_SPAN_MAX = {
+  5: 10,
+  10: 16,
+  20: 24,
+  50: 36,
+  100: 50,
+  500: 90,
+  1000: 110,
+};
 
 function clamp(v, lo, hi) {
   return Math.max(lo, Math.min(hi, v));
@@ -790,12 +799,24 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
     pGap3 = c3 / interGaps.length;
   }
   const spread = Math.max(1, q80 - q20);
-  const windowSpan = Math.max(1, Number(WINDOW_SPAN_PRIOR[target] || 3));
+  const baseSpan = Math.max(1, Number(WINDOW_SPAN_PRIOR[target] || 3));
+  const maxSpan = Math.max(baseSpan, Number(WINDOW_SPAN_MAX[target] || (baseSpan * 4)));
+  const quantileSpan = Math.max(1, Math.round(spread + 1));
+  const calibSpanMul = clamp(Number(calibration?.spanMultiplier || 1), 0.75, 3.2);
+  const absNormErr = clamp(Number(calibration?.absNormError || 0), 0, 2.5);
+  const earlyBias = Math.max(0, earlyDominance);
+  const lateBias = Math.max(0, -earlyDominance);
+  const spanBoost = 1 + (0.24 * absNormErr) + (0.2 * earlyBias) + (0.18 * lateBias);
+  const windowSpan = clamp(
+    Math.round(Math.max(baseSpan, quantileSpan) * calibSpanMul * spanBoost),
+    baseSpan,
+    maxSpan
+  );
 
   let centerAhead = q50;
   centerAhead *= 1 + Number(calibration?.shift || 0);
-  centerAhead *= 1 - (0.58 * Math.max(0, earlyDominance));
-  centerAhead *= 1 + (0.42 * Math.max(0, -earlyDominance));
+  centerAhead *= 1 - (0.86 * earlyBias);
+  centerAhead *= 1 + (0.58 * lateBias);
   const whiteDrift = target <= 10
     ? (-0.14 * whiteSeverity)
     : (target <= 50 ? (0.08 * whiteSeverity) : (0.22 * whiteSeverity));
@@ -822,7 +843,17 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
     centerAhead = ((1 - b2bStrength) * centerAhead) + (b2bStrength * b2bAnchor);
   }
 
-  centerAhead = Math.max(1, centerAhead);
+  if (earlyBias > 0) {
+    centerAhead -= Math.max(0, Math.round(windowSpan * Math.min(0.38, earlyBias * 0.75)));
+  }
+  if (lateBias > 0) {
+    centerAhead += Math.max(0, Math.round(windowSpan * Math.min(0.32, lateBias * 0.7)));
+  }
+  centerAhead = clamp(
+    centerAhead,
+    Math.max(1, q20 - Math.max(1, (windowSpan * 0.35))),
+    Math.max(1, q80 + Math.max(1, (windowSpan * 0.35)))
+  );
 
   const skewDen = Math.max(0.000001, q80 - q20);
   const leftSkew = clamp((q50 - q20) / skewDen, 0.1, 0.9);
@@ -841,6 +872,11 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
   const support = clamp(neighbors.length / Math.max(20, Math.sqrt(Math.max(1, pre.n)) * 3), 0, 1);
   const uncertainty = clamp(1 - (spread / Math.max(2, q80 + q20)), 0, 1);
   const calibScale = clamp(Number(calibration?.confidenceScale || 0.5), 0.1, 1);
+  const calibrationPenalty = clamp(
+    (Number(calibration?.earlyRate || 0) + Number(calibration?.lossRate || 0)) * 0.35,
+    0,
+    0.35
+  );
   const regimeEvidence = clamp((quickEmpirical.regimeObs || 0) / 220, 0, 1);
   const consensus = clamp(1 - Math.abs(quickRaw - quickEmpirical.score), 0, 1);
   const blendBalance = clamp(1 - Math.abs(blend.neighbor - blend.hazard), 0, 1);
@@ -851,7 +887,8 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
     (0.14 * calibScale) +
     (0.06 * regimeEvidence) +
     (0.03 * consensus) +
-    (0.03 * blendBalance),
+    (0.03 * blendBalance) -
+    (0.08 * calibrationPenalty),
     0.04,
     0.98
   );
@@ -1720,7 +1757,7 @@ function buildAlertSummary(pre, currentIdx, targetsOut) {
     : 0;
 
   return {
-    source: 'range-lock-v8-hyper',
+    source: 'range-lock-v9-adaptive',
     generatedAt: new Date().toISOString(),
     b2bByTarget,
     topB2B: topB2B
@@ -1779,7 +1816,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
   const calibration = buildCalibrationMap(options.historyRows || [], pre);
   if (pre.n < 800) {
     return {
-      model: 'range-lock-v8-hyper',
+      model: 'range-lock-v9-adaptive',
       generatedAt: new Date().toISOString(),
       asOfRound: pre.rounds[pre.n - 1]?.roundId || null,
       targets: [],
@@ -1806,15 +1843,12 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
     const key = String(target);
     const existing = normalizeLockInput(existingLocksRaw[key]);
     const evalResult = evaluateLock(existing, target, pre, currentRound);
-    const fixedSpan = Math.max(1, Number(WINDOW_SPAN_PRIOR[target] || 3));
-    const existingSpan = existing ? Math.max(1, (Number(existing.hi) - Number(existing.lo) + 1)) : null;
-    const spanMismatch = Boolean(existing && Number.isFinite(existingSpan) && existingSpan !== fixedSpan);
 
     let lockToUse = existing;
     let status = 'pending';
     let previousOutcome = null;
 
-    if (!existing || evalResult.resolved || spanMismatch) {
+    if (!existing || evalResult.resolved) {
       if (existing && evalResult.resolved) {
         previousOutcome = {
           outcome: evalResult.outcome,
@@ -1843,7 +1877,11 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       )
         ? Math.max(currentRound + 1, Number(existing.hi || 0) + 1)
         : (currentRound + 1);
-      const adjustedNext = enforceNextWindowStart(nextLock, fixedSpan, minNextLo);
+      const nextSpan = Math.max(
+        1,
+        Number(nextLock?.eta?.windowSpan || ((nextLock?.hi || 0) - (nextLock?.lo || 0) + 1) || WINDOW_SPAN_PRIOR[target] || 3)
+      );
+      const adjustedNext = enforceNextWindowStart(nextLock, nextSpan, minNextLo);
       const generation = existing ? Number(existing.generation || 1) + 1 : 1;
       lockToUse = {
         lo: adjustedNext.lo,
@@ -1875,7 +1913,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
   targetsOut.sort((a, b) => a.target - b.target);
 
   return {
-    model: 'range-lock-v8-hyper',
+    model: 'range-lock-v9-adaptive',
     generatedAt: new Date().toISOString(),
     asOfRound: currentRound,
     sampleSize: pre.n,
@@ -1885,11 +1923,13 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
     calibration,
     settings: {
       windowSpan: WINDOW_SPAN_PRIOR,
+      windowSpanMax: WINDOW_SPAN_MAX,
       adaptive: true,
-      fixedWindowSpan: true,
+      fixedWindowSpan: false,
       regimeAwareQuickHit: true,
       whiteReleaseModel: true,
       hardGapImpulse: true,
+      calibrationSpanAdaptive: true,
     },
     alertSummary: buildAlertSummary(pre, currentIdx, targetsOut),
     summary: {
