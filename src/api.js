@@ -67,8 +67,15 @@ if (!ADMIN_SECRET) console.warn('⚠️  ADMIN_SECRET not set');
 
 function requireAdmin(req, res, next) {
   const secret = req.headers['x-admin-secret'];
-  if (!ADMIN_SECRET || !secret || secret !== ADMIN_SECRET)
-    return res.status(403).json({ ok: false, error: 'Forbidden' });
+  if (!ADMIN_SECRET) {
+    return res.status(503).json({ ok: false, error: 'ADMIN_SECRET_NOT_SET' });
+  }
+  if (!secret) {
+    return res.status(403).json({ ok: false, error: 'ADMIN_SECRET_MISSING' });
+  }
+  if (secret !== ADMIN_SECRET) {
+    return res.status(403).json({ ok: false, error: 'ADMIN_SECRET_MISMATCH' });
+  }
   next();
 }
 
