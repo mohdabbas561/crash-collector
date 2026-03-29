@@ -10,14 +10,32 @@ const WINDOW_SPAN_PRIOR = {
   500: 50,
   1000: 60,
 };
-const WINDOW_SPAN_MAX = {
-  5: 10,
-  10: 16,
-  20: 24,
-  50: 36,
-  100: 50,
-  500: 90,
+const WINDOW_AHEAD_CAP = {
+  5: 9,
+  10: 12,
+  20: 17,
+  50: 30,
+  100: 42,
+  500: 85,
   1000: 110,
+};
+const ACTIVATE_MIN_CONF = {
+  5: 0.36,
+  10: 0.4,
+  20: 0.45,
+  50: 0.52,
+  100: 0.58,
+  500: 0.66,
+  1000: 0.72,
+};
+const ACTIVATE_MIN_P1 = {
+  5: 0.12,
+  10: 0.1,
+  20: 0.08,
+  50: 0.06,
+  100: 0.05,
+  500: 0.03,
+  1000: 0.02,
 };
 
 function clamp(v, lo, hi) {
@@ -799,19 +817,9 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
     pGap3 = c3 / interGaps.length;
   }
   const spread = Math.max(1, q80 - q20);
-  const baseSpan = Math.max(1, Number(WINDOW_SPAN_PRIOR[target] || 3));
-  const maxSpan = Math.max(baseSpan, Number(WINDOW_SPAN_MAX[target] || (baseSpan * 4)));
-  const quantileSpan = Math.max(1, Math.round(spread + 1));
-  const calibSpanMul = clamp(Number(calibration?.spanMultiplier || 1), 0.75, 3.2);
-  const absNormErr = clamp(Number(calibration?.absNormError || 0), 0, 2.5);
+  const windowSpan = Math.max(1, Number(WINDOW_SPAN_PRIOR[target] || 3));
   const earlyBias = Math.max(0, earlyDominance);
   const lateBias = Math.max(0, -earlyDominance);
-  const spanBoost = 1 + (0.24 * absNormErr) + (0.2 * earlyBias) + (0.18 * lateBias);
-  const windowSpan = clamp(
-    Math.round(Math.max(baseSpan, quantileSpan) * calibSpanMul * spanBoost),
-    baseSpan,
-    maxSpan
-  );
 
   let centerAhead = q50;
   centerAhead *= 1 + Number(calibration?.shift || 0);
@@ -863,8 +871,12 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
     windowSpan + 1,
     Math.round((stats.q99 || stats.q95 || stats.q90 || stats.mean || 20) * 6)
   );
+  const cappedMaxAhead = Math.max(
+    windowSpan + 1,
+    Math.min(dynamicMaxAhead, Number(WINDOW_AHEAD_CAP[target] || dynamicMaxAhead))
+  );
   let loAhead = Math.max(1, Math.round(centerAhead) - halfLeft);
-  loAhead = Math.min(loAhead, Math.max(1, dynamicMaxAhead - windowSpan + 1));
+  loAhead = Math.min(loAhead, Math.max(1, cappedMaxAhead - windowSpan + 1));
   const hiAhead = loAhead + windowSpan - 1;
 
   const componentCenters = [neighQ50, hazard.q50, priorQ50].map(v => Math.log1p(Math.max(1, v)));
@@ -983,6 +995,7 @@ function enforceNextWindowStart(nextLock, fixedSpan, minLo) {
 
 function evaluateLock(lock, target, pre, currentRound) {
   if (!lock) return { resolved: false, status: 'missing' };
+  if (lock.suspended) return { resolved: false, status: 'waiting' };
   const roundWhenMade = Number(lock.roundWhenMade || lock.round_when_made || 0);
   const lo = Number(lock.lo);
   const hi = Number(lock.hi);
@@ -1005,14 +1018,64 @@ function evaluateLock(lock, target, pre, currentRound) {
   return { resolved: false, status: 'window-open' };
 }
 
+function shouldActivateWindow(target, nextLock, calibration = null) {
+  const eta = nextLock?.eta || {};
+  const confidence = clamp(Number(eta.confidence || 0), 0, 1);
+  const p1 = clamp(Number(eta.pHit1 || 0), 0, 1);
+  const quick = clamp(Number(eta.quickHitEmpirical ?? eta.quickHitSignal ?? 0), 0, 1);
+  const hard = clamp(Number(eta.hardGapImpulse || 0), 0, 1);
+  const white = clamp(Number(eta.whiteClusterSeverity || 0), 0, 1);
+  const release = clamp(Number(eta.whiteReleaseSignal || 0), 0, 1);
+  const calWilson = clamp(Number(calibration?.wilsonLow || 0.5), 0, 1);
+  const calPenalty = clamp(
+    (Number(calibration?.lossRate || 0) + Number(calibration?.earlyRate || 0)) * 0.35,
+    0,
+    0.3
+  );
+
+  const minConf = Number(ACTIVATE_MIN_CONF[target] || 0.5);
+  const minP1 = Number(ACTIVATE_MIN_P1[target] || 0.05);
+
+  let score = (
+    (0.44 * confidence) +
+    (0.22 * quick) +
+    (0.18 * hard) +
+    (0.16 * p1)
+  );
+  if (target <= 10) score += (0.1 * white);
+  if (target <= 10) score -= (0.08 * release);
+  score = clamp((0.82 * score) + (0.18 * calWilson) - calPenalty, 0, 1);
+
+  let active = false;
+  if (target <= 20) {
+    active = (score >= (minConf - 0.08)) && (quick >= 0.18 || p1 >= minP1 || hard >= 0.18);
+  } else if (target <= 100) {
+    active = (score >= minConf) && (p1 >= minP1 || hard >= 0.22);
+  } else if (target <= 500) {
+    active = (score >= minConf) && (hard >= 0.28 || p1 >= minP1);
+  } else {
+    active = (score >= minConf) && (hard >= 0.34 || p1 >= minP1);
+  }
+
+  return {
+    active,
+    score: roundNum(score, 6),
+    minConf: roundNum(minConf, 6),
+    minP1: roundNum(minP1, 6),
+  };
+}
+
 function normalizeLockInput(input) {
   if (!input) return null;
+  const eta = input.eta || input.eta_json || null;
+  const suspended = Boolean(input.suspended ?? eta?.suspended);
   return {
     lo: Number(input.lo),
     hi: Number(input.hi),
     roundWhenMade: Number(input.roundWhenMade ?? input.round_when_made),
     generation: Number(input.generation || 1),
-    eta: input.eta || input.eta_json || null,
+    suspended,
+    eta,
   };
 }
 
@@ -1757,7 +1820,7 @@ function buildAlertSummary(pre, currentIdx, targetsOut) {
     : 0;
 
   return {
-    source: 'range-lock-v9-adaptive',
+    source: 'range-lock-v10-selective',
     generatedAt: new Date().toISOString(),
     b2bByTarget,
     topB2B: topB2B
@@ -1816,7 +1879,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
   const calibration = buildCalibrationMap(options.historyRows || [], pre);
   if (pre.n < 800) {
     return {
-      model: 'range-lock-v9-adaptive',
+      model: 'range-lock-v10-selective',
       generatedAt: new Date().toISOString(),
       asOfRound: pre.rounds[pre.n - 1]?.roundId || null,
       targets: [],
@@ -1836,6 +1899,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
   const targetsOut = [];
 
   let pendingCount = 0;
+  let waitingCount = 0;
   let openCount = 0;
   let relockedCount = 0;
 
@@ -1843,12 +1907,15 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
     const key = String(target);
     const existing = normalizeLockInput(existingLocksRaw[key]);
     const evalResult = evaluateLock(existing, target, pre, currentRound);
+    const fixedSpan = Math.max(1, Number(WINDOW_SPAN_PRIOR[target] || 3));
+    const existingSpan = existing ? Math.max(1, (Number(existing.hi) - Number(existing.lo) + 1)) : null;
+    const spanMismatch = Boolean(existing && Number.isFinite(existingSpan) && existingSpan !== fixedSpan);
 
     let lockToUse = existing;
     let status = 'pending';
     let previousOutcome = null;
 
-    if (!existing || evalResult.resolved) {
+    if (!existing || evalResult.resolved || spanMismatch || existing?.suspended) {
       if (existing && evalResult.resolved) {
         previousOutcome = {
           outcome: evalResult.outcome,
@@ -1877,26 +1944,53 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       )
         ? Math.max(currentRound + 1, Number(existing.hi || 0) + 1)
         : (currentRound + 1);
-      const nextSpan = Math.max(
-        1,
-        Number(nextLock?.eta?.windowSpan || ((nextLock?.hi || 0) - (nextLock?.lo || 0) + 1) || WINDOW_SPAN_PRIOR[target] || 3)
-      );
-      const adjustedNext = enforceNextWindowStart(nextLock, nextSpan, minNextLo);
-      const generation = existing ? Number(existing.generation || 1) + 1 : 1;
-      lockToUse = {
-        lo: adjustedNext.lo,
-        hi: adjustedNext.hi,
-        roundWhenMade: adjustedNext.roundWhenMade,
-        generation,
-        eta: adjustedNext.eta,
-      };
-      status = 'locked';
-      relockedCount++;
+      const activation = shouldActivateWindow(target, nextLock, calibration[target]);
+      if (!activation.active) {
+        const generation = existing ? Number(existing.generation || 1) : 1;
+        const suspendedLo = currentRound + 1;
+        const suspendedHi = suspendedLo + fixedSpan - 1;
+        lockToUse = {
+          lo: suspendedLo,
+          hi: suspendedHi,
+          roundWhenMade: currentRound,
+          generation,
+          suspended: true,
+          eta: {
+            ...(nextLock.eta || {}),
+            suspended: true,
+            suspendedReason: 'low-signal',
+            activationScore: activation.score,
+            activationMinConfidence: activation.minConf,
+            activationMinP1: activation.minP1,
+          },
+        };
+        status = 'waiting';
+      } else {
+        const adjustedNext = enforceNextWindowStart(nextLock, fixedSpan, minNextLo);
+        const generation = existing ? Number(existing.generation || 1) + 1 : 1;
+        lockToUse = {
+          lo: adjustedNext.lo,
+          hi: adjustedNext.hi,
+          roundWhenMade: adjustedNext.roundWhenMade,
+          generation,
+          suspended: false,
+          eta: {
+            ...(adjustedNext.eta || {}),
+            suspended: false,
+            activationScore: activation.score,
+            activationMinConfidence: activation.minConf,
+            activationMinP1: activation.minP1,
+          },
+        };
+        status = 'locked';
+        relockedCount++;
+      }
     } else {
       status = evalResult.status || 'pending';
     }
 
     if (status === 'pending') pendingCount++;
+    if (status === 'waiting') waitingCount++;
     if (status === 'window-open') openCount++;
 
     locksToSave[key] = {
@@ -1904,6 +1998,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       hi: Number(lockToUse.hi),
       roundWhenMade: Number(lockToUse.roundWhenMade),
       generation: Number(lockToUse.generation || 1),
+      suspended: Boolean(lockToUse.suspended),
       eta: lockToUse.eta || null,
     };
 
@@ -1913,7 +2008,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
   targetsOut.sort((a, b) => a.target - b.target);
 
   return {
-    model: 'range-lock-v9-adaptive',
+    model: 'range-lock-v10-selective',
     generatedAt: new Date().toISOString(),
     asOfRound: currentRound,
     sampleSize: pre.n,
@@ -1923,17 +2018,19 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
     calibration,
     settings: {
       windowSpan: WINDOW_SPAN_PRIOR,
-      windowSpanMax: WINDOW_SPAN_MAX,
+      windowAheadCap: WINDOW_AHEAD_CAP,
       adaptive: true,
-      fixedWindowSpan: false,
+      fixedWindowSpan: true,
       regimeAwareQuickHit: true,
       whiteReleaseModel: true,
       hardGapImpulse: true,
-      calibrationSpanAdaptive: true,
+      calibrationSpanAdaptive: false,
+      selectiveLocking: true,
     },
     alertSummary: buildAlertSummary(pre, currentIdx, targetsOut),
     summary: {
       pending: pendingCount,
+      waiting: waitingCount,
       windowOpen: openCount,
       relocked: relockedCount,
       sampleSize: pre.n,
