@@ -91,10 +91,12 @@ const PREDICT_DEFAULT_LIMIT = toPositiveInt(process.env.PREDICT_DEFAULT_LIMIT, 1
 const PREDICT_MAX_LIMIT = Math.max(PREDICT_DEFAULT_LIMIT, toPositiveInt(process.env.PREDICT_MAX_LIMIT, 25000));
 const LOCKED_DEFAULT_LIMIT = toPositiveInt(process.env.LOCKED_DEFAULT_LIMIT, 15000);
 const LOCKED_MAX_LIMIT = Math.max(LOCKED_DEFAULT_LIMIT, toPositiveInt(process.env.LOCKED_MAX_LIMIT, 25000));
+const ROUNDS_DEFAULT_LIMIT = toPositiveInt(process.env.ROUNDS_DEFAULT_LIMIT, 5000);
+const ROUNDS_MAX_LIMIT = Math.max(ROUNDS_DEFAULT_LIMIT, toPositiveInt(process.env.ROUNDS_MAX_LIMIT, 25000));
 const PREDICT_CACHE_TTL_MS = toPositiveInt(process.env.PREDICT_CACHE_TTL_MS, 15000);
 const LOCKED_CACHE_TTL_MS = toPositiveInt(process.env.LOCKED_CACHE_TTL_MS, 15000);
 const LOCKED_USE_FULL_DATA = String(process.env.LOCKED_USE_FULL_DATA || 'true').trim().toLowerCase() !== 'false';
-const LOCKED_BACKGROUND_INTERVAL_MS = toPositiveInt(process.env.LOCKED_BACKGROUND_INTERVAL_MS, 10000);
+const LOCKED_BACKGROUND_INTERVAL_MS = toPositiveInt(process.env.LOCKED_BACKGROUND_INTERVAL_MS, 30000);
 
 const predictCache = {
   asOfRound: null,
@@ -294,17 +296,34 @@ async function refreshLockedPredictionInBackground() {
 
 app.get('/rounds', rateLimit(60), async (req, res) => {
   try {
-    const limit      = Math.min(parseInt(req.query.limit  || '1000'), 100000);
+    const limit      = clampInt(req.query.limit, 100, ROUNDS_MAX_LIMIT, ROUNDS_DEFAULT_LIMIT);
     const offset     = parseInt(req.query.offset || '0');
     const since      = req.query.since ? Number(req.query.since) : null;
     const minRoundId = since && since > 0 ? since + 1 : null;
     const rounds = await getRounds({ limit, offset, from: req.query.from||null, to: req.query.to||null, minRoundId });
     res.json({ ok:true, count: rounds.length, rounds });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+  } catch(e) {
+    console.error('[rounds] error:', e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
 });
 
-app.get('/stats',         rateLimit(30), async (req,res) => { try { res.json({ ok:true, ...(await getStats()) }); } catch(e) { res.status(500).json({ ok:false, error:e.message }); } });
-app.get('/storage-stats', rateLimit(20), async (req,res) => { try { res.json({ ok:true, ...(await getStorageStats()) }); } catch(e) { res.status(500).json({ ok:false, error:e.message }); } });
+app.get('/stats', rateLimit(30), async (req,res) => {
+  try {
+    res.json({ ok:true, ...(await getStats()) });
+  } catch(e) {
+    console.error('[stats] error:', e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+app.get('/storage-stats', rateLimit(20), async (req,res) => {
+  try {
+    res.json({ ok:true, ...(await getStorageStats()) });
+  } catch(e) {
+    console.error('[storage-stats] error:', e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
 app.get('/health', (req,res) => res.json({ ok:true, ts:new Date().toISOString() }));
 
 app.get('/predict', rateLimit(20), async (req, res) => {
