@@ -1947,8 +1947,11 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       const activation = shouldActivateWindow(target, nextLock, calibration[target]);
       if (!activation.active) {
         const generation = existing ? Number(existing.generation || 1) : 1;
-        const suspendedLo = currentRound + 1;
-        const suspendedHi = suspendedLo + fixedSpan - 1;
+        // Keep the true data-driven ETA window while suspended so WAIT timing is real,
+        // not hardcoded to +1.
+        const waitingNext = enforceNextWindowStart(nextLock, fixedSpan, minNextLo);
+        const suspendedLo = Number(waitingNext.lo);
+        const suspendedHi = Number(waitingNext.hi);
         lockToUse = {
           lo: suspendedLo,
           hi: suspendedHi,
@@ -1956,7 +1959,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
           generation,
           suspended: true,
           eta: {
-            ...(nextLock.eta || {}),
+            ...(waitingNext.eta || {}),
             suspended: true,
             suspendedReason: 'low-signal',
             activationScore: activation.score,
