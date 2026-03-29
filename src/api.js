@@ -113,6 +113,40 @@ const lockedCache = {
 let predictComputeInFlight = null;
 let lockedComputeInFlight = null;
 let lockedBackgroundTimer = null;
+let dbState = {
+  available: true,
+  lastError: '',
+  since: new Date().toISOString(),
+};
+
+function setDatabaseAvailability(available, errorMessage = '') {
+  const nextAvailable = Boolean(available);
+  const nextError = nextAvailable ? '' : String(errorMessage || 'Database unavailable');
+  const changed = dbState.available !== nextAvailable || dbState.lastError !== nextError;
+  if (changed) {
+    dbState = {
+      available: nextAvailable,
+      lastError: nextError,
+      since: new Date().toISOString(),
+    };
+    if (nextAvailable) {
+      console.log('[db-state] ONLINE');
+    } else {
+      console.error('[db-state] OFFLINE:', nextError);
+    }
+  }
+}
+
+function requireDatabase(req, res, next) {
+  if (dbState.available) return next();
+  return res.status(503).json({
+    ok: false,
+    code: 'DB_UNAVAILABLE',
+    error: 'Database temporarily unavailable',
+    detail: dbState.lastError || 'Unknown database error',
+    since: dbState.since,
+  });
+}
 
 function invalidatePredictionCaches() {
   predictCache.asOfRound = null;
@@ -294,7 +328,7 @@ async function refreshLockedPredictionInBackground() {
   }
 }
 
-app.get('/rounds', rateLimit(60), async (req, res) => {
+app.get('/rounds', requireDatabase, rateLimit(60), async (req, res) => {
   try {
     const limit      = clampInt(req.query.limit, 100, ROUNDS_MAX_LIMIT, ROUNDS_DEFAULT_LIMIT);
     const offset     = parseInt(req.query.offset || '0');
@@ -303,30 +337,42 @@ app.get('/rounds', rateLimit(60), async (req, res) => {
     const rounds = await getRounds({ limit, offset, from: req.query.from||null, to: req.query.to||null, minRoundId });
     res.json({ ok:true, count: rounds.length, rounds });
   } catch(e) {
+    setDatabaseAvailability(false, e.message);
     console.error('[rounds] error:', e.message);
     res.status(500).json({ ok:false, error:e.message });
   }
 });
 
-app.get('/stats', rateLimit(30), async (req,res) => {
+app.get('/stats', requireDatabase, rateLimit(30), async (req,res) => {
   try {
     res.json({ ok:true, ...(await getStats()) });
   } catch(e) {
+    setDatabaseAvailability(false, e.message);
     console.error('[stats] error:', e.message);
     res.status(500).json({ ok:false, error:e.message });
   }
 });
-app.get('/storage-stats', rateLimit(20), async (req,res) => {
+app.get('/storage-stats', requireDatabase, rateLimit(20), async (req,res) => {
   try {
     res.json({ ok:true, ...(await getStorageStats()) });
   } catch(e) {
+    setDatabaseAvailability(false, e.message);
     console.error('[storage-stats] error:', e.message);
     res.status(500).json({ ok:false, error:e.message });
   }
 });
-app.get('/health', (req,res) => res.json({ ok:true, ts:new Date().toISOString() }));
+app.get('/health', (req,res) => {
+  res.json({
+    ok: true,
+    status: dbState.available ? 'online' : 'degraded',
+    dbAvailable: dbState.available,
+    dbError: dbState.lastError || null,
+    dbSince: dbState.since,
+    ts: new Date().toISOString(),
+  });
+});
 
-app.get('/predict', rateLimit(20), async (req, res) => {
+app.get('/predict', requireDatabase, rateLimit(20), async (req, res) => {
   try {
     const limit = clampInt(req.query.limit, 1000, PREDICT_MAX_LIMIT, PREDICT_DEFAULT_LIMIT);
 
@@ -373,11 +419,12 @@ app.get('/predict', rateLimit(20), async (req, res) => {
       }
     }
   } catch (e) {
+    setDatabaseAvailability(false, e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-app.get('/predict/locked', rateLimit(20), async (req, res) => {
+app.get('/predict/locked', requireDatabase, rateLimit(20), async (req, res) => {
   try {
     const { limit, limitKey } = parseLockedLimit(req.query.limit);
     const historyTarget = normalizeHistoryTarget(req.query.historyTarget);
@@ -398,6 +445,7 @@ app.get('/predict/locked', rateLimit(20), async (req, res) => {
     const basePayload = await ensureLockedPredictionComputed({ latestRound, limit, limitKey });
     return res.json(withHistoryFilter(basePayload, historyTarget));
   } catch (e) {
+    setDatabaseAvailability(false, e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
@@ -408,11 +456,12 @@ const clearHistoryHandler = async (req, res) => {
     invalidatePredictionCaches();
     res.json({ ok: true, ...result });
   } catch (e) {
+    setDatabaseAvailability(false, e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 };
-app.delete('/clear-history', requireAdmin, rateLimit(10), clearHistoryHandler);
-app.post('/clear-history', requireAdmin, rateLimit(10), clearHistoryHandler);
+app.delete('/clear-history', requireDatabase, requireAdmin, rateLimit(10), clearHistoryHandler);
+app.post('/clear-history', requireDatabase, requireAdmin, rateLimit(10), clearHistoryHandler);
 
 const clearLocksHandler = async (req, res) => {
   try {
@@ -420,13 +469,14 @@ const clearLocksHandler = async (req, res) => {
     invalidatePredictionCaches();
     res.json({ ok: true, ...result });
   } catch (e) {
+    setDatabaseAvailability(false, e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 };
-app.delete('/clear-locks', requireAdmin, rateLimit(10), clearLocksHandler);
-app.post('/clear-locks', requireAdmin, rateLimit(10), clearLocksHandler);
+app.delete('/clear-locks', requireDatabase, requireAdmin, rateLimit(10), clearLocksHandler);
+app.post('/clear-locks', requireDatabase, requireAdmin, rateLimit(10), clearLocksHandler);
 
-app.post('/access/verify', rateLimit(20), async (req, res) => {
+app.post('/access/verify', requireDatabase, rateLimit(20), async (req, res) => {
   try {
     const { code } = req.body;
     if (!code) return res.json({ ok:false, reason:'no_code' });
@@ -437,48 +487,77 @@ app.post('/access/verify', rateLimit(20), async (req, res) => {
     if (row.use_count >= row.max_uses && !sameIP) return res.json({ ok:false, reason:'used_up' });
     if (!row.ip || (!sameIP && row.use_count < row.max_uses)) await updateAccessCodeIP(code.trim(), ip);
     res.json({ ok:true, expiresAt:row.expires_at });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+  } catch(e) {
+    setDatabaseAvailability(false, e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
 });
 
-app.post('/access/create', requireAdmin, rateLimit(10), async (req, res) => {
+app.post('/access/create', requireDatabase, requireAdmin, rateLimit(10), async (req, res) => {
   try {
     const { code, expiresAt, note, maxUses } = req.body;
     if (!code || !expiresAt) return res.status(400).json({ ok:false, error:'code and expiresAt required' });
     res.json({ ok:true, row: await createAccessCode({ code, expiresAt, note, maxUses:maxUses||1 }) });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+  } catch(e) {
+    setDatabaseAvailability(false, e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
 });
 
-app.get('/access/list', requireAdmin, rateLimit(20), async (req,res) => {
+app.get('/access/list', requireDatabase, requireAdmin, rateLimit(20), async (req,res) => {
   try { res.json({ ok:true, codes: await getAllAccessCodes() }); }
-  catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+  catch(e) {
+    setDatabaseAvailability(false, e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
 });
 
-app.delete('/access/:id', requireAdmin, rateLimit(10), async (req,res) => {
+app.delete('/access/:id', requireDatabase, requireAdmin, rateLimit(10), async (req,res) => {
   try { await deleteAccessCode(req.params.id); res.json({ ok:true }); }
-  catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+  catch(e) {
+    setDatabaseAvailability(false, e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
 });
 
-app.get('/wallets', requireAdmin, rateLimit(20), async (req,res) => {
+app.get('/wallets', requireDatabase, requireAdmin, rateLimit(20), async (req,res) => {
   try { res.json({ ok:true, wallets: await getWallets() }); }
-  catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+  catch(e) {
+    setDatabaseAvailability(false, e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
 });
 
-app.post('/wallets', requireAdmin, rateLimit(20), async (req, res) => {
+app.post('/wallets', requireDatabase, requireAdmin, rateLimit(20), async (req, res) => {
   try {
     const { privateKey, rpcUrl, playerAccountPDA, pubkey } = req.body;
     if (!privateKey) return res.status(400).json({ ok:false, error:'privateKey required' });
     res.json({ ok:true, wallet: await saveWallet({ privateKey, rpcUrl, playerAccountPDA, pubkey }) });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+  } catch(e) {
+    setDatabaseAvailability(false, e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
 });
 
-app.delete('/wallets/:id', requireAdmin, rateLimit(10), async (req,res) => {
+app.delete('/wallets/:id', requireDatabase, requireAdmin, rateLimit(10), async (req,res) => {
   try { await deleteWallet(req.params.id); res.json({ ok:true }); }
-  catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+  catch(e) {
+    setDatabaseAvailability(false, e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
 });
 
 function startAPI() {
-  initAccessCodes().catch(e => console.error('initAccessCodes error:', e.message));
-  initWalletStorage().catch(e => console.error('initWalletStorage error:', e.message));
+  initAccessCodes()
+    .then(() => setDatabaseAvailability(true))
+    .catch(e => {
+      setDatabaseAvailability(false, e.message);
+      console.error('initAccessCodes error:', e.message);
+    });
+  initWalletStorage().catch(e => {
+    setDatabaseAvailability(false, e.message);
+    console.error('initWalletStorage error:', e.message);
+  });
   if (!lockedBackgroundTimer) {
     refreshLockedPredictionInBackground().catch(e => console.error('[locked-bg] warmup error:', e.message));
     lockedBackgroundTimer = setInterval(() => {
@@ -489,4 +568,4 @@ function startAPI() {
   app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
 }
 
-module.exports = { startAPI };
+module.exports = { startAPI, setDatabaseAvailability };

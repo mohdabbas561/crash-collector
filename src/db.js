@@ -5,8 +5,50 @@
 
 const { Pool } = require('pg');
 
+function firstNonEmpty(...values) {
+  for (const v of values) {
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
+  return '';
+}
+
+function normalizeDatabaseUrl(rawUrl) {
+  if (!rawUrl) return rawUrl;
+  try {
+    const url = new URL(rawUrl);
+    const sslMode = String(url.searchParams.get('sslmode') || '').toLowerCase();
+    if (sslMode === 'require' && !url.searchParams.has('uselibpqcompat')) {
+      url.searchParams.set('uselibpqcompat', 'true');
+    }
+    return url.toString();
+  } catch {
+    return rawUrl;
+  }
+}
+
+function buildUrlFromParts() {
+  const host = firstNonEmpty(process.env.PGHOST, process.env.POSTGRES_HOST, process.env.DB_HOST);
+  const port = firstNonEmpty(process.env.PGPORT, process.env.POSTGRES_PORT, process.env.DB_PORT) || '5432';
+  const user = firstNonEmpty(process.env.PGUSER, process.env.POSTGRES_USER, process.env.DB_USER);
+  const pass = firstNonEmpty(process.env.PGPASSWORD, process.env.POSTGRES_PASSWORD, process.env.DB_PASSWORD);
+  const name = firstNonEmpty(process.env.PGDATABASE, process.env.POSTGRES_DB, process.env.DB_NAME);
+  if (!host || !user || !pass || !name) return '';
+  return `postgres://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${host}:${port}/${encodeURIComponent(name)}?sslmode=require`;
+}
+
+const RAW_DATABASE_URL = firstNonEmpty(
+  process.env.DATABASE_URL,
+  process.env.RAILWAY_DATABASE_URL,
+  process.env.DATABASE_PUBLIC_URL,
+  process.env.DATABASE_PRIVATE_URL,
+  process.env.POSTGRES_URL,
+  process.env.POSTGRESQL_URL,
+  buildUrlFromParts()
+);
+const DATABASE_URL = normalizeDatabaseUrl(RAW_DATABASE_URL);
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
   // FIX: connection pool limits — prevent runaway connection growth under high load
   max: 10,
@@ -20,6 +62,11 @@ pool.on('error', (err) => {
 });
 
 async function initDB() {
+  if (!DATABASE_URL) {
+    throw new Error(
+      'DATABASE_URL is missing. Set DATABASE_URL (or Railway/Postgres env vars) in Render environment variables.'
+    );
+  }
   await pool.query(`
     CREATE TABLE IF NOT EXISTS rounds (
       round_id    BIGINT PRIMARY KEY,
@@ -307,6 +354,11 @@ async function getRoundCount() {
   return Number(res.rows[0]?.total || 0);
 }
 
+async function pingDB() {
+  await pool.query('SELECT 1');
+  return true;
+}
+
 async function clearPredictions() {
   const res = await pool.query(`DELETE FROM predictions`);
   return { predictionsCleared: res.rowCount || 0 };
@@ -591,7 +643,7 @@ async function getLockedConsensusPreds() {
 module.exports = {
   pool,
   initDB, saveRounds, getRounds, getStorageStats, getStats,
-  getLatestRoundId, getRoundCount,
+  getLatestRoundId, getRoundCount, pingDB,
   saveLockedPreds, getLockedPreds,
   saveLockedAdvPreds, getLockedAdvPreds,
   saveLockedConsensusPreds, getLockedConsensusPreds,

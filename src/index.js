@@ -1,19 +1,69 @@
-const { initDB, initAccessCodes } = require('./db');
+const { initDB, pingDB } = require('./db');
 const { startCollector } = require('./collector');
-const { startAPI } = require('./api');
+const { startAPI, setDatabaseAvailability } = require('./api');
+
+const DB_RETRY_MS = Number.parseInt(process.env.DB_RETRY_MS || '60000', 10);
+
+let collectorStarted = false;
+let dbReady = false;
+
+async function tryInitDatabase() {
+  try {
+    await initDB();
+    dbReady = true;
+    setDatabaseAvailability(true);
+    console.log('✅ Database ready');
+    return true;
+  } catch (err) {
+    dbReady = false;
+    setDatabaseAvailability(false, err.message);
+    console.error(`❌ Database init failed: ${err.message}`);
+    return false;
+  }
+}
+
+function startCollectorOnce() {
+  if (collectorStarted) return;
+  startCollector();
+  collectorStarted = true;
+  console.log('✅ Collector started');
+}
+
+function startDbRecoveryLoop() {
+  setInterval(async () => {
+    if (dbReady) {
+      try {
+        await pingDB();
+      } catch (err) {
+        dbReady = false;
+        setDatabaseAvailability(false, err.message);
+        console.error(`[db-health] Database went offline: ${err.message}`);
+      }
+      return;
+    }
+
+    console.log('[db-recovery] Retrying database init...');
+    const recovered = await tryInitDatabase();
+    if (recovered) {
+      console.log('[db-recovery] Database back online');
+      startCollectorOnce();
+    }
+  }, Math.max(10000, DB_RETRY_MS));
+}
 
 async function main() {
   console.log('🚀 Crash Collector starting...');
-  await initDB();
-  await initAccessCodes();
-  console.log('✅ Database ready');
-  startCollector();
-  console.log('✅ Collector started');
+  const ready = await tryInitDatabase();
+  if (ready) {
+    startCollectorOnce();
+  } else {
+    console.warn('⚠️ Starting API in degraded mode (database unavailable)');
+  }
   startAPI();
   console.log('✅ API started');
+  startDbRecoveryLoop();
 }
 
 main().catch(err => {
-  console.error('Fatal error:', err);
-  process.exit(1);
+  console.error('Unhandled startup error (service kept alive):', err);
 });
