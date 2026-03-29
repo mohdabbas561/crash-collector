@@ -62,11 +62,11 @@ setInterval(() => {
   for (const [k, v] of rateLimits) if (now > v.reset) rateLimits.delete(k);
 }, 60000);
 
-const ADMIN_SECRET = process.env.ADMIN_SECRET;
+const ADMIN_SECRET = String(process.env.ADMIN_SECRET || '').trim();
 if (!ADMIN_SECRET) console.warn('⚠️  ADMIN_SECRET not set');
 
 function requireAdmin(req, res, next) {
-  const secret = req.headers['x-admin-secret'];
+  const secret = String(req.headers['x-admin-secret'] || '').trim();
   if (!ADMIN_SECRET) {
     return res.status(503).json({ ok: false, error: 'ADMIN_SECRET_NOT_SET' });
   }
