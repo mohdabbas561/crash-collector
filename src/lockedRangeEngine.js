@@ -2004,7 +2004,13 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
     let status = 'pending';
     let previousOutcome = null;
 
-    const suspendedNeedsRefresh = Boolean(existing?.suspended);
+    // Keep WAIT windows stable while they are alive to prevent +1 drift on every poll.
+    // Recompute only after the suspended window has fully passed.
+    const suspendedNeedsRefresh = Boolean(
+      existing?.suspended &&
+      Number.isFinite(Number(existing.hi)) &&
+      currentRound > Number(existing.hi)
+    );
 
     if (!existing || evalResult.resolved || spanMismatch || suspendedNeedsRefresh) {
       if (existing && evalResult.resolved) {
@@ -2038,10 +2044,40 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       const activation = shouldActivateWindow(target, nextLock, calibration[target]);
       if (!activation.active) {
         const generation = existing ? Number(existing.generation || 1) : 1;
-        // Keep the true data-driven ETA window while suspended so WAIT timing is real,
-        // not hardcoded to +1.
-        // Engine-only waiting window: use direct model output (buildWindow) with non-overlap guard.
-        const waitingNext = enforceNextWindowStart(nextLock, fixedSpan, minNextLo);
+        // Engine-derived WAIT window with anti-drift guard:
+        // do not keep pushing WAIT farther every tick unless the engine brings it earlier.
+        const waitingCandidate = buildAdaptiveWaitingWindow(
+          nextLock,
+          target,
+          fixedSpan,
+          currentRound,
+          minNextLo,
+          existing
+        );
+        let waitingNext = waitingCandidate;
+        if (
+          existing?.suspended &&
+          Number.isFinite(Number(existing.lo)) &&
+          Number.isFinite(Number(existing.hi))
+        ) {
+          const existingLo = Number(existing.lo);
+          const existingHi = Number(existing.hi);
+          const candidateLo = Number(waitingCandidate.lo);
+          const canCountdown = existingHi >= currentRound;
+          const candidatePushesOut = candidateLo > existingLo;
+          if (canCountdown && candidatePushesOut) {
+            waitingNext = {
+              ...waitingCandidate,
+              lo: existingLo,
+              hi: existingHi,
+              eta: {
+                ...(waitingCandidate.eta || {}),
+                waitingSticky: true,
+                waitingStickyLo: existingLo,
+              },
+            };
+          }
+        }
         const suspendedLo = Number(waitingNext.lo);
         const suspendedHi = Number(waitingNext.hi);
         lockToUse = {
