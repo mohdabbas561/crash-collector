@@ -993,6 +993,72 @@ function enforceNextWindowStart(nextLock, fixedSpan, minLo) {
   return lock;
 }
 
+function buildAdaptiveWaitingWindow(nextLock, target, fixedSpan, currentRound, minLo, existing = null) {
+  const base = enforceNextWindowStart(nextLock, fixedSpan, minLo);
+  const eta = base.eta || {};
+  const span = Math.max(1, Number(fixedSpan) || 1);
+  const cap = Math.max(
+    span + 1,
+    Number(WINDOW_AHEAD_CAP[target] || (span + 8))
+  );
+  const maxStartAhead = Math.max(1, cap - span + 1);
+
+  const q20 = Math.max(1, Number(eta.q20 || 1));
+  const q50 = Math.max(q20, Number(eta.q50 || q20));
+  const hazardQ20 = Math.max(1, Number(eta.hazardQ20 || q20));
+  const currentGap = Math.max(0, Number(eta.currentGap || 0));
+  const quick = clamp(Number(eta.quickHitEmpirical ?? eta.quickHitSignal ?? 0), 0, 1);
+  const hard = clamp(Number(eta.hardGapImpulse ?? eta.hardGapPressure ?? 0), 0, 1);
+  const white = clamp(Number(eta.whiteClusterSeverity || 0), 0, 1);
+  const release = clamp(Number(eta.whiteReleaseSignal || 0), 0, 1);
+  const confidence = clamp(Number(eta.confidence || 0), 0, 1);
+
+  // Data-driven pre-window start: blend hazard/gap/cluster signals (not fixed offsets).
+  let startAhead = (
+    (0.4 * q20) +
+    (0.31 * hazardQ20) +
+    (0.21 * q50) +
+    (0.08 * Math.max(1, currentGap * 0.55))
+  );
+  startAhead -= (target <= 20 ? 2.7 : 2.1) * quick;
+  startAhead -= (target >= 50 ? 1.8 : 1.0) * hard;
+
+  if (target <= 10) {
+    startAhead -= 1.05 * white;
+    startAhead += 1.45 * release;
+  } else {
+    startAhead += 0.58 * white;
+    startAhead += 0.2 * release;
+  }
+
+  if (confidence < 0.45) {
+    startAhead += (0.45 - confidence) * 3.5;
+  }
+
+  if (existing?.suspended && Number.isFinite(Number(existing.lo))) {
+    const prevAhead = clamp(Number(existing.lo) - Number(currentRound || 0), 1, maxStartAhead);
+    const keepPrev = clamp(0.32 + (0.42 * (1 - confidence)), 0.3, 0.76);
+    startAhead = (keepPrev * prevAhead) + ((1 - keepPrev) * startAhead);
+  }
+
+  const roundedAhead = clamp(Math.round(startAhead), 1, maxStartAhead);
+  const absoluteLo = Math.max(Number(minLo || (currentRound + 1)), Number(currentRound || 0) + roundedAhead);
+  const absoluteHi = absoluteLo + span - 1;
+
+  return {
+    ...base,
+    lo: absoluteLo,
+    hi: absoluteHi,
+    eta: {
+      ...eta,
+      adaptiveWaiting: true,
+      waitingStartAhead: roundedAhead,
+      waitingBlendConfidence: roundNum(confidence, 4),
+      waitingSource: 'hazard+gap+quick+hard+cluster',
+    },
+  };
+}
+
 function evaluateLock(lock, target, pre, currentRound) {
   if (!lock) return { resolved: false, status: 'missing' };
   const suspended = Boolean(lock.suspended);
@@ -1938,11 +2004,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
     let status = 'pending';
     let previousOutcome = null;
 
-    const suspendedNeedsRefresh = (
-      Boolean(existing?.suspended) &&
-      Number.isFinite(Number(existing?.lo)) &&
-      currentRound >= Number(existing.lo)
-    );
+    const suspendedNeedsRefresh = Boolean(existing?.suspended);
 
     if (!existing || evalResult.resolved || spanMismatch || suspendedNeedsRefresh) {
       if (existing && evalResult.resolved) {
@@ -1978,7 +2040,14 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
         const generation = existing ? Number(existing.generation || 1) : 1;
         // Keep the true data-driven ETA window while suspended so WAIT timing is real,
         // not hardcoded to +1.
-        const waitingNext = enforceNextWindowStart(nextLock, fixedSpan, minNextLo);
+        const waitingNext = buildAdaptiveWaitingWindow(
+          nextLock,
+          target,
+          fixedSpan,
+          currentRound,
+          minNextLo,
+          existing
+        );
         const suspendedLo = Number(waitingNext.lo);
         const suspendedHi = Number(waitingNext.hi);
         lockToUse = {
