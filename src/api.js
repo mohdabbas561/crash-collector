@@ -109,6 +109,10 @@ const LOCKED_DEFAULT_LIMIT = toPositiveInt(process.env.LOCKED_DEFAULT_LIMIT, 150
 const LOCKED_MAX_LIMIT = Math.max(LOCKED_DEFAULT_LIMIT, toPositiveInt(process.env.LOCKED_MAX_LIMIT, 25000));
 const ROUNDS_DEFAULT_LIMIT = toPositiveInt(process.env.ROUNDS_DEFAULT_LIMIT, 5000);
 const ROUNDS_MAX_LIMIT = Math.max(ROUNDS_DEFAULT_LIMIT, toPositiveInt(process.env.ROUNDS_MAX_LIMIT, 25000));
+const DASHBOARD_DEFAULT_RECENT = toPositiveInt(process.env.DASHBOARD_DEFAULT_RECENT, 80);
+const DASHBOARD_MAX_RECENT = Math.max(DASHBOARD_DEFAULT_RECENT, toPositiveInt(process.env.DASHBOARD_MAX_RECENT, 400));
+const DASHBOARD_DELTA_MAX = Math.max(DASHBOARD_MAX_RECENT, toPositiveInt(process.env.DASHBOARD_DELTA_MAX, 2500));
+const DASHBOARD_CACHE_TTL_MS = toPositiveInt(process.env.DASHBOARD_CACHE_TTL_MS, 4000);
 const PREDICT_CACHE_TTL_MS = toPositiveInt(process.env.PREDICT_CACHE_TTL_MS, 15000);
 const LOCKED_CACHE_TTL_MS = toPositiveInt(process.env.LOCKED_CACHE_TTL_MS, 15000);
 const LOCKED_USE_FULL_DATA = String(process.env.LOCKED_USE_FULL_DATA || 'true').trim().toLowerCase() !== 'false';
@@ -125,6 +129,12 @@ const lockedCache = {
   limit: null,
   createdAt: 0,
   basePayload: null,
+};
+const dashboardCache = {
+  asOfRound: null,
+  recentLimit: null,
+  createdAt: 0,
+  payload: null,
 };
 let predictComputeInFlight = null;
 let lockedComputeInFlight = null;
@@ -175,6 +185,10 @@ function invalidatePredictionCaches() {
   lockedCache.createdAt = 0;
   lockedCache.basePayload = null;
   lockedComputeInFlight = null;
+  dashboardCache.asOfRound = null;
+  dashboardCache.recentLimit = null;
+  dashboardCache.createdAt = 0;
+  dashboardCache.payload = null;
 }
 
 function normalizeHistoryTarget(raw) {
@@ -241,6 +255,15 @@ function parseLockedLimit(rawLimit) {
   }
   const limit = clampInt(rawLimit, 2000, LOCKED_MAX_LIMIT, LOCKED_DEFAULT_LIMIT);
   return { limit, limitKey: String(limit) };
+}
+
+async function parseRoundsLimit(rawLimit) {
+  const raw = String(rawLimit ?? '').trim().toLowerCase();
+  if (raw === 'all' || raw === 'full' || raw === 'max') {
+    const total = await getRoundCount();
+    return Math.max(1, Number(total || 0));
+  }
+  return clampInt(rawLimit, 100, ROUNDS_MAX_LIMIT, ROUNDS_DEFAULT_LIMIT);
 }
 
 async function getRoundsForLockedPrediction(limit) {
@@ -346,7 +369,7 @@ async function refreshLockedPredictionInBackground() {
 
 app.get('/rounds', requireDatabase, rateLimit(60), async (req, res) => {
   try {
-    const limit      = clampInt(req.query.limit, 100, ROUNDS_MAX_LIMIT, ROUNDS_DEFAULT_LIMIT);
+    const limit      = await parseRoundsLimit(req.query.limit);
     const offset     = parseInt(req.query.offset || '0');
     const since      = req.query.since ? Number(req.query.since) : null;
     const minRoundId = since && since > 0 ? since + 1 : null;
@@ -356,6 +379,59 @@ app.get('/rounds', requireDatabase, rateLimit(60), async (req, res) => {
     setDatabaseAvailability(false, e.message);
     console.error('[rounds] error:', e.message);
     res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+app.get('/dashboard', requireDatabase, rateLimit(60), async (req, res) => {
+  try {
+    const recentLimit = clampInt(req.query.recentLimit, 30, DASHBOARD_MAX_RECENT, DASHBOARD_DEFAULT_RECENT);
+    const since = req.query.since ? Number(req.query.since) : null;
+    const minRoundId = Number.isFinite(since) && since > 0 ? since + 1 : null;
+
+    if (!minRoundId) {
+      const cacheFresh = (
+        dashboardCache.payload &&
+        dashboardCache.recentLimit === recentLimit &&
+        (Date.now() - dashboardCache.createdAt) < DASHBOARD_CACHE_TTL_MS
+      );
+      if (cacheFresh) return res.json(dashboardCache.payload);
+    }
+
+    const [stats, recentRounds] = await Promise.all([
+      getStats(),
+      minRoundId
+        ? getRounds({ limit: DASHBOARD_DELTA_MAX, minRoundId })
+        : getRounds({ limit: recentLimit, order: 'DESC' }),
+    ]);
+
+    const payload = {
+      ok: true,
+      generatedAt: new Date().toISOString(),
+      stats: {
+        tracked: Number(stats?.tracked || 0),
+        avg: stats?.avg ?? '0.00',
+        highest: stats?.highest ?? '0.00',
+        currentRound: Number(stats?.currentRound || 0),
+        distribution: stats?.distribution || {},
+      },
+      gaps: stats?.gaps || {},
+      distribution: stats?.distribution || {},
+      recentRounds,
+      count: recentRounds.length,
+    };
+
+    if (!minRoundId) {
+      dashboardCache.asOfRound = Number(stats?.currentRound || 0);
+      dashboardCache.recentLimit = recentLimit;
+      dashboardCache.createdAt = Date.now();
+      dashboardCache.payload = payload;
+    }
+
+    res.json(payload);
+  } catch (e) {
+    setDatabaseAvailability(false, e.message);
+    console.error('[dashboard] error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
