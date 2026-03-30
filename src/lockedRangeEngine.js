@@ -1915,7 +1915,13 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
     let status = 'pending';
     let previousOutcome = null;
 
-    if (!existing || evalResult.resolved || spanMismatch || existing?.suspended) {
+    const suspendedNeedsRefresh = (
+      Boolean(existing?.suspended) &&
+      Number.isFinite(Number(existing?.lo)) &&
+      currentRound >= Number(existing.lo)
+    );
+
+    if (!existing || evalResult.resolved || spanMismatch || suspendedNeedsRefresh) {
       if (existing && evalResult.resolved) {
         previousOutcome = {
           outcome: evalResult.outcome,
