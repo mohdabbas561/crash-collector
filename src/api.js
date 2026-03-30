@@ -166,14 +166,34 @@ function setDatabaseAvailability(available, errorMessage = '') {
 }
 
 function requireDatabase(req, res, next) {
-  if (dbState.available) return next();
-  return res.status(503).json({
-    ok: false,
-    code: 'DB_UNAVAILABLE',
-    error: 'Database temporarily unavailable',
-    detail: dbState.lastError || 'Unknown database error',
-    since: dbState.since,
-  });
+  // Do not hard-block requests based on stale health state.
+  // Allow routes to attempt DB work and self-recover when DB comes back.
+  return next();
+}
+
+function isLikelyDbError(err) {
+  const code = String(err?.code || '').toUpperCase();
+  if ([
+    'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN',
+    '57P01', '57P02', '57P03', '08000', '08001', '08003', '08006',
+    '53300', '53400', 'XX000',
+  ].includes(code)) {
+    return true;
+  }
+  const msg = String(err?.message || '').toLowerCase();
+  return (
+    msg.includes('connection terminated') ||
+    msg.includes('connect econnrefused') ||
+    msg.includes('remaining connection slots') ||
+    msg.includes('database unavailable') ||
+    msg.includes('the database system is starting up') ||
+    msg.includes('timeout expired') ||
+    msg.includes('project has exceeded the data transfer quota')
+  );
+}
+
+function markDbHealthy() {
+  if (!dbState.available) setDatabaseAvailability(true);
 }
 
 function invalidatePredictionCaches() {
@@ -392,9 +412,10 @@ app.get('/rounds', requireDatabase, rateLimit(60), async (req, res) => {
     const since      = req.query.since ? Number(req.query.since) : null;
     const minRoundId = since && since > 0 ? since + 1 : null;
     const rounds = await getRounds({ limit, offset, from: req.query.from||null, to: req.query.to||null, minRoundId });
+    markDbHealthy();
     res.json({ ok:true, count: rounds.length, rounds });
   } catch(e) {
-    setDatabaseAvailability(false, e.message);
+    if (isLikelyDbError(e)) setDatabaseAvailability(false, e.message);
     console.error('[rounds] error:', e.message);
     res.status(500).json({ ok:false, error:e.message });
   }
@@ -421,6 +442,7 @@ app.get('/dashboard', requireDatabase, rateLimit(60), async (req, res) => {
         ? getRounds({ limit: DASHBOARD_DELTA_MAX, minRoundId })
         : getRounds({ limit: recentLimit, order: 'DESC' }),
     ]);
+    markDbHealthy();
 
     const payload = {
       ok: true,
@@ -447,7 +469,7 @@ app.get('/dashboard', requireDatabase, rateLimit(60), async (req, res) => {
 
     res.json(payload);
   } catch (e) {
-    setDatabaseAvailability(false, e.message);
+    if (isLikelyDbError(e)) setDatabaseAvailability(false, e.message);
     console.error('[dashboard] error:', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -455,18 +477,22 @@ app.get('/dashboard', requireDatabase, rateLimit(60), async (req, res) => {
 
 app.get('/stats', requireDatabase, rateLimit(30), async (req,res) => {
   try {
-    res.json({ ok:true, ...(await getStats()) });
+    const data = await getStats();
+    markDbHealthy();
+    res.json({ ok:true, ...data });
   } catch(e) {
-    setDatabaseAvailability(false, e.message);
+    if (isLikelyDbError(e)) setDatabaseAvailability(false, e.message);
     console.error('[stats] error:', e.message);
     res.status(500).json({ ok:false, error:e.message });
   }
 });
 app.get('/storage-stats', requireDatabase, rateLimit(20), async (req,res) => {
   try {
-    res.json({ ok:true, ...(await getStorageStats()) });
+    const data = await getStorageStats();
+    markDbHealthy();
+    res.json({ ok:true, ...data });
   } catch(e) {
-    setDatabaseAvailability(false, e.message);
+    if (isLikelyDbError(e)) setDatabaseAvailability(false, e.message);
     console.error('[storage-stats] error:', e.message);
     res.status(500).json({ ok:false, error:e.message });
   }
@@ -487,6 +513,7 @@ app.get('/predict', requireDatabase, rateLimit(20), async (req, res) => {
     const limit = clampInt(req.query.limit, 1000, PREDICT_MAX_LIMIT, PREDICT_DEFAULT_LIMIT);
 
     const latestRound = await getLatestRoundId();
+    markDbHealthy();
     const cacheFresh = (
       predictCache.payload &&
       predictCache.asOfRound != null &&
@@ -529,7 +556,7 @@ app.get('/predict', requireDatabase, rateLimit(20), async (req, res) => {
       }
     }
   } catch (e) {
-    setDatabaseAvailability(false, e.message);
+    if (isLikelyDbError(e)) setDatabaseAvailability(false, e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
@@ -540,6 +567,7 @@ app.get('/predict/locked', requireDatabase, rateLimit(20), async (req, res) => {
     const historyTarget = normalizeHistoryTarget(req.query.historyTarget);
 
     const latestRound = await getLatestRoundId();
+    markDbHealthy();
     const hasCacheForLimit = Boolean(lockedCache.basePayload && lockedCache.limit === limitKey);
     const cacheFresh = (
       hasCacheForLimit &&
@@ -555,19 +583,16 @@ app.get('/predict/locked', requireDatabase, rateLimit(20), async (req, res) => {
     // Serve stale cache instantly and refresh in background.
     // This keeps prediction tab snappy instead of blocking on full recompute.
     if (hasCacheForLimit) {
-      const staleAgeMs = Date.now() - lockedCache.createdAt;
-      const shouldRefreshNow = staleAgeMs >= Math.min(LOCKED_CACHE_TTL_MS, LOCKED_MIN_RECOMPUTE_MS);
-      if (shouldRefreshNow) {
-        ensureLockedPredictionComputed({ latestRound, limit, limitKey })
-          .catch((err) => console.error('[predict/locked] async refresh error:', err.message));
-      }
+      ensureLockedPredictionComputed({ latestRound, limit, limitKey })
+        .catch((err) => console.error('[predict/locked] async refresh error:', err.message));
       return res.json(withHistoryFilter(lockedCache.basePayload, historyTarget));
     }
 
     const basePayload = await ensureLockedPredictionComputed({ latestRound, limit, limitKey });
+    markDbHealthy();
     return res.json(withHistoryFilter(basePayload, historyTarget));
   } catch (e) {
-    setDatabaseAvailability(false, e.message);
+    if (isLikelyDbError(e)) setDatabaseAvailability(false, e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
