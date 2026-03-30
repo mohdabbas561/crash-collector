@@ -995,7 +995,7 @@ function enforceNextWindowStart(nextLock, fixedSpan, minLo) {
 
 function evaluateLock(lock, target, pre, currentRound) {
   if (!lock) return { resolved: false, status: 'missing' };
-  if (lock.suspended) return { resolved: false, status: 'waiting' };
+  const suspended = Boolean(lock.suspended);
   const roundWhenMade = Number(lock.roundWhenMade || lock.round_when_made || 0);
   const lo = Number(lock.lo);
   const hi = Number(lock.hi);
@@ -1014,8 +1014,8 @@ function evaluateLock(lock, target, pre, currentRound) {
   // Window is inclusive. If current round reached/ended hi without a hit, it is a miss now.
   if (currentRound >= hi) return { resolved: true, outcome: 'loss', hitRound: null };
 
-  if (currentRound < lo) return { resolved: false, status: 'pending' };
-  return { resolved: false, status: 'window-open' };
+  if (currentRound < lo) return { resolved: false, status: suspended ? 'waiting' : 'pending' };
+  return { resolved: false, status: suspended ? 'waiting' : 'window-open' };
 }
 
 function shouldActivateWindow(target, nextLock, calibration = null) {
