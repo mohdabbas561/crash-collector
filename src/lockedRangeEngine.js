@@ -2040,14 +2040,8 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
         const generation = existing ? Number(existing.generation || 1) : 1;
         // Keep the true data-driven ETA window while suspended so WAIT timing is real,
         // not hardcoded to +1.
-        const waitingNext = buildAdaptiveWaitingWindow(
-          nextLock,
-          target,
-          fixedSpan,
-          currentRound,
-          minNextLo,
-          existing
-        );
+        // Engine-only waiting window: use direct model output (buildWindow) with non-overlap guard.
+        const waitingNext = enforceNextWindowStart(nextLock, fixedSpan, minNextLo);
         const suspendedLo = Number(waitingNext.lo);
         const suspendedHi = Number(waitingNext.hi);
         lockToUse = {
