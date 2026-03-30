@@ -522,15 +522,23 @@ app.get('/predict/locked', requireDatabase, rateLimit(20), async (req, res) => {
     const historyTarget = normalizeHistoryTarget(req.query.historyTarget);
 
     const latestRound = await getLatestRoundId();
+    const hasCacheForLimit = Boolean(lockedCache.basePayload && lockedCache.limit === limitKey);
     const cacheFresh = (
-      lockedCache.basePayload &&
+      hasCacheForLimit &&
       lockedCache.asOfRound != null &&
       lockedCache.asOfRound === latestRound &&
-      lockedCache.limit === limitKey &&
       (Date.now() - lockedCache.createdAt) < LOCKED_CACHE_TTL_MS
     );
 
     if (cacheFresh) {
+      return res.json(withHistoryFilter(lockedCache.basePayload, historyTarget));
+    }
+
+    // Serve stale cache instantly and refresh in background.
+    // This keeps prediction tab snappy instead of blocking on full recompute.
+    if (hasCacheForLimit) {
+      ensureLockedPredictionComputed({ latestRound, limit, limitKey })
+        .catch((err) => console.error('[predict/locked] async refresh error:', err.message));
       return res.json(withHistoryFilter(lockedCache.basePayload, historyTarget));
     }
 
