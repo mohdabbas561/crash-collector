@@ -360,22 +360,38 @@ async function pingDB() {
 }
 
 async function clearPredictions() {
-  const res = await pool.query(`DELETE FROM predictions`);
-  return { predictionsCleared: res.rowCount || 0 };
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const countRes = await client.query(`SELECT COUNT(*)::BIGINT AS total FROM predictions`);
+    await client.query(`TRUNCATE TABLE predictions RESTART IDENTITY`);
+    await client.query('COMMIT');
+    return { predictionsCleared: Number(countRes.rows?.[0]?.total || 0) };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 async function clearAllLocks() {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const consensusRes = await client.query(`DELETE FROM locked_preds_consensus`);
-    const advRes = await client.query(`DELETE FROM locked_preds_adv`);
-    const engineRes = await client.query(`DELETE FROM locked_preds`);
+    const countRes = await client.query(`
+      SELECT
+        (SELECT COUNT(*)::BIGINT FROM locked_preds_consensus) AS consensus_total,
+        (SELECT COUNT(*)::BIGINT FROM locked_preds_adv) AS adv_total,
+        (SELECT COUNT(*)::BIGINT FROM locked_preds) AS engine_total
+    `);
+    await client.query(`TRUNCATE TABLE locked_preds_consensus, locked_preds_adv, locked_preds`);
     await client.query('COMMIT');
+    const row = countRes.rows?.[0] || {};
     return {
-      consensusLocksCleared: consensusRes.rowCount || 0,
-      advLocksCleared: advRes.rowCount || 0,
-      engineLocksCleared: engineRes.rowCount || 0,
+      consensusLocksCleared: Number(row.consensus_total || 0),
+      advLocksCleared: Number(row.adv_total || 0),
+      engineLocksCleared: Number(row.engine_total || 0),
     };
   } catch (e) {
     await client.query('ROLLBACK');
