@@ -164,7 +164,11 @@ async function getPredictions({ limit = 500, target = null, source = null } = {}
   const res = await pool.query(
     `SELECT id, target, min_mult, outcome, window_lo, window_hi, hit_round, generation, source, prob_w, created_at
      FROM predictions ${where}
-     ORDER BY created_at DESC
+     ORDER BY
+       COALESCE(hit_round, window_hi) DESC,
+       window_hi DESC,
+       created_at DESC,
+       id DESC
      LIMIT $${idx}`,
     params
   );

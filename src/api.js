@@ -117,8 +117,14 @@ const PREDICT_CACHE_TTL_MS = toPositiveInt(process.env.PREDICT_CACHE_TTL_MS, 150
 const LOCKED_CACHE_TTL_MS = toPositiveInt(process.env.LOCKED_CACHE_TTL_MS, 15000);
 const LOCKED_MIN_RECOMPUTE_MS = toPositiveInt(process.env.LOCKED_MIN_RECOMPUTE_MS, 8000);
 const LOCKED_COMPUTE_TIMEOUT_MS = toPositiveInt(process.env.LOCKED_COMPUTE_TIMEOUT_MS, 25000);
+const LOCKED_HISTORY_LIMIT = toPositiveInt(process.env.LOCKED_HISTORY_LIMIT, 1200);
+const LOCKED_HISTORY_PREFETCH_LIMIT = Math.max(
+  LOCKED_HISTORY_LIMIT,
+  toPositiveInt(process.env.LOCKED_HISTORY_PREFETCH_LIMIT, 3000)
+);
 const LOCKED_USE_FULL_DATA = String(process.env.LOCKED_USE_FULL_DATA || 'true').trim().toLowerCase() !== 'false';
 const LOCKED_BACKGROUND_INTERVAL_MS = toPositiveInt(process.env.LOCKED_BACKGROUND_INTERVAL_MS, 30000);
+const HISTORY_TARGETS = ['5x', '10x', '20x', '50x', '100x', '500x', '1000x'];
 
 const predictCache = {
   asOfRound: null,
@@ -231,6 +237,14 @@ function summarizeHistory(rows) {
   return out;
 }
 
+function summarizeHistoryByTarget(rows) {
+  const byTarget = {};
+  for (const t of HISTORY_TARGETS) {
+    byTarget[t] = summarizeHistory((rows || []).filter(h => String(h.target || '').toLowerCase() === t));
+  }
+  return byTarget;
+}
+
 function sameLock(a, b) {
   if (!a || !b) return false;
   return (
@@ -253,17 +267,36 @@ function locksNeedSave(existing, next) {
 }
 
 function withHistoryFilter(basePayload, historyTarget) {
-  const allRows = basePayload?.historyAll || [];
-  const { historyAll, ...rest } = basePayload || {};
+  const allRows = Array.isArray(basePayload?.historyAll) ? basePayload.historyAll : [];
+  const { historyAll, historyByTarget, ...rest } = basePayload || {};
   const filtered = historyTarget
     ? allRows.filter(h => String(h.target || '').toLowerCase() === historyTarget)
     : allRows;
   return {
     ...rest,
+    historyByTarget: (historyByTarget && typeof historyByTarget === 'object')
+      ? historyByTarget
+      : summarizeHistoryByTarget(allRows),
     history: filtered,
     historySummary: summarizeHistory(filtered),
     historyFilter: historyTarget || 'all',
   };
+}
+
+async function attachLiveLockedHistory(basePayload) {
+  if (!basePayload || typeof basePayload !== 'object') return basePayload;
+  try {
+    const liveHistory = await getPredictions({ limit: LOCKED_HISTORY_LIMIT, source: 'range_lock_v1' });
+    markDbHealthy();
+    return {
+      ...basePayload,
+      historyAll: liveHistory,
+      historyByTarget: summarizeHistoryByTarget(liveHistory),
+    };
+  } catch (e) {
+    if (isLikelyDbError(e)) setDatabaseAvailability(false, e.message);
+    return basePayload;
+  }
 }
 
 function parseLockedLimit(rawLimit) {
@@ -314,7 +347,7 @@ async function computeAndPersistLockedPrediction({ latestRound, limit, limitKey 
   const [rounds, locked, historyRows] = await Promise.all([
     getRoundsForLockedPrediction(limit),
     getLockedConsensusPreds(),
-    getPredictions({ limit: 3000, source: 'range_lock_v1' }),
+    getPredictions({ limit: LOCKED_HISTORY_PREFETCH_LIMIT, source: 'range_lock_v1' }),
   ]);
 
   const engine = computeLockedRangePredictions(rounds, locked, { historyRows });
@@ -340,19 +373,14 @@ async function computeAndPersistLockedPrediction({ latestRound, limit, limitKey 
   }
 
   const fullHistory = savedResolvedCount > 0
-    ? await getPredictions({ limit: 1200, source: 'range_lock_v1' })
-    : historyRows.slice(0, 1200);
-
-  const byTarget = {};
-  for (const t of ['5x', '10x', '20x', '50x', '100x', '500x', '1000x']) {
-    byTarget[t] = summarizeHistory(fullHistory.filter(h => String(h.target || '').toLowerCase() === t));
-  }
+    ? await getPredictions({ limit: LOCKED_HISTORY_LIMIT, source: 'range_lock_v1' })
+    : historyRows.slice(0, LOCKED_HISTORY_LIMIT);
 
   const basePayload = {
     ok: true,
     ...engine,
     historyAll: fullHistory,
-    historyByTarget: byTarget,
+    historyByTarget: summarizeHistoryByTarget(fullHistory),
     historyStorage: 'postgres',
     savedResolvedCount,
   };
@@ -577,7 +605,8 @@ app.get('/predict/locked', requireDatabase, rateLimit(20), async (req, res) => {
     );
 
     if (cacheFresh) {
-      return res.json(withHistoryFilter(lockedCache.basePayload, historyTarget));
+      const payload = await attachLiveLockedHistory(lockedCache.basePayload);
+      return res.json(withHistoryFilter(payload, historyTarget));
     }
 
     // Serve stale cache instantly and refresh in background.
@@ -585,10 +614,12 @@ app.get('/predict/locked', requireDatabase, rateLimit(20), async (req, res) => {
     if (hasCacheForLimit) {
       ensureLockedPredictionComputed({ latestRound, limit, limitKey })
         .catch((err) => console.error('[predict/locked] async refresh error:', err.message));
-      return res.json(withHistoryFilter(lockedCache.basePayload, historyTarget));
+      const payload = await attachLiveLockedHistory(lockedCache.basePayload);
+      return res.json(withHistoryFilter(payload, historyTarget));
     }
 
-    const basePayload = await ensureLockedPredictionComputed({ latestRound, limit, limitKey });
+    const computedPayload = await ensureLockedPredictionComputed({ latestRound, limit, limitKey });
+    const basePayload = await attachLiveLockedHistory(computedPayload);
     markDbHealthy();
     return res.json(withHistoryFilter(basePayload, historyTarget));
   } catch (e) {
