@@ -699,7 +699,17 @@ app.delete('/access/:id', requireDatabase, requireAdmin, rateLimit(10), async (r
 });
 
 app.get('/wallets', requireDatabase, requireAdmin, rateLimit(20), async (req,res) => {
-  try { res.json({ ok:true, wallets: await getWallets() }); }
+  try {
+    const wallets = await getWallets();
+    const safeWallets = (wallets || []).map((w) => ({
+      id: w.id,
+      rpc_url: w.rpc_url ?? null,
+      player_account_pda: w.player_account_pda ?? null,
+      pubkey: w.pubkey ?? null,
+      updated_at: w.updated_at ?? null,
+    }));
+    res.json({ ok:true, wallets: safeWallets });
+  }
   catch(e) {
     setDatabaseAvailability(false, e.message);
     res.status(500).json({ ok:false, error:e.message });

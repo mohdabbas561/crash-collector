@@ -1726,6 +1726,7 @@ function buildAlertSummary(pre, currentIdx, targetsOut) {
     const gainNorm = clamp(gain / 0.2, 0, 1);
     const sampleNorm = clamp(Number(calc.samples || 0) / (target >= 100 ? 20 : 28), 0, 1);
     const evidenceNorm = clamp(Number(calc.evidence || 0), 0, 1);
+    const highChainNorm = clamp(Number(calc.highChainScore || 0), 0, 1);
     let actionScore = (
       (0.36 * effectiveProbability) +
       (0.27 * liftNorm) +
@@ -1737,14 +1738,36 @@ function buildAlertSummary(pre, currentIdx, targetsOut) {
       actionScore -= 0.05 * (1 - clamp((lift - 1) / 0.7, 0, 1));
     }
     if (target >= 50) {
-      actionScore += 0.04 * clamp(Number(calc.highChainScore || 0), 0, 1);
+      actionScore += 0.04 * highChainNorm;
     }
     actionScore = clamp(actionScore, 0, 1);
+    // Use a target-normalized display score so B2B does not get permanently pinned to 5x.
+    // This highlights relative pressure/lift for higher targets when true signal exists.
+    let relativePressure = clamp(
+      (0.48 * liftNorm) +
+      (0.24 * gainNorm) +
+      (0.18 * evidenceNorm) +
+      (0.10 * highChainNorm),
+      0,
+      1
+    );
+    if (target === 5 && lift < 1.2) {
+      relativePressure = clamp(relativePressure * 0.86, 0, 1);
+    }
+    const displayProbability = clamp(
+      target >= 50
+        ? ((0.34 * effectiveProbability) + (0.66 * relativePressure))
+        : ((0.76 * effectiveProbability) + (0.24 * relativePressure)),
+      0,
+      1
+    );
     return {
       target,
       targetLabel: `${target}x`,
       probability: roundNum(effectiveProbability, 6),
       effectiveProbability: roundNum(effectiveProbability, 6),
+      displayProbability: roundNum(displayProbability, 6),
+      relativePressure: roundNum(relativePressure, 6),
       rawProbability: roundNum(rawProbability, 6),
       actionScore: roundNum(actionScore, 6),
       lift: roundNum(lift, 6),
