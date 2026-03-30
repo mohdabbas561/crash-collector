@@ -37,6 +37,7 @@ const ACTIVATE_MIN_P1 = {
   500: 0.03,
   1000: 0.02,
 };
+const WAITING_MODEL_VERSION = 'v11-adaptive-live';
 
 function clamp(v, lo, hi) {
   return Math.max(lo, Math.min(hi, v));
@@ -997,30 +998,43 @@ function buildAdaptiveWaitingWindow(nextLock, target, fixedSpan, currentRound, m
   const base = enforceNextWindowStart(nextLock, fixedSpan, minLo);
   const eta = base.eta || {};
   const span = Math.max(1, Number(fixedSpan) || 1);
-  const cap = Math.max(
+  const historicalQ90 = Math.max(1, Number(eta.historicalQ90 || eta.hazardQ80 || eta.q80 || eta.q50 || 1));
+  const historicalGapMean = Math.max(1, Number(eta.historicalGapMean || eta.q50 || 1));
+  const dynamicCapRaw = Math.max(
     span + 1,
-    Number(WINDOW_AHEAD_CAP[target] || (span + 8))
+    Math.round((target >= 100 ? 2.6 : 2.2) * historicalQ90),
+    Math.round((target >= 100 ? 2.1 : 1.8) * historicalGapMean),
+    Math.round(Math.max(0, Number(eta.currentGap || 0)) + Math.max(6, span * 1.4))
   );
+  const cap = clamp(dynamicCapRaw, span + 1, 220);
   const maxStartAhead = Math.max(1, cap - span + 1);
 
   const q20 = Math.max(1, Number(eta.q20 || 1));
   const q50 = Math.max(q20, Number(eta.q50 || q20));
   const hazardQ20 = Math.max(1, Number(eta.hazardQ20 || q20));
   const currentGap = Math.max(0, Number(eta.currentGap || 0));
+  const pHit1 = clamp(Number(eta.pHit1 || 0), 0, 1);
+  const pGap2 = clamp(Number(eta.pGapLe2 || 0), 0, 1);
+  const pGap3 = clamp(Number(eta.pGapLe3 || 0), 0, 1);
   const quick = clamp(Number(eta.quickHitEmpirical ?? eta.quickHitSignal ?? 0), 0, 1);
   const hard = clamp(Number(eta.hardGapImpulse ?? eta.hardGapPressure ?? 0), 0, 1);
   const white = clamp(Number(eta.whiteClusterSeverity || 0), 0, 1);
   const release = clamp(Number(eta.whiteReleaseSignal || 0), 0, 1);
   const confidence = clamp(Number(eta.confidence || 0), 0, 1);
+  const centerAhead = Math.max(1, Number(eta.centerAhead || q50));
+  const expectedFromP1 = pHit1 > 0 ? clamp(1 / pHit1, 1, maxStartAhead) : maxStartAhead;
+  const b2bPull = clamp((target <= 20 ? ((0.65 * pGap2) + (0.35 * pGap3)) : ((0.45 * pGap2) + (0.55 * pGap3))), 0, 1);
 
   // Data-driven pre-window start: blend hazard/gap/cluster signals (not fixed offsets).
   let startAhead = (
-    (0.4 * q20) +
-    (0.31 * hazardQ20) +
-    (0.21 * q50) +
-    (0.08 * Math.max(1, currentGap * 0.55))
+    (0.34 * q20) +
+    (0.24 * hazardQ20) +
+    (0.18 * q50) +
+    (0.24 * expectedFromP1)
   );
-  startAhead -= (target <= 20 ? 2.7 : 2.1) * quick;
+  startAhead = (0.66 * startAhead) + (0.34 * centerAhead);
+  startAhead -= (target <= 20 ? 4.2 : 2.2) * quick;
+  startAhead -= (target <= 20 ? 2.8 : 1.5) * b2bPull;
   startAhead -= (target >= 50 ? 1.8 : 1.0) * hard;
 
   if (target <= 10) {
@@ -1052,8 +1066,12 @@ function buildAdaptiveWaitingWindow(nextLock, target, fixedSpan, currentRound, m
     eta: {
       ...eta,
       adaptiveWaiting: true,
+      waitingModelVersion: WAITING_MODEL_VERSION,
       waitingStartAhead: roundedAhead,
       waitingBlendConfidence: roundNum(confidence, 4),
+      waitingBlendExpectedFromP1: roundNum(expectedFromP1, 2),
+      waitingBlendB2BPull: roundNum(b2bPull, 4),
+      waitingDynamicCap: cap,
       waitingSource: 'hazard+gap+quick+hard+cluster',
     },
   };
@@ -2004,13 +2022,19 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
     let status = 'pending';
     let previousOutcome = null;
 
-    // Keep WAIT windows stable while they are alive to prevent +1 drift on every poll.
-    // Recompute only after the suspended window has fully passed.
-    const suspendedNeedsRefresh = Boolean(
+    // Keep WAIT windows stable while alive, but refresh if:
+    // 1) suspended window already expired, or
+    // 2) suspended lock was produced by older waiting model version.
+    const suspendedExpired = Boolean(
       existing?.suspended &&
       Number.isFinite(Number(existing.hi)) &&
       currentRound > Number(existing.hi)
     );
+    const suspendedVersionMismatch = Boolean(
+      existing?.suspended &&
+      String(existing?.eta?.waitingModelVersion || '') !== WAITING_MODEL_VERSION
+    );
+    const suspendedNeedsRefresh = suspendedExpired || suspendedVersionMismatch;
 
     if (!existing || evalResult.resolved || spanMismatch || suspendedNeedsRefresh) {
       if (existing && evalResult.resolved) {
@@ -2065,7 +2089,14 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
           const candidateLo = Number(waitingCandidate.lo);
           const canCountdown = existingHi >= currentRound;
           const candidatePushesOut = candidateLo > existingLo;
-          if (canCountdown && candidatePushesOut) {
+          const existingBlendConfidence = clamp(Number(existing?.eta?.waitingBlendConfidence ?? existing?.eta?.confidence ?? 0), 0, 1);
+          const candidateBlendConfidence = clamp(
+            Number(waitingCandidate?.eta?.waitingBlendConfidence ?? waitingCandidate?.eta?.confidence ?? 0),
+            0,
+            1
+          );
+          const allowPushOut = candidatePushesOut && (candidateBlendConfidence > (existingBlendConfidence + 0.22));
+          if (canCountdown && candidatePushesOut && !allowPushOut) {
             waitingNext = {
               ...waitingCandidate,
               lo: existingLo,
