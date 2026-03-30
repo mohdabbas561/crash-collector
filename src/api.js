@@ -115,6 +115,8 @@ const DASHBOARD_DELTA_MAX = Math.max(DASHBOARD_MAX_RECENT, toPositiveInt(process
 const DASHBOARD_CACHE_TTL_MS = toPositiveInt(process.env.DASHBOARD_CACHE_TTL_MS, 4000);
 const PREDICT_CACHE_TTL_MS = toPositiveInt(process.env.PREDICT_CACHE_TTL_MS, 15000);
 const LOCKED_CACHE_TTL_MS = toPositiveInt(process.env.LOCKED_CACHE_TTL_MS, 15000);
+const LOCKED_MIN_RECOMPUTE_MS = toPositiveInt(process.env.LOCKED_MIN_RECOMPUTE_MS, 8000);
+const LOCKED_COMPUTE_TIMEOUT_MS = toPositiveInt(process.env.LOCKED_COMPUTE_TIMEOUT_MS, 25000);
 const LOCKED_USE_FULL_DATA = String(process.env.LOCKED_USE_FULL_DATA || 'true').trim().toLowerCase() !== 'false';
 const LOCKED_BACKGROUND_INTERVAL_MS = toPositiveInt(process.env.LOCKED_BACKGROUND_INTERVAL_MS, 30000);
 
@@ -257,6 +259,19 @@ function parseLockedLimit(rawLimit) {
   return { limit, limitKey: String(limit) };
 }
 
+function withTimeout(promise, timeoutMs, label) {
+  const ms = Math.max(1000, Number(timeoutMs || 0));
+  let timer = null;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${label || 'Operation'} timed out after ${ms}ms`));
+    }, ms);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
 async function parseRoundsLimit(rawLimit) {
   const raw = String(rawLimit ?? '').trim().toLowerCase();
   if (raw === 'all' || raw === 'full' || raw === 'max') {
@@ -332,12 +347,15 @@ async function computeAndPersistLockedPrediction({ latestRound, limit, limitKey 
 async function ensureLockedPredictionComputed({ latestRound, limit, limitKey }) {
   const sameInFlight = (
     lockedComputeInFlight &&
-    lockedComputeInFlight.latestRound === latestRound &&
     lockedComputeInFlight.limitKey === limitKey
   );
   if (sameInFlight) return lockedComputeInFlight.promise;
 
-  const promise = computeAndPersistLockedPrediction({ latestRound, limit, limitKey });
+  const promise = withTimeout(
+    computeAndPersistLockedPrediction({ latestRound, limit, limitKey }),
+    LOCKED_COMPUTE_TIMEOUT_MS,
+    'Locked prediction compute'
+  );
   lockedComputeInFlight = { latestRound, limitKey, promise };
   try {
     return await promise;
@@ -537,8 +555,12 @@ app.get('/predict/locked', requireDatabase, rateLimit(20), async (req, res) => {
     // Serve stale cache instantly and refresh in background.
     // This keeps prediction tab snappy instead of blocking on full recompute.
     if (hasCacheForLimit) {
-      ensureLockedPredictionComputed({ latestRound, limit, limitKey })
-        .catch((err) => console.error('[predict/locked] async refresh error:', err.message));
+      const staleAgeMs = Date.now() - lockedCache.createdAt;
+      const shouldRefreshNow = staleAgeMs >= Math.min(LOCKED_CACHE_TTL_MS, LOCKED_MIN_RECOMPUTE_MS);
+      if (shouldRefreshNow) {
+        ensureLockedPredictionComputed({ latestRound, limit, limitKey })
+          .catch((err) => console.error('[predict/locked] async refresh error:', err.message));
+      }
       return res.json(withHistoryFilter(lockedCache.basePayload, historyTarget));
     }
 
