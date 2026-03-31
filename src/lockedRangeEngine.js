@@ -998,10 +998,10 @@ function buildWindow(pre, target, currentIdx, calibration = null, globalSignals 
   if (target <= 20) {
     const lowTargetCap = clamp(
       Math.round(
-        (target <= 5 ? 14 : (target <= 10 ? 22 : 32)) +
-        ((target <= 10 ? 8 : 8) * trendDownAdj) +
-        ((target <= 10 ? 6 : 6) * globalWhitePressureAdj) -
-        ((target <= 10 ? 5 : 6) * earlyRelax)
+        (target <= 5 ? 10 : (target <= 10 ? 16 : 24)) +
+        ((target <= 10 ? 4 : 5) * trendDownAdj) +
+        ((target <= 10 ? 2 : 3) * globalWhitePressureAdj) -
+        ((target <= 10 ? 4 : 5) * earlyRelax)
       ),
       windowSpan + 1,
       Math.max(windowSpan + 2, cappedMaxAhead)
@@ -1312,10 +1312,10 @@ function buildAdaptiveWaitingWindow(nextLock, target, fixedSpan, currentRound, m
   if (target <= 20) {
     const lowTargetCap = clamp(
       Math.round(
-        (target <= 5 ? 14 : (target <= 10 ? 22 : 32)) +
-        ((target <= 10 ? 8 : 8) * trendDownAdj) +
-        ((target <= 10 ? 6 : 6) * globalWhitePressureAdj) -
-        ((target <= 10 ? 5 : 6) * earlyRelax)
+        (target <= 5 ? 10 : (target <= 10 ? 16 : 24)) +
+        ((target <= 10 ? 4 : 5) * trendDownAdj) +
+        ((target <= 10 ? 2 : 3) * globalWhitePressureAdj) -
+        ((target <= 10 ? 4 : 5) * earlyRelax)
       ),
       1,
       maxStartAhead
@@ -1543,6 +1543,12 @@ function shouldActivateWindow(target, nextLock, calibration = null, globalSignal
       trendB2BPressure >= 0.62 &&
       trendDownRisk <= 0.52 &&
       (quick >= 0.22 || p1 >= (minP1 * 0.92) || b2bComposite >= 0.24)
+    ) {
+      active = true;
+    }
+    if (
+      earlyRelax >= 0.45 &&
+      (quick >= 0.1 || aiProbability >= 0.18 || p1 >= (minP1 * 0.75))
     ) {
       active = true;
     }
@@ -2427,7 +2433,7 @@ function buildIndependentWhiteClusterAlert(pre, currentIdx) {
     0.88
   );
   if (currentRun >= 3) {
-    priorEvent = Math.max(priorEvent, clamp(0.35 + (0.08 * Math.min(5, currentRun - 2)), 0.35, 0.85));
+    priorEvent = Math.max(priorEvent, clamp(0.22 + (0.06 * Math.min(5, currentRun - 2)), 0.22, 0.72));
   }
   const priorRelease = clamp(
     (0.18 + (0.44 * (1 - runSignal)) + (0.22 * clamp(curVol - 1, 0, 1)) + (0.16 * clamp(curTrend / 0.08, 0, 1))),
@@ -2444,7 +2450,7 @@ function buildIndependentWhiteClusterAlert(pre, currentIdx) {
   const baselineCluster = clamp(Math.pow(clamp(whiteRate, 0, 1), 3), 0.01, 0.96);
   let risk = clamp((riskRaw - baselineCluster) / Math.max(0.05, 1 - baselineCluster), 0, 1);
   if (currentRun >= 3) {
-    risk = Math.max(risk, clamp(0.35 + (0.1 * Math.min(5, currentRun - 2)), 0.35, 0.9));
+    risk = Math.max(risk, clamp(0.2 + (0.07 * Math.min(5, currentRun - 2)), 0.2, 0.72));
   }
   risk = clamp(risk + (0.16 * whiteRateSignal), 0, 1);
   const release = clamp((releaseW + (alpha * priorRelease)) / Math.max(0.0001, totalW + alpha), 0, 1);
@@ -2988,21 +2994,47 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
   const currentRound = pre.rounds[currentIdx].roundId;
   const globalWhite = buildIndependentWhiteClusterAlert(pre, currentIdx);
   const regimeIntel = buildRegimeIntelligence(pre, currentIdx);
+  const lowTargets = [5, 10, 20];
+  const lowCalRows = lowTargets.map((t) => calibration?.[t] || {});
+  const avgCal = (key, fallback = 0) => {
+    let sum = 0;
+    let n = 0;
+    for (const row of lowCalRows) {
+      const v = Number(row?.[key]);
+      if (Number.isFinite(v)) {
+        sum += v;
+        n += 1;
+      }
+    }
+    return n > 0 ? (sum / n) : fallback;
+  };
+  const globalEarlyRelax = clamp(
+    (0.62 * avgCal('recentEarlyRate', avgCal('earlyRate', 0))) +
+    (0.38 * avgCal('earlyRate', 0)) -
+    (0.55 * avgCal('recentLossRate', avgCal('lossRate', 0))),
+    0,
+    1
+  );
   const globalWhitePressure = clamp(
     (Number(globalWhite.risk || 0) * 1.05) - (Number(globalWhite.release || 0) * 0.72),
     0,
     1
   );
+  const globalWhitePressureAdj = clamp(globalWhitePressure * (1 - (0.55 * globalEarlyRelax)), 0, 1);
+  const trendDownAdj = clamp(Number(regimeIntel.downRisk || 0) * (1 - (0.58 * globalEarlyRelax)), 0, 1);
   const globalSignals = {
     whiteRisk: Number(globalWhite.risk || 0),
     whiteRelease: Number(globalWhite.release || 0),
     whitePressure: Number(globalWhitePressure || 0),
+    whitePressureAdj: Number(globalWhitePressureAdj || 0),
     whiteRun: Number(globalWhite.currentRun || 0),
     trendDownRisk: Number(regimeIntel.downRisk || 0),
+    trendDownAdj: Number(trendDownAdj || 0),
     trendB2BPressure: Number(regimeIntel.b2bPressure || 0),
     trendB2B10Pressure: Number(regimeIntel.b2b10Pressure || 0),
     regimeSample: Number(regimeIntel.sample || 0),
     regimeHorizon: Number(regimeIntel.horizon || 0),
+    earlyRelax: Number(globalEarlyRelax || 0),
     aiGlobalPrior: Number(aiProfiles?.global?.prior || 0.5),
     aiGlobalReliability: Number(aiProfiles?.global?.reliability || 0.5),
     aiGlobalSample: Number(aiProfiles?.global?.sample || 0),
