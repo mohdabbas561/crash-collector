@@ -1148,6 +1148,8 @@ function buildAdaptiveWaitingWindow(nextLock, target, fixedSpan, currentRound, m
   const trendDownRisk = clamp(Number(eta.trendDownRisk || 0), 0, 1);
   const trendB2BPressure = clamp(Number(eta.trendB2BPressure || 0), 0, 1);
   const trendB2B10Pressure = clamp(Number(eta.trendB2B10Pressure || 0), 0, 1);
+  const aiProbability = clamp(Number(eta.aiProbability || 0), 0, 1);
+  const aiConfidence = clamp(Number(eta.aiConfidence || 0), 0, 1);
   const confidence = clamp(Number(eta.confidence || 0), 0, 1);
   const cooldown = clamp(Number(eta.calibrationCooldown || 0), 0, 1);
   const recentLossStreak = Math.max(0, Number(eta.calibrationRecentLossStreak || 0));
@@ -1231,6 +1233,14 @@ function buildAdaptiveWaitingWindow(nextLock, target, fixedSpan, currentRound, m
   if (target <= 20 && regimeB2BBoost >= 0.55 && trendDownRisk < 0.5 && (quick > 0.24 || b2bPull > 0.28)) {
     startAhead = Math.min(startAhead, Math.max(1, q20 + Math.round(span * 0.12)));
   }
+  startAhead += (
+    target <= 20 ? 6.2
+    : (target <= 100 ? 3.4 : 2.1)
+  ) * (1 - aiProbability) * aiConfidence;
+  startAhead -= (
+    target <= 20 ? 3.1
+    : (target <= 100 ? 2 : 1.2)
+  ) * aiProbability * aiConfidence;
   if (target >= 100 && sparseSignal > 0.18) {
     const sparseMinAhead = clamp(
       Math.round(empiricalMeanGap * (target >= 500 ? 0.52 : 0.44)),
@@ -1271,6 +1281,8 @@ function buildAdaptiveWaitingWindow(nextLock, target, fixedSpan, currentRound, m
       waitingTrendDownRisk: roundNum(trendDownRisk, 4),
       waitingTrendB2BPressure: roundNum(trendB2BPressure, 4),
       waitingTrendB2B10Pressure: roundNum(trendB2B10Pressure, 4),
+      waitingAIProbability: roundNum(aiProbability, 4),
+      waitingAIConfidence: roundNum(aiConfidence, 4),
       waitingDynamicCap: cap,
       waitingSparseSignal: roundNum(sparseSignal, 4),
       waitingCooldown: roundNum(cooldown, 4),
@@ -1315,6 +1327,8 @@ function shouldActivateWindow(target, nextLock, calibration = null, globalSignal
   const release = clamp(Number(eta.whiteReleaseSignal || 0), 0, 1);
   const b2bComposite = clamp(Number(eta.b2bComposite || 0), 0, 1);
   const highChainHint = clamp(Number(eta.highTargetChainHint || 0), 0, 1);
+  const aiProbability = clamp(Number(eta.aiProbability || eta.aiWinProbability || 0), 0, 1);
+  const aiConfidence = clamp(Number(eta.aiConfidence || 0), 0, 1);
   const cooldown = clamp(Number(eta.calibrationCooldown || 0), 0, 1);
   const sparseSignal = clamp(Number(eta.sparseSignal || 0), 0, 1);
   const globalWhitePressure = clamp(
@@ -1366,6 +1380,16 @@ function shouldActivateWindow(target, nextLock, calibration = null, globalSignal
     (0.22 * quick) +
     (0.18 * hard) +
     (0.16 * p1)
+  );
+  score += (
+    target <= 20 ? (0.22 * aiProbability)
+    : (target <= 100 ? (0.16 * aiProbability)
+      : (0.12 * aiProbability))
+  );
+  score += (
+    target <= 20 ? (0.08 * aiConfidence)
+    : (target <= 100 ? (0.05 * aiConfidence)
+      : (0.03 * aiConfidence))
   );
   if (target <= 10) {
     score += (0.07 * b2bComposite);
@@ -1431,11 +1455,17 @@ function shouldActivateWindow(target, nextLock, calibration = null, globalSignal
     if (trendDownRisk >= 0.6 && globalWhitePressure >= 0.38 && quick < 0.42 && b2bComposite < 0.45) {
       active = false;
     }
+    if (aiProbability <= 0.24 && aiConfidence >= 0.58 && quick < 0.3 && hard < 0.28) {
+      active = false;
+    }
     if (
       trendB2BPressure >= 0.62 &&
       trendDownRisk <= 0.52 &&
       (quick >= 0.22 || p1 >= (minP1 * 0.92) || b2bComposite >= 0.24)
     ) {
+      active = true;
+    }
+    if (aiProbability >= 0.62 && aiConfidence >= 0.42 && trendDownRisk < 0.62) {
       active = true;
     }
   } else if (target <= 100) {
@@ -1444,6 +1474,12 @@ function shouldActivateWindow(target, nextLock, calibration = null, globalSignal
       active = false;
     }
     if (trendDownRisk >= 0.7 && hard < 0.35 && b2bComposite < 0.35) {
+      active = false;
+    }
+    if (aiProbability >= 0.56 && aiConfidence >= 0.4) {
+      active = true;
+    }
+    if (aiProbability <= 0.22 && aiConfidence >= 0.62 && hard < 0.32) {
       active = false;
     }
   } else if (target <= 500) {
@@ -1631,6 +1667,238 @@ function buildCalibrationMap(historyRows, pre) {
   // === UPGRADE END ===
 }
 
+function sigmoid(v) {
+  const x = clamp(Number(v) || 0, -20, 20);
+  return 1 / (1 + Math.exp(-x));
+}
+
+function safeLogit(p) {
+  const pp = clamp(Number(p) || 0.5, 0.000001, 0.999999);
+  return Math.log(pp / (1 - pp));
+}
+
+function buildAIPredictorProfiles(historyRows = []) {
+  const rows = Array.isArray(historyRows) ? historyRows : [];
+  const byTarget = {};
+  const out = {};
+
+  for (const target of TARGETS) byTarget[target] = [];
+  for (const row of rows) {
+    const label = String(row?.target || '').trim().toLowerCase();
+    const target = Number(label.replace('x', ''));
+    if (!TARGETS.includes(target)) continue;
+    byTarget[target].push(row);
+  }
+
+  let globalWins = 0;
+  let globalLoss = 0;
+  let globalEarly = 0;
+  let globalWeight = 0;
+  let globalErrNum = 0;
+  let globalErrDen = 0;
+
+  for (const target of TARGETS) {
+    const list = byTarget[target];
+    let wWin = 0;
+    let wLoss = 0;
+    let wEarly = 0;
+    let errNum = 0;
+    let errDen = 0;
+    const n = list.length;
+
+    for (let i = 0; i < n; i++) {
+      const row = list[i];
+      const recency = 1 + (2 * (((n - i) / Math.max(1, n)) ** 2));
+      const outcome = String(row?.outcome || '').toLowerCase();
+      if (outcome === 'win') wWin += recency;
+      else if (outcome === 'loss') wLoss += recency;
+      else if (outcome === 'early') wEarly += recency;
+
+      const p = row?.probW;
+      if (Number.isFinite(Number(p))) {
+        const pv = clamp(Number(p), 0, 1);
+        const y = outcome === 'win' ? 1 : (outcome === 'early' ? 0.35 : 0);
+        errNum += Math.abs(pv - y) * recency;
+        errDen += recency;
+      }
+    }
+
+    const total = wWin + wLoss + wEarly;
+    const prior = clamp((wWin + (0.45 * wEarly) + 2) / Math.max(4, total + 4), 0.03, 0.97);
+    const denomWL = Math.max(1, wWin + wLoss);
+    const winRate = wWin / denomWL;
+    const earlyRate = total > 0 ? (wEarly / total) : 0;
+    const lossRate = total > 0 ? (wLoss / total) : 0;
+    const mae = errDen > 0 ? (errNum / errDen) : 0.3;
+    const wb = wilsonBounds(wWin, wLoss);
+    const reliability = clamp(
+      ((0.72 * wb.low) + (0.28 * prior)) *
+      (1 - (0.35 * earlyRate)) *
+      (1 - (0.55 * mae)),
+      0.04,
+      0.98
+    );
+
+    out[target] = {
+      prior: roundNum(prior, 6),
+      reliability: roundNum(reliability, 6),
+      winRate: roundNum(winRate, 6),
+      earlyRate: roundNum(earlyRate, 6),
+      lossRate: roundNum(lossRate, 6),
+      mae: roundNum(mae, 6),
+      sample: Math.round(total),
+      source: 'history-outcome-calibration',
+    };
+
+    globalWins += wWin;
+    globalLoss += wLoss;
+    globalEarly += wEarly;
+    globalWeight += total;
+    globalErrNum += errNum;
+    globalErrDen += errDen;
+  }
+
+  const globalPrior = clamp((globalWins + (0.45 * globalEarly) + 2) / Math.max(4, globalWeight + 4), 0.04, 0.96);
+  const globalMae = globalErrDen > 0 ? (globalErrNum / globalErrDen) : 0.32;
+  const globalWb = wilsonBounds(globalWins, globalLoss);
+  const globalEarlyRate = globalWeight > 0 ? (globalEarly / globalWeight) : 0;
+  const globalReliability = clamp(
+    ((0.72 * globalWb.low) + (0.28 * globalPrior)) *
+    (1 - (0.35 * globalEarlyRate)) *
+    (1 - (0.55 * globalMae)),
+    0.04,
+    0.98
+  );
+
+  out.global = {
+    prior: roundNum(globalPrior, 6),
+    reliability: roundNum(globalReliability, 6),
+    mae: roundNum(globalMae, 6),
+    earlyRate: roundNum(globalEarlyRate, 6),
+    sample: Math.round(globalWeight),
+    source: 'history-outcome-calibration',
+  };
+
+  return out;
+}
+
+function evaluateAIPredictorTarget({ target, nextLock, calibration = null, globalSignals = null, profile = null, globalProfile = null }) {
+  const eta = nextLock?.eta || {};
+  const conf = clamp(Number(eta.confidence || 0), 0, 1);
+  const p1 = clamp(Number(eta.pHit1 || 0), 0, 1);
+  const quick = clamp(Number(eta.quickHitEmpirical ?? eta.quickHitSignal ?? 0), 0, 1);
+  const hard = clamp(Number(eta.hardGapImpulse || 0), 0, 1);
+  const white = clamp(Number(eta.whiteSuppression ?? eta.whiteClusterSeverity ?? 0), 0, 1);
+  const release = clamp(Number(eta.whiteReleaseSignal || 0), 0, 1);
+  const b2b = clamp(Number(eta.b2bComposite || 0), 0, 1);
+  const highChain = clamp(Number(eta.highTargetChainHint || 0), 0, 1);
+  const sparse = clamp(Number(eta.sparseSignal || 0), 0, 1);
+  const cooldown = clamp(Number(eta.calibrationCooldown || calibration?.cooldownScore || 0), 0, 1);
+  const trendDownRisk = clamp(Number(globalSignals?.trendDownRisk ?? eta.trendDownRisk ?? 0), 0, 1);
+  const trendB2BPressure = clamp(Number(globalSignals?.trendB2BPressure ?? eta.trendB2BPressure ?? 0), 0, 1);
+  const trendB2B10Pressure = clamp(Number(globalSignals?.trendB2B10Pressure ?? eta.trendB2B10Pressure ?? 0), 0, 1);
+  const regimeB2BBoost = clamp(
+    target <= 20
+      ? trendB2BPressure
+      : (target <= 100
+        ? ((0.62 * trendB2BPressure) + (0.38 * trendB2B10Pressure))
+        : trendB2B10Pressure),
+    0,
+    1
+  );
+
+  const gp = globalProfile || { prior: 0.5, reliability: 0.5, mae: 0.32, sample: 0 };
+  const tp = profile || { prior: gp.prior, reliability: gp.reliability, mae: gp.mae, sample: 0 };
+  const prior = clamp(Number(tp.prior || gp.prior || 0.5), 0.02, 0.98);
+  const reliability = clamp(Number(tp.reliability || gp.reliability || 0.5), 0.02, 0.99);
+  const mae = clamp(Number(tp.mae || gp.mae || 0.32), 0, 1);
+  const sample = Math.max(0, Number(tp.sample || 0));
+  const p1Base = Math.max(0.01, Number(ACTIVATE_MIN_P1[target] || 0.05));
+
+  let z = safeLogit(prior);
+  z += 1.25 * (conf - 0.5);
+  z += 0.95 * ((p1 - p1Base) / Math.max(0.02, p1Base + 0.05));
+  z += 0.82 * (quick - 0.2);
+  z += 0.54 * (hard - 0.2);
+  z += 0.78 * (b2b - 0.24);
+  z -= 1.08 * white;
+  z += 0.66 * release;
+  z -= (target <= 20 ? 1.22 : 0.9) * trendDownRisk;
+  z += (target <= 20 ? 0.92 : 0.64) * regimeB2BBoost;
+  z -= 0.62 * cooldown;
+  z -= (target >= 100 ? 0.5 : 0.28) * sparse;
+  z += 0.46 * (reliability - 0.5);
+  z -= 0.36 * mae;
+  if (target >= 50) z += 0.34 * highChain;
+
+  const winProbability = clamp(sigmoid(z), 0.001, 0.999);
+  const sampleNorm = clamp(sample / 180, 0, 1);
+  const consistency = clamp(1 - Math.abs(quick - p1), 0, 1);
+  const aiConfidence = clamp(
+    0.28 + (0.4 * sampleNorm) + (0.18 * reliability) + (0.14 * consistency) - (0.2 * mae),
+    0.06,
+    0.98
+  );
+  const fusedConfidence = clamp(
+    (0.7 * conf) + (0.3 * ((winProbability + aiConfidence) * 0.5)),
+    0.04,
+    0.99
+  );
+  const score = clamp((0.72 * winProbability) + (0.28 * aiConfidence), 0, 1);
+
+  return {
+    probability: roundNum(winProbability, 6),
+    confidence: roundNum(aiConfidence, 6),
+    fusedConfidence: roundNum(fusedConfidence, 6),
+    score: roundNum(score, 6),
+    prior: roundNum(prior, 6),
+    reliability: roundNum(reliability, 6),
+    mae: roundNum(mae, 6),
+    sample: Math.round(sample),
+    source: 'ai-meta-v1',
+  };
+}
+
+function buildAIPredictorSummary(targetsOut, globalSignals = null, profiles = null) {
+  const rows = Array.isArray(targetsOut) ? targetsOut : [];
+  const byTarget = rows.map((row) => {
+    const aiP = clamp(Number(row?.signals?.aiProbability || 0), 0, 1);
+    const aiC = clamp(Number(row?.signals?.aiConfidence || 0), 0, 1);
+    const aiScore = clamp(Number(row?.signals?.aiScore || ((0.72 * aiP) + (0.28 * aiC))), 0, 1);
+    return {
+      target: Number(row.target || 0),
+      targetLabel: row.targetLabel || `${row.target}x`,
+      probability: roundNum(aiP, 6),
+      confidence: roundNum(aiC, 6),
+      score: roundNum(aiScore, 6),
+      status: row.status || 'unknown',
+      aheadLo: Number(row?.window?.aheadLo || 0),
+      aheadHi: Number(row?.window?.aheadHi || 0),
+    };
+  }).sort((a, b) => (b.score - a.score) || (a.aheadLo - b.aheadLo));
+
+  const top = byTarget[0] || null;
+  const trendDownRisk = clamp(Number(globalSignals?.trendDownRisk || 0), 0, 1);
+  const trendB2BPressure = clamp(Number(globalSignals?.trendB2BPressure || 0), 0, 1);
+  const trendB2B10Pressure = clamp(Number(globalSignals?.trendB2B10Pressure || 0), 0, 1);
+
+  let mode = 'balanced';
+  if (trendDownRisk >= 0.62) mode = 'downtrend-protect';
+  else if (trendB2B10Pressure >= 0.58 || trendB2BPressure >= 0.62) mode = 'b2b-attack';
+
+  return {
+    source: 'ai-meta-v1',
+    generatedAt: new Date().toISOString(),
+    mode,
+    trendDownRisk: roundNum(trendDownRisk, 6),
+    trendB2BPressure: roundNum(trendB2BPressure, 6),
+    trendB2B10Pressure: roundNum(trendB2B10Pressure, 6),
+    historySample: Number(profiles?.global?.sample || 0),
+    topTarget: top,
+    byTarget,
+  };
+}
+
 function buildUiTarget(target, lock, status, currentRound, previousOutcome = null) {
   const loAhead = Math.max(1, Number(lock.lo) - currentRound);
   const hiAhead = Math.max(loAhead, Number(lock.hi) - currentRound);
@@ -1678,6 +1946,12 @@ function buildUiTarget(target, lock, status, currentRound, previousOutcome = nul
       pGapLe1: roundNum(lock.eta?.pGapLe1 || 0, 6),
       pGapLe2: roundNum(lock.eta?.pGapLe2 || 0, 6),
       pGapLe3: roundNum(lock.eta?.pGapLe3 || 0, 6),
+      aiProbability: roundNum(lock.eta?.aiProbability || 0, 6),
+      aiConfidence: roundNum(lock.eta?.aiConfidence || 0, 6),
+      aiScore: roundNum(lock.eta?.aiScore || 0, 6),
+      trendDownRisk: roundNum(lock.eta?.trendDownRisk || 0, 6),
+      trendB2BPressure: roundNum(lock.eta?.trendB2BPressure || 0, 6),
+      trendB2B10Pressure: roundNum(lock.eta?.trendB2B10Pressure || 0, 6),
     },
     reason: lock.eta?.reason || 'Range locked from historical cluster-pattern analogs.',
     previousOutcome,
@@ -2580,7 +2854,9 @@ function buildAlertSummary(pre, currentIdx, targetsOut, globalSignals = null) {
 
 function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = {}) {
   const pre = preprocess(rounds || []);
-  const calibration = buildCalibrationMap(options.historyRows || [], pre);
+  const historyRows = Array.isArray(options?.historyRows) ? options.historyRows : [];
+  const calibration = buildCalibrationMap(historyRows, pre);
+  const aiProfiles = buildAIPredictorProfiles(historyRows);
   if (pre.n < 800) {
     return {
       model: 'range-lock-v11-selective',
@@ -2589,6 +2865,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       targets: [],
       locksToSave: {},
       resolvedHistory: [],
+      aiPredictor: buildAIPredictorSummary([], null, aiProfiles),
       summary: { pending: 0, windowOpen: 0, relocked: 0, sampleSize: pre.n },
       calibration,
       settings: { windowSpan: WINDOW_SPAN_PRIOR, adaptive: true },
@@ -2615,6 +2892,9 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
     trendB2B10Pressure: Number(regimeIntel.b2b10Pressure || 0),
     regimeSample: Number(regimeIntel.sample || 0),
     regimeHorizon: Number(regimeIntel.horizon || 0),
+    aiGlobalPrior: Number(aiProfiles?.global?.prior || 0.5),
+    aiGlobalReliability: Number(aiProfiles?.global?.reliability || 0.5),
+    aiGlobalSample: Number(aiProfiles?.global?.sample || 0),
   };
   const locksToSave = {};
   const resolvedHistory = [];
@@ -2671,11 +2951,33 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
           hi: existing.hi,
           hitRound: evalResult.hitRound,
           generation: existing.generation,
-          confidence: Number(existing?.eta?.confidence ?? null),
+          confidence: Number(existing?.eta?.aiProbability ?? existing?.eta?.confidence ?? null),
         });
       }
 
       const nextLock = buildWindow(pre, target, currentIdx, calibration[target], globalSignals);
+      const aiSignal = evaluateAIPredictorTarget({
+        target,
+        nextLock,
+        calibration: calibration[target],
+        globalSignals,
+        profile: aiProfiles?.[target],
+        globalProfile: aiProfiles?.global,
+      });
+      const fusedConfidence = clamp(Number(aiSignal.fusedConfidence || nextLock?.eta?.confidence || 0.5), 0.04, 0.99);
+      nextLock.eta = {
+        ...(nextLock.eta || {}),
+        confidence: roundNum(fusedConfidence, 4),
+        aiProbability: roundNum(aiSignal.probability, 6),
+        aiConfidence: roundNum(aiSignal.confidence, 6),
+        aiScore: roundNum(aiSignal.score, 6),
+        aiPrior: roundNum(aiSignal.prior, 6),
+        aiReliability: roundNum(aiSignal.reliability, 6),
+        aiMae: roundNum(aiSignal.mae, 6),
+        aiSample: Number(aiSignal.sample || 0),
+        aiSource: aiSignal.source || 'ai-meta-v1',
+      };
+      nextLock.confidence = roundNum(fusedConfidence, 4);
       // Only force non-overlap after a true miss.
       // For win/early we allow next lock to start from next round so engine can adapt.
       const lossCooldown = (
@@ -2809,6 +3111,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
   }
 
   targetsOut.sort((a, b) => a.target - b.target);
+  const aiPredictor = buildAIPredictorSummary(targetsOut, globalSignals, aiProfiles);
 
   return {
     model: 'range-lock-v11-selective',
@@ -2819,6 +3122,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
     locksToSave,
     resolvedHistory,
     calibration,
+    aiPredictor,
     settings: {
       windowSpan: WINDOW_SPAN_PRIOR,
       windowAheadCap: WINDOW_AHEAD_CAP,
@@ -2829,6 +3133,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       hardGapImpulse: true,
       calibrationSpanAdaptive: false,
       selectiveLocking: true,
+      aiMetaPredictor: true,
     },
     alertSummary: buildAlertSummary(pre, currentIdx, targetsOut, globalSignals),
     summary: {
