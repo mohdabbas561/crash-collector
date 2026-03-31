@@ -74,7 +74,7 @@ async function poll() {
 // FIX: uses offset pagination and stops when DB is caught up.
 // FIX: MAX_PAGES raised to 200 (20k rounds) from 50 (5k rounds).
 async function fillGap(latestInDb) {
-  if (!latestInDb) return;
+  if (latestInDb == null) return;
   console.log(`[gap-fill] DB latest: #${latestInDb} — checking for missed rounds...`);
   let offset = 0;
   let filled = 0;
@@ -131,6 +131,7 @@ async function startCollector() {
     // This ensures gap-fill starts from the real DB latest, not the API window.
     const dbRecent = await getRounds({ limit: 1, order: 'DESC' });
     const dbLatest = dbRecent.length ? dbRecent[dbRecent.length - 1].roundId : 0;
+    const gapFillBaseline = dbLatest;
     if (dbLatest > 0) {
       lastSeenRoundId = dbLatest;
       console.log(`Collector: DB latest round: #${dbLatest}`);
@@ -145,7 +146,7 @@ async function startCollector() {
     }
 
     // Fill any gap from offline downtime
-    await fillGap(lastSeenRoundId);
+    await fillGap(gapFillBaseline);
   } catch (e) {
     console.error('Collector: initial fetch failed:', e.message);
   }
