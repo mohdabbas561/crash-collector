@@ -2004,6 +2004,16 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
   const locksToSave = {};
   const resolvedHistory = [];
   const targetsOut = [];
+  const evaluatedByTarget = {};
+  let anyResolvedThisTick = false;
+
+  for (const target of TARGETS) {
+    const key = String(target);
+    const existing = normalizeLockInput(existingLocksRaw[key]);
+    const evalResult = evaluateLock(existing, target, pre, currentRound);
+    evaluatedByTarget[key] = { existing, evalResult };
+    if (evalResult.resolved) anyResolvedThisTick = true;
+  }
 
   let pendingCount = 0;
   let waitingCount = 0;
@@ -2012,8 +2022,9 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
 
   for (const target of TARGETS) {
     const key = String(target);
-    const existing = normalizeLockInput(existingLocksRaw[key]);
-    const evalResult = evaluateLock(existing, target, pre, currentRound);
+    const evaluated = evaluatedByTarget[key] || {};
+    const existing = evaluated.existing || normalizeLockInput(existingLocksRaw[key]);
+    const evalResult = evaluated.evalResult || evaluateLock(existing, target, pre, currentRound);
     const fixedSpan = Math.max(1, Number(WINDOW_SPAN_PRIOR[target] || 3));
     const existingSpan = existing ? Math.max(1, (Number(existing.hi) - Number(existing.lo) + 1)) : null;
     const spanMismatch = Boolean(existing && Number.isFinite(existingSpan) && existingSpan !== fixedSpan);
@@ -2024,7 +2035,9 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
 
     // Keep WAIT windows stable while alive, but refresh if:
     // 1) suspended window already expired, or
-    // 2) suspended lock was produced by older waiting model version.
+    // 2) suspended lock was produced by older waiting model version, or
+    // 3) suspended wait has reached its own start, or
+    // 4) another target resolved on this tick (global state shift).
     const suspendedExpired = Boolean(
       existing?.suspended &&
       Number.isFinite(Number(existing.hi)) &&
@@ -2034,7 +2047,22 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       existing?.suspended &&
       String(existing?.eta?.waitingModelVersion || '') !== WAITING_MODEL_VERSION
     );
-    const suspendedNeedsRefresh = suspendedExpired || suspendedVersionMismatch;
+    const suspendedReachedStart = Boolean(
+      existing?.suspended &&
+      Number.isFinite(Number(existing.lo)) &&
+      currentRound >= Number(existing.lo)
+    );
+    const suspendedRecomputeOnAnyResolve = Boolean(
+      anyResolvedThisTick &&
+      existing?.suspended &&
+      !evalResult.resolved
+    );
+    const suspendedNeedsRefresh = (
+      suspendedExpired ||
+      suspendedVersionMismatch ||
+      suspendedReachedStart ||
+      suspendedRecomputeOnAnyResolve
+    );
 
     if (!existing || evalResult.resolved || spanMismatch || suspendedNeedsRefresh) {
       if (existing && evalResult.resolved) {
@@ -2058,10 +2086,12 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       }
 
       const nextLock = buildWindow(pre, target, currentIdx, calibration[target]);
+      // Only force non-overlap after a true miss.
+      // For win/early we allow next lock to start from next round so engine can adapt.
       const minNextLo = (
         existing &&
         evalResult.resolved &&
-        evalResult.outcome !== 'early'
+        evalResult.outcome === 'loss'
       )
         ? Math.max(currentRound + 1, Number(existing.hi || 0) + 1)
         : (currentRound + 1);
