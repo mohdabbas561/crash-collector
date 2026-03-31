@@ -760,7 +760,7 @@ function hardGapImpulse(stats, pressure, target, currentGap) {
   return clamp(base * targetScale, 0, 1);
 }
 
-function buildWindow(pre, target, currentIdx, calibration = null) {
+function buildWindow(pre, target, currentIdx, calibration = null, globalSignals = null) {
   // === v7 SUPERVISED LEARNING & ADAPTIVE UPGRADE START ===
   // Justification: adaptive window center/span from blended predictors + white-cluster + calibration feedback.
   const currentRound = pre.rounds[currentIdx].roundId;
@@ -805,6 +805,11 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
     -0.8,
     0.8
   );
+  const globalWhiteRisk = clamp(Number(globalSignals?.whiteRisk || 0), 0, 1);
+  const globalWhiteRelease = clamp(Number(globalSignals?.whiteRelease || 0), 0, 1);
+  const globalWhitePressure = clamp(Number(globalSignals?.whitePressure || 0), 0, 1);
+  const calibrationCooldown = clamp(Number(calibration?.cooldownScore || 0), 0, 1);
+  const recentLossStreak = Math.max(0, Number(calibration?.recentLossStreak || 0));
   const interGaps = Array.isArray(stats.interGaps) ? stats.interGaps : [];
   const hitCount = Array.isArray(pre.hitRoundIds?.[target]) ? pre.hitRoundIds[target].length : 0;
   const sparseSignal = clamp((18 - hitCount) / 18, 0, 1);
@@ -893,6 +898,21 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
   if (lateBias > 0) {
     centerAhead += Math.max(0, Math.round(windowSpan * Math.min(0.32, lateBias * 0.7)));
   }
+  if (calibrationCooldown > 0) {
+    const cooldownShift = (
+      target <= 10 ? 3.2
+      : (target <= 50 ? 4.6
+        : (target <= 100 ? 6.5 : 9.5))
+    );
+    centerAhead += cooldownShift * calibrationCooldown;
+  }
+  if (target <= 20 && recentLossStreak >= 2) {
+    centerAhead += Math.min(8, recentLossStreak * 1.2);
+  }
+  if (target <= 20 && globalWhitePressure > 0.35) {
+    centerAhead += (target <= 10 ? 7.4 : 10.2) * globalWhitePressure;
+    centerAhead -= (target <= 10 ? 1.6 : 2.2) * globalWhiteRelease;
+  }
   if (target >= 100 && sparseSignal > 0.12) {
     const sparseFloorRaw = Math.max(
       q20,
@@ -950,6 +970,7 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
     (0.08 * calibrationPenalty) +
     (0.06 * b2bComposite) -
     (0.08 * whiteSuppression * (target >= 20 ? 1 : 0.65)) -
+    (0.12 * calibrationCooldown) -
     ((target >= 100 ? 0.1 : 0.05) * sparseSignal),
     0.04,
     0.98
@@ -1026,6 +1047,11 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
       calibrationEarlyRate: roundNum(calibration?.earlyRate || 0, 4),
       calibrationLossRate: roundNum(calibration?.lossRate || 0, 4),
       calibrationWilsonLow: roundNum(calibration?.wilsonLow || 0.5, 4),
+      calibrationCooldown: roundNum(calibrationCooldown, 4),
+      calibrationRecentLossStreak: Number(recentLossStreak || 0),
+      globalWhiteRisk: roundNum(globalWhiteRisk, 4),
+      globalWhiteRelease: roundNum(globalWhiteRelease, 4),
+      globalWhitePressure: roundNum(globalWhitePressure, 4),
       calibrationSpanMultiplier: 1,
     },
     confidence: roundNum(confidence, 4),
@@ -1075,7 +1101,11 @@ function buildAdaptiveWaitingWindow(nextLock, target, fixedSpan, currentRound, m
   const hard = clamp(Number(eta.hardGapImpulse ?? eta.hardGapPressure ?? 0), 0, 1);
   const white = clamp(Number(eta.whiteSuppression ?? eta.whiteClusterSeverity ?? 0), 0, 1);
   const release = clamp(Number(eta.whiteReleaseSignal || 0), 0, 1);
+  const globalWhitePressure = clamp(Number(eta.globalWhitePressure || 0), 0, 1);
+  const globalWhiteRelease = clamp(Number(eta.globalWhiteRelease || 0), 0, 1);
   const confidence = clamp(Number(eta.confidence || 0), 0, 1);
+  const cooldown = clamp(Number(eta.calibrationCooldown || 0), 0, 1);
+  const recentLossStreak = Math.max(0, Number(eta.calibrationRecentLossStreak || 0));
   const sparseSignal = clamp(Number(eta.sparseSignal || 0), 0, 1);
   const empiricalMeanGap = Math.max(1, Number(eta.empiricalMeanGap || historicalGapMean || q50 || 1));
   const b2bComposite = clamp(Number(eta.b2bComposite || 0), 0, 1);
@@ -1116,6 +1146,21 @@ function buildAdaptiveWaitingWindow(nextLock, target, fixedSpan, currentRound, m
   if (confidence < 0.45) {
     startAhead += (0.45 - confidence) * 3.5;
   }
+  if (cooldown > 0) {
+    const cooldownShift = (
+      target <= 10 ? 2.8
+      : (target <= 50 ? 4.2
+        : (target <= 100 ? 6.2 : 8.8))
+    );
+    startAhead += cooldownShift * cooldown;
+  }
+  if (target <= 20 && recentLossStreak >= 2) {
+    startAhead += Math.min(6, recentLossStreak);
+  }
+  if (target <= 20 && globalWhitePressure > 0.35) {
+    startAhead += (target <= 10 ? 6.6 : 9.2) * globalWhitePressure;
+    startAhead -= (target <= 10 ? 1.4 : 1.9) * globalWhiteRelease;
+  }
   if (target >= 100 && sparseSignal > 0.18) {
     const sparseMinAhead = clamp(
       Math.round(empiricalMeanGap * (target >= 500 ? 0.52 : 0.44)),
@@ -1155,6 +1200,7 @@ function buildAdaptiveWaitingWindow(nextLock, target, fixedSpan, currentRound, m
       waitingBlendB2BPull: roundNum(b2bPull, 4),
       waitingDynamicCap: cap,
       waitingSparseSignal: roundNum(sparseSignal, 4),
+      waitingCooldown: roundNum(cooldown, 4),
       waitingSource: 'hazard+gap+quick+hard+cluster',
     },
   };
@@ -1186,7 +1232,7 @@ function evaluateLock(lock, target, pre, currentRound) {
   return { resolved: false, status: 'window-open' };
 }
 
-function shouldActivateWindow(target, nextLock, calibration = null) {
+function shouldActivateWindow(target, nextLock, calibration = null, globalSignals = null) {
   const eta = nextLock?.eta || {};
   const confidence = clamp(Number(eta.confidence || 0), 0, 1);
   const p1 = clamp(Number(eta.pHit1 || 0), 0, 1);
@@ -1196,7 +1242,18 @@ function shouldActivateWindow(target, nextLock, calibration = null) {
   const release = clamp(Number(eta.whiteReleaseSignal || 0), 0, 1);
   const b2bComposite = clamp(Number(eta.b2bComposite || 0), 0, 1);
   const highChainHint = clamp(Number(eta.highTargetChainHint || 0), 0, 1);
+  const cooldown = clamp(Number(eta.calibrationCooldown || 0), 0, 1);
   const sparseSignal = clamp(Number(eta.sparseSignal || 0), 0, 1);
+  const globalWhitePressure = clamp(
+    Number(globalSignals?.whitePressure ?? eta.globalWhitePressure ?? 0),
+    0,
+    1
+  );
+  const globalWhiteRelease = clamp(
+    Number(globalSignals?.whiteRelease ?? eta.globalWhiteRelease ?? 0),
+    0,
+    1
+  );
   const calWilson = clamp(Number(calibration?.wilsonLow || 0.5), 0, 1);
   const calPenalty = clamp(
     (Number(calibration?.lossRate || 0) + Number(calibration?.earlyRate || 0)) * 0.35,
@@ -1229,6 +1286,18 @@ function shouldActivateWindow(target, nextLock, calibration = null) {
   if (target >= 100) {
     score -= (0.06 * sparseSignal * (1 - hard));
   }
+  if (target <= 20) {
+    score -= (0.34 * globalWhitePressure);
+    score += (0.08 * globalWhiteRelease);
+  } else if (target <= 100) {
+    score -= (0.16 * globalWhitePressure);
+    score += (0.06 * globalWhiteRelease);
+  }
+  score -= (
+    target <= 10 ? (0.16 * cooldown)
+    : (target <= 50 ? (0.14 * cooldown)
+      : (0.1 * cooldown))
+  );
   score = clamp((0.82 * score) + (0.18 * calWilson) - calPenalty, 0, 1);
 
   let active = false;
@@ -1239,8 +1308,24 @@ function shouldActivateWindow(target, nextLock, calibration = null) {
       b2bComposite >= 0.2 ||
       hard >= 0.18
     );
+    if (cooldown > 0.35) {
+      active = active && (
+        quick >= 0.24 ||
+        p1 >= (minP1 + 0.03) ||
+        b2bComposite >= 0.28
+      );
+    }
+    if (white >= 0.65 && release <= 0.35 && quick < 0.32 && b2bComposite < 0.34) {
+      active = false;
+    }
+    if (globalWhitePressure >= 0.48 && globalWhiteRelease <= 0.62 && quick < 0.36 && b2bComposite < 0.42) {
+      active = false;
+    }
   } else if (target <= 100) {
     active = (score >= minConf) && (p1 >= minP1 || hard >= 0.22 || b2bComposite >= 0.18);
+    if (white >= 0.68 && release <= 0.34 && hard < 0.3) {
+      active = false;
+    }
   } else if (target <= 500) {
     const sparseGate = sparseSignal > 0.22
       ? (hard >= 0.3 || highChainHint >= 0.2 || p1 >= (minP1 + 0.012))
@@ -1298,6 +1383,11 @@ function buildCalibrationMap(historyRows, pre) {
         lossRate: 0,
         wilsonLow: 0.5,
         confidenceScale: 0.5,
+        recentLossStreak: 0,
+        recentWinStreak: 0,
+        recentLossRate: 0,
+        recentEarlyRate: 0,
+        cooldownScore: 0,
       };
       continue;
     }
@@ -1373,6 +1463,30 @@ function buildCalibrationMap(historyRows, pre) {
     const shift = clamp(blendedShift * sampleFactor, -0.72, 0.72);
     const spanMultiplier = clamp((1 + absNormErr) * (1 + (earlyRate * 0.45)), 0.75, 2.9);
     const confidenceScale = clamp((wb.low + wb.mid) * 0.5, 0.1, 1);
+    const recentWindow = rows.slice(0, 18);
+    const recentTotal = Math.max(1, recentWindow.length);
+    const recentLossRate = recentWindow.filter(r => String(r?.outcome || '').toLowerCase() === 'loss').length / recentTotal;
+    const recentEarlyRate = recentWindow.filter(r => String(r?.outcome || '').toLowerCase() === 'early').length / recentTotal;
+    let recentLossStreak = 0;
+    let recentWinStreak = 0;
+    for (const row of recentWindow) {
+      const outc = String(row?.outcome || '').toLowerCase();
+      if (outc === 'loss') recentLossStreak += 1;
+      else break;
+    }
+    for (const row of recentWindow) {
+      const outc = String(row?.outcome || '').toLowerCase();
+      if (outc === 'win') recentWinStreak += 1;
+      else break;
+    }
+    const cooldownScore = clamp(
+      (0.62 * clamp(recentLossStreak / 5, 0, 1)) +
+      (0.28 * recentLossRate) +
+      (0.16 * recentEarlyRate) -
+      (0.2 * clamp(recentWinStreak / 4, 0, 1)),
+      0,
+      1
+    );
 
     out[target] = {
       shift: roundNum(shift, 4),
@@ -1386,6 +1500,11 @@ function buildCalibrationMap(historyRows, pre) {
       absNormError: roundNum(absNormErr, 4),
       wilsonLow: roundNum(wb.low, 4),
       confidenceScale: roundNum(confidenceScale, 4),
+      recentLossStreak: Number(recentLossStreak || 0),
+      recentWinStreak: Number(recentWinStreak || 0),
+      recentLossRate: roundNum(recentLossRate, 4),
+      recentEarlyRate: roundNum(recentEarlyRate, 4),
+      cooldownScore: roundNum(cooldownScore, 4),
     };
   }
   return out;
@@ -2153,6 +2272,18 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
 
   const currentIdx = pre.n - 1;
   const currentRound = pre.rounds[currentIdx].roundId;
+  const globalWhite = buildIndependentWhiteClusterAlert(pre, currentIdx);
+  const globalWhitePressure = clamp(
+    (Number(globalWhite.risk || 0) * 1.05) - (Number(globalWhite.release || 0) * 0.72),
+    0,
+    1
+  );
+  const globalSignals = {
+    whiteRisk: Number(globalWhite.risk || 0),
+    whiteRelease: Number(globalWhite.release || 0),
+    whitePressure: Number(globalWhitePressure || 0),
+    whiteRun: Number(globalWhite.currentRun || 0),
+  };
   const locksToSave = {};
   const resolvedHistory = [];
   const targetsOut = [];
@@ -2212,17 +2343,30 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
         });
       }
 
-      const nextLock = buildWindow(pre, target, currentIdx, calibration[target]);
+      const nextLock = buildWindow(pre, target, currentIdx, calibration[target], globalSignals);
       // Only force non-overlap after a true miss.
       // For win/early we allow next lock to start from next round so engine can adapt.
+      const lossCooldown = (
+        existing &&
+        evalResult.resolved &&
+        evalResult.outcome === 'loss'
+      )
+        ? Math.max(
+          0,
+          Math.round(
+            clamp(Number(calibration[target]?.cooldownScore || 0), 0, 1) *
+            (target <= 10 ? 3 : (target <= 50 ? 5 : 8))
+          )
+        )
+        : 0;
       const minNextLo = (
         existing &&
         evalResult.resolved &&
         evalResult.outcome === 'loss'
       )
-        ? Math.max(currentRound + 1, Number(existing.hi || 0) + 1)
+        ? Math.max(currentRound + 1, Number(existing.hi || 0) + 1) + lossCooldown
         : (currentRound + 1);
-      const activation = shouldActivateWindow(target, nextLock, calibration[target]);
+      const activation = shouldActivateWindow(target, nextLock, calibration[target], globalSignals);
       if (!activation.active) {
         const generation = existing ? Number(existing.generation || 1) : 1;
         // Engine-derived WAIT window with anti-drift guard:
