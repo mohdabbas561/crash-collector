@@ -822,6 +822,13 @@ function buildWindow(pre, target, currentIdx, calibration = null, globalSignals 
     0,
     1
   );
+  const earlyLeadBias = clamp(
+    (0.62 * calRecentEarlyRate) +
+    (0.38 * calEarlyRate) -
+    (0.35 * calRecentLossRate),
+    0,
+    1
+  );
   const whiteSuppressionAdj = clamp(whiteSuppression * (1 - (0.52 * earlyRelax)), 0, 1);
   const trendDownAdj = clamp(trendDownRisk * (1 - (0.58 * earlyRelax)), 0, 1);
   const globalWhitePressureAdj = clamp(globalWhitePressure * (1 - (0.55 * earlyRelax)), 0, 1);
@@ -979,6 +986,14 @@ function buildWindow(pre, target, currentIdx, calibration = null, globalSignals 
     Math.max(1, q20 - Math.max(1, (windowSpan * 0.35))),
     Math.max(1, q80 + Math.max(1, (windowSpan * 0.35)))
   );
+  if (target <= 20 && earlyLeadBias > 0) {
+    centerAhead = Math.max(
+      1,
+      centerAhead - (
+        (target <= 5 ? 2.2 : (target <= 10 ? 3.6 : 5.2)) * earlyLeadBias
+      )
+    );
+  }
 
   const skewDen = Math.max(0.000001, q80 - q20);
   const leftSkew = clamp((q50 - q20) / skewDen, 0.1, 0.9);
@@ -998,10 +1013,10 @@ function buildWindow(pre, target, currentIdx, calibration = null, globalSignals 
   if (target <= 20) {
     const lowTargetCap = clamp(
       Math.round(
-        (target <= 5 ? 10 : (target <= 10 ? 16 : 24)) +
-        ((target <= 10 ? 4 : 5) * trendDownAdj) +
-        ((target <= 10 ? 2 : 3) * globalWhitePressureAdj) -
-        ((target <= 10 ? 4 : 5) * earlyRelax)
+        (target <= 5 ? 8 : (target <= 10 ? 12 : 18)) +
+        ((target <= 10 ? 3 : 4) * trendDownAdj) +
+        ((target <= 10 ? 2 : 2.5) * globalWhitePressureAdj) -
+        ((target <= 10 ? 6 : 7) * earlyRelax)
       ),
       windowSpan + 1,
       Math.max(windowSpan + 2, cappedMaxAhead)
@@ -1191,6 +1206,13 @@ function buildAdaptiveWaitingWindow(nextLock, target, fixedSpan, currentRound, m
     0,
     1
   );
+  const earlyLeadBias = clamp(
+    (0.62 * calRecentEarlyRate) +
+    (0.38 * calEarlyRate) -
+    (0.35 * calRecentLossRate),
+    0,
+    1
+  );
   const trendDownAdj = clamp(trendDownRisk * (1 - (0.58 * earlyRelax)), 0, 1);
   const globalWhitePressureAdj = clamp(globalWhitePressure * (1 - (0.55 * earlyRelax)), 0, 1);
   const aiProbability = clamp(Number(eta.aiProbability || 0), 0, 1);
@@ -1263,7 +1285,7 @@ function buildAdaptiveWaitingWindow(nextLock, target, fixedSpan, currentRound, m
     startAhead -= (target <= 10 ? 1.4 : 1.9) * globalWhiteRelease;
   }
   startAhead += (
-    target <= 20 ? 2
+    target <= 20 ? 1.2
     : (target <= 100 ? 2.2
       : 1.5)
   ) * trendDownAdj;
@@ -1288,6 +1310,11 @@ function buildAdaptiveWaitingWindow(nextLock, target, fixedSpan, currentRound, m
     target <= 20 ? 2.8
     : (target <= 100 ? 1.8 : 1.1)
   ) * aiLeadStrength;
+  if (target <= 20 && earlyLeadBias > 0) {
+    startAhead -= (
+      (target <= 5 ? 1.8 : (target <= 10 ? 2.8 : 4.2)) * earlyLeadBias
+    );
+  }
   if (target >= 100 && sparseSignal > 0.18) {
     const sparseMinAhead = clamp(
       Math.round(empiricalMeanGap * (target >= 500 ? 0.52 : 0.44)),
@@ -1312,10 +1339,10 @@ function buildAdaptiveWaitingWindow(nextLock, target, fixedSpan, currentRound, m
   if (target <= 20) {
     const lowTargetCap = clamp(
       Math.round(
-        (target <= 5 ? 10 : (target <= 10 ? 16 : 24)) +
-        ((target <= 10 ? 4 : 5) * trendDownAdj) +
-        ((target <= 10 ? 2 : 3) * globalWhitePressureAdj) -
-        ((target <= 10 ? 4 : 5) * earlyRelax)
+        (target <= 5 ? 8 : (target <= 10 ? 12 : 18)) +
+        ((target <= 10 ? 3 : 4) * trendDownAdj) +
+        ((target <= 10 ? 2 : 2.5) * globalWhitePressureAdj) -
+        ((target <= 10 ? 6 : 7) * earlyRelax)
       ),
       1,
       maxStartAhead
