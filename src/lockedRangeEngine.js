@@ -808,6 +808,9 @@ function buildWindow(pre, target, currentIdx, calibration = null, globalSignals 
   const globalWhiteRisk = clamp(Number(globalSignals?.whiteRisk || 0), 0, 1);
   const globalWhiteRelease = clamp(Number(globalSignals?.whiteRelease || 0), 0, 1);
   const globalWhitePressure = clamp(Number(globalSignals?.whitePressure || 0), 0, 1);
+  const trendDownRisk = clamp(Number(globalSignals?.trendDownRisk || 0), 0, 1);
+  const trendB2BPressure = clamp(Number(globalSignals?.trendB2BPressure || 0), 0, 1);
+  const trendB2B10Pressure = clamp(Number(globalSignals?.trendB2B10Pressure || 0), 0, 1);
   const calibrationCooldown = clamp(Number(calibration?.cooldownScore || 0), 0, 1);
   const recentLossStreak = Math.max(0, Number(calibration?.recentLossStreak || 0));
   const interGaps = Array.isArray(stats.interGaps) ? stats.interGaps : [];
@@ -851,8 +854,20 @@ function buildWindow(pre, target, currentIdx, calibration = null, globalSignals 
   const highTargetChainHint = target >= 50
     ? clamp((Math.max(currentMult, prevMult) - Math.max(18, target * 0.35)) / Math.max(8, target * 0.45), 0, 1)
     : 0;
+  const regimeB2BBoost = clamp(
+    target <= 20
+      ? trendB2BPressure
+      : (target <= 100
+        ? ((0.62 * trendB2BPressure) + (0.38 * trendB2B10Pressure))
+        : trendB2B10Pressure),
+    0,
+    1
+  );
   const b2bComposite = clamp(
-    quickB2B + (target >= 50 ? (0.24 * highTargetChainHint) : 0),
+    quickB2B +
+    (target >= 50 ? (0.24 * highTargetChainHint) : 0) +
+    (target <= 20 ? (0.28 * regimeB2BBoost) : (0.16 * regimeB2BBoost)) -
+    (target <= 20 ? (0.22 * trendDownRisk) : (0.12 * trendDownRisk)),
     0,
     1
   );
@@ -867,6 +882,20 @@ function buildWindow(pre, target, currentIdx, calibration = null, globalSignals 
   centerAhead *= 1 + whiteDrift;
   centerAhead *= 1 - (releaseRelief * (target >= 50 ? 0.36 : (target >= 20 ? 0.3 : 0.22)));
   centerAhead *= 1 - (pressure.hard * 0.24);
+  if (trendDownRisk > 0) {
+    centerAhead *= 1 + (
+      target <= 10 ? (0.52 * trendDownRisk)
+      : (target <= 50 ? (0.34 * trendDownRisk)
+        : (0.2 * trendDownRisk))
+    );
+  }
+  if (regimeB2BBoost > 0) {
+    centerAhead *= 1 - (
+      target <= 20 ? (0.36 * regimeB2BBoost)
+      : (target <= 100 ? (0.24 * regimeB2BBoost)
+        : (0.16 * regimeB2BBoost))
+    );
+  }
 
   if (quickSignal > 0) {
     const quickAnchor = Math.max(1, (0.68 * neighQ20) + (0.32 * hazard.q20));
@@ -912,6 +941,14 @@ function buildWindow(pre, target, currentIdx, calibration = null, globalSignals 
   if (target <= 20 && globalWhitePressure > 0.35) {
     centerAhead += (target <= 10 ? 7.4 : 10.2) * globalWhitePressure;
     centerAhead -= (target <= 10 ? 1.6 : 2.2) * globalWhiteRelease;
+  }
+  if (target <= 20 && trendDownRisk >= 0.55 && releaseRelief < 0.58 && quickSignal < 0.45) {
+    const downFloor = q50 + (windowSpan * (0.45 + (0.55 * trendDownRisk)));
+    centerAhead = Math.max(centerAhead, downFloor);
+  }
+  if (target <= 20 && regimeB2BBoost >= 0.5 && trendDownRisk < 0.5 && (quickSignal > 0.22 || pGap2 > 0.12)) {
+    const b2bCeil = q20 + Math.max(1, Math.round(windowSpan * (0.14 + (0.32 * (1 - trendDownRisk)))));
+    centerAhead = Math.min(centerAhead, b2bCeil);
   }
   if (target >= 100 && sparseSignal > 0.12) {
     const sparseFloorRaw = Math.max(
@@ -970,6 +1007,8 @@ function buildWindow(pre, target, currentIdx, calibration = null, globalSignals 
     (0.08 * calibrationPenalty) +
     (0.06 * b2bComposite) -
     (0.08 * whiteSuppression * (target >= 20 ? 1 : 0.65)) -
+    ((target <= 20 ? 0.09 : (target <= 100 ? 0.05 : 0.03)) * trendDownRisk) +
+    ((target <= 20 ? 0.07 : 0.04) * regimeB2BBoost) -
     (0.12 * calibrationCooldown) -
     ((target >= 100 ? 0.1 : 0.05) * sparseSignal),
     0.04,
@@ -1052,6 +1091,9 @@ function buildWindow(pre, target, currentIdx, calibration = null, globalSignals 
       globalWhiteRisk: roundNum(globalWhiteRisk, 4),
       globalWhiteRelease: roundNum(globalWhiteRelease, 4),
       globalWhitePressure: roundNum(globalWhitePressure, 4),
+      trendDownRisk: roundNum(trendDownRisk, 4),
+      trendB2BPressure: roundNum(trendB2BPressure, 4),
+      trendB2B10Pressure: roundNum(trendB2B10Pressure, 4),
       calibrationSpanMultiplier: 1,
     },
     confidence: roundNum(confidence, 4),
@@ -1103,6 +1145,9 @@ function buildAdaptiveWaitingWindow(nextLock, target, fixedSpan, currentRound, m
   const release = clamp(Number(eta.whiteReleaseSignal || 0), 0, 1);
   const globalWhitePressure = clamp(Number(eta.globalWhitePressure || 0), 0, 1);
   const globalWhiteRelease = clamp(Number(eta.globalWhiteRelease || 0), 0, 1);
+  const trendDownRisk = clamp(Number(eta.trendDownRisk || 0), 0, 1);
+  const trendB2BPressure = clamp(Number(eta.trendB2BPressure || 0), 0, 1);
+  const trendB2B10Pressure = clamp(Number(eta.trendB2B10Pressure || 0), 0, 1);
   const confidence = clamp(Number(eta.confidence || 0), 0, 1);
   const cooldown = clamp(Number(eta.calibrationCooldown || 0), 0, 1);
   const recentLossStreak = Math.max(0, Number(eta.calibrationRecentLossStreak || 0));
@@ -1111,6 +1156,15 @@ function buildAdaptiveWaitingWindow(nextLock, target, fixedSpan, currentRound, m
   const b2bComposite = clamp(Number(eta.b2bComposite || 0), 0, 1);
   const highChainHint = clamp(Number(eta.highTargetChainHint || 0), 0, 1);
   const centerAhead = Math.max(1, Number(eta.centerAhead || q50));
+  const regimeB2BBoost = clamp(
+    target <= 20
+      ? trendB2BPressure
+      : (target <= 100
+        ? ((0.65 * trendB2BPressure) + (0.35 * trendB2B10Pressure))
+        : trendB2B10Pressure),
+    0,
+    1
+  );
   const expectedFromP1 = pHit1 > 0 ? clamp(1 / pHit1, 1, maxStartAhead) : maxStartAhead;
   const b2bPull = clamp(
     (target <= 20
@@ -1161,6 +1215,22 @@ function buildAdaptiveWaitingWindow(nextLock, target, fixedSpan, currentRound, m
     startAhead += (target <= 10 ? 6.6 : 9.2) * globalWhitePressure;
     startAhead -= (target <= 10 ? 1.4 : 1.9) * globalWhiteRelease;
   }
+  startAhead += (
+    target <= 20 ? 8.6
+    : (target <= 100 ? 5.1
+      : 3.1)
+  ) * trendDownRisk;
+  startAhead -= (
+    target <= 20 ? 4.1
+    : (target <= 100 ? 2.3
+      : 1.5)
+  ) * regimeB2BBoost;
+  if (target <= 20 && trendDownRisk >= 0.62 && quick < 0.42 && b2bPull < 0.45) {
+    startAhead = Math.max(startAhead, q50 + (span * 0.75));
+  }
+  if (target <= 20 && regimeB2BBoost >= 0.55 && trendDownRisk < 0.5 && (quick > 0.24 || b2bPull > 0.28)) {
+    startAhead = Math.min(startAhead, Math.max(1, q20 + Math.round(span * 0.12)));
+  }
   if (target >= 100 && sparseSignal > 0.18) {
     const sparseMinAhead = clamp(
       Math.round(empiricalMeanGap * (target >= 500 ? 0.52 : 0.44)),
@@ -1198,6 +1268,9 @@ function buildAdaptiveWaitingWindow(nextLock, target, fixedSpan, currentRound, m
       waitingBlendConfidence: roundNum(confidence, 4),
       waitingBlendExpectedFromP1: roundNum(expectedFromP1, 2),
       waitingBlendB2BPull: roundNum(b2bPull, 4),
+      waitingTrendDownRisk: roundNum(trendDownRisk, 4),
+      waitingTrendB2BPressure: roundNum(trendB2BPressure, 4),
+      waitingTrendB2B10Pressure: roundNum(trendB2B10Pressure, 4),
       waitingDynamicCap: cap,
       waitingSparseSignal: roundNum(sparseSignal, 4),
       waitingCooldown: roundNum(cooldown, 4),
@@ -1254,6 +1327,30 @@ function shouldActivateWindow(target, nextLock, calibration = null, globalSignal
     0,
     1
   );
+  const trendDownRisk = clamp(
+    Number(globalSignals?.trendDownRisk ?? eta.trendDownRisk ?? 0),
+    0,
+    1
+  );
+  const trendB2BPressure = clamp(
+    Number(globalSignals?.trendB2BPressure ?? eta.trendB2BPressure ?? 0),
+    0,
+    1
+  );
+  const trendB2B10Pressure = clamp(
+    Number(globalSignals?.trendB2B10Pressure ?? eta.trendB2B10Pressure ?? 0),
+    0,
+    1
+  );
+  const regimeB2BBoost = clamp(
+    target <= 20
+      ? trendB2BPressure
+      : (target <= 100
+        ? ((0.62 * trendB2BPressure) + (0.38 * trendB2B10Pressure))
+        : trendB2B10Pressure),
+    0,
+    1
+  );
   const calWilson = clamp(Number(calibration?.wilsonLow || 0.5), 0, 1);
   const calPenalty = clamp(
     (Number(calibration?.lossRate || 0) + Number(calibration?.earlyRate || 0)) * 0.35,
@@ -1294,6 +1391,16 @@ function shouldActivateWindow(target, nextLock, calibration = null, globalSignal
     score += (0.06 * globalWhiteRelease);
   }
   score -= (
+    target <= 20 ? (0.22 * trendDownRisk)
+    : (target <= 100 ? (0.14 * trendDownRisk)
+      : (0.08 * trendDownRisk))
+  );
+  score += (
+    target <= 20 ? (0.16 * regimeB2BBoost)
+    : (target <= 100 ? (0.1 * regimeB2BBoost)
+      : (0.08 * regimeB2BBoost))
+  );
+  score -= (
     target <= 10 ? (0.16 * cooldown)
     : (target <= 50 ? (0.14 * cooldown)
       : (0.1 * cooldown))
@@ -1321,9 +1428,22 @@ function shouldActivateWindow(target, nextLock, calibration = null, globalSignal
     if (globalWhitePressure >= 0.48 && globalWhiteRelease <= 0.62 && quick < 0.36 && b2bComposite < 0.42) {
       active = false;
     }
+    if (trendDownRisk >= 0.6 && globalWhitePressure >= 0.38 && quick < 0.42 && b2bComposite < 0.45) {
+      active = false;
+    }
+    if (
+      trendB2BPressure >= 0.62 &&
+      trendDownRisk <= 0.52 &&
+      (quick >= 0.22 || p1 >= (minP1 * 0.92) || b2bComposite >= 0.24)
+    ) {
+      active = true;
+    }
   } else if (target <= 100) {
     active = (score >= minConf) && (p1 >= minP1 || hard >= 0.22 || b2bComposite >= 0.18);
     if (white >= 0.68 && release <= 0.34 && hard < 0.3) {
+      active = false;
+    }
+    if (trendDownRisk >= 0.7 && hard < 0.35 && b2bComposite < 0.35) {
       active = false;
     }
   } else if (target <= 500) {
@@ -2037,7 +2157,183 @@ function buildWhiteContextB2BAdjusters(pre, currentIdx) {
   return out;
 }
 
-function buildAlertSummary(pre, currentIdx, targetsOut) {
+function evaluateRegimeFuture(rounds, startIdx, endIdx) {
+  const s = clamp(startIdx, 0, Math.max(0, rounds.length - 1));
+  const e = clamp(endIdx, s, Math.max(0, rounds.length - 1));
+  let lowRun3 = 0;
+  let maxLowRun3 = 0;
+  let countLt3 = 0;
+  let countLt4 = 0;
+  let b2b5 = false;
+  let b2b10 = false;
+  let last5 = -999;
+  let last10 = -999;
+
+  for (let i = s; i <= e; i++) {
+    const m = Number(rounds[i]?.multiplier || 0);
+    if (m < 3) {
+      countLt3 += 1;
+      lowRun3 += 1;
+      if (lowRun3 > maxLowRun3) maxLowRun3 = lowRun3;
+    } else {
+      lowRun3 = 0;
+    }
+    if (m < 4) countLt4 += 1;
+    if (m >= 5) {
+      if ((i - last5) <= 2) b2b5 = true;
+      last5 = i;
+    }
+    if (m >= 10) {
+      if ((i - last10) <= 2) b2b10 = true;
+      last10 = i;
+    }
+  }
+
+  const downEvent = maxLowRun3 >= 3 || countLt4 >= 4 || countLt3 >= 3;
+  const b2bEvent = b2b10 || b2b5;
+  return {
+    downEvent,
+    b2bEvent,
+    b2b5,
+    b2b10,
+    maxLowRun3,
+    countLt3,
+    countLt4,
+  };
+}
+
+function buildRegimeIntelligence(pre, currentIdx) {
+  const rounds = pre.rounds || [];
+  const n = Number(pre.n || rounds.length || 0);
+  if (!n || currentIdx < 80) {
+    return {
+      downRisk: 0,
+      b2bPressure: 0,
+      b2b10Pressure: 0,
+      sample: 0,
+      horizon: 6,
+      source: 'regime-analog-v1',
+    };
+  }
+
+  const horizon = 6;
+  const curTrend = Number(pre.trendByIdx?.[currentIdx] || 0);
+  const curVol = Number(pre.volRatioByIdx?.[currentIdx] || 1);
+  const curUnder2 = Number(pre.under2RateByIdx?.[currentIdx] || 0);
+  const curRun = Number(pre.whiteStreak?.[currentIdx] || 0);
+  const curRegime = String(pre.regimeByIdx?.[currentIdx] || 'balanced');
+  const curPeak3 = Math.max(
+    Number(rounds[currentIdx]?.multiplier || 0),
+    Number(rounds[Math.max(0, currentIdx - 1)]?.multiplier || 0),
+    Number(rounds[Math.max(0, currentIdx - 2)]?.multiplier || 0)
+  );
+
+  const start = Math.max(120, currentIdx - 240000);
+  const rawSpan = Math.max(1, currentIdx - start);
+  const maxScan = 70000;
+  const stride = Math.max(1, Math.floor(rawSpan / maxScan));
+  let totalW = 0;
+  let downW = 0;
+  let b2bW = 0;
+  let b2b10W = 0;
+
+  for (let idx = start; idx < currentIdx - horizon - 1; idx += stride) {
+    let dist = 0;
+    dist += 2.2 * Math.abs(curTrend - Number(pre.trendByIdx?.[idx] || 0));
+    dist += 1.15 * Math.abs(curVol - Number(pre.volRatioByIdx?.[idx] || 1));
+    dist += 1.25 * Math.abs(curUnder2 - Number(pre.under2RateByIdx?.[idx] || 0));
+    dist += 0.38 * Math.abs(curRun - Number(pre.whiteStreak?.[idx] || 0));
+    if (String(pre.regimeByIdx?.[idx] || 'balanced') !== curRegime) dist += 0.42;
+    dist += 0.2 * sequenceLogDistance(rounds, currentIdx, idx, 8);
+
+    const recency = 0.42 + (0.58 * ((idx + 1) / Math.max(1, currentIdx)) ** 1.18);
+    const weight = Math.exp(-dist * 0.9) * recency;
+    if (weight < 0.001) continue;
+
+    totalW += weight;
+    const fut = evaluateRegimeFuture(rounds, idx + 1, idx + horizon);
+    if (fut.downEvent) downW += weight;
+    if (fut.b2bEvent) b2bW += weight;
+    if (fut.b2b10) b2b10W += weight;
+  }
+
+  const recentWindow = clamp(Math.round(Math.sqrt(Math.max(1, n)) * 1.35), 30, 180);
+  const recentStart = Math.max(0, currentIdx - recentWindow + 1);
+  let recentLt3 = 0;
+  let recentLt4 = 0;
+  for (let i = recentStart; i <= currentIdx; i++) {
+    const m = Number(rounds[i]?.multiplier || 0);
+    if (m < 3) recentLt3 += 1;
+    if (m < 4) recentLt4 += 1;
+  }
+  const recentLt3Rate = recentLt3 / Math.max(1, currentIdx - recentStart + 1);
+  const recentLt4Rate = recentLt4 / Math.max(1, currentIdx - recentStart + 1);
+  const baseDown = clamp(
+    (0.45 * recentLt3Rate) +
+    (0.3 * recentLt4Rate) +
+    (0.15 * clamp((-curTrend) / 0.08, 0, 1)) +
+    (0.1 * clamp((curUnder2 - 0.55) / 0.35, 0, 1)),
+    0.04,
+    0.94
+  );
+  const baseB2B = clamp(
+    (0.58 * Number(pre.gapStats?.[5]?.quick?.global?.le2 || 0)) +
+    (0.28 * Number(pre.gapStats?.[10]?.quick?.global?.le2 || 0)) +
+    (0.14 * Number(pre.gapStats?.[20]?.quick?.global?.le2 || 0)),
+    0.02,
+    0.82
+  );
+  const baseB2B10 = clamp(
+    (0.62 * Number(pre.gapStats?.[10]?.quick?.global?.le2 || 0)) +
+    (0.38 * Number(pre.gapStats?.[20]?.quick?.global?.le2 || 0)),
+    0.01,
+    0.8
+  );
+  const alpha = totalW >= 30 ? 6 : 10;
+  const condDown = clamp((downW + (alpha * baseDown)) / Math.max(0.0001, totalW + alpha), 0, 1);
+  const condB2B = clamp((b2bW + (alpha * baseB2B)) / Math.max(0.0001, totalW + alpha), 0, 1);
+  const condB2B10 = clamp((b2b10W + (alpha * baseB2B10)) / Math.max(0.0001, totalW + alpha), 0, 1);
+
+  let downRisk = clamp((condDown - baseDown) / Math.max(0.05, 1 - baseDown), 0, 1);
+  downRisk = clamp(
+    downRisk +
+    (0.24 * clamp(curRun / 5, 0, 1)) +
+    (0.2 * clamp((-curTrend) / 0.08, 0, 1)) +
+    (0.14 * clamp((curUnder2 - 0.55) / 0.35, 0, 1)),
+    0,
+    1
+  );
+
+  let b2bPressure = clamp((condB2B - baseB2B) / Math.max(0.05, 1 - baseB2B), 0, 1);
+  b2bPressure = clamp(
+    b2bPressure +
+    (0.22 * clamp(curTrend / 0.08, 0, 1)) +
+    (0.16 * clamp((1.12 - curUnder2) / 0.42, 0, 1)) +
+    (0.18 * clamp(curPeak3 / 14, 0, 1)),
+    0,
+    1
+  );
+
+  let b2b10Pressure = clamp((condB2B10 - baseB2B10) / Math.max(0.05, 1 - baseB2B10), 0, 1);
+  b2b10Pressure = clamp(
+    b2b10Pressure +
+    (0.28 * clamp(curPeak3 / 24, 0, 1)) +
+    (0.12 * clamp(curTrend / 0.08, 0, 1)),
+    0,
+    1
+  );
+
+  return {
+    downRisk: roundNum(downRisk, 6),
+    b2bPressure: roundNum(b2bPressure, 6),
+    b2b10Pressure: roundNum(b2b10Pressure, 6),
+    sample: Math.round(totalW),
+    horizon,
+    source: 'regime-analog-v1',
+  };
+}
+
+function buildAlertSummary(pre, currentIdx, targetsOut, globalSignals = null) {
   const byTargetUi = {};
   for (const row of (targetsOut || [])) byTargetUi[Number(row.target)] = row;
 
@@ -2049,6 +2345,9 @@ function buildAlertSummary(pre, currentIdx, targetsOut) {
     1
   );
   const whiteBlend = clamp(0.18 + (0.82 * whitePressure), 0, 1);
+  const trendDownRisk = clamp(Number(globalSignals?.trendDownRisk || 0), 0, 1);
+  const trendB2BPressure = clamp(Number(globalSignals?.trendB2BPressure || 0), 0, 1);
+  const trendB2B10Pressure = clamp(Number(globalSignals?.trendB2B10Pressure || 0), 0, 1);
 
   const b2bByTarget = TARGETS.map((target) => {
     const calc = buildIndependentB2BTargetAlert(pre, target, currentIdx);
@@ -2062,7 +2361,23 @@ function buildAlertSummary(pre, currentIdx, targetsOut) {
       ratioAdj = Math.max(ratioAdj, clamp(0.82 + (0.55 * Number(calc.highChainScore || 0)), 0.82, 1.4));
     }
     const blendFactor = (1 - targetWhiteBlend) + (targetWhiteBlend * ratioAdj);
-    const effectiveProbability = clamp(rawProbability * blendFactor, 0, 1);
+    const downAdjust = clamp(
+      target <= 20
+        ? (1 - (0.45 * trendDownRisk))
+        : (1 - (0.22 * trendDownRisk)),
+      0.45,
+      1.2
+    );
+    const b2bBoost = clamp(
+      target <= 20
+        ? (1 + (0.35 * trendB2BPressure))
+        : (target <= 100
+          ? (1 + (0.18 * ((0.6 * trendB2BPressure) + (0.4 * trendB2B10Pressure))))
+          : (1 + (0.22 * trendB2B10Pressure))),
+      0.8,
+      1.65
+    );
+    const effectiveProbability = clamp(rawProbability * blendFactor * downAdjust * b2bBoost, 0, 1);
     const baseRef = clamp(Number(adj.baseP3 || 0), 0, 1);
     const lift = clamp(effectiveProbability / Math.max(0.02, baseRef || 0.02), 0, 4);
     const gain = clamp(effectiveProbability - baseRef, -1, 1);
@@ -2184,13 +2499,21 @@ function buildAlertSummary(pre, currentIdx, targetsOut) {
     (topB2BRaw?.rawProbability || 0) > (topB2B?.effectiveProbability || 0) + 0.08
   );
   let dominantSignal = 'neutral';
-  if ((topB2BHigh?.effectiveProbability || 0) >= 0.2 && (topB2BHighRaw?.rawProbability || 0) >= 0.18) {
+  if (
+    trendB2B10Pressure >= 0.62 ||
+    ((topB2BHigh?.effectiveProbability || 0) >= 0.2 && (topB2BHighRaw?.rawProbability || 0) >= 0.18)
+  ) {
     dominantSignal = 'b2b_spike';
-  } else if (b2bSuppressedByWhite || whitePressure >= 0.58 || (white.currentRun >= 3 && white.risk >= 0.52)) {
+  } else if (
+    trendDownRisk >= 0.62 ||
+    b2bSuppressedByWhite ||
+    whitePressure >= 0.58 ||
+    (white.currentRun >= 3 && white.risk >= 0.52)
+  ) {
     dominantSignal = 'white_cluster';
-  } else if ((topB2B?.effectiveProbability || 0) >= 0.32) {
+  } else if ((topB2B?.effectiveProbability || 0) >= 0.32 || trendB2BPressure >= 0.48) {
     dominantSignal = 'b2b';
-  } else if (white.risk >= 0.34) {
+  } else if (white.risk >= 0.34 || trendDownRisk >= 0.42) {
     dominantSignal = 'white_watch';
   }
   const hardGapRisk = (targetsOut || []).length
@@ -2248,6 +2571,9 @@ function buildAlertSummary(pre, currentIdx, targetsOut) {
     whiteAheadHi: Number(white.aheadHi || 5),
     whiteSamples: Number(white.samples || 0),
     whiteBaseRate: roundNum(white.whiteRate, 6),
+    trendDownRisk: roundNum(trendDownRisk, 6),
+    trendB2BPressure: roundNum(trendB2BPressure, 6),
+    trendB2B10Pressure: roundNum(trendB2B10Pressure, 6),
     hardGapRisk: roundNum(hardGapRisk, 6),
   };
 }
@@ -2273,6 +2599,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
   const currentIdx = pre.n - 1;
   const currentRound = pre.rounds[currentIdx].roundId;
   const globalWhite = buildIndependentWhiteClusterAlert(pre, currentIdx);
+  const regimeIntel = buildRegimeIntelligence(pre, currentIdx);
   const globalWhitePressure = clamp(
     (Number(globalWhite.risk || 0) * 1.05) - (Number(globalWhite.release || 0) * 0.72),
     0,
@@ -2283,6 +2610,11 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
     whiteRelease: Number(globalWhite.release || 0),
     whitePressure: Number(globalWhitePressure || 0),
     whiteRun: Number(globalWhite.currentRun || 0),
+    trendDownRisk: Number(regimeIntel.downRisk || 0),
+    trendB2BPressure: Number(regimeIntel.b2bPressure || 0),
+    trendB2B10Pressure: Number(regimeIntel.b2b10Pressure || 0),
+    regimeSample: Number(regimeIntel.sample || 0),
+    regimeHorizon: Number(regimeIntel.horizon || 0),
   };
   const locksToSave = {};
   const resolvedHistory = [];
@@ -2498,7 +2830,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       calibrationSpanAdaptive: false,
       selectiveLocking: true,
     },
-    alertSummary: buildAlertSummary(pre, currentIdx, targetsOut),
+    alertSummary: buildAlertSummary(pre, currentIdx, targetsOut, globalSignals),
     summary: {
       pending: pendingCount,
       waiting: waitingCount,
