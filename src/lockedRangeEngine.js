@@ -2087,7 +2087,9 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
           const existingLo = Number(existing.lo);
           const existingHi = Number(existing.hi);
           const candidateLo = Number(waitingCandidate.lo);
-          const canCountdown = existingHi >= currentRound;
+          // Keep sticky WAIT only while the previous window is still fully ahead.
+          // If current round already reached prior lo, allow recompute forward now.
+          const canCountdown = existingLo > currentRound;
           const candidatePushesOut = candidateLo > existingLo;
           const existingBlendConfidence = clamp(Number(existing?.eta?.waitingBlendConfidence ?? existing?.eta?.confidence ?? 0), 0, 1);
           const candidateBlendConfidence = clamp(

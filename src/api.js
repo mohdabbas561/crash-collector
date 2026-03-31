@@ -124,6 +124,7 @@ const LOCKED_HISTORY_PREFETCH_LIMIT = Math.max(
 );
 const STRICT_FRESH_MODE = String(process.env.STRICT_FRESH_MODE || 'true').trim().toLowerCase() !== 'false';
 const LOCKED_USE_FULL_DATA = String(process.env.LOCKED_USE_FULL_DATA || 'true').trim().toLowerCase() !== 'false';
+const LOCKED_BACKGROUND_ENABLED = String(process.env.LOCKED_BACKGROUND_ENABLED || 'true').trim().toLowerCase() !== 'false';
 const LOCKED_BACKGROUND_INTERVAL_MS = toPositiveInt(process.env.LOCKED_BACKGROUND_INTERVAL_MS, 30000);
 const HISTORY_TARGETS = ['5x', '10x', '20x', '50x', '100x', '500x', '1000x'];
 
@@ -444,7 +445,6 @@ async function ensurePredictFresh({ limit }) {
 }
 
 async function refreshLockedPredictionInBackground() {
-  if (STRICT_FRESH_MODE) return;
   try {
     const latestRound = await getLatestRoundId();
     if (latestRound == null) return;
@@ -783,12 +783,12 @@ function startAPI() {
     setDatabaseAvailability(false, e.message);
     console.error('initWalletStorage error:', e.message);
   });
-  if (!STRICT_FRESH_MODE && !lockedBackgroundTimer) {
+  if (LOCKED_BACKGROUND_ENABLED && !lockedBackgroundTimer) {
     refreshLockedPredictionInBackground().catch(e => console.error('[locked-bg] warmup error:', e.message));
     lockedBackgroundTimer = setInterval(() => {
       refreshLockedPredictionInBackground().catch(e => console.error('[locked-bg] tick error:', e.message));
     }, LOCKED_BACKGROUND_INTERVAL_MS);
-    console.log(`[locked-bg] running every ${LOCKED_BACKGROUND_INTERVAL_MS}ms (${LOCKED_USE_FULL_DATA ? 'full-data mode' : 'limited mode'})`);
+    console.log(`[locked-bg] running every ${LOCKED_BACKGROUND_INTERVAL_MS}ms (${LOCKED_USE_FULL_DATA ? 'full-data mode' : 'limited mode'}, strict=${STRICT_FRESH_MODE ? 'on' : 'off'})`);
   }
   if (STRICT_FRESH_MODE) {
     console.log('[strict-fresh] enabled (stale response cache disabled)');
