@@ -1793,6 +1793,7 @@ function evaluateAIPredictorTarget({ target, nextLock, calibration = null, globa
   const b2b = clamp(Number(eta.b2bComposite || 0), 0, 1);
   const highChain = clamp(Number(eta.highTargetChainHint || 0), 0, 1);
   const sparse = clamp(Number(eta.sparseSignal || 0), 0, 1);
+  const empiricalMeanGap = Math.max(1, Number(eta.empiricalMeanGap || eta.historicalGapMean || 10));
   const cooldown = clamp(Number(eta.calibrationCooldown || calibration?.cooldownScore || 0), 0, 1);
   const trendDownRisk = clamp(Number(globalSignals?.trendDownRisk ?? eta.trendDownRisk ?? 0), 0, 1);
   const trendB2BPressure = clamp(Number(globalSignals?.trendB2BPressure ?? eta.trendB2BPressure ?? 0), 0, 1);
@@ -1814,6 +1815,13 @@ function evaluateAIPredictorTarget({ target, nextLock, calibration = null, globa
   const mae = clamp(Number(tp.mae || gp.mae || 0.32), 0, 1);
   const sample = Math.max(0, Number(tp.sample || 0));
   const p1Base = Math.max(0.01, Number(ACTIVATE_MIN_P1[target] || 0.05));
+  const reachScale = (
+    target <= 20 ? 7
+    : (target <= 100 ? 10
+      : (target <= 500 ? 14 : 18))
+  );
+  const reachPrior = clamp(reachScale / empiricalMeanGap, 0.003, 0.9);
+  const targetDifficulty = clamp(Math.log10(Math.max(2, target)) / 3, 0.18, 1);
 
   let z = safeLogit(prior);
   z += 1.25 * (conf - 0.5);
@@ -1829,9 +1837,18 @@ function evaluateAIPredictorTarget({ target, nextLock, calibration = null, globa
   z -= (target >= 100 ? 0.5 : 0.28) * sparse;
   z += 0.46 * (reliability - 0.5);
   z -= 0.36 * mae;
+  z += 0.9 * ((reachPrior - 0.12) / 0.22);
+  z -= (target >= 100 ? 0.95 : (target >= 50 ? 0.45 : 0.1)) * (1 - reachPrior);
+  z -= (0.32 + (0.58 * trendDownRisk)) * targetDifficulty;
   if (target >= 50) z += 0.34 * highChain;
 
-  const winProbability = clamp(sigmoid(z), 0.001, 0.999);
+  let winProbability = clamp(sigmoid(z), 0.001, 0.999);
+  const structuralGuard = clamp((0.7 * reachPrior) + (0.2 * p1) + (0.1 * hard), 0.001, 0.95);
+  winProbability = clamp((0.62 * winProbability) + (0.38 * structuralGuard), 0.001, 0.999);
+  if (target >= 100) {
+    const sparsePenalty = clamp(1 - (0.7 * sparse) + (0.28 * hard) + (0.24 * highChain), 0.18, 1.1);
+    winProbability = clamp(winProbability * sparsePenalty, 0.001, 0.999);
+  }
   const sampleNorm = clamp(sample / 180, 0, 1);
   const consistency = clamp(1 - Math.abs(quick - p1), 0, 1);
   const aiConfidence = clamp(
@@ -1864,15 +1881,28 @@ function buildAIPredictorSummary(targetsOut, globalSignals = null, profiles = nu
   const byTarget = rows.map((row) => {
     const aiP = clamp(Number(row?.signals?.aiProbability || 0), 0, 1);
     const aiC = clamp(Number(row?.signals?.aiConfidence || 0), 0, 1);
-    const aiScore = clamp(Number(row?.signals?.aiScore || ((0.72 * aiP) + (0.28 * aiC))), 0, 1);
+    const aiScoreRaw = clamp(Number(row?.signals?.aiScore || ((0.72 * aiP) + (0.28 * aiC))), 0, 1);
+    const status = String(row.status || 'unknown');
+    const aheadLo = Number(row?.window?.aheadLo || 0);
+    const statusWeight = (
+      status === 'window-open' || status === 'locked' ? 1
+      : (status === 'waiting' ? 0.78 : 0.7)
+    );
+    const horizonLimit = Number(row?.target || 0) >= 100 ? 260 : 120;
+    const horizonWeight = clamp(1 - (aheadLo / horizonLimit), 0.25, 1);
+    const targetNorm = (
+      Number(row?.target || 0) >= 500 ? 0.88
+      : (Number(row?.target || 0) >= 100 ? 0.93 : 1)
+    );
+    const aiScore = clamp(aiScoreRaw * statusWeight * horizonWeight * targetNorm, 0, 1);
     return {
       target: Number(row.target || 0),
       targetLabel: row.targetLabel || `${row.target}x`,
       probability: roundNum(aiP, 6),
       confidence: roundNum(aiC, 6),
       score: roundNum(aiScore, 6),
-      status: row.status || 'unknown',
-      aheadLo: Number(row?.window?.aheadLo || 0),
+      status,
+      aheadLo,
       aheadHi: Number(row?.window?.aheadHi || 0),
     };
   }).sort((a, b) => (b.score - a.score) || (a.aheadLo - b.aheadLo));
