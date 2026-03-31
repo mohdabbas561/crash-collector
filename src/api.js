@@ -388,17 +388,13 @@ async function computeAndPersistLockedPrediction({ latestRound, limit, limitKey 
     savedResolvedCount,
   };
 
-  if (RESPONSE_CACHE_ENABLED) {
-    lockedCache.asOfRound = engine?.asOfRound ?? latestRound ?? null;
-    lockedCache.limit = limitKey;
-    lockedCache.createdAt = Date.now();
-    lockedCache.basePayload = basePayload;
-  } else {
-    lockedCache.asOfRound = null;
-    lockedCache.limit = null;
-    lockedCache.createdAt = 0;
-    lockedCache.basePayload = null;
-  }
+  // Always keep an in-memory same-round snapshot so repeated requests on the
+  // same round do not re-run full engine compute. This is fresh-by-round and
+  // does not serve stale data across new rounds.
+  lockedCache.asOfRound = engine?.asOfRound ?? latestRound ?? null;
+  lockedCache.limit = limitKey;
+  lockedCache.createdAt = Date.now();
+  lockedCache.basePayload = basePayload;
   return basePayload;
 }
 
@@ -457,12 +453,11 @@ async function refreshLockedPredictionInBackground() {
     const latestRound = await getLatestRoundId();
     if (latestRound == null) return;
     const { limit, limitKey } = parseLockedLimit(null);
-    const cacheFresh = RESPONSE_CACHE_ENABLED && (
+    const cacheFresh = (
       lockedCache.basePayload &&
       lockedCache.asOfRound != null &&
       lockedCache.asOfRound === latestRound &&
-      lockedCache.limit === limitKey &&
-      (Date.now() - lockedCache.createdAt) < LOCKED_CACHE_TTL_MS
+      lockedCache.limit === limitKey
     );
     if (cacheFresh) return;
     await ensureLockedPredictionComputed({ latestRound, limit, limitKey });
@@ -495,11 +490,15 @@ app.get('/dashboard', requireDatabase, rateLimit(60), async (req, res) => {
     const latestRound = await getLatestRoundId();
 
     if (!minRoundId) {
-      const cacheFresh = RESPONSE_CACHE_ENABLED && (
+      const sameRoundFresh = (
         dashboardCache.payload &&
         dashboardCache.recentLimit === recentLimit &&
         dashboardCache.asOfRound != null &&
-        dashboardCache.asOfRound === latestRound &&
+        latestRound != null &&
+        dashboardCache.asOfRound === latestRound
+      );
+      const cacheFresh = sameRoundFresh && (
+        !RESPONSE_CACHE_ENABLED ||
         (Date.now() - dashboardCache.createdAt) < DASHBOARD_CACHE_TTL_MS
       );
       if (cacheFresh) return res.json(dashboardCache.payload);
@@ -529,7 +528,7 @@ app.get('/dashboard', requireDatabase, rateLimit(60), async (req, res) => {
       count: recentRounds.length,
     };
 
-    if (!minRoundId && RESPONSE_CACHE_ENABLED) {
+    if (!minRoundId) {
       dashboardCache.asOfRound = latestRound ?? Number(stats?.currentRound || 0);
       dashboardCache.recentLimit = recentLimit;
       dashboardCache.createdAt = Date.now();
@@ -583,11 +582,15 @@ app.get('/predict', requireDatabase, rateLimit(20), async (req, res) => {
     const latestRound = await getLatestRoundId();
     markDbHealthy();
 
-    const cacheFresh = RESPONSE_CACHE_ENABLED && (
+    const sameRoundFresh = (
       predictCache.payload &&
       predictCache.asOfRound != null &&
+      latestRound != null &&
       predictCache.asOfRound === latestRound &&
-      predictCache.limit === limit &&
+      predictCache.limit === limit
+    );
+    const cacheFresh = sameRoundFresh && (
+      !RESPONSE_CACHE_ENABLED ||
       (Date.now() - predictCache.createdAt) < PREDICT_CACHE_TTL_MS
     );
     if (cacheFresh) {
@@ -605,24 +608,17 @@ app.get('/predict', requireDatabase, rateLimit(20), async (req, res) => {
 
     const promise = (async () => {
       const payload = await ensurePredictFresh({ limit });
-      if (RESPONSE_CACHE_ENABLED) {
-        if (!STRICT_FRESH_MODE) {
-          const latestRound = payload?.asOfRound ?? await getLatestRoundId();
-          predictCache.asOfRound = latestRound ?? null;
-          predictCache.limit = limit;
-          predictCache.createdAt = Date.now();
-          predictCache.payload = payload;
-        } else {
-          predictCache.asOfRound = payload?.asOfRound ?? latestRound ?? null;
-          predictCache.limit = limit;
-          predictCache.createdAt = Date.now();
-          predictCache.payload = payload;
-        }
+      if (!STRICT_FRESH_MODE) {
+        const latestRound = payload?.asOfRound ?? await getLatestRoundId();
+        predictCache.asOfRound = latestRound ?? null;
+        predictCache.limit = limit;
+        predictCache.createdAt = Date.now();
+        predictCache.payload = payload;
       } else {
-        predictCache.asOfRound = null;
-        predictCache.limit = null;
-        predictCache.createdAt = 0;
-        predictCache.payload = null;
+        predictCache.asOfRound = payload?.asOfRound ?? latestRound ?? null;
+        predictCache.limit = limit;
+        predictCache.createdAt = Date.now();
+        predictCache.payload = payload;
       }
       return payload;
     })();
@@ -649,11 +645,15 @@ app.get('/predict/locked', requireDatabase, rateLimit(20), async (req, res) => {
     const latestRound = await getLatestRoundId();
 
     markDbHealthy();
-    const hasCacheForLimit = RESPONSE_CACHE_ENABLED && Boolean(lockedCache.basePayload && lockedCache.limit === limitKey);
-    const cacheFresh = (
+    const hasCacheForLimit = Boolean(lockedCache.basePayload && lockedCache.limit === limitKey);
+    const sameRoundFresh = (
       hasCacheForLimit &&
       lockedCache.asOfRound != null &&
-      lockedCache.asOfRound === latestRound &&
+      latestRound != null &&
+      lockedCache.asOfRound === latestRound
+    );
+    const cacheFresh = sameRoundFresh && (
+      !RESPONSE_CACHE_ENABLED ||
       (Date.now() - lockedCache.createdAt) < LOCKED_CACHE_TTL_MS
     );
 

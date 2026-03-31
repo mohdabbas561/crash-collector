@@ -37,7 +37,7 @@ const ACTIVATE_MIN_P1 = {
   500: 0.03,
   1000: 0.02,
 };
-const WAITING_MODEL_VERSION = 'v11-adaptive-live';
+const WAITING_MODEL_VERSION = 'v12-context-adaptive';
 
 function clamp(v, lo, hi) {
   return Math.max(lo, Math.min(hi, v));
@@ -795,12 +795,25 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
   const quickSignal = clamp((0.68 * quickRaw) + (0.32 * quickEmpirical.score), 0, 1);
   const whiteRelease = whiteReleaseSignal(pre, currentState, target, currentIdx);
   const hardImpulse = hardGapImpulse(stats, pressure, target, gapNow);
+  const currentMult = Number(pre.rounds?.[currentIdx]?.multiplier || 0);
+  const prevMult = Number(pre.rounds?.[Math.max(0, currentIdx - 1)]?.multiplier || 0);
+  const whiteRunPressure = clamp((Number(currentState.whiteStreak || 0) - 2) / 5, 0, 1);
+  const whiteSuppression = clamp((0.62 * whiteSeverity) + (0.38 * whiteRunPressure), 0, 1);
+  const releaseRelief = clamp((0.7 * whiteRelease) + (0.3 * clamp((currentMult + prevMult - 4.8) / 8, 0, 1)), 0, 1);
   const earlyDominance = clamp(
     Number(calibration?.earlyRate || 0) - Number(calibration?.lossRate || 0),
     -0.8,
     0.8
   );
   const interGaps = Array.isArray(stats.interGaps) ? stats.interGaps : [];
+  const hitCount = Array.isArray(pre.hitRoundIds?.[target]) ? pre.hitRoundIds[target].length : 0;
+  const sparseSignal = clamp((18 - hitCount) / 18, 0, 1);
+  const empiricalMeanGap = Math.max(
+    1,
+    hitCount > 0
+      ? (pre.n / Math.max(1, hitCount))
+      : (target >= 500 ? 220 : (target >= 100 ? 140 : 60))
+  );
   let pGap1 = 0;
   let pGap2 = 0;
   let pGap3 = 0;
@@ -821,16 +834,33 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
   const windowSpan = Math.max(1, Number(WINDOW_SPAN_PRIOR[target] || 3));
   const earlyBias = Math.max(0, earlyDominance);
   const lateBias = Math.max(0, -earlyDominance);
+  const quickB2B = clamp(
+    (0.34 * quickSignal) +
+    (0.24 * quickEmpirical.le1) +
+    (0.18 * pGap1) +
+    (0.14 * pGap2) +
+    (0.1 * (gapNow <= 1 ? 1 : 0)),
+    0,
+    1
+  );
+  const highTargetChainHint = target >= 50
+    ? clamp((Math.max(currentMult, prevMult) - Math.max(18, target * 0.35)) / Math.max(8, target * 0.45), 0, 1)
+    : 0;
+  const b2bComposite = clamp(
+    quickB2B + (target >= 50 ? (0.24 * highTargetChainHint) : 0),
+    0,
+    1
+  );
 
   let centerAhead = q50;
   centerAhead *= 1 + Number(calibration?.shift || 0);
   centerAhead *= 1 - (0.86 * earlyBias);
   centerAhead *= 1 + (0.58 * lateBias);
   const whiteDrift = target <= 10
-    ? (-0.14 * whiteSeverity)
-    : (target <= 50 ? (0.08 * whiteSeverity) : (0.22 * whiteSeverity));
+    ? (0.12 * whiteSuppression)
+    : (target <= 50 ? (0.2 * whiteSuppression) : (0.28 * whiteSuppression));
   centerAhead *= 1 + whiteDrift;
-  centerAhead *= 1 - (whiteRelease * (target <= 20 ? 0.36 : 0.22));
+  centerAhead *= 1 - (releaseRelief * (target >= 50 ? 0.36 : (target >= 20 ? 0.3 : 0.22)));
   centerAhead *= 1 - (pressure.hard * 0.24);
 
   if (quickSignal > 0) {
@@ -846,10 +876,15 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
     centerAhead = ((1 - mix) * centerAhead) + (mix * hardAnchor);
   }
 
-  if (gapNow <= 1 && (pGap2 > 0.03 || pGap3 > 0.08)) {
-    const b2bStrength = clamp((0.62 * pGap2) + (0.38 * pGap3), 0, 0.82);
+  if (gapNow <= 1 && (pGap2 > 0.03 || pGap3 > 0.08 || quickSignal > 0.1)) {
+    const b2bStrength = clamp((0.52 * pGap2) + (0.26 * pGap3) + (0.22 * b2bComposite), 0, 0.86);
     const b2bAnchor = Math.max(1, (0.74 * neighQ20) + (0.26 * 1.2));
     centerAhead = ((1 - b2bStrength) * centerAhead) + (b2bStrength * b2bAnchor);
+  }
+  if (b2bComposite > 0.22) {
+    const b2bAnchor = Math.max(1, (0.8 * q20) + (0.2 * hazard.q20));
+    const mix = clamp((b2bComposite - 0.22) / 0.62, 0, 1) * (target >= 50 ? 0.55 : 0.42);
+    centerAhead = ((1 - mix) * centerAhead) + (mix * b2bAnchor);
   }
 
   if (earlyBias > 0) {
@@ -857,6 +892,16 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
   }
   if (lateBias > 0) {
     centerAhead += Math.max(0, Math.round(windowSpan * Math.min(0.32, lateBias * 0.7)));
+  }
+  if (target >= 100 && sparseSignal > 0.12) {
+    const sparseFloorRaw = Math.max(
+      q20,
+      Math.min(
+        q80 + Math.max(1, (windowSpan * 0.6)),
+        empiricalMeanGap * (target >= 500 ? 0.62 : 0.5)
+      )
+    );
+    centerAhead = Math.max(centerAhead, sparseFloorRaw);
   }
   centerAhead = clamp(
     centerAhead,
@@ -870,7 +915,8 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
 
   const dynamicMaxAhead = Math.max(
     windowSpan + 1,
-    Math.round((stats.q99 || stats.q95 || stats.q90 || stats.mean || 20) * 6)
+    Math.round((stats.q99 || stats.q95 || stats.q90 || stats.mean || 20) * 6),
+    sparseSignal > 0.2 ? Math.round(empiricalMeanGap * (target >= 500 ? 1.25 : (target >= 100 ? 1.05 : 0.85))) : 0
   );
   const cappedMaxAhead = Math.max(
     windowSpan + 1,
@@ -901,7 +947,10 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
     (0.06 * regimeEvidence) +
     (0.03 * consensus) +
     (0.03 * blendBalance) -
-    (0.08 * calibrationPenalty),
+    (0.08 * calibrationPenalty) +
+    (0.06 * b2bComposite) -
+    (0.08 * whiteSuppression * (target >= 20 ? 1 : 0.65)) -
+    ((target >= 100 ? 0.1 : 0.05) * sparseSignal),
     0.04,
     0.98
   );
@@ -954,10 +1003,16 @@ function buildWindow(pre, target, currentIdx, calibration = null) {
       quickEmpiricalP2: roundNum(quickEmpirical.le2, 4),
       quickEmpiricalP3: roundNum(quickEmpirical.le3, 4),
       quickEmpiricalRegimeObs: Number(quickEmpirical.regimeObs || 0),
+      hitCount: Number(hitCount || 0),
+      sparseSignal: roundNum(sparseSignal, 4),
+      empiricalMeanGap: roundNum(empiricalMeanGap, 3),
       pGapLe1: roundNum(pGap1, 4),
       pGapLe2: roundNum(pGap2, 4),
       pGapLe3: roundNum(pGap3, 4),
+      b2bComposite: roundNum(b2bComposite, 4),
+      highTargetChainHint: roundNum(highTargetChainHint, 4),
       whiteReleaseSignal: roundNum(whiteRelease, 4),
+      whiteSuppression: roundNum(whiteSuppression, 4),
       hardGapImpulse: roundNum(hardImpulse, 4),
       confidence: roundNum(confidence, 4),
       reason: currentState.regime === 'white'
@@ -1018,12 +1073,22 @@ function buildAdaptiveWaitingWindow(nextLock, target, fixedSpan, currentRound, m
   const pGap3 = clamp(Number(eta.pGapLe3 || 0), 0, 1);
   const quick = clamp(Number(eta.quickHitEmpirical ?? eta.quickHitSignal ?? 0), 0, 1);
   const hard = clamp(Number(eta.hardGapImpulse ?? eta.hardGapPressure ?? 0), 0, 1);
-  const white = clamp(Number(eta.whiteClusterSeverity || 0), 0, 1);
+  const white = clamp(Number(eta.whiteSuppression ?? eta.whiteClusterSeverity ?? 0), 0, 1);
   const release = clamp(Number(eta.whiteReleaseSignal || 0), 0, 1);
   const confidence = clamp(Number(eta.confidence || 0), 0, 1);
+  const sparseSignal = clamp(Number(eta.sparseSignal || 0), 0, 1);
+  const empiricalMeanGap = Math.max(1, Number(eta.empiricalMeanGap || historicalGapMean || q50 || 1));
+  const b2bComposite = clamp(Number(eta.b2bComposite || 0), 0, 1);
+  const highChainHint = clamp(Number(eta.highTargetChainHint || 0), 0, 1);
   const centerAhead = Math.max(1, Number(eta.centerAhead || q50));
   const expectedFromP1 = pHit1 > 0 ? clamp(1 / pHit1, 1, maxStartAhead) : maxStartAhead;
-  const b2bPull = clamp((target <= 20 ? ((0.65 * pGap2) + (0.35 * pGap3)) : ((0.45 * pGap2) + (0.55 * pGap3))), 0, 1);
+  const b2bPull = clamp(
+    (target <= 20
+      ? ((0.5 * pGap2) + (0.22 * pGap3) + (0.28 * b2bComposite))
+      : ((0.34 * pGap2) + (0.24 * pGap3) + (0.34 * b2bComposite) + (0.08 * highChainHint))),
+    0,
+    1
+  );
 
   // Data-driven pre-window start: blend hazard/gap/cluster signals (not fixed offsets).
   let startAhead = (
@@ -1038,15 +1103,32 @@ function buildAdaptiveWaitingWindow(nextLock, target, fixedSpan, currentRound, m
   startAhead -= (target >= 50 ? 1.8 : 1.0) * hard;
 
   if (target <= 10) {
-    startAhead -= 1.05 * white;
-    startAhead += 1.45 * release;
+    startAhead += 0.9 * white;
+    startAhead -= 0.95 * release;
+  } else if (target <= 50) {
+    startAhead += 1.2 * white;
+    startAhead -= 1.15 * release;
   } else {
-    startAhead += 0.58 * white;
-    startAhead += 0.2 * release;
+    startAhead += 1.55 * white;
+    startAhead -= 1.45 * release;
   }
 
   if (confidence < 0.45) {
     startAhead += (0.45 - confidence) * 3.5;
+  }
+  if (target >= 100 && sparseSignal > 0.18) {
+    const sparseMinAhead = clamp(
+      Math.round(empiricalMeanGap * (target >= 500 ? 0.52 : 0.44)),
+      2,
+      maxStartAhead
+    );
+    const aggressiveRelease = target >= 500
+      ? (highChainHint >= 0.4 || hard >= 0.45)
+      : (highChainHint >= 0.32 || hard >= 0.4);
+    const aggressiveB2B = b2bComposite >= (target >= 500 ? 0.45 : 0.38);
+    if (!aggressiveRelease && !aggressiveB2B && pHit1 < (target >= 500 ? 0.045 : 0.06)) {
+      startAhead = Math.max(startAhead, sparseMinAhead);
+    }
   }
 
   if (existing?.suspended && Number.isFinite(Number(existing.lo))) {
@@ -1072,6 +1154,7 @@ function buildAdaptiveWaitingWindow(nextLock, target, fixedSpan, currentRound, m
       waitingBlendExpectedFromP1: roundNum(expectedFromP1, 2),
       waitingBlendB2BPull: roundNum(b2bPull, 4),
       waitingDynamicCap: cap,
+      waitingSparseSignal: roundNum(sparseSignal, 4),
       waitingSource: 'hazard+gap+quick+hard+cluster',
     },
   };
@@ -1109,8 +1192,11 @@ function shouldActivateWindow(target, nextLock, calibration = null) {
   const p1 = clamp(Number(eta.pHit1 || 0), 0, 1);
   const quick = clamp(Number(eta.quickHitEmpirical ?? eta.quickHitSignal ?? 0), 0, 1);
   const hard = clamp(Number(eta.hardGapImpulse || 0), 0, 1);
-  const white = clamp(Number(eta.whiteClusterSeverity || 0), 0, 1);
+  const white = clamp(Number(eta.whiteSuppression ?? eta.whiteClusterSeverity ?? 0), 0, 1);
   const release = clamp(Number(eta.whiteReleaseSignal || 0), 0, 1);
+  const b2bComposite = clamp(Number(eta.b2bComposite || 0), 0, 1);
+  const highChainHint = clamp(Number(eta.highTargetChainHint || 0), 0, 1);
+  const sparseSignal = clamp(Number(eta.sparseSignal || 0), 0, 1);
   const calWilson = clamp(Number(calibration?.wilsonLow || 0.5), 0, 1);
   const calPenalty = clamp(
     (Number(calibration?.lossRate || 0) + Number(calibration?.earlyRate || 0)) * 0.35,
@@ -1127,19 +1213,44 @@ function shouldActivateWindow(target, nextLock, calibration = null) {
     (0.18 * hard) +
     (0.16 * p1)
   );
-  if (target <= 10) score += (0.1 * white);
-  if (target <= 10) score -= (0.08 * release);
+  if (target <= 10) {
+    score += (0.07 * b2bComposite);
+    score -= (0.12 * white);
+    score += (0.09 * release);
+  } else if (target <= 100) {
+    score += (0.06 * b2bComposite);
+    score -= (0.1 * white);
+    score += (0.1 * release);
+  } else {
+    score += (0.06 * b2bComposite) + (0.07 * highChainHint);
+    score -= (0.12 * white);
+    score += (0.12 * release);
+  }
+  if (target >= 100) {
+    score -= (0.06 * sparseSignal * (1 - hard));
+  }
   score = clamp((0.82 * score) + (0.18 * calWilson) - calPenalty, 0, 1);
 
   let active = false;
   if (target <= 20) {
-    active = (score >= (minConf - 0.08)) && (quick >= 0.18 || p1 >= minP1 || hard >= 0.18);
+    active = (score >= (minConf - 0.08)) && (
+      quick >= 0.18 ||
+      p1 >= minP1 ||
+      b2bComposite >= 0.2 ||
+      hard >= 0.18
+    );
   } else if (target <= 100) {
-    active = (score >= minConf) && (p1 >= minP1 || hard >= 0.22);
+    active = (score >= minConf) && (p1 >= minP1 || hard >= 0.22 || b2bComposite >= 0.18);
   } else if (target <= 500) {
-    active = (score >= minConf) && (hard >= 0.28 || p1 >= minP1);
+    const sparseGate = sparseSignal > 0.22
+      ? (hard >= 0.3 || highChainHint >= 0.2 || p1 >= (minP1 + 0.012))
+      : true;
+    active = (score >= minConf) && (hard >= 0.28 || p1 >= minP1 || highChainHint >= 0.18) && sparseGate;
   } else {
-    active = (score >= minConf) && (hard >= 0.34 || p1 >= minP1);
+    const sparseGate = sparseSignal > 0.22
+      ? (hard >= 0.36 || highChainHint >= 0.24 || p1 >= (minP1 + 0.015))
+      : true;
+    active = (score >= minConf) && (hard >= 0.34 || p1 >= minP1 || highChainHint >= 0.22) && sparseGate;
   }
 
   return {
@@ -1620,6 +1731,10 @@ function buildIndependentWhiteClusterAlert(pre, currentIdx) {
   const maxScan = 70000;
   const stride = Math.max(1, Math.floor(rawSpan / maxScan));
   const currentRun = Number(pre.whiteStreak?.[currentIdx] || 0);
+  const runSorted = [...(pre.whiteStreak || [])].sort((a, b) => a - b);
+  const runQ85 = quantile(runSorted, 0.85);
+  const runQ95 = quantile(runSorted, 0.95);
+  const runSignal = clamp((currentRun - runQ85) / Math.max(1, runQ95 - runQ85), 0, 1);
 
   let totalW = 0;
   let eventW = 0;
@@ -1630,6 +1745,14 @@ function buildIndependentWhiteClusterAlert(pre, currentIdx) {
 
   const whiteTotal = rounds.reduce((acc, r) => acc + (Number(r.multiplier) < 3 ? 1 : 0), 0);
   const whiteRate = whiteTotal / Math.max(1, n);
+  const recentWin = clamp(Math.round(Math.sqrt(Math.max(1, n)) * 1.2), 24, 160);
+  const recentStart = Math.max(0, currentIdx - recentWin + 1);
+  let recentWhite = 0;
+  for (let i = recentStart; i <= currentIdx; i++) {
+    if (Number(rounds[i]?.multiplier || 0) < 3) recentWhite += 1;
+  }
+  const recentWhiteRate = recentWhite / Math.max(1, currentIdx - recentStart + 1);
+  const whiteRateSignal = clamp((recentWhiteRate - whiteRate) / Math.max(0.04, 1 - whiteRate), 0, 1);
   const curTrend = Number(pre.trendByIdx?.[currentIdx] || 0);
   const curVol = Number(pre.volRatioByIdx?.[currentIdx] || 1);
   const curUnder2 = Number(pre.under2RateByIdx?.[currentIdx] || 0);
@@ -1670,19 +1793,36 @@ function buildIndependentWhiteClusterAlert(pre, currentIdx) {
     }
   }
 
-  let priorEvent = clamp(whiteRate * 1.9, 0.02, 0.9);
+  const compressionSignal = clamp((-curTrend) / 0.08, 0, 1);
+  let priorEvent = clamp(
+    0.08 +
+    (0.52 * runSignal) +
+    (0.28 * whiteRateSignal) +
+    (0.12 * compressionSignal),
+    0.04,
+    0.88
+  );
   if (currentRun >= 3) {
-    priorEvent = Math.max(priorEvent, clamp(0.56 + (0.09 * Math.min(4, currentRun - 3)), 0.56, 0.92));
+    priorEvent = Math.max(priorEvent, clamp(0.35 + (0.08 * Math.min(5, currentRun - 2)), 0.35, 0.85));
   }
-  const priorRelease = clamp((1 - priorEvent) * 0.75, 0.03, 0.95);
+  const priorRelease = clamp(
+    (0.18 + (0.44 * (1 - runSignal)) + (0.22 * clamp(curVol - 1, 0, 1)) + (0.16 * clamp(curTrend / 0.08, 0, 1))),
+    0.05,
+    0.95
+  );
   const alpha = totalW >= 26 ? 6 : 10;
 
-  let risk = (eventW + (alpha * priorEvent)) / Math.max(0.0001, totalW + alpha);
+  let riskRaw = (eventW + (alpha * priorEvent)) / Math.max(0.0001, totalW + alpha);
   if (currentRun >= 3 && contTotalW > 0) {
     const contRisk = (contEventW + (6 * priorEvent)) / Math.max(0.0001, contTotalW + 6);
-    risk = Math.max(risk, contRisk);
+    riskRaw = Math.max(riskRaw, contRisk);
   }
-  risk = clamp(risk, 0, 1);
+  const baselineCluster = clamp(Math.pow(clamp(whiteRate, 0, 1), 3), 0.01, 0.96);
+  let risk = clamp((riskRaw - baselineCluster) / Math.max(0.05, 1 - baselineCluster), 0, 1);
+  if (currentRun >= 3) {
+    risk = Math.max(risk, clamp(0.35 + (0.1 * Math.min(5, currentRun - 2)), 0.35, 0.9));
+  }
+  risk = clamp(risk + (0.16 * whiteRateSignal), 0, 1);
   const release = clamp((releaseW + (alpha * priorRelease)) / Math.max(0.0001, totalW + alpha), 0, 1);
 
   let aheadLo = 1;
@@ -1878,20 +2018,31 @@ function buildAlertSummary(pre, currentIdx, targetsOut) {
     };
   });
 
-  const byAction = b2bByTarget
-    .slice()
-    .sort((a, b) => b.actionScore - a.actionScore);
-  let topB2B = byAction[0] || null;
-  const topNon5Action = byAction.find((row) => Number(row.target) !== 5) || null;
-  if (topB2B?.target === 5 && topNon5Action) {
-    const closeScore = topNon5Action.actionScore >= (topB2B.actionScore - 0.035);
-    const non5Actionable = (
-      topNon5Action.effectiveProbability >= 0.1 ||
-      topNon5Action.highChainActive ||
-      topNon5Action.lift >= 1.28
+  const withPickScore = b2bByTarget.map((row) => {
+    const evidence = clamp(Number(row.evidence || 0), 0, 1);
+    const chain = clamp(Number(row.highChainScore || 0), 0, 1);
+    const pickScore = clamp(
+      (0.44 * Number(row.displayProbability || 0)) +
+      (0.3 * Number(row.relativePressure || 0)) +
+      (0.18 * evidence) +
+      (0.08 * chain),
+      0,
+      1
     );
-    if (closeScore && non5Actionable) topB2B = topNon5Action;
-  }
+    return { ...row, pickScore: roundNum(pickScore, 6) };
+  });
+  const byAction = withPickScore
+    .slice()
+    .sort((a, b) => (b.pickScore - a.pickScore) || (b.actionScore - a.actionScore));
+  const actionableGate = (row) => {
+    const target = Number(row?.target || 0);
+    const display = Number(row?.displayProbability || 0);
+    const lift = Number(row?.lift || 0);
+    if (target <= 10) return display >= 0.16 || lift >= 1.2;
+    if (target <= 50) return display >= 0.12 || lift >= 1.24;
+    return display >= 0.09 || lift >= 1.28 || row?.highChainActive;
+  };
+  let topB2B = byAction.find(actionableGate) || byAction[0] || null;
   const topB2BByProbability = b2bByTarget
     .slice()
     .sort((a, b) => b.effectiveProbability - a.effectiveProbability)[0] || null;
@@ -1928,7 +2079,7 @@ function buildAlertSummary(pre, currentIdx, targetsOut) {
     : 0;
 
   return {
-    source: 'range-lock-v10-selective',
+    source: 'range-lock-v11-selective',
     generatedAt: new Date().toISOString(),
     b2bByTarget,
     topB2B: topB2B
@@ -1987,7 +2138,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
   const calibration = buildCalibrationMap(options.historyRows || [], pre);
   if (pre.n < 800) {
     return {
-      model: 'range-lock-v10-selective',
+      model: 'range-lock-v11-selective',
       generatedAt: new Date().toISOString(),
       asOfRound: pre.rounds[pre.n - 1]?.roundId || null,
       targets: [],
@@ -2159,6 +2310,12 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       status = evalResult.status || 'pending';
     }
 
+    // Guardrail: never expose WAIT/PENDING when the window already started.
+    // This prevents "Starts in 0 rounds" UI states from stale/inconsistent lock rows.
+    if ((status === 'pending' || status === 'waiting') && Number(lockToUse.lo) <= currentRound) {
+      status = 'window-open';
+    }
+
     if (status === 'pending') pendingCount++;
     if (status === 'waiting') waitingCount++;
     if (status === 'window-open') openCount++;
@@ -2178,7 +2335,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
   targetsOut.sort((a, b) => a.target - b.target);
 
   return {
-    model: 'range-lock-v10-selective',
+    model: 'range-lock-v11-selective',
     generatedAt: new Date().toISOString(),
     asOfRound: currentRound,
     sampleSize: pre.n,
