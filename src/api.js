@@ -127,6 +127,16 @@ const STRICT_FRESH_MODE = String(process.env.STRICT_FRESH_MODE || 'true').trim()
 const LOCKED_USE_FULL_DATA = String(process.env.LOCKED_USE_FULL_DATA || 'true').trim().toLowerCase() !== 'false';
 const LOCKED_BACKGROUND_ENABLED = String(process.env.LOCKED_BACKGROUND_ENABLED || 'true').trim().toLowerCase() !== 'false';
 const LOCKED_BACKGROUND_INTERVAL_MS = toPositiveInt(process.env.LOCKED_BACKGROUND_INTERVAL_MS, 30000);
+const BOT_RPC_URL = String(
+  process.env.BOT_RPC_URL ||
+  process.env.CRASH_BOT_RPC_URL ||
+  'https://mainnet.helius-rpc.com/?api-key=14a95398-c1a2-425f-aca6-dadc58b319c8'
+).trim();
+const BOT_PLAYER_ACCOUNT_PDA = String(
+  process.env.BOT_PLAYER_ACCOUNT_PDA ||
+  process.env.CRASH_BOT_PLAYER_ACCOUNT_PDA ||
+  '7b1VfRjNoCn7gPEQ7HFAg8wtjaLkrVrZTQNvkEdmrwsj'
+).trim();
 const HISTORY_TARGETS = ['5x', '10x', '20x', '50x', '100x', '500x', '1000x'];
 
 const predictCache = {
@@ -573,6 +583,16 @@ app.get('/health', (req,res) => {
     dbError: dbState.lastError || null,
     dbSince: dbState.since,
     ts: new Date().toISOString(),
+  });
+});
+
+app.get('/bot/config', rateLimit(60), (req, res) => {
+  res.json({
+    ok: true,
+    config: {
+      rpcUrl: BOT_RPC_URL,
+      playerAccountPDA: BOT_PLAYER_ACCOUNT_PDA,
+    },
   });
 });
 
