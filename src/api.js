@@ -137,6 +137,14 @@ const BOT_PLAYER_ACCOUNT_PDA = String(
   process.env.CRASH_BOT_PLAYER_ACCOUNT_PDA ||
   '7b1VfRjNoCn7gPEQ7HFAg8wtjaLkrVrZTQNvkEdmrwsj'
 ).trim();
+const BOT_WALLET_AUTH_API = String(
+  process.env.BOT_WALLET_AUTH_API ||
+  'https://api.degencoinflip.com/v2'
+).trim().replace(/\/+$/, '');
+const BOT_CASHOUT_API = String(
+  process.env.BOT_CASHOUT_API ||
+  'https://crash-api.degencoinflip.com/api/status/set_cashout_multiplier'
+).trim();
 const HISTORY_TARGETS = ['5x', '10x', '20x', '50x', '100x', '500x', '1000x'];
 
 const predictCache = {
@@ -336,6 +344,15 @@ function withTimeout(promise, timeoutMs, label) {
   return Promise.race([promise, timeoutPromise]).finally(() => {
     if (timer) clearTimeout(timer);
   });
+}
+
+async function readResponsePayload(res) {
+  const raw = await res.text();
+  try {
+    return { raw, data: JSON.parse(raw) };
+  } catch {
+    return { raw, data: null };
+  }
 }
 
 async function parseRoundsLimit(rawLimit) {
@@ -594,6 +611,50 @@ app.get('/bot/config', rateLimit(60), (req, res) => {
       playerAccountPDA: BOT_PLAYER_ACCOUNT_PDA,
     },
   });
+});
+
+app.get('/bot/site-auth/nonce/:walletId', rateLimit(30), async (req, res) => {
+  try {
+    const walletId = String(req.params.walletId || '').trim();
+    if (!walletId) return res.status(400).json({ ok: false, error: 'walletId required' });
+
+    const upstream = await fetch(`${BOT_WALLET_AUTH_API}/wallets/${encodeURIComponent(walletId)}/nonce`);
+    const { raw, data } = await readResponsePayload(upstream);
+    if (!upstream.ok) {
+      return res.status(upstream.status).json({ ok: false, error: raw || `Nonce upstream error ${upstream.status}` });
+    }
+    res.json({ ok: true, ...(data && typeof data === 'object' ? data : { payload: raw }) });
+  } catch (e) {
+    console.error('[bot/site-auth/nonce] error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/bot/site-auth/authorize', express.json({ limit: '20kb' }), rateLimit(30), async (req, res) => {
+  try {
+    const walletId = String(req.body?.walletId || '').trim();
+    const signature = String(req.body?.signature || '').trim();
+    if (!walletId || !signature) {
+      return res.status(400).json({ ok: false, error: 'walletId and signature required' });
+    }
+
+    const upstream = await fetch(`${BOT_WALLET_AUTH_API}/authorize`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Signature-Encoding': 'base64',
+      },
+      body: JSON.stringify({ walletId, signature }),
+    });
+    const { raw, data } = await readResponsePayload(upstream);
+    if (!upstream.ok) {
+      return res.status(upstream.status).json({ ok: false, error: raw || `Authorize upstream error ${upstream.status}` });
+    }
+    res.json({ ok: true, ...(data && typeof data === 'object' ? data : { payload: raw }) });
+  } catch (e) {
+    console.error('[bot/site-auth/authorize] error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 app.get('/predict', requireDatabase, rateLimit(20), async (req, res) => {
