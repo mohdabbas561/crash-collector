@@ -700,9 +700,9 @@ function buildTargetCandidate(state, targetData, calibration) {
     p1 *= (1 - (0.28 * whiteRisk)) * (1 + (0.3 * b2bPressure));
     pSoon *= (1 - (0.24 * whiteRisk)) * (1 + (0.24 * b2bPressure));
   }
-  if (target >= 100) {
-    p1 *= (1 + (0.18 * b2bImmediate));
-    pSoon *= (1 + (0.14 * b2bImmediate));
+  if (target <= 10) {
+    p1 *= (1 + (0.14 * b2bImmediate));
+    pSoon *= (1 + (0.11 * b2bImmediate));
   }
   p1 = clamp(p1, 0.000001, 0.999);
   pSoon = clamp(Math.max(pSoon, p1), 0.000001, 0.999);
@@ -738,11 +738,28 @@ function buildTargetCandidate(state, targetData, calibration) {
 
   const minP1 = clamp(calibration?.minP1 ?? (0.04 + (targetData.baseRate * 0.6)), 0.01, 0.95);
   const minConfidence = clamp(calibration?.minConfidence ?? 0.4, 0.1, 0.95);
-  const confidence = clamp((0.2 + (0.46 * pSoon) + (0.18 * knn.support) + (0.12 * reliability) + (0.04 * (1 - trendDownRisk))), 0.05, 0.99);
+  const rarityPenalty = clamp((Math.log10(Math.max(5, target)) / Math.log10(1000)) * (1 - clamp(targetData.baseRate * 24, 0, 1)), 0, 1);
+  const supportPenalty = clamp((0.32 * (1 - knn.support)) + (0.18 * (1 - hazard.support)), 0, 0.6);
+  const whitePenalty = target >= 20 ? (0.34 * whiteRisk) : (0.16 * whiteRisk);
+  const downPenalty = target >= 50 ? (0.22 * trendDownRisk) : (0.08 * trendDownRisk);
+  const confidence = clamp(
+    (0.08 + (0.34 * pSoon) + (0.16 * p1) + (0.12 * knn.support) + (0.1 * hazard.support) + (0.1 * reliability) + (0.06 * (1 - rarityPenalty)))
+      - whitePenalty - downPenalty - supportPenalty,
+    0.03,
+    0.96
+  );
   const actionScore = clamp((0.55 * p1) + (0.45 * confidence), 0, 1);
-  let active = actionScore >= ((minP1 + minConfidence) * 0.5);
+  let activationThreshold = ((minP1 + minConfidence) * 0.5);
+  activationThreshold += target >= 50 ? (0.04 + (0.08 * rarityPenalty)) : 0;
+  activationThreshold += target >= 100 ? (0.06 * (1 - reliability)) : 0;
+  activationThreshold += target >= 20 ? (0.08 * whiteRisk) : (0.03 * whiteRisk);
+  activationThreshold += target >= 50 ? (0.06 * trendDownRisk) : 0;
+  activationThreshold = clamp(activationThreshold, 0.12, 0.92);
+  let active = actionScore >= activationThreshold;
   if (target >= 50 && whiteRisk >= 0.8 && whiteRelease <= 0.25) active = false;
-  if (target <= 20 && b2bPressure >= 0.55 && p1 >= (minP1 * 0.8)) active = true;
+  if (target >= 100 && knn.support < 0.18 && hazard.support < 0.2) active = false;
+  if (target >= 500 && (whiteRisk >= 0.55 || trendDownRisk >= 0.55)) active = false;
+  if (target <= 20 && b2bPressure >= 0.55 && p1 >= (minP1 * 0.86) && whiteRisk <= 0.72) active = true;
 
   return {
     target,
@@ -763,6 +780,7 @@ function buildTargetCandidate(state, targetData, calibration) {
       spread: roundNum(spread, 3),
       minP1: roundNum(minP1, 6),
       minConfidence: roundNum(minConfidence, 6),
+      activationThreshold: roundNum(activationThreshold, 6),
       actionScore: roundNum(actionScore, 6),
       confidenceBand: confidenceBandWord(confidence),
       calibrationShift: roundNum(calShift, 6),
@@ -778,7 +796,10 @@ function buildTargetCandidate(state, targetData, calibration) {
       knnSupport: roundNum(knn.support, 6),
       knnEffectiveSample: roundNum(knn.effectiveSample, 3),
       hazardP1: roundNum(p1Hazard, 6),
+      hazardSupport: roundNum(hazard.support, 6),
       baseRate: roundNum(baseRate, 6),
+      rarityPenalty: roundNum(rarityPenalty, 6),
+      supportPenalty: roundNum(supportPenalty, 6),
       blend: { knn: roundNum(wKnn, 6), hazard: roundNum(wHaz, 6), base: roundNum(wBase, 6) },
       aiProbability: roundNum(actionScore, 6),
       aiConfidence: roundNum(confidence, 6),
@@ -1088,7 +1109,14 @@ function buildPredictionReport(rounds) {
   cashoutPlan.zoneHigh = roundNum(rec.target * 1.08, 3);
   cashoutPlan.reason = 'Unified v8 data-driven expected value ranking.';
 
-  const confidence = clamp((0.32 * bucketProb[topIdx]) + (0.24 * (1 - clamp(stddev(mult.slice(-120).map(safeLog)) / 0.8, 0, 1))) + (0.18 * (1 - white.continueProb)) + (0.16 * clamp(pBalanced, 0, 1)) + (0.1 * clamp(1 + trend, 0, 1)), 0.05, 0.99);
+  const stability = 1 - clamp(stddev(mult.slice(-120).map(safeLog)) / 0.8, 0, 1);
+  const whitePenalty = clamp(Math.max(0, white.continueProb - white.reboundProb), 0, 1);
+  const confidence = clamp(
+    (0.12 + (0.24 * bucketProb[topIdx]) + (0.22 * stability) + (0.16 * (1 - white.continueProb)) + (0.14 * clamp(pBalanced, 0, 1)) + (0.08 * clamp(1 + trend, 0, 1)))
+      - (0.14 * whitePenalty),
+    0.05,
+    0.9
+  );
 
   return {
     model: 'unified-v8-report',
@@ -1110,6 +1138,7 @@ function buildPredictionReport(rounds) {
     diagnostics: {
       whiteCluster: { run: Number(whiteRun), risk: roundNum(white.continueProb, 6), release: roundNum(white.reboundProb, 6) },
       trend: { score: roundNum(trend, 6) },
+      stability: roundNum(stability, 6),
     },
     cashoutPlan,
     similarPatterns: [],
