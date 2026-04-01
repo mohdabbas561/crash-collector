@@ -37,7 +37,7 @@ const ACTIVATE_MIN_P1 = {
   500: 0.03,
   1000: 0.02,
 };
-const WAITING_MODEL_VERSION = 'v12-context-adaptive';
+const WAITING_MODEL_VERSION = 'v13-context-adaptive';
 
 function clamp(v, lo, hi) {
   return Math.max(lo, Math.min(hi, v));
@@ -1011,12 +1011,16 @@ function buildWindow(pre, target, currentIdx, calibration = null, globalSignals 
   let loAhead = Math.max(1, Math.round(centerAhead) - halfLeft);
   loAhead = Math.min(loAhead, Math.max(1, cappedMaxAhead - windowSpan + 1));
   if (target <= 20) {
+    const b2bEarlyRelief = clamp((0.64 * b2bComposite) + (0.36 * regimeB2BBoost), 0, 1);
+    const quickTempoRelief = clamp((0.6 * quickSignal) + (0.4 * hardImpulse), 0, 1);
     const lowTargetCap = clamp(
       Math.round(
         (target <= 5 ? 8 : (target <= 10 ? 12 : 18)) +
         ((target <= 10 ? 3 : 4) * trendDownAdj) +
         ((target <= 10 ? 2 : 2.5) * globalWhitePressureAdj) -
-        ((target <= 10 ? 6 : 7) * earlyRelax)
+        ((target <= 10 ? 6 : 7) * earlyRelax) -
+        ((target <= 10 ? 3 : 4) * b2bEarlyRelief) -
+        ((target <= 10 ? 1.8 : 2.4) * quickTempoRelief)
       ),
       windowSpan + 1,
       Math.max(windowSpan + 2, cappedMaxAhead)
@@ -1337,12 +1341,16 @@ function buildAdaptiveWaitingWindow(nextLock, target, fixedSpan, currentRound, m
   }
 
   if (target <= 20) {
+    const b2bEarlyRelief = clamp((0.64 * b2bPull) + (0.36 * regimeB2BBoost), 0, 1);
+    const quickTempoRelief = clamp((0.58 * quick) + (0.42 * hard), 0, 1);
     const lowTargetCap = clamp(
       Math.round(
         (target <= 5 ? 8 : (target <= 10 ? 12 : 18)) +
         ((target <= 10 ? 3 : 4) * trendDownAdj) +
         ((target <= 10 ? 2 : 2.5) * globalWhitePressureAdj) -
-        ((target <= 10 ? 6 : 7) * earlyRelax)
+        ((target <= 10 ? 6 : 7) * earlyRelax) -
+        ((target <= 10 ? 3 : 4) * b2bEarlyRelief) -
+        ((target <= 10 ? 1.8 : 2.4) * quickTempoRelief)
       ),
       1,
       maxStartAhead
@@ -1554,13 +1562,33 @@ function shouldActivateWindow(target, nextLock, calibration = null, globalSignal
         b2bComposite >= 0.28
       );
     }
-    if (white >= 0.65 && release <= 0.35 && quick < 0.32 && b2bComposite < 0.34) {
+    if (
+      white >= 0.72 &&
+      release <= 0.3 &&
+      quick < 0.26 &&
+      p1 < (minP1 * 0.9) &&
+      b2bComposite < 0.3 &&
+      aiProbability < 0.28
+    ) {
       active = false;
     }
-    if (globalWhitePressure >= 0.62 && globalWhiteRelease <= 0.5 && quick < 0.3 && b2bComposite < 0.35) {
+    if (
+      globalWhitePressure >= 0.68 &&
+      globalWhiteRelease <= 0.42 &&
+      quick < 0.26 &&
+      b2bComposite < 0.32 &&
+      hard < 0.2 &&
+      aiProbability < 0.3
+    ) {
       active = false;
     }
-    if (trendDownRisk >= 0.75 && globalWhitePressure >= 0.52 && quick < 0.34 && b2bComposite < 0.38) {
+    if (
+      trendDownRisk >= 0.82 &&
+      globalWhitePressure >= 0.58 &&
+      quick < 0.28 &&
+      b2bComposite < 0.34 &&
+      aiProbability < 0.24
+    ) {
       active = false;
     }
     if (aiProbability <= 0.14 && aiConfidence >= 0.72 && quick < 0.24 && hard < 0.22) {
@@ -1584,10 +1612,10 @@ function shouldActivateWindow(target, nextLock, calibration = null, globalSignal
     }
   } else if (target <= 100) {
     active = (score >= adaptiveMinConf) && (p1 >= minP1 || hard >= 0.22 || b2bComposite >= 0.18);
-    if (white >= 0.68 && release <= 0.34 && hard < 0.3) {
+    if (white >= 0.74 && release <= 0.28 && hard < 0.24 && aiProbability < 0.26) {
       active = false;
     }
-    if (trendDownRisk >= 0.82 && hard < 0.32 && b2bComposite < 0.32) {
+    if (trendDownRisk >= 0.86 && hard < 0.28 && b2bComposite < 0.3 && aiProbability < 0.24) {
       active = false;
     }
     if (aiProbability >= 0.56 && aiConfidence >= 0.4) {
@@ -3284,7 +3312,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
   const aiPredictor = buildAIPredictorSummary(targetsOut, globalSignals, aiProfiles);
 
   return {
-    model: 'range-lock-v11-selective',
+    model: 'range-lock-v12-selective',
     generatedAt: new Date().toISOString(),
     asOfRound: currentRound,
     sampleSize: pre.n,

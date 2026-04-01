@@ -61,6 +61,17 @@ pool.on('error', (err) => {
   console.error('[db] Unexpected pool error:', err.message);
 });
 
+function canonicalizePredictionOutcome({ lo, hi, hitRound }) {
+  const loN = Number(lo);
+  const hiN = Number(hi);
+  const hitN = hitRound == null ? null : Number(hitRound);
+  const hasHit = Number.isFinite(hitN);
+  if (!hasHit) return { outcome: 'loss', hitRound: null };
+  if (hitN < loN) return { outcome: 'early', hitRound: hitN };
+  if (hitN <= hiN) return { outcome: 'win', hitRound: hitN };
+  return { outcome: 'loss', hitRound: hitN };
+}
+
 async function initDB() {
   if (!DATABASE_URL) {
     throw new Error(
@@ -129,6 +140,25 @@ async function initDB() {
     END
     $$;
   `).catch(() => {});
+
+  // Repair legacy rows where stored outcome conflicts with hit/window relation.
+  await pool.query(`
+    UPDATE predictions
+       SET outcome = CASE
+         WHEN hit_round IS NULL THEN 'loss'
+         WHEN hit_round < window_lo THEN 'early'
+         WHEN hit_round <= window_hi THEN 'win'
+         ELSE 'loss'
+       END
+     WHERE
+       (hit_round IS NULL AND outcome <> 'loss')
+       OR
+       (hit_round IS NOT NULL AND hit_round < window_lo AND outcome <> 'early')
+       OR
+       (hit_round IS NOT NULL AND hit_round >= window_lo AND hit_round <= window_hi AND outcome <> 'win')
+       OR
+       (hit_round IS NOT NULL AND hit_round > window_hi AND outcome <> 'loss')
+  `).catch(() => {});
 }
 
 async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation, source = 'engine', probW = null }) {
@@ -136,20 +166,44 @@ async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, gene
   if (!target || !outcome || lo == null || hi == null) throw new Error('savePrediction: missing required fields');
   if (!Number.isFinite(Number(lo)) || !Number.isFinite(Number(hi)) || Number(hi) < Number(lo))
     throw new Error(`savePrediction: invalid window lo=${lo} hi=${hi}`);
+  const normalized = canonicalizePredictionOutcome({ lo, hi, hitRound });
 
   await pool.query(
     `INSERT INTO predictions (target, min_mult, outcome, window_lo, window_hi, hit_round, generation, source, prob_w)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      ON CONFLICT (source, target, window_lo, window_hi) DO UPDATE
-       SET outcome    = CASE
-                          WHEN predictions.outcome = 'win'                           THEN predictions.outcome
-                          WHEN predictions.outcome = 'early' AND EXCLUDED.outcome = 'loss' THEN predictions.outcome
-                          ELSE EXCLUDED.outcome
+       SET hit_round  = CASE
+                          WHEN predictions.hit_round IS NULL THEN EXCLUDED.hit_round
+                          WHEN EXCLUDED.hit_round IS NULL THEN predictions.hit_round
+                          ELSE LEAST(predictions.hit_round, EXCLUDED.hit_round)
                         END,
-           hit_round  = COALESCE(predictions.hit_round, EXCLUDED.hit_round),
            generation = GREATEST(EXCLUDED.generation, predictions.generation),
-           prob_w     = COALESCE(EXCLUDED.prob_w, predictions.prob_w)`,
-    [target, minMult, outcome, lo, hi, hitRound ?? null, generation ?? 1, source, probW ?? null]
+           prob_w     = COALESCE(EXCLUDED.prob_w, predictions.prob_w),
+           outcome    = CASE
+                          WHEN (
+                            CASE
+                              WHEN predictions.hit_round IS NULL THEN EXCLUDED.hit_round
+                              WHEN EXCLUDED.hit_round IS NULL THEN predictions.hit_round
+                              ELSE LEAST(predictions.hit_round, EXCLUDED.hit_round)
+                            END
+                          ) IS NULL THEN 'loss'
+                          WHEN (
+                            CASE
+                              WHEN predictions.hit_round IS NULL THEN EXCLUDED.hit_round
+                              WHEN EXCLUDED.hit_round IS NULL THEN predictions.hit_round
+                              ELSE LEAST(predictions.hit_round, EXCLUDED.hit_round)
+                            END
+                          ) < predictions.window_lo THEN 'early'
+                          WHEN (
+                            CASE
+                              WHEN predictions.hit_round IS NULL THEN EXCLUDED.hit_round
+                              WHEN EXCLUDED.hit_round IS NULL THEN predictions.hit_round
+                              ELSE LEAST(predictions.hit_round, EXCLUDED.hit_round)
+                            END
+                          ) <= predictions.window_hi THEN 'win'
+                          ELSE 'loss'
+                        END`,
+    [target, minMult, normalized.outcome, lo, hi, normalized.hitRound, generation ?? 1, source, probW ?? null]
   );
 }
 
@@ -172,19 +226,25 @@ async function getPredictions({ limit = 500, target = null, source = null } = {}
      LIMIT $${idx}`,
     params
   );
-  return res.rows.map(r => ({
-    id:         r.id,
-    target:     r.target,
-    minMult:    parseFloat(r.min_mult),
-    outcome:    r.outcome,
-    lo:         Number(r.window_lo),
-    hi:         Number(r.window_hi),
-    hitRound:   r.hit_round ? Number(r.hit_round) : null,
-    generation: r.generation,
-    source:     r.source || 'engine',
-    probW:      r.prob_w != null ? parseFloat(r.prob_w) : null,
-    ts:         new Date(r.created_at).getTime(),
-  }));
+  return res.rows.map(r => {
+    const lo = Number(r.window_lo);
+    const hi = Number(r.window_hi);
+    const hitRound = r.hit_round != null ? Number(r.hit_round) : null;
+    const normalized = canonicalizePredictionOutcome({ lo, hi, hitRound });
+    return {
+      id:         r.id,
+      target:     r.target,
+      minMult:    parseFloat(r.min_mult),
+      outcome:    normalized.outcome,
+      lo,
+      hi,
+      hitRound:   normalized.hitRound,
+      generation: r.generation,
+      source:     r.source || 'engine',
+      probW:      r.prob_w != null ? parseFloat(r.prob_w) : null,
+      ts:         new Date(r.created_at).getTime(),
+    };
+  });
 }
 
 const ROUND_BATCH_CHUNK = 1000; // 3 params per row → 3000 params max per chunk
