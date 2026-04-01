@@ -2,6 +2,15 @@
 
 const TARGETS = [5, 10, 20, 50, 100, 500, 1000];
 const REPORT_THRESHOLDS = [2, 5, 10, 25, 50];
+const FIXED_WINDOW_SPAN = {
+  5: 3,
+  10: 6,
+  20: 10,
+  50: 18,
+  100: 27,
+  500: 50,
+  1000: 75,
+};
 
 const BUCKETS = [
   { id: 'micro', label: 'Micro', min: 1, max: 1.99, color: '#ff4560' },
@@ -723,9 +732,9 @@ function buildTargetCandidate(state, targetData, calibration) {
   aheadLo = clamp(aheadLo, 1, adaptiveCap);
   aheadMid = clamp(aheadMid, aheadLo, adaptiveCap + Math.max(2, spread));
 
-  const span = Math.max(2, spread + 1);
+  const span = Math.max(1, Number(FIXED_WINDOW_SPAN[target] || Math.max(2, spread + 1)));
   const lo = currentRound + aheadLo;
-  const hi = Math.max(currentRound + aheadMid, lo + span - 1);
+  const hi = lo + span - 1;
 
   const minP1 = clamp(calibration?.minP1 ?? (0.04 + (targetData.baseRate * 0.6)), 0.01, 0.95);
   const minConfidence = clamp(calibration?.minConfidence ?? 0.4, 0.1, 0.95);
@@ -897,12 +906,15 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
     const existing = normalizeLockInput(existingLocksRaw[key]);
     const evalResult = evaluateExistingLock(existing, targetData.hitRoundIds, currentRound);
     const candidate = buildTargetCandidate(state, targetData, calibration[target]);
+    const expectedSpan = Number(FIXED_WINDOW_SPAN[target] || 3);
+    const existingSpan = existing ? Math.max(1, Number(existing.hi) - Number(existing.lo) + 1) : null;
+    const spanMismatch = Boolean(existing && Number.isFinite(existingSpan) && existingSpan !== expectedSpan);
 
     let lockToUse = existing;
     let status = evalResult.status;
     let previousOutcome = null;
 
-    if (!existing || evalResult.resolved) {
+    if (!existing || evalResult.resolved || spanMismatch) {
       if (existing && evalResult.resolved) {
         previousOutcome = {
           outcome: evalResult.outcome,
@@ -982,6 +994,8 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
     alertSummary,
     settings: {
       adaptive: true,
+      fixedWindowSpan: true,
+      fixedWindowSpanByTarget: FIXED_WINDOW_SPAN,
       pureData: true,
       supervisedLearning: true,
       immediateRecalcOnResolve: true,
@@ -1110,6 +1124,7 @@ function buildPredictionReport(rounds) {
 
 module.exports = {
   TARGETS,
+  FIXED_WINDOW_SPAN,
   buildPredictionReport,
   computeLockedRangePredictions,
 };
