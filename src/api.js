@@ -135,7 +135,7 @@ const BOT_RPC_URL = String(
 const BOT_PLAYER_ACCOUNT_PDA = String(
   process.env.BOT_PLAYER_ACCOUNT_PDA ||
   process.env.CRASH_BOT_PLAYER_ACCOUNT_PDA ||
-  '7b1VfRjNoCn7gPEQ7HFAg8wtjaLkrVrZTQNvkEdmrwsj'
+  '9PKoSP4k2uzkCCWMi1x6iUzPPBsK5RZbVpEaz1CS2Vnk'
 ).trim();
 const BOT_WALLET_AUTH_API = String(
   process.env.BOT_WALLET_AUTH_API ||
