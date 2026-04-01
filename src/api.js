@@ -145,6 +145,10 @@ const BOT_CASHOUT_API = String(
   process.env.BOT_CASHOUT_API ||
   'https://crash-api.degencoinflip.com/api/status/set_cashout_multiplier'
 ).trim();
+const BOT_STOP_CASHOUT_API = String(
+  process.env.BOT_STOP_CASHOUT_API ||
+  'https://crash-api.degencoinflip.com/api/status/cashout'
+).trim();
 const HISTORY_TARGETS = ['5x', '10x', '20x', '50x', '100x', '500x', '1000x'];
 
 const predictCache = {
@@ -653,6 +657,60 @@ app.post('/bot/site-auth/authorize', express.json({ limit: '20kb' }), rateLimit(
     res.json({ ok: true, ...(data && typeof data === 'object' ? data : { payload: raw }) });
   } catch (e) {
     console.error('[bot/site-auth/authorize] error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/bot/site-cashout/multiplier', express.json({ limit: '20kb' }), rateLimit(40), async (req, res) => {
+  try {
+    const token = String(req.body?.token || '').trim();
+    const multiplier = String(req.body?.multiplier || '').trim();
+    if (!token || !multiplier) {
+      return res.status(400).json({ ok: false, error: 'token and multiplier required' });
+    }
+
+    const upstream = await fetch(BOT_CASHOUT_API, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: token,
+      },
+      body: JSON.stringify({ multiplier }),
+    });
+    const { raw, data } = await readResponsePayload(upstream);
+    if (!upstream.ok) {
+      return res.status(upstream.status).json({ ok: false, error: raw || `Cashout upstream error ${upstream.status}` });
+    }
+    res.json({ ok: true, ...(data && typeof data === 'object' ? data : { payload: raw }) });
+  } catch (e) {
+    console.error('[bot/site-cashout/multiplier] error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/bot/site-cashout/cashout', express.json({ limit: '20kb' }), rateLimit(40), async (req, res) => {
+  try {
+    const token = String(req.body?.token || '').trim();
+    const mult = String(req.body?.mult || '').trim();
+    if (!token || !mult) {
+      return res.status(400).json({ ok: false, error: 'token and mult required' });
+    }
+
+    const upstream = await fetch(BOT_STOP_CASHOUT_API, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: token,
+      },
+      body: JSON.stringify({ message: 'STOP', mult }),
+    });
+    const { raw, data } = await readResponsePayload(upstream);
+    if (!upstream.ok) {
+      return res.status(upstream.status).json({ ok: false, error: raw || `Stop cashout upstream error ${upstream.status}` });
+    }
+    res.json({ ok: true, ...(data && typeof data === 'object' ? data : { payload: raw }) });
+  } catch (e) {
+    console.error('[bot/site-cashout/cashout] error:', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
