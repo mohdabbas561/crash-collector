@@ -1471,7 +1471,8 @@ function runTargetWalkForward(state, target, cfg) {
   };
 }
 
-function buildLockFromLive(state, targetResult, currentRound, generation, cfg) {
+function buildLockFromLive(state, targetResult, currentRound, generation, cfg, options = {}) {
+  const forceLock = Boolean(options?.forceLock);
   const live = targetResult.live;
   const band = estimateAheadBand(state, targetResult);
   const regimeWindowMult = clamp(Number(live?.regime?.windowMult ?? 1), 1, 1.35);
@@ -1481,7 +1482,7 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg) {
   const hi = currentRound + aheadHi;
   const p = Number.isFinite(live.pFinal) ? live.pFinal : live.pAdj;
   const pSoon = clamp(1 - Math.pow(1 - p, 3), 0, 1);
-  const suspended = !live.actionable;
+  const suspended = forceLock ? false : !live.actionable;
 
   return {
     lo,
@@ -1548,7 +1549,10 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg) {
       isMutable: false,
       roundsSinceLock: 0,
       suspended,
-      suspendReason: live.entropy.disabled ? 'entropy_random_regime' : (!live.actionable ? 'ev_below_threshold' : null),
+      suspendReason: suspended
+        ? (live.entropy.disabled ? 'entropy_random_regime' : (!live.actionable ? 'ev_below_threshold' : null))
+        : null,
+      forcedLock: forceLock,
       walkForwardNoLeakage: true,
     },
   };
@@ -1777,17 +1781,10 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
         }
       }
       const generation = existing ? Number(existing.generation || 1) + 1 : 1;
-      if (result.live.actionable) {
-        lockToUse = buildLockFromLive(state, result, currentRound, generation, cfg);
-        status = 'locked';
-        relockedCount += 1;
-      } else if (existing && evalExisting.status === 'idle') {
-        lockToUse = existing;
-        status = 'idle';
-      } else {
-        lockToUse = buildIdleLock(state, result, currentRound, generation, cfg);
-        status = 'idle';
-      }
+      // Execution mode requested by user: always emit a predictive lock window.
+      lockToUse = buildLockFromLive(state, result, currentRound, generation, cfg, { forceLock: true });
+      status = 'locked';
+      relockedCount += 1;
     }
 
     if (status === 'locked' && Number(lockToUse.lo) <= currentRound) {
