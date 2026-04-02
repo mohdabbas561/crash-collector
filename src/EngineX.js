@@ -2041,8 +2041,13 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       // Recompute target model only when we are about to create a new decision
       // (fresh target OR after resolution OR idle monitor update).
       const result = getTargetResult(target);
+      const existingWasIdle = existing
+        ? (
+            String(existing?.eta?.lockStatus || '').toUpperCase() === 'IDLE' ||
+            Boolean(existing?.suspended)
+          )
+        : false;
       if (existing && evalExisting.resolved) {
-        const existingWasIdle = String(existing?.eta?.lockStatus || '').toUpperCase() === 'IDLE';
         previousOutcome = existingWasIdle ? null : {
           outcome: evalExisting.outcome,
           hitRound: evalExisting.hitRound,
@@ -2066,7 +2071,12 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
         }
       }
       const generation = existing ? Number(existing.generation || 1) + 1 : 1;
-      if (result.live.actionable) {
+
+      // Freeze IDLE locks while signal remains non-actionable to prevent +1 sliding drift.
+      if (existingWasIdle && !evalExisting.resolved && !spanMismatch && !result.live.actionable) {
+        lockToUse = existing;
+        status = 'idle';
+      } else if (result.live.actionable) {
         lockToUse = buildLockFromLive(state, result, currentRound, generation, cfg);
         status = 'locked';
         relockedCount += 1;
