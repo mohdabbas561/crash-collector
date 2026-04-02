@@ -121,6 +121,11 @@ const DEFAULT_CONFIG = Object.freeze({
   // Edge validation confidence scaling.
   edgeValidationFloor: 0.25,
   edgeValidationCeil: 1.2,
+
+  // Execution mode toggle:
+  // true => always emit lock windows (quick prediction mode),
+  // false => strict pre-condition gate can keep targets idle.
+  alwaysEmitLocks: true,
 });
 
 const BUCKETS = [
@@ -1730,7 +1735,8 @@ function runTargetWalkForward(state, target, cfg) {
   };
 }
 
-function buildLockFromLive(state, targetResult, currentRound, generation, cfg) {
+function buildLockFromLive(state, targetResult, currentRound, generation, cfg, options = {}) {
+  const forceLock = Boolean(options?.forceLock);
   const live = targetResult.live;
   const band = estimateAheadBand(state, targetResult);
   const regimeWindowMult = clamp(Number(live?.regime?.windowMult ?? 1), 1, 1.35);
@@ -1741,7 +1747,7 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg) {
   const hi = lo + fixedSpan - 1;
   const p = Number.isFinite(live.pFinal) ? live.pFinal : live.pAdj;
   const pSoon = clamp(1 - Math.pow(1 - p, 3), 0, 1);
-  const suspended = !live.actionable;
+  const suspended = forceLock ? false : !live.actionable;
 
   return {
     lo,
@@ -1823,6 +1829,7 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg) {
       suspendReason: suspended
         ? (live.entropy.disabled ? 'entropy_random_regime' : (!live.actionable ? 'ev_below_threshold' : null))
         : null,
+      forcedLock: forceLock,
       walkForwardNoLeakage: true,
     },
   };
@@ -2073,11 +2080,11 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       const generation = existing ? Number(existing.generation || 1) + 1 : 1;
 
       // Freeze IDLE locks while signal remains non-actionable to prevent +1 sliding drift.
-      if (existingWasIdle && !evalExisting.resolved && !spanMismatch && !result.live.actionable) {
+      if (existingWasIdle && !evalExisting.resolved && !spanMismatch && !result.live.actionable && !cfg.alwaysEmitLocks) {
         lockToUse = existing;
         status = 'idle';
-      } else if (result.live.actionable) {
-        lockToUse = buildLockFromLive(state, result, currentRound, generation, cfg);
+      } else if (result.live.actionable || cfg.alwaysEmitLocks) {
+        lockToUse = buildLockFromLive(state, result, currentRound, generation, cfg, { forceLock: Boolean(cfg.alwaysEmitLocks) });
         status = 'locked';
         relockedCount += 1;
       } else {
@@ -2156,6 +2163,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       baselineFormula: 'P(x)=1/x',
       noFixedWindows: false,
       fixedWindowSpans: FIXED_WINDOW_SPAN,
+      alwaysEmitLocks: Boolean(cfg.alwaysEmitLocks),
       immutableLocks: true,
       relockOnlyAfterResolved: true,
       perRoundPrediction: false,
