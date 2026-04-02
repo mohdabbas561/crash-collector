@@ -800,7 +800,10 @@ function confidenceFromComponents(p, baseline, weights, entropyInfo, extras = {}
 }
 
 function evaluateExistingLock(lock, hitRoundIds, currentRound) {
-  if (!lock) return { resolved: false, status: 'none', outcome: null, hitRound: null };
+  if (!lock) return { resolved: false, status: 'idle', outcome: null, hitRound: null };
+  if (Boolean(lock.suspended) || String(lock?.eta?.lockStatus || '') === 'IDLE') {
+    return { resolved: false, status: 'idle', outcome: null, hitRound: null };
+  }
   const lo = Number(lock.lo);
   const hi = Number(lock.hi);
   const madeRaw = Number(lock.roundWhenMade ?? (lo - 1));
@@ -816,7 +819,7 @@ function evaluateExistingLock(lock, hitRoundIds, currentRound) {
   }
   if (currentRound >= hi) return { resolved: true, status: 'resolved', outcome: 'loss', hitRound: null };
   if (currentRound >= lo) return { resolved: false, status: 'window-open', outcome: null, hitRound: null };
-  return { resolved: false, status: 'waiting', outcome: null, hitRound: null };
+  return { resolved: false, status: 'locked', outcome: null, hitRound: null };
 }
 
 function confidenceBand(score) {
@@ -829,17 +832,27 @@ function confidenceBand(score) {
 }
 
 function buildUiTarget(target, lock, status, currentRound, previousOutcome) {
-  const lo = Number(lock.lo);
-  const hi = Number(lock.hi);
-  const eta = lock.eta || {};
-  const aheadLo = Math.max(0, lo - currentRound);
-  const aheadHi = Math.max(0, hi - currentRound);
+  const lo = Number(lock?.lo);
+  const hi = Number(lock?.hi);
+  const eta = lock?.eta || {};
+  const aheadLo = Number.isFinite(lo) ? Math.max(0, lo - currentRound) : 0;
+  const aheadHi = Number.isFinite(hi) ? Math.max(0, hi - currentRound) : 0;
+  const lockCreatedAtRound = Number(lock?.roundWhenMade ?? eta.lockCreatedAtRound ?? currentRound);
+  const roundsSinceLock = Math.max(0, currentRound - lockCreatedAtRound);
+  const lockStatus = (
+    status === 'window-open' ? 'ACTIVE'
+      : status === 'locked' ? 'LOCKED'
+        : status === 'resolved' ? 'RESOLVED'
+          : 'IDLE'
+  );
   return {
     target,
     targetLabel: `${target}x`,
-    status,
-    confidence: clamp(Number(lock.confidence ?? eta.aiConfidence ?? 0), 0, 1),
-    confidenceBand: confidenceBand(lock.confidence ?? eta.aiConfidence ?? 0),
+    // Keep legacy status values for existing frontend mapping.
+    status: status === 'idle' ? 'waiting' : status,
+    lockStatus,
+    confidence: clamp(Number(lock?.confidence ?? eta.aiConfidence ?? 0), 0, 1),
+    confidenceBand: confidenceBand(lock?.confidence ?? eta.aiConfidence ?? 0),
     window: {
       lo,
       hi,
@@ -865,6 +878,12 @@ function buildUiTarget(target, lock, status, currentRound, previousOutcome) {
       edge: eta.edge ?? null,
       ev: eta.ev ?? null,
       entropyRandomLike: eta.entropyRandomLike ?? null,
+    },
+    debug: {
+      lockCreatedAtRound,
+      lockStatus,
+      isMutable: false,
+      roundsSinceLock,
     },
     previousOutcome: previousOutcome || null,
   };
@@ -957,7 +976,7 @@ function makeRollingEdgeValidation(maxLen) {
       if (negRatio > 0.55) {
         score *= clamp(1 - (negRatio - 0.55) * 0.8, 0.4, 1);
       }
-      score = clamp(score, 0.25, 1.2);
+      score = clamp(score, 0, 1);
       return {
         count: n,
         predictedEV: meanPred,
@@ -1107,6 +1126,8 @@ function runTargetWalkForward(state, target, cfg) {
   const brierHaz = makeRollingBrier(cfg.brierWindow);
   const brierKnn = makeRollingBrier(cfg.brierWindow);
   const brierBase = makeRollingBrier(cfg.brierWindow);
+  const entropyBaseline = makeRollingMeanStd(Math.max(40, Math.floor(cfg.entropyRecentWindow / Math.max(1, cfg.entropyStep))));
+  const edgeValidation = makeRollingEdgeValidation(cfg.edgeValidationWindow);
 
   const whiteStats = createWhiteTransitionStats();
   for (let j = 0; j < Math.max(0, evalStart - 1); j += 1) {
@@ -1124,22 +1145,109 @@ function runTargetWalkForward(state, target, cfg) {
   let peak = 0;
   let maxDrawdown = 0;
   let evSum = 0;
+  const rollingReturns = [];
+  let edgePredCount = 0;
+  let edgePredCorrect = 0;
+  let hazardDisabled = false;
+
+  function pushRollingReturn(v) {
+    rollingReturns.push(v);
+    if (rollingReturns.length > cfg.performanceWindow) rollingReturns.shift();
+  }
+
+  function maxDrawdownOf(values) {
+    if (!Array.isArray(values) || !values.length) return null;
+    let eq = 0;
+    let peakEq = 0;
+    let dd = 0;
+    for (let i = 0; i < values.length; i += 1) {
+      eq += values[i];
+      peakEq = Math.max(peakEq, eq);
+      dd = Math.max(dd, peakEq - eq);
+    }
+    return dd;
+  }
 
   function predictAt(idx) {
     const baselineP = 1 / target;
-    const pHaz = hazardPredictAt(state, targetState, idx, cfg);
-    const knn = knnPredictAt(state, targetState, idx, cfg);
-    const pKnn = knn?.p ?? null;
-    const availability = { hazard: Number.isFinite(pHaz), knn: Number.isFinite(pKnn) };
     const brierMeans = {
       baseline: brierBase.mean(),
       hazard: brierHaz.mean(),
       knn: brierKnn.mean(),
     };
-    const weights = blendWeightsFromBrier(brierMeans, cfg, availability);
+    const hazardEligible = (
+      brierHaz.count() >= cfg.hazardMinEvalCount &&
+      Number.isFinite(brierMeans.hazard) &&
+      Number.isFinite(brierMeans.baseline)
+    );
+    if (hazardEligible && (brierMeans.hazard >= (brierMeans.baseline + Math.max(0, cfg.hazardDisableTolerance)))) {
+      hazardDisabled = true;
+    }
+
+    const pHaz = hazardDisabled ? null : hazardPredictAt(state, targetState, idx, cfg);
+    const knn = knnPredictAt(state, targetState, idx, cfg);
+    const pKnn = knn?.p ?? null;
+    const availability = { hazard: Number.isFinite(pHaz), knn: Number.isFinite(pKnn) };
+    const entropy = entropyAtIndex(state, targetState, idx, entropyThresholds, cfg);
+    const entropyMean = entropyBaseline.mean();
+    const entropyStd = entropyBaseline.std();
+    const entropyTrend = (Number.isFinite(entropy.js) && Number.isFinite(entropyMean))
+      ? (entropy.js - entropyMean)
+      : 0;
+    const entropySpike = (
+      Number.isFinite(entropyTrend) &&
+      Number.isFinite(entropyStd) &&
+      entropyStd > 0 &&
+      entropyTrend > (entropyStd * cfg.entropySpikeStdMult)
+    );
+
+    const shortVolW = Math.max(12, Math.floor(cfg.featureVolWindow / 2));
+    const longVolW = Math.max(shortVolW + 4, cfg.featureVolWindow);
+    const shortL = Math.max(0, idx - shortVolW + 1);
+    const longL = Math.max(0, idx - longVolW + 1);
+    const shortN = idx - shortL + 1;
+    const longN = idx - longL + 1;
+    const shortMean = shortN > 0 ? (windowSum(state.logPrefix, shortL, idx) / shortN) : 0;
+    const longMean = longN > 0 ? (windowSum(state.logPrefix, longL, idx) / longN) : shortMean;
+    const shortSq = shortN > 0 ? (windowSum(state.logSqPrefix, shortL, idx) / shortN) : 0;
+    const longSq = longN > 0 ? (windowSum(state.logSqPrefix, longL, idx) / longN) : 0;
+    const shortStd = Math.sqrt(Math.max(0, shortSq - (shortMean * shortMean)));
+    const longStd = Math.sqrt(Math.max(0, longSq - (longMean * longMean)));
+    const volShift = longStd > 1e-6 ? ((shortStd - longStd) / longStd) : 0;
+
+    const recentHitRate = rateInWindow(targetState.hitPrefix, idx, cfg.b2bMomentumWindowShort);
+    const longHitRate = rateInWindow(targetState.hitPrefix, idx, cfg.b2bMomentumWindowLong);
+    const hitRateDrift = recentHitRate - longHitRate;
+
+    const recentWhiteRate = (windowSum(
+      state.whitePrefix,
+      Math.max(0, idx - cfg.b2bMomentumWindowShort + 1),
+      idx
+    ) || 0) / Math.max(1, Math.min(cfg.b2bMomentumWindowShort, idx + 1));
+    const longWhiteRate = (windowSum(
+      state.whitePrefix,
+      Math.max(0, idx - cfg.b2bMomentumWindowLong + 1),
+      idx
+    ) || 0) / Math.max(1, Math.min(cfg.b2bMomentumWindowLong, idx + 1));
+    const clusterScore = Math.max(0, recentWhiteRate - longWhiteRate);
+
+    const regime = classifyRegime({
+      entropy,
+      lagCorr: Number(entropy.lagCorr || 0),
+      volShift,
+      hitRateDrift,
+      clusterScore,
+      entropyTrend,
+    }, cfg);
+
+    const weights = blendWeightsFromBrier(brierMeans, cfg, availability, {
+      hazardDisabled,
+      knnReliability: Number(knn?.reliability ?? 0),
+      trendingBoost: regime.label === 'TRENDING' ? regime.trendingBias : 0,
+    });
     const h = Number.isFinite(pHaz) ? pHaz : baselineP;
     const k = Number.isFinite(pKnn) ? pKnn : baselineP;
-    const pBlend = clamp(
+    let pBlend = clamp(
       weights.baseline * baselineP +
       weights.hazard * h +
       weights.knn * k,
@@ -1147,41 +1255,96 @@ function runTargetWalkForward(state, target, cfg) {
       1
     );
 
+    const modelDisagreement = (
+      Number.isFinite(pHaz) && Number.isFinite(pKnn)
+        ? Math.abs(pHaz - pKnn)
+        : Math.max(Math.abs(h - baselineP), Math.abs(k - baselineP))
+    );
+    if (modelDisagreement > cfg.modelDisagreementHigh) {
+      const denom = Math.max(0.01, cfg.modelDisagreementHard - cfg.modelDisagreementHigh);
+      const shrink = clamp(1 - ((modelDisagreement - cfg.modelDisagreementHigh) / denom), 0.50, 1);
+      pBlend = baselineP + ((pBlend - baselineP) * shrink);
+    }
+
     const whiteRunNow = state.whiteRun[idx] || 0;
     const whiteEst = whiteEstimate(whiteStats, whiteRunNow);
     const continueProb = Number.isFinite(whiteEst.continueProb) ? whiteEst.continueProb : 0;
     const reboundProb = Number.isFinite(whiteEst.reboundProb) ? whiteEst.reboundProb : 0;
     const whiteDelta = clamp(reboundProb - continueProb, -1, 1);
-    const pAdj = clamp(pBlend * (1 + cfg.whiteModifierStrength * whiteDelta), 0, 1);
-
-    const edge = pAdj - baselineP;
-    const ev = (pAdj * target) - 1;
-    const entropy = entropyAtIndex(state, targetState, idx, entropyThresholds, cfg);
-    const actionable = !entropy.disabled && ev > cfg.evThreshold;
-    const confidence = confidenceFromComponents(pAdj, baselineP, weights, entropy);
+    let pAdj = clamp(pBlend * (1 + cfg.whiteModifierStrength * whiteDelta), 0, 1);
 
     const b2bImm = rateInWindow(targetState.hitPrefix, idx, 2);
-    const b2bNear = rateInWindow(targetState.hitPrefix, idx, 5);
+    const b2bNear = rateInWindow(targetState.hitPrefix, idx, cfg.b2bNearWindow);
+    const b2bNearRate = rateInWindow(targetState.hitPrefix, idx, cfg.b2bMomentumWindowShort);
+    const b2bLongRate = rateInWindow(targetState.hitPrefix, idx, cfg.b2bMomentumWindowLong);
+    const b2bSampleReady = (idx + 1) >= Math.max(32, cfg.b2bMomentumWindowShort * 2);
+    const b2bMomentum = b2bSampleReady ? clamp(b2bNearRate - b2bLongRate, -1, 1) : 0;
+    if (b2bMomentum > 0 && !entropy.randomLike) {
+      pAdj = clamp(
+        pAdj * (1 + (Math.min(cfg.b2bBoostCap, 0.05) * b2bMomentum)),
+        0,
+        1
+      );
+    }
+
+    const edgeVal = edgeValidation.metrics();
+    const edgeConfidenceScore = edgeVal.count >= cfg.edgeValidationMinTrades
+      ? clamp(edgeVal.score, 0, 1)
+      : 1;
+    const pFinal = clamp(pAdj * edgeConfidenceScore, 0, 1);
+
+    const edge = pFinal - baselineP;
+    const ev = (pFinal * target) - 1;
+    const evThreshold = (cfg.evThreshold || 0) + (regime.label === 'CLUSTERED' ? regime.evAdjust : 0);
+    const actionable = !entropy.disabled && !regime.randomLike && !entropySpike && ev > evThreshold;
+
+    const modelAgreement = clamp(
+      1 - (modelDisagreement / Math.max(1e-6, cfg.modelDisagreementHard)),
+      0,
+      1
+    );
+    const confidence = confidenceFromComponents(pFinal, baselineP, weights, entropy, {
+      modelAgreement,
+      edgeConfidenceScore,
+      entropyTrend,
+      modelDisagreement,
+      entropySpike,
+    });
+    const recommendedBetFraction = kellyFraction(pFinal, target, confidence, cfg.maxRiskFraction);
 
     return {
       baselineP,
       pHaz,
       pKnn,
       pBlend,
+      pFinal,
       pAdj,
       edge,
       ev,
       actionable,
       entropy,
+      entropyTrend,
+      entropySpike,
+      regime,
       confidence,
+      recommendedBetFraction,
       weights,
       knnSupport: knn?.support ?? null,
+      knnReliability: knn?.reliability ?? null,
+      knnSimilarity: knn?.similarityScore ?? null,
+      modelDisagreement: roundNum(modelDisagreement, 6),
+      modelAgreement: roundNum(modelAgreement, 6),
+      edgeConfidenceScore: roundNum(edgeConfidenceScore, 6),
+      edgeValidation: edgeVal,
       whiteRun: whiteRunNow,
       whiteContinue: whiteEst.continueProb,
       whiteRebound: whiteEst.reboundProb,
       whiteSample: whiteEst.sample,
       b2bImm,
       b2bNear,
+      b2bNearRate,
+      b2bLongRate,
+      b2bMomentum,
     };
   }
 
@@ -1193,14 +1356,22 @@ function runTargetWalkForward(state, target, cfg) {
       brierBase.add((pred.baselineP - y) ** 2);
       if (Number.isFinite(pred.pHaz)) brierHaz.add((pred.pHaz - y) ** 2);
       if (Number.isFinite(pred.pKnn)) brierKnn.add((pred.pKnn - y) ** 2);
+      if (Number.isFinite(pred.entropy.js)) entropyBaseline.add(pred.entropy.js);
 
       if (pred.actionable) {
         bets += 1;
         wins += y;
-        pnl += y ? (target - 1) : -1;
+        const realizedEV = y ? (target - 1) : -1;
+        pnl += realizedEV;
         peak = Math.max(peak, pnl);
         maxDrawdown = Math.max(maxDrawdown, peak - pnl);
         evSum += pred.ev;
+        pushRollingReturn(realizedEV);
+        edgeValidation.add(pred.ev, realizedEV);
+        edgePredCount += 1;
+        const predPositive = pred.ev >= 0;
+        const realPositive = realizedEV >= 0;
+        if (predPositive === realPositive) edgePredCorrect += 1;
       }
 
       const runLen = state.whiteRun[i] || 0;
@@ -1215,6 +1386,14 @@ function runTargetWalkForward(state, target, cfg) {
   const empiricalHitRate = evalEnd >= evalStart
     ? rateInWindow(targetState.hitPrefix, evalEnd + 1, evalEnd - evalStart + 1)
     : null;
+  const edgeValidationMetrics = edgeValidation.metrics();
+  const rollingEV = mean(rollingReturns);
+  const rollingWinRate = rollingReturns.length
+    ? (rollingReturns.filter((v) => v > 0).length / rollingReturns.length)
+    : null;
+  const rollingDrawdown = maxDrawdownOf(rollingReturns);
+  const rollingSharpe = sharpeLike(rollingReturns);
+  const edgeAccuracy = edgePredCount > 0 ? (edgePredCorrect / edgePredCount) : null;
 
   return {
     target,
@@ -1244,19 +1423,44 @@ function runTargetWalkForward(state, target, cfg) {
           ? (((empiricalHitRate * target) - 1) * bets)
           : null,
       },
+      performance: {
+        rollingEV: roundNum(rollingEV, 6),
+        rollingWinRate: roundNum(rollingWinRate, 6),
+        rollingMaxDrawdown: roundNum(rollingDrawdown, 6),
+        sharpeLike: roundNum(rollingSharpe, 6),
+        edgeAccuracy: roundNum(edgeAccuracy, 6),
+      },
+      edgeValidation: {
+        count: edgeValidationMetrics.count,
+        predictedEV: roundNum(edgeValidationMetrics.predictedEV, 6),
+        realizedEV: roundNum(edgeValidationMetrics.realizedEV, 6),
+        edgeError: roundNum(edgeValidationMetrics.edgeError, 6),
+        negativeErrorRatio: roundNum(edgeValidationMetrics.negativeErrorRatio, 6),
+        edgeConfidenceScore: roundNum(edgeValidationMetrics.score, 6),
+      },
       walkForward: true,
       noFutureLeakage: true,
     },
     entropyThresholds,
+    performanceDashboard: {
+      rollingEV: roundNum(rollingEV, 6),
+      winRate: roundNum(rollingWinRate, 6),
+      maxDrawdown: roundNum(rollingDrawdown, 6),
+      sharpeLike: roundNum(rollingSharpe, 6),
+      edgeAccuracy: roundNum(edgeAccuracy, 6),
+    },
   };
 }
 
 function buildLockFromLive(state, targetResult, currentRound, generation, cfg) {
   const live = targetResult.live;
   const band = estimateAheadBand(state, targetResult);
-  const lo = currentRound + band.aheadLo;
-  const hi = currentRound + band.aheadHi;
-  const p = live.pAdj;
+  const regimeWindowMult = clamp(Number(live?.regime?.windowMult ?? 1), 1, 1.35);
+  const aheadLo = Math.max(1, Math.round(band.aheadLo * regimeWindowMult));
+  const aheadHi = Math.max(aheadLo, Math.round(band.aheadHi * regimeWindowMult));
+  const lo = currentRound + aheadLo;
+  const hi = currentRound + aheadHi;
+  const p = Number.isFinite(live.pFinal) ? live.pFinal : live.pAdj;
   const pSoon = clamp(1 - Math.pow(1 - p, 3), 0, 1);
   const suspended = !live.actionable;
 
@@ -1273,6 +1477,8 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg) {
       pHit1: roundNum(p, 6),
       pHitSoon: roundNum(pSoon, 6),
       quickHit: roundNum(p, 6),
+      pAdj: roundNum(live.pAdj, 6),
+      pFinal: roundNum(live.pFinal, 6),
       edge: roundNum(live.edge, 6),
       ev: roundNum(live.ev, 6),
       targetEVThreshold: roundNum(cfg.evThreshold, 6),
@@ -1280,6 +1486,8 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg) {
       hazardP1: roundNum(live.pHaz, 6),
       knnP1: roundNum(live.pKnn, 6),
       knnSupport: roundNum(live.knnSupport, 6),
+      knnReliabilityScore: roundNum(live.knnReliability, 6),
+      knnSimilarityScore: roundNum(live.knnSimilarity, 6),
       blend: {
         baseline: roundNum(live.weights.baseline, 6),
         hazard: roundNum(live.weights.hazard, 6),
@@ -1292,23 +1500,68 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg) {
       whiteClusterSample: Number(live.whiteSample || 0),
       b2bImmRate: roundNum(live.b2bImm, 6),
       b2bNearRate: roundNum(live.b2bNear, 6),
+      b2bMomentum: roundNum(live.b2bMomentum, 6),
       entropyRandomLike: Boolean(live.entropy.randomLike),
       entropyDisabled: Boolean(live.entropy.disabled),
       entropyJs: live.entropy.js,
       entropyDrift: live.entropy.drift,
       entropyLag: live.entropy.lagCorr,
+      entropyTrend: roundNum(live.entropyTrend, 8),
+      entropySpike: Boolean(live.entropySpike),
       entropyThresholdSample: Number(live.entropy.thresholdSample || 0),
+      regime: live.regime?.label || 'RANDOM',
+      regimeWindowMult: roundNum(regimeWindowMult, 4),
       aiConfidence: roundNum(live.confidence, 6),
-      aheadLo: band.aheadLo,
-      aheadHi: band.aheadHi,
+      edgeConfidenceScore: roundNum(live.edgeConfidenceScore, 6),
+      modelAgreement: roundNum(live.modelAgreement, 6),
+      modelDisagreement: roundNum(live.modelDisagreement, 6),
+      recommendedBetFraction: roundNum(live.recommendedBetFraction, 6),
+      aheadLo,
+      aheadHi,
       q25: band.q20,
       q50: band.q50,
       q75: band.q75,
       q90: band.q90,
       q95: band.q95,
       gapNow: band.gapNow,
+      lockCreatedAtRound: Number(currentRound),
+      lockStatus: suspended ? 'IDLE' : 'LOCKED',
+      isMutable: false,
+      roundsSinceLock: 0,
       suspended,
       suspendReason: live.entropy.disabled ? 'entropy_random_regime' : (!live.actionable ? 'ev_below_threshold' : null),
+      walkForwardNoLeakage: true,
+    },
+  };
+}
+
+function buildIdleLock(targetResult, currentRound, generation) {
+  const live = targetResult.live;
+  const baselineP = 1 / targetResult.target;
+  return {
+    lo: currentRound + 1,
+    hi: currentRound + 1,
+    roundWhenMade: currentRound,
+    generation,
+    suspended: true,
+    confidence: Number(live?.confidence || 0),
+    eta: {
+      modelVersion: 'EngineX-v1-edge',
+      baselineFormula: 'P(x)=1/x',
+      pHit1: roundNum(live?.pFinal ?? live?.pAdj ?? baselineP, 6),
+      pHitSoon: roundNum(live?.pFinal ?? live?.pAdj ?? baselineP, 6),
+      quickHit: roundNum(live?.pFinal ?? live?.pAdj ?? baselineP, 6),
+      edge: roundNum(live?.edge, 6),
+      ev: roundNum(live?.ev, 6),
+      baseRate: roundNum(baselineP, 6),
+      aiConfidence: roundNum(live?.confidence, 6),
+      edgeConfidenceScore: roundNum(live?.edgeConfidenceScore, 6),
+      lockCreatedAtRound: Number(currentRound),
+      lockStatus: 'IDLE',
+      isMutable: false,
+      roundsSinceLock: 0,
+      suspended: true,
+      suspendReason: 'no_actionable_edge',
       walkForwardNoLeakage: true,
     },
   };
@@ -1360,6 +1613,45 @@ function summarizeBacktests(results) {
   };
 }
 
+function summarizePerformanceDashboard(results) {
+  const perTarget = [];
+  const evSeries = [];
+  const wrSeries = [];
+  const ddSeries = [];
+  const sharpeSeries = [];
+  const edgeAccSeries = [];
+  for (let i = 0; i < results.length; i += 1) {
+    const r = results[i];
+    const perf = r?.backtest?.performance || {};
+    perTarget.push({
+      target: r.target,
+      rollingEV: roundNum(perf.rollingEV, 6),
+      winRate: roundNum(perf.rollingWinRate, 6),
+      maxDrawdown: roundNum(perf.rollingMaxDrawdown, 6),
+      sharpeLike: roundNum(perf.sharpeLike, 6),
+      edgeAccuracy: roundNum(perf.edgeAccuracy, 6),
+      edgeConfidenceScore: roundNum(r?.live?.edgeConfidenceScore, 6),
+      recommendedBetFraction: roundNum(r?.live?.recommendedBetFraction, 6),
+      regime: r?.live?.regime?.label || 'RANDOM',
+    });
+    if (Number.isFinite(perf.rollingEV)) evSeries.push(perf.rollingEV);
+    if (Number.isFinite(perf.rollingWinRate)) wrSeries.push(perf.rollingWinRate);
+    if (Number.isFinite(perf.rollingMaxDrawdown)) ddSeries.push(perf.rollingMaxDrawdown);
+    if (Number.isFinite(perf.sharpeLike)) sharpeSeries.push(perf.sharpeLike);
+    if (Number.isFinite(perf.edgeAccuracy)) edgeAccSeries.push(perf.edgeAccuracy);
+  }
+  return {
+    perTarget,
+    aggregate: {
+      rollingEV: roundNum(mean(evSeries), 6),
+      winRate: roundNum(mean(wrSeries), 6),
+      maxDrawdown: roundNum(mean(ddSeries), 6),
+      sharpeLike: roundNum(mean(sharpeSeries), 6),
+      edgeAccuracy: roundNum(mean(edgeAccSeries), 6),
+    },
+  };
+}
+
 function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = {}) {
   const cfg = { ...DEFAULT_CONFIG, ...(options.config || {}) };
   const cleanRounds = normalizeRounds(rounds);
@@ -1401,63 +1693,59 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
     const existing = normalizeLockInput(existingLocksRaw[key]);
     const hitRoundIds = result.targetState.hitIdx.map((ix) => state.roundIds[ix]);
     const evalExisting = evaluateExistingLock(existing, hitRoundIds, currentRound);
-    const existingSpan = existing ? (Number(existing.hi) - Number(existing.lo) + 1) : null;
-    const existingLead = existing ? (Number(existing.lo) - Number(existing.roundWhenMade)) : null;
-    const legacyWindow = Boolean(existing) && (
-      !Number.isFinite(existingSpan) ||
-      existingSpan !== 1 ||
-      !Number.isFinite(existingLead) ||
-      existingLead !== 1 ||
-      String(existing?.eta?.modelVersion || '') !== 'EngineX-v1-edge'
-    );
 
     let previousOutcome = null;
     let lockToUse = existing;
     let status = evalExisting.status;
 
-    if (!existing || evalExisting.resolved || legacyWindow) {
+    // STRICT LOCK LIFECYCLE:
+    // If an existing lock is still active, freeze it completely (no mutation, no drift).
+    if (existing && !evalExisting.resolved && evalExisting.status !== 'idle') {
+      lockToUse = existing;
+      status = evalExisting.status;
+    } else {
       if (existing && evalExisting.resolved) {
-        previousOutcome = {
+        const existingWasIdle = Boolean(existing?.suspended || String(existing?.eta?.lockStatus || '') === 'IDLE');
+        previousOutcome = existingWasIdle ? null : {
           outcome: evalExisting.outcome,
           hitRound: evalExisting.hitRound,
           lo: existing.lo,
           hi: existing.hi,
           generation: existing.generation,
         };
-        resolvedHistory.push({
-          target: `${target}x`,
-          minMult: Number(target),
-          outcome: evalExisting.outcome,
-          lo: Number(existing.lo),
-          hi: Number(existing.hi),
-          hitRound: evalExisting.hitRound,
-          generation: Number(existing.generation || 1),
-          probW: existing?.eta?.pHit1 ?? null,
-          confidence: existing?.confidence ?? existing?.eta?.aiConfidence ?? null,
-          roundWhenMade: Number(existing.roundWhenMade),
-        });
+        if (!existingWasIdle) {
+          resolvedHistory.push({
+            target: `${target}x`,
+            minMult: Number(target),
+            outcome: evalExisting.outcome,
+            lo: Number(existing.lo),
+            hi: Number(existing.hi),
+            hitRound: evalExisting.hitRound,
+            generation: Number(existing.generation || 1),
+            probW: existing?.eta?.pHit1 ?? null,
+            confidence: existing?.confidence ?? existing?.eta?.aiConfidence ?? null,
+            roundWhenMade: Number(existing.roundWhenMade),
+          });
+        }
       }
       const generation = existing ? Number(existing.generation || 1) + 1 : 1;
-      lockToUse = buildLockFromLive(state, result, currentRound, generation, cfg);
-      status = lockToUse.suspended ? 'waiting' : 'locked';
-      relockedCount += 1;
-    } else {
-      lockToUse = {
-        ...existing,
-        confidence: Number(result.live.confidence || existing.confidence || 0),
-        eta: {
-          ...(existing.eta || {}),
-          ...(buildLockFromLive(state, result, currentRound, existing.generation || 1, cfg).eta || {}),
-          suspended: Boolean(existing.suspended),
-        },
-      };
-      status = evalExisting.status;
+      if (result.live.actionable) {
+        lockToUse = buildLockFromLive(state, result, currentRound, generation, cfg);
+        status = 'locked';
+        relockedCount += 1;
+      } else if (existing && evalExisting.status === 'idle') {
+        lockToUse = existing;
+        status = 'idle';
+      } else {
+        lockToUse = buildIdleLock(result, currentRound, generation);
+        status = 'idle';
+      }
     }
 
-    if ((status === 'waiting' || status === 'locked') && Number(lockToUse.lo) <= currentRound) {
+    if (status === 'locked' && Number(lockToUse.lo) <= currentRound) {
       status = 'window-open';
     }
-    if (status === 'waiting') waitingCount += 1;
+    if (status === 'idle') waitingCount += 1;
     if (status === 'window-open') openCount += 1;
 
     locksToSave[key] = {
@@ -1478,6 +1766,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
   const whiteGlobalContinue = mean(targetResults.map((r) => r.live.whiteContinue).filter((v) => Number.isFinite(v)));
   const whiteGlobalRebound = mean(targetResults.map((r) => r.live.whiteRebound).filter((v) => Number.isFinite(v)));
   const randomSignals = targetResults.map((r) => Boolean(r.live.entropy.randomLike));
+  const performanceDashboard = summarizePerformanceDashboard(targetResults);
 
   return {
     model: 'EngineX-v1-edge',
@@ -1504,11 +1793,14 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       randomLikeTargets: randomSignals.filter(Boolean).length,
     },
     backtest: summarizeBacktests(targetResults),
+    performanceDashboard,
     settings: {
       modelVersion: 'EngineX-v1-edge',
       mode: 'edge-detection',
       baselineFormula: 'P(x)=1/x',
       noFixedWindows: true,
+      immutableLocks: true,
+      relockOnlyAfterResolved: true,
       perRoundPrediction: true,
       hazardAsWeakSignal: true,
       gapPressurePrimarySignal: false,
