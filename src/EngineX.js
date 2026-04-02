@@ -95,6 +95,17 @@ const DEFAULT_CONFIG = Object.freeze({
   b2bBoostCap: 0.05,
   b2bNearWindow: 5,
 
+  // Pre-condition detector windows/thresholds (all thresholding is quantile-based).
+  // These implement state detection, not hard outcome prediction.
+  preconditionWhiteWindow: 36,
+  preconditionVolShortWindow: 24,
+  preconditionVolLongWindow: 96,
+  preconditionCalibrationMin: 220,
+  whiteRegimeThresholdQuantile: 0.72,
+  releaseRunThresholdQuantile: 0.80,
+  releaseThresholdQuantile: 0.70,
+  momentumThresholdQuantile: 0.72,
+
   // Risk sizing.
   maxRiskFraction: 0.15,
 
@@ -428,6 +439,154 @@ function rateInWindow(prefix, idx, window) {
   const n = right - left + 1;
   if (n <= 0) return 0;
   return windowSum(prefix, left, right) / n;
+}
+
+function safeRateInWindow(prefix, idx, window) {
+  const i = Number(idx);
+  if (!Number.isFinite(i) || i < 0) return 0;
+  return rateInWindow(prefix, i, window);
+}
+
+function volatilityContextAt(state, idx, shortW, longW) {
+  const i = clamp(idx, 0, state.n - 1);
+  const sw = Math.max(6, Math.round(shortW));
+  const lw = Math.max(sw + 4, Math.round(longW));
+  const shortL = Math.max(0, i - sw + 1);
+  const longL = Math.max(0, i - lw + 1);
+  const shortN = i - shortL + 1;
+  const longN = i - longL + 1;
+  const shortMean = shortN > 0 ? (windowSum(state.logPrefix, shortL, i) / shortN) : 0;
+  const longMean = longN > 0 ? (windowSum(state.logPrefix, longL, i) / longN) : shortMean;
+  const shortSq = shortN > 0 ? (windowSum(state.logSqPrefix, shortL, i) / shortN) : 0;
+  const longSq = longN > 0 ? (windowSum(state.logSqPrefix, longL, i) / longN) : 0;
+  const shortStd = Math.sqrt(Math.max(0, shortSq - (shortMean * shortMean)));
+  const longStd = Math.sqrt(Math.max(0, longSq - (longMean * longMean)));
+  const denom = Math.max(1e-6, longStd);
+  const expansion = clamp((shortStd - longStd) / denom, 0, 1);
+  const lowVolatility = clamp(1 - expansion, 0, 1);
+  return {
+    shortStd,
+    longStd,
+    expansion,
+    lowVolatility,
+  };
+}
+
+function calibratePreconditionThresholds(state, targetState, cfg, calibrationEnd) {
+  const end = Math.min(state.n - 1, Math.max(0, Math.round(calibrationEnd)));
+  const minNeeded = Math.max(cfg.preconditionCalibrationMin, cfg.featureLongWindow);
+  if (end < minNeeded) {
+    return {
+      sample: 0,
+      whiteRegimeThreshold: 0.62,
+      releaseThreshold: Number.POSITIVE_INFINITY,
+      momentumThreshold: Number.POSITIVE_INFINITY,
+      releaseRunThreshold: Math.max(2, Math.round(quantile(state.whiteRun.filter((x) => x > 0), 0.80) || 2)),
+    };
+  }
+
+  const whiteWindow = Math.max(8, cfg.preconditionWhiteWindow);
+  const volShort = Math.max(6, cfg.preconditionVolShortWindow);
+  const volLong = Math.max(volShort + 4, cfg.preconditionVolLongWindow);
+  const whiteRuns = [];
+  for (let i = 1; i <= end; i += 1) {
+    const run = Number(state.whiteRun[i] || 0);
+    if (run > 0) whiteRuns.push(run);
+  }
+  const runQ = quantile(whiteRuns, cfg.releaseRunThresholdQuantile);
+  const releaseRunThreshold = Math.max(2, Math.round(Number.isFinite(runQ) ? runQ : 2));
+
+  const whiteScores = [];
+  const releaseScores = [];
+  const momentumScores = [];
+  for (let i = 1; i <= end; i += 1) {
+    const volCtx = volatilityContextAt(state, i, volShort, volLong);
+    const currentWhiteRate = safeRateInWindow(state.whitePrefix, i, whiteWindow);
+    const previousWhiteRate = safeRateInWindow(state.whitePrefix, i - whiteWindow, whiteWindow);
+    const whiteRun = Number(state.whiteRun[i] || 0);
+    const whiteRunNormalized = clamp(whiteRun / Math.max(1, releaseRunThreshold), 0, 1);
+    const whiteRegimeScore = (
+      currentWhiteRate * 0.60 +
+      whiteRunNormalized * 0.25 +
+      volCtx.lowVolatility * 0.15
+    );
+
+    const releaseScore = (
+      (whiteRun > releaseRunThreshold ? 1 : 0) *
+      volCtx.expansion *
+      Math.max(0, previousWhiteRate - currentWhiteRate)
+    );
+
+    const recentHighHitRate = safeRateInWindow(targetState.hitPrefix, i, cfg.b2bMomentumWindowShort);
+    const longTermHighHitRate = safeRateInWindow(targetState.hitPrefix, i, cfg.b2bMomentumWindowLong);
+    const momentumScore = (
+      (recentHighHitRate - longTermHighHitRate) * 0.70 +
+      volCtx.expansion * 0.30
+    );
+
+    whiteScores.push(whiteRegimeScore);
+    if (releaseScore > 0) releaseScores.push(releaseScore);
+    momentumScores.push(momentumScore);
+  }
+
+  const whiteRegimeThresholdQ = quantile(whiteScores, cfg.whiteRegimeThresholdQuantile);
+  const releaseThresholdQ = quantile(releaseScores, cfg.releaseThresholdQuantile);
+  const momentumThresholdQ = quantile(momentumScores, cfg.momentumThresholdQuantile);
+  const whiteFallback = clamp(
+    (Number(mean(whiteScores) || 0.5) + (Number(stddev(whiteScores) || 0) * 0.20)),
+    0.45,
+    0.90
+  );
+
+  return {
+    sample: whiteScores.length,
+    whiteRegimeThreshold: Number.isFinite(whiteRegimeThresholdQ) ? whiteRegimeThresholdQ : whiteFallback,
+    releaseThreshold: Number.isFinite(releaseThresholdQ) ? Math.max(0, releaseThresholdQ) : Number.POSITIVE_INFINITY,
+    momentumThreshold: Number.isFinite(momentumThresholdQ) ? momentumThresholdQ : Number.POSITIVE_INFINITY,
+    releaseRunThreshold,
+  };
+}
+
+function classifyPreconditionState({
+  whiteDominant,
+  releasePhase,
+  momentumPhase,
+  entropyBlocked,
+  whiteRegimeScore,
+  whiteRegimeThreshold,
+  releaseScore,
+  releaseThreshold,
+  momentumScore,
+  momentumThreshold,
+}) {
+  if (whiteDominant) {
+    return {
+      state: 'WHITE_DOMINANT',
+      explanation: `White regime score ${roundNum(whiteRegimeScore, 4)} > ${roundNum(whiteRegimeThreshold, 4)}.`,
+    };
+  }
+  if (releasePhase) {
+    return {
+      state: 'RELEASE_PHASE',
+      explanation: `Release score ${roundNum(releaseScore, 5)} > ${roundNum(releaseThreshold, 5)}.`,
+    };
+  }
+  if (momentumPhase) {
+    return {
+      state: 'MOMENTUM',
+      explanation: `Momentum score ${roundNum(momentumScore, 5)} > ${roundNum(momentumThreshold, 5)}.`,
+    };
+  }
+  if (entropyBlocked) {
+    return {
+      state: 'NEUTRAL',
+      explanation: 'Entropy is random-like; pre-decision filter blocked.',
+    };
+  }
+  return {
+    state: 'NEUTRAL',
+    explanation: 'No release or momentum pre-condition detected.',
+  };
 }
 
 function featureAtIndex(state, targetState, idx, cfg) {
@@ -864,6 +1023,8 @@ function buildUiTarget(target, lock, status, currentRound, previousOutcome) {
     lockStatus,
     confidence: clamp(Number(lock?.confidence ?? eta.aiConfidence ?? 0), 0, 1),
     confidenceBand: confidenceBand(lock?.confidence ?? eta.aiConfidence ?? 0),
+    state: eta.preconditionState ?? 'NEUTRAL',
+    explanation: eta.preconditionExplanation ?? '',
     window: {
       lo: Number.isFinite(lo) ? lo : null,
       hi: Number.isFinite(hi) ? hi : null,
@@ -889,6 +1050,12 @@ function buildUiTarget(target, lock, status, currentRound, previousOutcome) {
       edge: eta.edge ?? null,
       ev: eta.ev ?? null,
       entropyRandomLike: eta.entropyRandomLike ?? null,
+      preconditionState: eta.preconditionState ?? 'NEUTRAL',
+      preconditionExplanation: eta.preconditionExplanation ?? '',
+      preconditionPass: Boolean(eta.preconditionPass),
+      whiteRegimeScore: eta.whiteRegimeScore ?? null,
+      releaseScore: eta.releaseScore ?? null,
+      momentumScore: eta.momentumScore ?? null,
     },
     debug: {
       lockCreatedAtRound,
@@ -1161,6 +1328,12 @@ function runTargetWalkForward(state, target, cfg) {
   }
 
   const entropyThresholds = deriveEntropyThresholds(state, targetState, cfg, Math.max(evalStart, n - 2));
+  const preconditionThresholds = calibratePreconditionThresholds(
+    state,
+    targetState,
+    cfg,
+    Math.max(cfg.minTrainingRounds, evalStart - 1)
+  );
 
   let bets = 0;
   let wins = 0;
@@ -1193,28 +1366,6 @@ function runTargetWalkForward(state, target, cfg) {
 
   function predictAt(idx) {
     const baselineP = 1 / target;
-    const brierMeans = {
-      baseline: brierBase.mean(),
-      hazard: brierHaz.mean(),
-      knn: brierKnn.mean(),
-    };
-    const hazardEligible = (
-      brierHaz.count() >= cfg.hazardMinEvalCount &&
-      Number.isFinite(brierMeans.hazard) &&
-      Number.isFinite(brierMeans.baseline)
-    );
-    if (hazardEligible && (brierMeans.hazard >= (brierMeans.baseline + Math.max(0, cfg.hazardDisableTolerance)))) {
-      hazardDisabled = true;
-    }
-
-    const pHaz = hazardDisabled ? null : hazardPredictAt(state, targetState, idx, cfg);
-    const knn = knnPredictAt(state, targetState, idx, cfg);
-    const pKnn = knn?.p ?? null;
-    const availability = {
-      // Enforce reliability minimum before a model can influence blending.
-      hazard: Number.isFinite(pHaz) && brierHaz.count() >= cfg.hazardMinEvalCount && !hazardDisabled,
-      knn: Number.isFinite(pKnn) && brierKnn.count() >= cfg.knnKMin && Number(knn?.reliability ?? 0) >= cfg.knnMinReliability,
-    };
     const entropy = entropyAtIndex(state, targetState, idx, entropyThresholds, cfg);
     const entropyMean = entropyBaseline.mean();
     const entropyStd = entropyBaseline.std();
@@ -1242,9 +1393,88 @@ function runTargetWalkForward(state, target, cfg) {
     const longStd = Math.sqrt(Math.max(0, longSq - (longMean * longMean)));
     const volShift = longStd > 1e-6 ? ((shortStd - longStd) / longStd) : 0;
 
+    // --- Pre-condition detectors (state detection, not direct outcome prediction) ---
+    const whiteWindow = Math.max(8, cfg.preconditionWhiteWindow);
+    const preVol = volatilityContextAt(
+      state,
+      idx,
+      cfg.preconditionVolShortWindow,
+      cfg.preconditionVolLongWindow
+    );
+    const currentWhiteRate = safeRateInWindow(state.whitePrefix, idx, whiteWindow);
+    const previousWhiteRate = safeRateInWindow(state.whitePrefix, idx - whiteWindow, whiteWindow);
+    const whiteRunNow = Number(state.whiteRun[idx] || 0);
+    const whiteRunNormalized = clamp(
+      whiteRunNow / Math.max(1, Number(preconditionThresholds.releaseRunThreshold || 1)),
+      0,
+      1
+    );
+    const whiteRegimeScore = (
+      currentWhiteRate * 0.60 +
+      whiteRunNormalized * 0.25 +
+      preVol.lowVolatility * 0.15
+    );
+    const whiteDominant = whiteRegimeScore > Number(preconditionThresholds.whiteRegimeThreshold || Number.POSITIVE_INFINITY);
+
+    const releaseScore = (
+      (whiteRunNow > Number(preconditionThresholds.releaseRunThreshold || Number.POSITIVE_INFINITY) ? 1 : 0) *
+      preVol.expansion *
+      Math.max(0, previousWhiteRate - currentWhiteRate)
+    );
+    const releasePhase = releaseScore > Number(preconditionThresholds.releaseThreshold || Number.POSITIVE_INFINITY);
+
     const recentHitRate = rateInWindow(targetState.hitPrefix, idx, cfg.b2bMomentumWindowShort);
     const longHitRate = rateInWindow(targetState.hitPrefix, idx, cfg.b2bMomentumWindowLong);
     const hitRateDrift = recentHitRate - longHitRate;
+
+    const momentumScore = (
+      (recentHitRate - longHitRate) * 0.70 +
+      preVol.expansion * 0.30
+    );
+    const momentumPhase = (
+      momentumScore > Number(preconditionThresholds.momentumThreshold || Number.POSITIVE_INFINITY) &&
+      !entropy.randomLike &&
+      !entropy.disabled
+    );
+
+    const entropyBlocked = Boolean(entropy.randomLike || entropy.disabled);
+    const signalBlocked = !releasePhase && !momentumPhase;
+    const preconditionPass = !whiteDominant && !entropyBlocked && !signalBlocked;
+    const precondition = classifyPreconditionState({
+      whiteDominant,
+      releasePhase,
+      momentumPhase,
+      entropyBlocked,
+      whiteRegimeScore,
+      whiteRegimeThreshold: preconditionThresholds.whiteRegimeThreshold,
+      releaseScore,
+      releaseThreshold: preconditionThresholds.releaseThreshold,
+      momentumScore,
+      momentumThreshold: preconditionThresholds.momentumThreshold,
+    });
+
+    const brierMeans = {
+      baseline: brierBase.mean(),
+      hazard: brierHaz.mean(),
+      knn: brierKnn.mean(),
+    };
+    const hazardEligible = (
+      brierHaz.count() >= cfg.hazardMinEvalCount &&
+      Number.isFinite(brierMeans.hazard) &&
+      Number.isFinite(brierMeans.baseline)
+    );
+    if (hazardEligible && (brierMeans.hazard >= (brierMeans.baseline + Math.max(0, cfg.hazardDisableTolerance)))) {
+      hazardDisabled = true;
+    }
+
+    const pHaz = hazardDisabled ? null : hazardPredictAt(state, targetState, idx, cfg);
+    const knn = knnPredictAt(state, targetState, idx, cfg);
+    const pKnn = knn?.p ?? null;
+    const availability = {
+      // Enforce reliability minimum before a model can influence blending.
+      hazard: Number.isFinite(pHaz) && brierHaz.count() >= cfg.hazardMinEvalCount && !hazardDisabled,
+      knn: Number.isFinite(pKnn) && brierKnn.count() >= cfg.knnKMin && Number(knn?.reliability ?? 0) >= cfg.knnMinReliability,
+    };
 
     const recentWhiteRate = (windowSum(
       state.whitePrefix,
@@ -1293,13 +1523,12 @@ function runTargetWalkForward(state, target, cfg) {
       pBlend = baselineP + ((pBlend - baselineP) * shrink);
     }
 
-    const whiteRunNow = state.whiteRun[idx] || 0;
     const whiteEst = whiteEstimate(whiteStats, whiteRunNow);
     const continueProb = Number.isFinite(whiteEst.continueProb) ? whiteEst.continueProb : 0;
     const reboundProb = Number.isFinite(whiteEst.reboundProb) ? whiteEst.reboundProb : 0;
     const whiteDelta = clamp(reboundProb - continueProb, -1, 1);
     const whiteStrength = Math.min(Number(cfg.whiteModifierStrength || 0), 0.08);
-    let pAdj = clamp(pBlend * (1 + whiteStrength * whiteDelta), 0, 1);
+    let pAdjModel = clamp(pBlend * (1 + whiteStrength * whiteDelta), 0, 1);
 
     const b2bImm = rateInWindow(targetState.hitPrefix, idx, 2);
     const b2bNear = rateInWindow(targetState.hitPrefix, idx, cfg.b2bNearWindow);
@@ -1308,8 +1537,8 @@ function runTargetWalkForward(state, target, cfg) {
     const b2bSampleReady = (idx + 1) >= Math.max(32, cfg.b2bMomentumWindowShort * 2);
     const b2bMomentum = b2bSampleReady ? clamp(b2bNearRate - b2bLongRate, -1, 1) : 0;
     if (b2bMomentum > 0 && !entropy.randomLike) {
-      pAdj = clamp(
-        pAdj * (1 + (Math.min(cfg.b2bBoostCap, 0.05) * b2bMomentum)),
+      pAdjModel = clamp(
+        pAdjModel * (1 + (Math.min(cfg.b2bBoostCap, 0.05) * b2bMomentum)),
         0,
         1
       );
@@ -1319,25 +1548,27 @@ function runTargetWalkForward(state, target, cfg) {
     const edgeConfidenceScore = edgeVal.count >= cfg.edgeValidationMinTrades
       ? clamp(edgeVal.score, 0, 1)
       : 1;
-    const pFinal = clamp(pAdj * edgeConfidenceScore, 0, 1);
+    const pAdj = preconditionPass ? pAdjModel : baselineP;
+    const pFinal = preconditionPass ? clamp(pAdj * edgeConfidenceScore, 0, 1) : baselineP;
 
     const edge = pFinal - baselineP;
     const ev = (pFinal * target) - 1;
     const evThreshold = (cfg.evThreshold || 0) + (regime.label === 'CLUSTERED' ? regime.evAdjust : 0);
-    const actionable = !entropy.disabled && !regime.randomLike && !entropySpike && ev > evThreshold;
+    const actionable = preconditionPass && !entropySpike && ev > evThreshold;
 
     const modelAgreement = clamp(
       1 - (modelDisagreement / Math.max(1e-6, cfg.modelDisagreementHard)),
       0,
       1
     );
-    const confidence = confidenceFromComponents(pFinal, baselineP, weights, entropy, {
+    const confidenceRaw = confidenceFromComponents(pFinal, baselineP, weights, entropy, {
       modelAgreement,
       edgeConfidenceScore,
       entropyTrend,
       modelDisagreement,
       entropySpike,
     });
+    const confidence = preconditionPass ? confidenceRaw : clamp(confidenceRaw * 0.45, 0, 0.45);
     const recommendedBetFraction = kellyFraction(pFinal, target, confidence, cfg.maxRiskFraction);
 
     return {
@@ -1368,6 +1599,25 @@ function runTargetWalkForward(state, target, cfg) {
       whiteContinue: whiteEst.continueProb,
       whiteRebound: whiteEst.reboundProb,
       whiteSample: whiteEst.sample,
+      currentWhiteRate,
+      previousWhiteRate,
+      whiteRegimeScore: roundNum(whiteRegimeScore, 6),
+      whiteRegimeThreshold: roundNum(preconditionThresholds.whiteRegimeThreshold, 6),
+      releaseScore: roundNum(releaseScore, 6),
+      releaseThreshold: roundNum(preconditionThresholds.releaseThreshold, 6),
+      momentumScore: roundNum(momentumScore, 6),
+      momentumThreshold: roundNum(preconditionThresholds.momentumThreshold, 6),
+      releaseRunThreshold: Number(preconditionThresholds.releaseRunThreshold || 0),
+      volatilityExpansion: roundNum(preVol.expansion, 6),
+      lowVolatility: roundNum(preVol.lowVolatility, 6),
+      preconditionState: precondition.state,
+      preconditionExplanation: precondition.explanation,
+      preconditionPass,
+      preconditionBlockers: {
+        whiteDominant,
+        entropyBlocked,
+        signalMissing: signalBlocked,
+      },
       b2bImm,
       b2bNear,
       b2bNearRate,
@@ -1480,8 +1730,7 @@ function runTargetWalkForward(state, target, cfg) {
   };
 }
 
-function buildLockFromLive(state, targetResult, currentRound, generation, cfg, options = {}) {
-  const forceLock = Boolean(options?.forceLock);
+function buildLockFromLive(state, targetResult, currentRound, generation, cfg) {
   const live = targetResult.live;
   const band = estimateAheadBand(state, targetResult);
   const regimeWindowMult = clamp(Number(live?.regime?.windowMult ?? 1), 1, 1.35);
@@ -1492,7 +1741,7 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg, o
   const hi = lo + fixedSpan - 1;
   const p = Number.isFinite(live.pFinal) ? live.pFinal : live.pAdj;
   const pSoon = clamp(1 - Math.pow(1 - p, 3), 0, 1);
-  const suspended = forceLock ? false : !live.actionable;
+  const suspended = !live.actionable;
 
   return {
     lo,
@@ -1528,6 +1777,18 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg, o
       whiteClusterRelease: roundNum(live.whiteRebound, 6),
       whiteClusterDelta: roundNum((live.whiteRebound ?? 0) - (live.whiteContinue ?? 0), 6),
       whiteClusterSample: Number(live.whiteSample || 0),
+      preconditionState: String(live.preconditionState || 'NEUTRAL'),
+      preconditionExplanation: String(live.preconditionExplanation || ''),
+      preconditionPass: Boolean(live.preconditionPass),
+      whiteRegimeScore: roundNum(live.whiteRegimeScore, 6),
+      whiteRegimeThreshold: roundNum(live.whiteRegimeThreshold, 6),
+      releaseScore: roundNum(live.releaseScore, 6),
+      releaseThreshold: roundNum(live.releaseThreshold, 6),
+      momentumScore: roundNum(live.momentumScore, 6),
+      momentumThreshold: roundNum(live.momentumThreshold, 6),
+      releaseRunThreshold: Number(live.releaseRunThreshold || 0),
+      volatilityExpansion: roundNum(live.volatilityExpansion, 6),
+      lowVolatility: roundNum(live.lowVolatility, 6),
       b2bImmRate: roundNum(live.b2bImm, 6),
       b2bNearRate: roundNum(live.b2bNear, 6),
       b2bMomentum: roundNum(live.b2bMomentum, 6),
@@ -1562,7 +1823,6 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg, o
       suspendReason: suspended
         ? (live.entropy.disabled ? 'entropy_random_regime' : (!live.actionable ? 'ev_below_threshold' : null))
         : null,
-      forcedLock: forceLock,
       walkForwardNoLeakage: true,
     },
   };
@@ -1596,6 +1856,15 @@ function buildIdleLock(state, targetResult, currentRound, generation, cfg) {
       baseRate: roundNum(baselineP, 6),
       aiConfidence: roundNum(live?.confidence, 6),
       edgeConfidenceScore: roundNum(live?.edgeConfidenceScore, 6),
+      preconditionState: String(live?.preconditionState || 'NEUTRAL'),
+      preconditionExplanation: String(live?.preconditionExplanation || 'No pre-condition edge detected.'),
+      preconditionPass: Boolean(live?.preconditionPass),
+      whiteRegimeScore: roundNum(live?.whiteRegimeScore, 6),
+      whiteRegimeThreshold: roundNum(live?.whiteRegimeThreshold, 6),
+      releaseScore: roundNum(live?.releaseScore, 6),
+      releaseThreshold: roundNum(live?.releaseThreshold, 6),
+      momentumScore: roundNum(live?.momentumScore, 6),
+      momentumThreshold: roundNum(live?.momentumThreshold, 6),
       aheadLo,
       aheadHi,
       lockCreatedAtRound: Number(currentRound),
@@ -1710,7 +1979,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       whiteCluster: null,
       summary: { waiting: 0, windowOpen: 0, relocked: 0, sampleSize: 0 },
       settings: {
-        mode: 'edge-detection',
+        mode: 'precondition-edge-detection',
         baselineFormula: 'P(x)=1/x',
         evThreshold: cfg.evThreshold,
       },
@@ -1792,10 +2061,14 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
         }
       }
       const generation = existing ? Number(existing.generation || 1) + 1 : 1;
-      // Execution mode requested by user: always emit a predictive lock window.
-      lockToUse = buildLockFromLive(state, result, currentRound, generation, cfg, { forceLock: true });
-      status = 'locked';
-      relockedCount += 1;
+      if (result.live.actionable) {
+        lockToUse = buildLockFromLive(state, result, currentRound, generation, cfg);
+        status = 'locked';
+        relockedCount += 1;
+      } else {
+        lockToUse = buildIdleLock(state, result, currentRound, generation, cfg);
+        status = 'idle';
+      }
     }
 
     if (status === 'locked' && Number(lockToUse.lo) <= currentRound) {
@@ -1818,6 +2091,11 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
   }
 
   targetsOut.sort((a, b) => a.target - b.target);
+  const preconditionStates = targetsOut.reduce((acc, t) => {
+    const st = String(t?.signals?.preconditionState || 'NEUTRAL');
+    acc[st] = (acc[st] || 0) + 1;
+    return acc;
+  }, {});
   const whiteRunNow = state.whiteRun[state.n - 1] || 0;
   const computedResults = TARGETS.map((t) => targetResultCache.get(Number(t))).filter(Boolean);
   const whiteGlobalContinue = mean(computedResults.map((r) => r.live.whiteContinue).filter((v) => Number.isFinite(v)));
@@ -1853,12 +2131,13 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       relocked: relockedCount,
       sampleSize: state.n,
       randomLikeTargets: randomSignals.filter(Boolean).length,
+      preconditionStates,
     },
     backtest: backtestSummary,
     performanceDashboard,
     settings: {
       modelVersion: 'EngineX-v1-edge',
-      mode: 'edge-detection',
+      mode: 'precondition-edge-detection',
       baselineFormula: 'P(x)=1/x',
       noFixedWindows: false,
       fixedWindowSpans: FIXED_WINDOW_SPAN,
@@ -1981,7 +2260,7 @@ function buildPredictionReport(rounds, options = {}) {
     backtest,
     diagnostics: {
       baselineFormula: 'P(x)=1/x',
-      mode: 'edge-detection',
+      mode: 'precondition-edge-detection',
       noFixedWindows: false,
       fixedWindowSpans: FIXED_WINDOW_SPAN,
       walkForwardValidation: true,
