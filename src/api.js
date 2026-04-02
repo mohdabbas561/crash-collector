@@ -17,18 +17,76 @@ const {
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
-  .split(',').map(s => s.trim()).filter(Boolean);
+const DEFAULT_ALLOWED_ORIGINS = [
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+];
+const ALLOWED_ORIGIN_RULES = Array.from(new Set([
+  ...DEFAULT_ALLOWED_ORIGINS,
+  ...(process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean),
+]));
 
-app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);
-    if (ALLOWED_ORIGINS.length === 0) return cb(null, true);
-    if (ALLOWED_ORIGINS.some(o => origin.startsWith(o))) return cb(null, true);
-    cb(new Error('Not allowed by CORS'));
-  },
-  credentials: true,
-}));
+function normalizeOriginValue(value) {
+  return String(value || '').trim().replace(/\/+$/, '');
+}
+
+function extractHost(value) {
+  const normalized = normalizeOriginValue(value);
+  if (!normalized) return '';
+  try {
+    return new URL(normalized).host.toLowerCase();
+  } catch {
+    return normalized.replace(/^https?:\/\//i, '').split('/')[0].toLowerCase();
+  }
+}
+
+function originMatchesRule(origin, rule) {
+  const normalizedOrigin = normalizeOriginValue(origin);
+  const normalizedRule = normalizeOriginValue(rule);
+  if (!normalizedRule) return false;
+  if (normalizedRule === '*') return true;
+  if (normalizedRule.endsWith('*')) {
+    return normalizedOrigin.startsWith(normalizedRule.slice(0, -1));
+  }
+  if (normalizedRule.includes('://')) {
+    return normalizedOrigin === normalizedRule;
+  }
+  return extractHost(normalizedOrigin) === extractHost(normalizedRule);
+}
+
+function isOriginAllowed(origin) {
+  if (!origin) return true;
+  if (ALLOWED_ORIGIN_RULES.length === 0) return true;
+  return ALLOWED_ORIGIN_RULES.some(rule => originMatchesRule(origin, rule));
+}
+
+const corsOptionsDelegate = (req, cb) => {
+  const requestOrigin = req.header('Origin');
+  const allowed = isOriginAllowed(requestOrigin);
+  cb(null, {
+    origin: allowed ? true : false,
+    credentials: true,
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'x-admin-secret',
+      'x-access-code',
+      'Cache-Control',
+      'Pragma',
+      'Expires',
+    ],
+    maxAge: 86400,
+  });
+};
+
+app.use(cors(corsOptionsDelegate));
+app.options('*', cors(corsOptionsDelegate));
 
 app.use(express.json({ limit: '50kb' }));
 app.use((req, res, next) => {
