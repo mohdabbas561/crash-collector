@@ -122,6 +122,7 @@ const LOCKED_HISTORY_PREFETCH_LIMIT = Math.max(
   LOCKED_HISTORY_LIMIT,
   toPositiveInt(process.env.LOCKED_HISTORY_PREFETCH_LIMIT, 3000)
 );
+const LOCKED_CATCHUP_MAX_ITERS = toPositiveInt(process.env.LOCKED_CATCHUP_MAX_ITERS, 240);
 const RESPONSE_CACHE_ENABLED = String(process.env.RESPONSE_CACHE_ENABLED || 'false').trim().toLowerCase() === 'true';
 const STRICT_FRESH_MODE = String(process.env.STRICT_FRESH_MODE || 'true').trim().toLowerCase() !== 'false';
 const LOCKED_USE_FULL_DATA = String(process.env.LOCKED_USE_FULL_DATA || 'true').trim().toLowerCase() !== 'false';
@@ -384,15 +385,40 @@ async function computeAndPersistLockedPrediction({ latestRound, limit, limitKey 
     getPredictions({ limit: LOCKED_HISTORY_PREFETCH_LIMIT, source: 'range_lock_v1' }),
   ]);
 
-  const engine = computeLockedRangePredictions(rounds, locked, { historyRows });
+  let engine = null;
+  let liveLocks = locked || {};
+  let liveHistoryRows = Array.isArray(historyRows) ? [...historyRows] : [];
+  const resolvedRowsToPersist = [];
 
-  if (Object.keys(engine.locksToSave || {}).length && locksNeedSave(locked, engine.locksToSave)) {
-    await saveLockedConsensusPreds(engine.locksToSave);
+  // Catch-up mode: if rounds advanced while frontend/server was offline,
+  // process multiple lock generations in one compute pass so history is not skipped.
+  for (let iter = 0; iter < LOCKED_CATCHUP_MAX_ITERS; iter += 1) {
+    engine = computeLockedRangePredictions(rounds, liveLocks, { historyRows: liveHistoryRows });
+    const resolvedNow = Array.isArray(engine?.resolvedHistory) ? engine.resolvedHistory : [];
+    const nextLocks = engine?.locksToSave || {};
+    const lockDelta = locksNeedSave(liveLocks, nextLocks);
+
+    if (resolvedNow.length) {
+      resolvedRowsToPersist.push(...resolvedNow);
+      // Feed freshly-resolved rows back into calibration immediately in this same tick.
+      liveHistoryRows = [...resolvedNow, ...liveHistoryRows].slice(0, LOCKED_HISTORY_PREFETCH_LIMIT);
+    }
+
+    liveLocks = nextLocks;
+
+    // Stop once no additional rows are being resolved in this pass.
+    if (!resolvedNow.length) break;
+    // Safety: if locks no longer move, avoid a pathological loop.
+    if (!lockDelta) break;
+  }
+
+  if (Object.keys(liveLocks || {}).length && locksNeedSave(locked, liveLocks)) {
+    await saveLockedConsensusPreds(liveLocks);
   }
 
   let savedResolvedCount = 0;
-  if (Array.isArray(engine.resolvedHistory) && engine.resolvedHistory.length) {
-    await Promise.all(engine.resolvedHistory.map((row) => savePrediction({
+  if (resolvedRowsToPersist.length) {
+    await Promise.all(resolvedRowsToPersist.map((row) => savePrediction({
       target: row.target,
       minMult: row.minMult,
       outcome: row.outcome,
@@ -403,7 +429,7 @@ async function computeAndPersistLockedPrediction({ latestRound, limit, limitKey 
       source: 'range_lock_v1',
       probW: row.confidence ?? null,
     })));
-    savedResolvedCount = engine.resolvedHistory.length;
+    savedResolvedCount = resolvedRowsToPersist.length;
   }
 
   const fullHistory = savedResolvedCount > 0
