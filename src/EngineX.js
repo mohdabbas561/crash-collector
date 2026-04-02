@@ -818,7 +818,8 @@ function evaluateExistingLock(lock, hitRoundIds, currentRound) {
     if (firstHit < lo) return { resolved: true, status: 'resolved', outcome: 'early', hitRound: firstHit };
     if (firstHit <= hi) return { resolved: true, status: 'resolved', outcome: 'win', hitRound: firstHit };
   }
-  if (currentRound >= hi) return { resolved: true, status: 'resolved', outcome: 'loss', hitRound: null };
+  // Loss is only final once we are strictly past hi.
+  if (currentRound > hi) return { resolved: true, status: 'resolved', outcome: 'loss', hitRound: null };
   if (currentRound >= lo) return { resolved: false, status: 'window-open', outcome: null, hitRound: null };
   return { resolved: false, status: 'locked', outcome: null, hitRound: null };
 }
@@ -885,6 +886,18 @@ function buildUiTarget(target, lock, status, currentRound, previousOutcome) {
       lockStatus,
       isMutable: false,
       roundsSinceLock,
+      pFinal: Number(eta.pFinal ?? eta.pHit1 ?? 0),
+      edge: Number(eta.edge ?? 0),
+      ev: Number(eta.ev ?? 0),
+      confidence: Number(lock?.confidence ?? eta.aiConfidence ?? 0),
+      edgeConfidenceScore: Number(eta.edgeConfidenceScore ?? 0),
+      entropyRandomLike: Boolean(eta.entropyRandomLike),
+      entropyDisabled: Boolean(eta.entropyDisabled),
+      modelWeights: {
+        baseline: Number(eta?.blend?.baseline ?? 0),
+        hazard: Number(eta?.blend?.hazard ?? 0),
+        knn: Number(eta?.blend?.knn ?? 0),
+      },
     },
     previousOutcome: previousOutcome || null,
   };
@@ -1188,7 +1201,11 @@ function runTargetWalkForward(state, target, cfg) {
     const pHaz = hazardDisabled ? null : hazardPredictAt(state, targetState, idx, cfg);
     const knn = knnPredictAt(state, targetState, idx, cfg);
     const pKnn = knn?.p ?? null;
-    const availability = { hazard: Number.isFinite(pHaz), knn: Number.isFinite(pKnn) };
+    const availability = {
+      // Enforce reliability minimum before a model can influence blending.
+      hazard: Number.isFinite(pHaz) && brierHaz.count() >= cfg.hazardMinEvalCount && !hazardDisabled,
+      knn: Number.isFinite(pKnn) && brierKnn.count() >= cfg.knnKMin && Number(knn?.reliability ?? 0) >= cfg.knnMinReliability,
+    };
     const entropy = entropyAtIndex(state, targetState, idx, entropyThresholds, cfg);
     const entropyMean = entropyBaseline.mean();
     const entropyStd = entropyBaseline.std();
@@ -1272,7 +1289,8 @@ function runTargetWalkForward(state, target, cfg) {
     const continueProb = Number.isFinite(whiteEst.continueProb) ? whiteEst.continueProb : 0;
     const reboundProb = Number.isFinite(whiteEst.reboundProb) ? whiteEst.reboundProb : 0;
     const whiteDelta = clamp(reboundProb - continueProb, -1, 1);
-    let pAdj = clamp(pBlend * (1 + cfg.whiteModifierStrength * whiteDelta), 0, 1);
+    const whiteStrength = Math.min(Number(cfg.whiteModifierStrength || 0), 0.08);
+    let pAdj = clamp(pBlend * (1 + whiteStrength * whiteDelta), 0, 1);
 
     const b2bImm = rateInWindow(targetState.hitPrefix, idx, 2);
     const b2bNear = rateInWindow(targetState.hitPrefix, idx, cfg.b2bNearWindow);
@@ -1686,7 +1704,26 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
 
   const state = buildGlobalState(cleanRounds, cfg);
   const currentRound = cleanRounds[cleanRounds.length - 1].roundId;
-  const targetResults = TARGETS.map((t) => runTargetWalkForward(state, t, cfg));
+  const targetResultCache = new Map();
+  const hitRoundCache = new Map();
+  const getTargetResult = (target) => {
+    const key = Number(target);
+    if (!targetResultCache.has(key)) {
+      targetResultCache.set(key, runTargetWalkForward(state, key, cfg));
+    }
+    return targetResultCache.get(key);
+  };
+  const getHitRoundIds = (target) => {
+    const key = Number(target);
+    if (!hitRoundCache.has(key)) {
+      const ids = [];
+      for (let ix = 0; ix < state.n; ix += 1) {
+        if (state.multipliers[ix] >= key) ids.push(state.roundIds[ix]);
+      }
+      hitRoundCache.set(key, ids);
+    }
+    return hitRoundCache.get(key);
+  };
 
   const locksToSave = {};
   const resolvedHistory = [];
@@ -1698,9 +1735,8 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
   for (let i = 0; i < TARGETS.length; i += 1) {
     const target = TARGETS[i];
     const key = String(target);
-    const result = targetResults[i];
     const existing = normalizeLockInput(existingLocksRaw[key]);
-    const hitRoundIds = result.targetState.hitIdx.map((ix) => state.roundIds[ix]);
+    const hitRoundIds = getHitRoundIds(target);
     const evalExisting = evaluateExistingLock(existing, hitRoundIds, currentRound);
 
     let previousOutcome = null;
@@ -1713,6 +1749,9 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       lockToUse = existing;
       status = evalExisting.status;
     } else {
+      // Recompute target model only when we are about to create a new decision
+      // (fresh target OR after resolution OR idle monitor update).
+      const result = getTargetResult(target);
       if (existing && evalExisting.resolved) {
         const existingWasIdle = String(existing?.eta?.lockStatus || '').toUpperCase() === 'IDLE';
         previousOutcome = existingWasIdle ? null : {
@@ -1772,10 +1811,16 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
 
   targetsOut.sort((a, b) => a.target - b.target);
   const whiteRunNow = state.whiteRun[state.n - 1] || 0;
-  const whiteGlobalContinue = mean(targetResults.map((r) => r.live.whiteContinue).filter((v) => Number.isFinite(v)));
-  const whiteGlobalRebound = mean(targetResults.map((r) => r.live.whiteRebound).filter((v) => Number.isFinite(v)));
-  const randomSignals = targetResults.map((r) => Boolean(r.live.entropy.randomLike));
-  const performanceDashboard = summarizePerformanceDashboard(targetResults);
+  const computedResults = TARGETS.map((t) => targetResultCache.get(Number(t))).filter(Boolean);
+  const whiteGlobalContinue = mean(computedResults.map((r) => r.live.whiteContinue).filter((v) => Number.isFinite(v)));
+  const whiteGlobalRebound = mean(computedResults.map((r) => r.live.whiteRebound).filter((v) => Number.isFinite(v)));
+  const randomSignals = computedResults.map((r) => Boolean(r.live.entropy.randomLike));
+  const performanceDashboard = computedResults.length
+    ? summarizePerformanceDashboard(computedResults)
+    : { perTarget: [], aggregate: { rollingEV: null, winRate: null, maxDrawdown: null, sharpeLike: null, edgeAccuracy: null } };
+  const backtestSummary = computedResults.length
+    ? summarizeBacktests(computedResults)
+    : { perTarget: [], aggregate: { bets: 0, wins: 0, losses: 0, winRate: null, totalEV: null, avgEV: null, maxDrawdown: null, randomExpectedTotalEVAtSameBets: null, walkForward: true, noFutureLeakage: true } };
 
   return {
     model: 'EngineX-v1-edge',
@@ -1801,7 +1846,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       sampleSize: state.n,
       randomLikeTargets: randomSignals.filter(Boolean).length,
     },
-    backtest: summarizeBacktests(targetResults),
+    backtest: backtestSummary,
     performanceDashboard,
     settings: {
       modelVersion: 'EngineX-v1-edge',
@@ -1810,7 +1855,8 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       noFixedWindows: true,
       immutableLocks: true,
       relockOnlyAfterResolved: true,
-      perRoundPrediction: true,
+      perRoundPrediction: false,
+      strictRealtimeRecalcOnOutcomeOnly: true,
       hazardAsWeakSignal: true,
       gapPressurePrimarySignal: false,
       blendByInverseBrier: true,
