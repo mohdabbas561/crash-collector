@@ -31,7 +31,10 @@ const DEFAULT_CONFIG = Object.freeze({
 
   // Hazard model uses rates first; gap only as weak, bounded modifier.
   hazardRecentWindow: 120,
-  hazardGapInfluence: 0.12,
+  // Hard-capped by design to avoid gambler's-fallacy style overreaction to gap.
+  hazardGapInfluence: 0.05,
+  hazardMinEvalCount: 80,
+  hazardDisableTolerance: 0.0,
 
   // White cluster thresholds from data quantiles.
   whiteCutQuantile: 0.40,
@@ -47,18 +50,57 @@ const DEFAULT_CONFIG = Object.freeze({
   maxHazardBlend: 0.25,
   minBaselineBlend: 0.15,
   modelErrorEps: 1e-6,
+  modelDisagreementHigh: 0.22,
+  modelDisagreementHard: 0.40,
 
   // EV gating.
   evThreshold: 0.0,
+  clusteredEvTolerance: 0.03,
 
   // Entropy/random regime detection.
   entropyRecentWindow: 300,
   entropyStep: 12,
   entropyQuantile: 0.35,
   entropyAutoDisable: true,
+  entropySpikeStdMult: 1.5,
+  entropyTrendPenaltyScale: 4.0,
 
   // Walk-forward range used both for reliability and backtest.
   walkForwardWindow: 3000,
+
+  // Edge validation (predicted vs realized EV consistency).
+  edgeValidationWindow: 220,
+  edgeValidationMinTrades: 20,
+
+  // Contextual KNN.
+  // Feature vector order:
+  // [prev, prev2, shortMean, longMean, vol, lowRateShort, lowRateLong, hitRateLong, gapNorm, whiteRunNorm]
+  featureWeights: [0.45, 0.35, 0.70, 0.65, 0.45, 0.22, 0.25, 1.00, 0.08, 0.12],
+  knnTemporalDecayRounds: 360,
+  knnDistanceSlack: 1.6,
+  knnMinReliability: 0.12,
+
+  // B2B exploit is intentionally tiny.
+  b2bMomentumWindowShort: 8,
+  b2bMomentumWindowLong: 180,
+  b2bBoostCap: 0.05,
+  b2bNearWindow: 5,
+
+  // Risk sizing.
+  maxRiskFraction: 0.15,
+
+  // Performance dashboard.
+  performanceWindow: 160,
+
+  // Regime thresholds.
+  regimeLagTrendThreshold: 0.10,
+  regimeDriftTrendThreshold: 0.05,
+  regimeVolatilityShiftThreshold: 0.20,
+  regimeClusterThreshold: 0.18,
+
+  // Edge validation confidence scaling.
+  edgeValidationFloor: 0.25,
+  edgeValidationCeil: 1.2,
 });
 
 const BUCKETS = [
@@ -422,11 +464,13 @@ function featureAtIndex(state, targetState, idx, cfg) {
   return f;
 }
 
-function distance(a, b) {
+function distance(a, b, weights) {
   let s = 0;
   for (let i = 0; i < a.length; i += 1) {
     const d = (a[i] || 0) - (b[i] || 0);
-    s += d * d;
+    const w = Number(weights?.[i]);
+    const ww = Number.isFinite(w) && w > 0 ? w : 1;
+    s += ww * d * d;
   }
   return Math.sqrt(s);
 }
@@ -451,7 +495,7 @@ function hazardPredictAt(state, targetState, idx, cfg) {
     const currentGap = targetState.gap[idx] || 0;
     const z = (currentGap - gapMean) / Math.max(1e-6, gapStd);
     const lift = tanh(z);
-    p *= (1 + cfg.hazardGapInfluence * lift);
+    p *= (1 + Math.min(cfg.hazardGapInfluence, 0.05) * lift);
   }
 
   return clamp(p, 0, 1);
@@ -470,9 +514,11 @@ function knnPredictAt(state, targetState, idx, cfg) {
   for (let j = left; j <= right; j += stride) {
     if (j + 1 >= state.n) break;
     const candidate = featureAtIndex(state, targetState, j, cfg);
-    const d = distance(query, candidate);
+    const d = distance(query, candidate, cfg.featureWeights);
     const y = targetState.hits[j + 1] ? 1 : 0;
-    pairs.push({ d, y });
+    const age = Math.max(0, idx - j);
+    const tDecay = Math.exp(-age / Math.max(1, cfg.knnTemporalDecayRounds));
+    pairs.push({ d, y, tDecay, age });
   }
   if (pairs.length < cfg.knnKMin) return null;
 
@@ -483,7 +529,7 @@ function knnPredictAt(state, targetState, idx, cfg) {
   let dSum = 0;
   for (let i = 0; i < k; i += 1) {
     const item = pairs[i];
-    const w = 1 / Math.max(1e-6, item.d);
+    const w = (1 / Math.max(1e-6, item.d)) * item.tDecay;
     wSum += w;
     ySum += w * item.y;
     dSum += item.d;
@@ -491,10 +537,23 @@ function knnPredictAt(state, targetState, idx, cfg) {
   if (wSum <= 0) return null;
   const p = clamp(ySum / wSum, 0, 1);
   const avgD = dSum / k;
+  const dQ25 = quantile(pairs.map((x) => x.d), 0.25);
+  const distanceThreshold = Number.isFinite(dQ25) ? (dQ25 * cfg.knnDistanceSlack) : null;
+  const similarityPass = Number.isFinite(distanceThreshold) ? (avgD <= distanceThreshold) : true;
+  const similarityScore = Number.isFinite(distanceThreshold)
+    ? clamp(1 - (avgD / Math.max(1e-6, distanceThreshold)), 0, 1)
+    : 0.5;
+  const sampleScore = clamp(pairs.length / Math.max(cfg.knnKMax, 1), 0, 1);
   const support = 1 / (1 + avgD);
+  const reliability = clamp(0.45 * support + 0.35 * similarityScore + 0.20 * sampleScore, 0, 1);
+  if (!similarityPass || reliability < cfg.knnMinReliability) return null;
   return {
     p,
     support: clamp(support, 0, 1),
+    reliability: roundNum(reliability, 6),
+    similarityScore: roundNum(similarityScore, 6),
+    avgDistance: roundNum(avgD, 6),
+    distanceThreshold: roundNum(distanceThreshold, 6),
     k,
     candidates: pairs.length,
   };
@@ -524,7 +583,7 @@ function makeRollingBrier(maxLen) {
   };
 }
 
-function blendWeightsFromBrier(brier, cfg, availability) {
+function blendWeightsFromBrier(brier, cfg, availability, tuning = {}) {
   const eps = cfg.modelErrorEps;
   const prior = 0.25; // Neutral Bernoulli uncertainty baseline.
   const vals = {
@@ -544,6 +603,16 @@ function blendWeightsFromBrier(brier, cfg, availability) {
   w.baseline /= total;
   w.hazard /= total;
   w.knn /= total;
+
+  // Hazard is only retained if it has proven value.
+  if (tuning.hazardDisabled) {
+    w.hazard = 0;
+    total = w.baseline + w.knn;
+    if (total <= 0) return { baseline: 1, hazard: 0, knn: 0 };
+    w.baseline /= total;
+    w.knn /= total;
+    return { baseline: w.baseline, hazard: 0, knn: w.knn };
+  }
 
   if (w.hazard > cfg.maxHazardBlend) {
     const excess = w.hazard - cfg.maxHazardBlend;
@@ -565,6 +634,23 @@ function blendWeightsFromBrier(brier, cfg, availability) {
       w.hazard -= need * (w.hazard / donor);
       w.knn -= need * (w.knn / donor);
     }
+  }
+
+  total = w.baseline + w.hazard + w.knn;
+  if (total <= 0) return { baseline: 1, hazard: 0, knn: 0 };
+  w.baseline /= total;
+  w.hazard /= total;
+  w.knn /= total;
+
+  // Contextual KNN reliability only nudges blend weight; it never dominates.
+  if (Number.isFinite(tuning.knnReliability)) {
+    const reliability = clamp(tuning.knnReliability, 0, 1);
+    w.knn *= reliability;
+  }
+
+  // Trending regime can modestly favor KNN if it remains reliable.
+  if (Number.isFinite(tuning.trendingBoost) && tuning.trendingBoost > 0) {
+    w.knn *= (1 + clamp(tuning.trendingBoost, 0, 0.20));
   }
 
   total = w.baseline + w.hazard + w.knn;
@@ -689,13 +775,28 @@ function entropyAtIndex(state, targetState, idx, thresholds, cfg) {
   };
 }
 
-function confidenceFromComponents(p, baseline, weights, entropyInfo) {
+function confidenceFromComponents(p, baseline, weights, entropyInfo, extras = {}) {
   const edge = Math.abs((p ?? baseline ?? 0) - (baseline ?? 0));
   const edgeScore = clamp(edge / Math.max(0.01, baseline || 0.01), 0, 1);
-  const modelBalance = clamp((weights.knn || 0) + (weights.hazard || 0.5 * (weights.baseline || 0)), 0, 1);
+  const modelBalance = clamp((weights.knn || 0) + (weights.hazard || (0.5 * (weights.baseline || 0))), 0, 1);
+  const agreement = clamp(Number(extras.modelAgreement ?? 0.5), 0, 1);
+  const edgeConfidenceScore = clamp(Number(extras.edgeConfidenceScore ?? 1), 0, 1.2);
+  const entropyTrend = Number(extras.entropyTrend || 0);
+  const disagreement = clamp(Number(extras.modelDisagreement || 0), 0, 1);
+  const disagreementPenalty = clamp(1 - disagreement, 0.45, 1);
   const entropyPenalty = entropyInfo?.disabled ? 0.35 : 1.0;
   const entropyNoisePenalty = entropyInfo?.randomLike ? 0.65 : 1.0;
-  return clamp((0.55 * edgeScore + 0.45 * modelBalance) * entropyPenalty * entropyNoisePenalty, 0, 1);
+  const entropySpikePenalty = extras.entropySpike ? 0.70 : 1.0;
+  const entropyTrendPenalty = entropyTrend > 0
+    ? clamp(1 - (entropyTrend * 4), 0.45, 1)
+    : 1;
+  const core = (
+    0.35 * edgeScore +
+    0.25 * modelBalance +
+    0.25 * agreement +
+    0.15 * clamp(edgeConfidenceScore, 0, 1)
+  );
+  return clamp(core * disagreementPenalty * entropyPenalty * entropyNoisePenalty * entropySpikePenalty * entropyTrendPenalty, 0, 1);
 }
 
 function evaluateExistingLock(lock, hitRoundIds, currentRound) {
@@ -767,6 +868,151 @@ function buildUiTarget(target, lock, status, currentRound, previousOutcome) {
     },
     previousOutcome: previousOutcome || null,
   };
+}
+
+function makeRollingMeanStd(maxLen) {
+  const q = [];
+  let sum = 0;
+  let sumSq = 0;
+  return {
+    add(v) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return;
+      q.push(n);
+      sum += n;
+      sumSq += n * n;
+      if (q.length > maxLen) {
+        const old = q.shift();
+        sum -= old;
+        sumSq -= old * old;
+      }
+    },
+    mean() {
+      if (!q.length) return null;
+      return sum / q.length;
+    },
+    std() {
+      if (q.length < 2) return null;
+      const m = sum / q.length;
+      return Math.sqrt(Math.max(0, (sumSq / q.length) - (m * m)));
+    },
+    count() {
+      return q.length;
+    },
+    values() {
+      return q.slice();
+    },
+  };
+}
+
+function makeRollingEdgeValidation(maxLen) {
+  const errors = [];
+  const predicted = [];
+  const realized = [];
+  let sumErr = 0;
+  let sumPred = 0;
+  let sumReal = 0;
+  let negCount = 0;
+  return {
+    add(predEV, realEV) {
+      const p = Number(predEV);
+      const r = Number(realEV);
+      if (!Number.isFinite(p) || !Number.isFinite(r)) return;
+      const e = r - p;
+      errors.push(e);
+      predicted.push(p);
+      realized.push(r);
+      sumErr += e;
+      sumPred += p;
+      sumReal += r;
+      if (e < 0) negCount += 1;
+      if (errors.length > maxLen) {
+        const oldE = errors.shift();
+        const oldP = predicted.shift();
+        const oldR = realized.shift();
+        sumErr -= oldE;
+        sumPred -= oldP;
+        sumReal -= oldR;
+        if (oldE < 0) negCount -= 1;
+      }
+    },
+    metrics() {
+      const n = errors.length;
+      if (!n) {
+        return {
+          count: 0,
+          predictedEV: null,
+          realizedEV: null,
+          edgeError: null,
+          negativeErrorRatio: null,
+          score: 1,
+        };
+      }
+      const meanErr = sumErr / n;
+      const meanPred = sumPred / n;
+      const meanReal = sumReal / n;
+      const negRatio = negCount / n;
+      const scale = Math.max(0.20, Math.abs(meanPred) + 0.20);
+      let score = 1 + (meanErr / scale);
+      if (negRatio > 0.55) {
+        score *= clamp(1 - (negRatio - 0.55) * 0.8, 0.4, 1);
+      }
+      score = clamp(score, 0.25, 1.2);
+      return {
+        count: n,
+        predictedEV: meanPred,
+        realizedEV: meanReal,
+        edgeError: meanErr,
+        negativeErrorRatio: negRatio,
+        score,
+      };
+    },
+  };
+}
+
+function kellyFraction(p, target, confidence, maxRisk) {
+  const pp = clamp(Number(p), 0, 1);
+  const t = Number(target);
+  if (!Number.isFinite(t) || t <= 1) return 0;
+  const raw = (pp * t - 1) / (t - 1);
+  return clamp(raw * clamp(Number(confidence), 0, 1), 0, maxRisk);
+}
+
+function sharpeLike(values) {
+  if (!Array.isArray(values) || values.length < 2) return null;
+  const m = mean(values);
+  const s = stddev(values, m);
+  if (!Number.isFinite(m) || !Number.isFinite(s) || s <= 0) return null;
+  return m / s;
+}
+
+function classifyRegime(ctx, cfg) {
+  const random = Boolean(ctx.entropy?.randomLike);
+  if (random) {
+    return { label: 'RANDOM', randomLike: true, trendingBias: 0, windowMult: 1.2, evAdjust: 0 };
+  }
+  const volSpike = Number(ctx.volShift || 0);
+  const lag = Math.abs(Number(ctx.lagCorr || 0));
+  const drift = Math.abs(Number(ctx.hitRateDrift || 0));
+  const clusterScore = Number(ctx.clusterScore || 0);
+  const entropyTrend = Number(ctx.entropyTrend || 0);
+
+  if (volSpike > cfg.regimeVolatilityShiftThreshold || entropyTrend > 0.02) {
+    return { label: 'VOLATILE', randomLike: false, trendingBias: -0.02, windowMult: 1.25, evAdjust: 0 };
+  }
+  if (clusterScore > cfg.regimeClusterThreshold) {
+    return {
+      label: 'CLUSTERED',
+      randomLike: false,
+      trendingBias: 0.0,
+      windowMult: 1.12,
+      evAdjust: -Math.abs(cfg.clusteredEvTolerance || 0),
+    };
+  }
+  if (lag > cfg.regimeLagTrendThreshold || drift > cfg.regimeDriftTrendThreshold) {
+    return { label: 'TRENDING', randomLike: false, trendingBias: 0.08, windowMult: 1.0, evAdjust: 0 };
+  }
+  return { label: 'RANDOM', randomLike: true, trendingBias: 0, windowMult: 1.15, evAdjust: 0 };
 }
 
 function geometricQuantile(p, q) {
