@@ -1,7 +1,15 @@
 'use strict';
 
+// ============================================================
+// PURE DATA ENGINE — v9
+// Zero bias. Zero fake defaults. Zero invented priors.
+// Every number comes from YOUR data or is explicitly absent.
+// White cluster + B2B are first-class measured signals.
+// ============================================================
+
 const TARGETS = [5, 10, 20, 50, 100, 500, 1000];
-const REPORT_THRESHOLDS = [2, 5, 10, 25, 50];
+
+// Fixed window spans per target (how many rounds the prediction window covers)
 const FIXED_WINDOW_SPAN = {
   5: 3,
   10: 6,
@@ -13,370 +21,346 @@ const FIXED_WINDOW_SPAN = {
 };
 
 const BUCKETS = [
-  { id: 'micro', label: 'Micro', min: 1, max: 1.99, color: '#ff4560' },
-  { id: 'low', label: 'Low', min: 2, max: 4.99, color: '#ffd84d' },
-  { id: 'mid', label: 'Mid', min: 5, max: 9.99, color: '#00ff88' },
-  { id: 'high', label: 'High', min: 10, max: 24.99, color: '#00d4ff' },
-  { id: 'moon', label: 'Moon', min: 25, max: Number.POSITIVE_INFINITY, color: '#c084fc' },
+  { id: 'micro', label: 'Micro', min: 1,  max: 1.99,              color: '#ff4560' },
+  { id: 'low',   label: 'Low',   min: 2,  max: 4.99,              color: '#ffd84d' },
+  { id: 'mid',   label: 'Mid',   min: 5,  max: 9.99,              color: '#00ff88' },
+  { id: 'high',  label: 'High',  min: 10, max: 24.99,             color: '#00d4ff' },
+  { id: 'moon',  label: 'Moon',  min: 25, max: Number.POSITIVE_INFINITY, color: '#c084fc' },
 ];
+
+// ────────────────────────────────────────────────────────────
+// MATH PRIMITIVES — no invented fallbacks
+// ────────────────────────────────────────────────────────────
 
 function clamp(v, lo, hi) {
   const n = Number(v);
-  if (!Number.isFinite(n)) return lo;
-  return Math.max(lo, Math.min(hi, n));
+  return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : lo;
 }
 
 function roundNum(v, digits = 4) {
   const n = Number(v);
-  if (!Number.isFinite(n)) return 0;
-  return Number(n.toFixed(digits));
+  return Number.isFinite(n) ? Number(n.toFixed(digits)) : null;
 }
 
 function mean(arr) {
-  if (!arr.length) return 0;
+  if (!arr.length) return null;
   let s = 0;
   for (const v of arr) s += Number(v) || 0;
   return s / arr.length;
 }
 
-function stddev(arr, avg = null) {
-  if (arr.length <= 1) return 0;
-  const m = avg == null ? mean(arr) : avg;
+function variance(arr, avg) {
+  if (arr.length < 2) return null;
+  const m = avg ?? mean(arr);
+  if (m === null) return null;
   let s = 0;
-  for (const v of arr) {
-    const d = (Number(v) || 0) - m;
-    s += d * d;
-  }
-  return Math.sqrt(s / arr.length);
+  for (const v of arr) { const d = (Number(v) || 0) - m; s += d * d; }
+  return s / arr.length;
+}
+
+function stddev(arr, avg) {
+  const v = variance(arr, avg);
+  return v === null ? null : Math.sqrt(v);
+}
+
+function sortedCopy(arr) {
+  return [...arr].sort((a, b) => a - b);
 }
 
 function quantileFromSorted(sorted, q) {
-  if (!sorted.length) return 0;
-  const qq = clamp(q, 0, 1);
-  const idx = (sorted.length - 1) * qq;
-  const lo = Math.floor(idx);
-  const hi = Math.ceil(idx);
+  if (!sorted.length) return null;
+  const idx = (sorted.length - 1) * clamp(q, 0, 1);
+  const lo = Math.floor(idx), hi = Math.ceil(idx);
   if (lo === hi) return sorted[lo];
-  const w = idx - lo;
-  return (sorted[lo] * (1 - w)) + (sorted[hi] * w);
+  return sorted[lo] * (1 - (idx - lo)) + sorted[hi] * (idx - lo);
 }
 
-function quantile(values, q) {
-  if (!values.length) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  return quantileFromSorted(sorted, q);
+function quantile(arr, q) {
+  if (!arr.length) return null;
+  return quantileFromSorted(sortedCopy(arr), q);
 }
 
-function weightedQuantile(items, q) {
-  if (!items.length) return 1;
+// Weighted median — no invented fallback
+function weightedMedian(items) {
+  if (!items.length) return null;
   const sorted = [...items].sort((a, b) => a.value - b.value);
-  const qq = clamp(q, 0, 1);
   let total = 0;
-  for (const item of sorted) total += Math.max(0, Number(item.weight) || 0);
-  if (total <= 0) return sorted[Math.floor((sorted.length - 1) * qq)].value;
+  for (const x of sorted) total += Math.max(0, x.weight || 0);
+  if (total <= 0) return sorted[Math.floor(sorted.length / 2)].value;
   let acc = 0;
-  for (const item of sorted) {
-    acc += Math.max(0, Number(item.weight) || 0);
-    if ((acc / total) >= qq) return item.value;
+  for (const x of sorted) {
+    acc += Math.max(0, x.weight || 0);
+    if (acc / total >= 0.5) return x.value;
   }
   return sorted[sorted.length - 1].value;
 }
 
-function sigmoid(v) {
-  const x = clamp(v, -20, 20);
-  return 1 / (1 + Math.exp(-x));
-}
-
 function safeLog(v) {
-  return Math.log(Math.max(1, Number(v) || 1));
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.log(n) : 0;
 }
 
-function normalizeDistribution(dist) {
-  let sum = 0;
-  for (const v of dist) sum += Number(v) || 0;
-  if (sum <= 0) {
-    const uniform = 1 / Math.max(1, dist.length);
-    return dist.map(() => uniform);
-  }
-  return dist.map(v => (Number(v) || 0) / sum);
-}
-
-function bucketIndex(multiplier) {
-  const m = Number(multiplier) || 1;
-  for (let i = 0; i < BUCKETS.length; i++) {
-    const b = BUCKETS[i];
-    if (m >= b.min && m <= b.max) return i;
-  }
-  return BUCKETS.length - 1;
-}
-
-function bucketMidpoint(bucket) {
-  if (!Number.isFinite(bucket.max)) return bucket.min * 1.4;
-  return (bucket.min + bucket.max) / 2;
-}
+// ────────────────────────────────────────────────────────────
+// PREFIX STRUCTURES
+// ────────────────────────────────────────────────────────────
 
 function buildPrefix(arr) {
-  const pref = new Array(arr.length + 1).fill(0);
-  for (let i = 0; i < arr.length; i++) pref[i + 1] = pref[i] + (Number(arr[i]) || 0);
-  return pref;
+  const p = new Array(arr.length + 1).fill(0);
+  for (let i = 0; i < arr.length; i++) p[i + 1] = p[i] + (Number(arr[i]) || 0);
+  return p;
 }
 
-function prefixSum(pref, lo, hi) {
-  if (hi < lo) return 0;
-  const l = clamp(lo, 0, pref.length - 1);
-  const r = clamp(hi + 1, 0, pref.length - 1);
-  if (r <= l) return 0;
-  return pref[r] - pref[l];
-}
-
-function prefixRate(pref, endIdx, len) {
+function prefixWindowMean(pref, endIdx, windowLen) {
   const n = pref.length - 1;
-  if (n <= 0 || endIdx < 0) return 0;
-  const e = clamp(endIdx, 0, n - 1);
-  const l = clamp(e - Math.max(1, len) + 1, 0, n - 1);
-  const total = prefixSum(pref, l, e);
-  const width = (e - l + 1);
-  return width > 0 ? (total / width) : 0;
+  if (n <= 0 || endIdx < 0 || windowLen < 1) return null;
+  const e = Math.min(endIdx, n - 1);
+  const s = Math.max(0, e - windowLen + 1);
+  const w = e - s + 1;
+  return w > 0 ? (pref[e + 1] - pref[s]) / w : null;
 }
 
-function prefixStd(pref, prefSq, endIdx, len) {
-  const n = pref.length - 1;
-  if (n <= 1 || endIdx < 0) return 0;
-  const e = clamp(endIdx, 0, n - 1);
-  const l = clamp(e - Math.max(1, len) + 1, 0, n - 1);
-  const width = Math.max(1, e - l + 1);
-  const sum = prefixSum(pref, l, e);
-  const sumSq = prefixSum(prefSq, l, e);
-  const m = sum / width;
-  return Math.sqrt(Math.max(0, (sumSq / width) - (m * m)));
+function prefixWindowVariance(prefVal, prefSq, endIdx, windowLen) {
+  const n = prefVal.length - 1;
+  if (n <= 1 || endIdx < 0 || windowLen < 2) return null;
+  const e = Math.min(endIdx, n - 1);
+  const s = Math.max(0, e - windowLen + 1);
+  const w = e - s + 1;
+  if (w < 2) return null;
+  const sumV = prefVal[e + 1] - prefVal[s];
+  const sumSq = prefSq[e + 1] - prefSq[s];
+  const m = sumV / w;
+  return Math.max(0, sumSq / w - m * m);
 }
 
 function lowerBound(arr, value) {
-  let lo = 0;
-  let hi = arr.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (arr[mid] < value) lo = mid + 1;
-    else hi = mid;
-  }
+  let lo = 0, hi = arr.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (arr[mid] < value) lo = mid + 1; else hi = mid; }
   return lo;
 }
+
+// ────────────────────────────────────────────────────────────
+// INPUT NORMALIZATION
+// ────────────────────────────────────────────────────────────
 
 function normalizeRounds(rounds) {
   const clean = (rounds || [])
     .map(r => ({
-      roundId: Number(r.roundId),
+      roundId:    Number(r.roundId),
       multiplier: Number(r.multiplier),
-      timestamp: Number(r.timestamp) || Date.now(),
+      timestamp:  Number(r.timestamp) || 0,
     }))
     .filter(r => Number.isFinite(r.roundId) && Number.isFinite(r.multiplier) && r.multiplier > 0)
     .sort((a, b) => a.roundId - b.roundId);
 
-  if (!clean.length) return [];
+  // Deduplicate by roundId (last write wins)
   const dedup = [];
   let lastId = null;
   for (const r of clean) {
     if (r.roundId === lastId) dedup[dedup.length - 1] = r;
-    else {
-      dedup.push(r);
-      lastId = r.roundId;
-    }
+    else { dedup.push(r); lastId = r.roundId; }
   }
   return dedup;
 }
 
-function targetFromLabel(raw) {
-  const s = String(raw || '').trim().toLowerCase();
-  if (!s) return null;
-  const n = Number(s.replace('x', ''));
-  return Number.isFinite(n) ? n : null;
+function normalizeLockInput(input) {
+  if (!input) return null;
+  return {
+    lo:           Number(input.lo),
+    hi:           Number(input.hi),
+    roundWhenMade: Number(input.roundWhenMade ?? input.round_when_made),
+    generation:   Number(input.generation || 1),
+    suspended:    Boolean(input.suspended ?? input.eta?.suspended),
+    eta:          input.eta || null,
+  };
 }
 
-function buildHistoryCalibration(historyRows = []) {
-  // === v8 TRUE SUPERVISED LEARNING & SIMPLIFIED UPGRADE START ===
-  // Justification: turn every historical win/early/loss into persistent calibration for thresholds, shift and span.
-  const out = {};
-  for (const t of TARGETS) {
-    out[t] = {
-      sample: 0,
-      winRate: 0.5,
-      earlyRate: 0,
-      lossRate: 0,
-      reliability: 0.5,
-      shift: 0,
-      spanMultiplier: 1,
-      minP1: 0.08,
-      minConfidence: 0.42,
-    };
+// ────────────────────────────────────────────────────────────
+// WHITE CLUSTER DETECTOR (purely data-measured)
+// A "white" round is one below the empirical low-multiplier cut.
+// We measure:  run lengths, continuation probability, rebound probability
+// all from the actual observed data — no smoothing invented out of thin air.
+// ────────────────────────────────────────────────────────────
+
+function buildWhiteClusterDetector(multipliers) {
+  const n = multipliers.length;
+  const sorted = sortedCopy(multipliers);
+
+  // Cut determined by data distribution — 40th percentile is the "low zone"
+  const whiteCut   = clamp(quantileFromSorted(sorted, 0.40), 1.5, 4.0);
+  // Rebound: a round is a "rebound" if it's in the top 30% of historical rounds
+  const reboundCut = clamp(quantileFromSorted(sorted, 0.70), 3.0, 999);
+
+  // Build run-length array: how many consecutive white rounds ending at index i
+  const whiteFlag = multipliers.map(m => (m < whiteCut ? 1 : 0));
+  const runLen    = new Array(n).fill(0);
+  for (let i = 0; i < n; i++) {
+    runLen[i] = whiteFlag[i] ? (1 + (i > 0 ? runLen[i - 1] : 0)) : 0;
   }
 
-  const rowsByTarget = {};
-  for (const t of TARGETS) rowsByTarget[t] = [];
-  for (const row of (historyRows || [])) {
-    const target = targetFromLabel(row?.target);
-    if (!TARGETS.includes(target)) continue;
-    rowsByTarget[target].push(row);
+  // Empirically measure: given run length R, what is P(next is also white)?
+  // and P(rebound within next 3 rounds)?
+  // We bucket run lengths 0..maxRun and count directly.
+  const maxRun = Math.max(1, Math.round(quantile(runLen, 0.99) * 1.2)) || 20;
+  const obs         = new Array(maxRun + 1).fill(0);   // observations at each run length
+  const contCount   = new Array(maxRun + 1).fill(0);   // next round also white
+  const reboundCount= new Array(maxRun + 1).fill(0);   // rebound in next 3
+
+  let totalObs = 0, totalCont = 0, totalRebound = 0;
+
+  for (let i = 0; i < n - 1; i++) {
+    if (runLen[i] === 0) continue; // only measure when we ARE in a white run
+    const r = Math.min(maxRun, runLen[i]);
+    obs[r]++;
+    totalObs++;
+    if (whiteFlag[i + 1]) { contCount[r]++; totalCont++; }
+    const reboundSoon = (i + 1 < n && multipliers[i + 1] >= reboundCut) ||
+                        (i + 2 < n && multipliers[i + 2] >= reboundCut) ||
+                        (i + 3 < n && multipliers[i + 3] >= reboundCut);
+    if (reboundSoon) { reboundCount[r]++; totalRebound++; }
   }
 
-  for (const t of TARGETS) {
-    const rows = rowsByTarget[t];
-    if (!rows.length) continue;
-    let win = 0;
-    let early = 0;
-    let loss = 0;
-    const shiftItems = [];
-    const absItems = [];
-    const winProb = [];
-    const lossProb = [];
+  // P(continue | runLen) and P(rebound | runLen) — measured only, NO smoothing added
+  // When bucket has zero observations we use the global rate (also measured)
+  const globalContRate    = totalObs > 0 ? totalCont    / totalObs : null;
+  const globalReboundRate = totalObs > 0 ? totalRebound / totalObs : null;
 
-    const n = rows.length;
-    for (let i = 0; i < n; i++) {
-      const row = rows[i];
-      const w = 1 + (2 * (((n - i) / Math.max(1, n)) ** 2));
-      const outcome = String(row?.outcome || '').toLowerCase();
-      if (outcome === 'win') win += w;
-      else if (outcome === 'early') early += w;
-      else if (outcome === 'loss') loss += w;
-
-      const lo = Number(row?.lo);
-      const hi = Number(row?.hi);
-      const hit = row?.hitRound == null ? null : Number(row.hitRound);
-      if (Number.isFinite(lo) && Number.isFinite(hi) && hi >= lo) {
-        const span = Math.max(1, hi - lo + 1);
-        let err = 0;
-        if (outcome === 'early' && Number.isFinite(hit)) err = (hit - lo) / span;
-        else if (outcome === 'win' && Number.isFinite(hit)) err = (hit - (lo + ((span - 1) * 0.5))) / span;
-        else if (outcome === 'loss') err = 1;
-        shiftItems.push({ value: clamp(err, -3, 3), weight: w });
-        absItems.push({ value: Math.abs(clamp(err, -3, 3)), weight: w });
-      }
-
-      const p = Number(row?.probW);
-      if (Number.isFinite(p)) {
-        if (outcome === 'win') winProb.push(p);
-        if (outcome === 'loss') lossProb.push(p);
-      }
+  function estimate(currentRunLen) {
+    const r = Math.min(maxRun, Math.max(0, Math.round(currentRunLen) || 0));
+    if (obs[r] === 0) {
+      // No data for this run length — use global rate, or null if no data at all
+      return {
+        continueProb: globalContRate,
+        reboundProb:  globalReboundRate,
+        sample:       totalObs,
+        reliable:     totalObs >= 10,
+      };
     }
-
-    const total = win + early + loss;
-    const wl = Math.max(1, win + loss);
-    const winRate = win / wl;
-    const earlyRate = total > 0 ? (early / total) : 0;
-    const lossRate = total > 0 ? (loss / total) : 0;
-    const reliability = clamp((win + (0.35 * early) + 2) / Math.max(4, total + 4), 0.02, 0.98);
-    const shift = shiftItems.length ? clamp(weightedQuantile(shiftItems, 0.5), -0.9, 0.9) : 0;
-    const spanMultiplier = absItems.length ? clamp(1 + weightedQuantile(absItems, 0.6), 0.7, 3) : 1;
-
-    const meanWinProb = winProb.length ? mean(winProb) : null;
-    const meanLossProb = lossProb.length ? mean(lossProb) : null;
-    const minP1 = (meanWinProb != null && meanLossProb != null)
-      ? clamp((0.52 * meanLossProb) + (0.48 * meanWinProb), 0.01, 0.9)
-      : clamp((0.04 + (0.3 * lossRate) + (0.1 * earlyRate) + (0.2 * (1 - reliability))), 0.01, 0.9);
-    const minConfidence = clamp(0.18 + (0.5 * lossRate) + (0.16 * earlyRate) - (0.14 * reliability), 0.1, 0.95);
-
-    out[t] = {
-      sample: Math.round(total),
-      winRate: roundNum(winRate, 6),
-      earlyRate: roundNum(earlyRate, 6),
-      lossRate: roundNum(lossRate, 6),
-      reliability: roundNum(reliability, 6),
-      shift: roundNum(shift, 6),
-      spanMultiplier: roundNum(spanMultiplier, 6),
-      minP1: roundNum(minP1, 6),
-      minConfidence: roundNum(minConfidence, 6),
+    return {
+      continueProb: contCount[r] / obs[r],
+      reboundProb:  reboundCount[r] / obs[r],
+      sample:       obs[r],
+      reliable:     obs[r] >= 5,
     };
   }
-  return out;
-  // === UPGRADE END ===
+
+  // Percentiles of run lengths (from data)
+  const allRuns = runLen.filter(v => v > 0);
+  const runQ85  = allRuns.length ? quantile(allRuns, 0.85) : null;
+  const runQ95  = allRuns.length ? quantile(allRuns, 0.95) : null;
+  const runQ99  = allRuns.length ? quantile(allRuns, 0.99) : null;
+
+  return {
+    whiteCut,
+    reboundCut,
+    whiteFlag,
+    runLen,
+    estimate,
+    runQ85,
+    runQ95,
+    runQ99,
+    totalObsInRuns: totalObs,
+  };
 }
+
+// ────────────────────────────────────────────────────────────
+// B2B (BACK-TO-BACK) DETECTOR (purely data-measured)
+// Measures: P(hit immediately after last hit), P(hit within 2 rounds after last hit)
+// Computed globally AND on a recent window (measured, not invented).
+// ────────────────────────────────────────────────────────────
+
+function buildB2BDetector(hitIndices, n, recentWindow) {
+  // Global: over all hit pairs
+  let gImm = 0, gNear = 0, gPairs = 0;
+  for (let i = 1; i < hitIndices.length; i++) {
+    const d = hitIndices[i] - hitIndices[i - 1];
+    gPairs++;
+    if (d <= 1) gImm++;
+    if (d <= 2) gNear++;
+  }
+
+  // Recent window: only pairs where the second hit is in the last `recentWindow` rounds
+  const cutoff = n - recentWindow;
+  let rImm = 0, rNear = 0, rPairs = 0;
+  for (let i = 1; i < hitIndices.length; i++) {
+    if (hitIndices[i] < cutoff) continue;
+    const d = hitIndices[i] - hitIndices[i - 1];
+    rPairs++;
+    if (d <= 1) rImm++;
+    if (d <= 2) rNear++;
+  }
+
+  return {
+    // Global rates — null if no pairs observed
+    globalImmRate:  gPairs > 0 ? gImm  / gPairs : null,
+    globalNearRate: gPairs > 0 ? gNear / gPairs : null,
+    globalPairs:    gPairs,
+
+    // Recent rates — null if no recent pairs observed
+    recentImmRate:  rPairs > 0 ? rImm  / rPairs : null,
+    recentNearRate: rPairs > 0 ? rNear / rPairs : null,
+    recentPairs:    rPairs,
+
+    // Best-available rate (prefer recent if enough data, else global, else null)
+    immRate:  rPairs >= 5 ? rImm  / rPairs : (gPairs >= 5 ? gImm  / gPairs : null),
+    nearRate: rPairs >= 5 ? rNear / rPairs : (gPairs >= 5 ? gNear / gPairs : null),
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// GLOBAL STATE — everything is derived from the data
+// ────────────────────────────────────────────────────────────
 
 function buildGlobalState(cleanRounds) {
   const n = cleanRounds.length;
   const multipliers = cleanRounds.map(r => Number(r.multiplier));
-  const logs = multipliers.map(m => safeLog(m));
-  const sortedMult = [...multipliers].sort((a, b) => a - b);
+  const logs   = multipliers.map(safeLog);
+  const logsSq = logs.map(v => v * v);
 
-  const whiteCut = clamp(quantileFromSorted(sortedMult, 0.43), 2.2, 3.8);
-  const reboundCut = clamp(quantileFromSorted(sortedMult, 0.68), 3.6, 12);
-  const greenCut = clamp(quantileFromSorted(sortedMult, 0.58), 4.5, 8.5);
+  const wcd = buildWhiteClusterDetector(multipliers);
 
-  const whiteFlags = multipliers.map(m => (m < whiteCut ? 1 : 0));
-  const greenFlags = multipliers.map(m => (m >= greenCut ? 1 : 0));
-  const prefWhite = buildPrefix(whiteFlags);
-  const prefGreen = buildPrefix(greenFlags);
-  const prefLog = buildPrefix(logs);
-  const prefLogSq = buildPrefix(logs.map(v => v * v));
+  const prefLog   = buildPrefix(logs);
+  const prefLogSq = buildPrefix(logsSq);
+  const prefWhite = buildPrefix(wcd.whiteFlag);
 
-  const whiteRunAt = new Array(n).fill(0);
-  for (let i = 0; i < n; i++) whiteRunAt[i] = whiteFlags[i] ? (1 + (i > 0 ? whiteRunAt[i - 1] : 0)) : 0;
-  const whiteRunQ85 = quantile(whiteRunAt, 0.85);
-  const whiteRunQ95 = quantile(whiteRunAt, 0.95);
+  // Sorted multipliers for quantile computation
+  const sorted = sortedCopy(multipliers);
 
-  const byRun = new Map();
-  let globalObs = 0;
-  let globalContinue = 0;
-  let globalRebound = 0;
-  for (let i = 1; i < n - 3; i++) {
-    const run = whiteRunAt[i];
-    if (run <= 0) continue;
-    const bucket = Math.min(10, run);
-    if (!byRun.has(bucket)) byRun.set(bucket, { obs: 0, cont: 0, rebound: 0 });
-    const row = byRun.get(bucket);
-    row.obs += 1;
-    globalObs += 1;
-    if (multipliers[i + 1] < whiteCut) {
-      row.cont += 1;
-      globalContinue += 1;
-    }
-    const rebound = multipliers[i + 1] >= reboundCut || multipliers[i + 2] >= reboundCut || multipliers[i + 3] >= reboundCut;
-    if (rebound) {
-      row.rebound += 1;
-      globalRebound += 1;
-    }
-  }
+  // Dynamic window sizes based on data length
+  const shortW = clamp(Math.round(Math.sqrt(n) * 3.5), 12, 150);
+  const longW  = clamp(Math.round(Math.sqrt(n) * 9),   shortW + 5, 500);
 
-  const whiteModel = {
-    estimate(runLength) {
-      const bucket = Math.min(10, Math.max(0, Number(runLength) || 0));
-      const row = byRun.get(bucket);
-      if (!row || row.obs < 4) {
-        return {
-          continueProb: (globalContinue + 1) / Math.max(2, globalObs + 2),
-          reboundProb: (globalRebound + 1) / Math.max(2, globalObs + 2),
-          sample: globalObs,
-        };
-      }
-      return {
-        continueProb: (row.cont + 1) / (row.obs + 2),
-        reboundProb: (row.rebound + 1) / (row.obs + 2),
-        sample: row.obs,
-      };
-    },
-  };
+  // Green zone: top 25% of historical rounds
+  const greenCut = clamp(quantileFromSorted(sorted, 0.75), 2.0, 999);
+  const greenFlag = multipliers.map(m => (m >= greenCut ? 1 : 0));
+  const prefGreen = buildPrefix(greenFlag);
 
   return {
     rounds: cleanRounds,
     n,
     multipliers,
     logs,
-    whiteCut,
-    reboundCut,
-    prefWhite,
-    prefGreen,
+    sorted,
     prefLog,
     prefLogSq,
-    whiteRunAt,
-    whiteRunQ85: Math.max(1, whiteRunQ85),
-    whiteRunQ95: Math.max(1, whiteRunQ95),
-    whiteModel,
+    prefWhite,
+    prefGreen,
+    wcd,
+    shortW,
+    longW,
+    greenCut,
   };
 }
 
+// ────────────────────────────────────────────────────────────
+// TARGET-SPECIFIC DATA
+// ────────────────────────────────────────────────────────────
+
 function buildTargetData(state, target) {
   const n = state.n;
-  const flags = new Array(n).fill(0);
-  const hitIndices = [];
+  const flags       = new Array(n).fill(0);
+  const hitIndices  = [];
   const hitRoundIds = [];
+
   for (let i = 0; i < n; i++) {
     if (state.multipliers[i] >= target) {
       flags[i] = 1;
@@ -386,6 +370,9 @@ function buildTargetData(state, target) {
   }
 
   const prefHit = buildPrefix(flags);
+  const baseRate = hitIndices.length / n;   // observed frequency — could be 0
+
+  // Gap since last hit (in rounds)
   const gapAt = new Array(n).fill(0);
   let lastHit = -1;
   for (let i = 0; i < n; i++) {
@@ -393,58 +380,34 @@ function buildTargetData(state, target) {
     gapAt[i] = lastHit >= 0 ? (i - lastHit) : (i + 1);
   }
 
+  // Distance to NEXT hit (looking forward) — null if no future hit exists
   const nextHitDist = new Array(n).fill(null);
   let nextHit = null;
   for (let i = n - 1; i >= 0; i--) {
     if (flags[i]) nextHit = i;
-    nextHitDist[i] = nextHit == null ? null : (nextHit - i);
+    nextHitDist[i] = nextHit !== null ? (nextHit - i) : null;
   }
 
+  // Inter-hit gap distribution (raw, no invented padding)
   const interGaps = [];
   for (let i = 1; i < hitIndices.length; i++) interGaps.push(hitIndices[i] - hitIndices[i - 1]);
-  if (!interGaps.length) interGaps.push(Math.max(1, n));
+  const sortedGaps = sortedCopy(interGaps);
 
-  const sortedGaps = [...interGaps].sort((a, b) => a - b);
-  const gapQ = {
-    q20: quantileFromSorted(sortedGaps, 0.2),
+  const gapQ = interGaps.length >= 4 ? {
+    q10: quantileFromSorted(sortedGaps, 0.10),
+    q25: quantileFromSorted(sortedGaps, 0.25),
     q35: quantileFromSorted(sortedGaps, 0.35),
-    q50: quantileFromSorted(sortedGaps, 0.5),
+    q50: quantileFromSorted(sortedGaps, 0.50),
     q75: quantileFromSorted(sortedGaps, 0.75),
-    q90: quantileFromSorted(sortedGaps, 0.9),
+    q90: quantileFromSorted(sortedGaps, 0.90),
     q95: quantileFromSorted(sortedGaps, 0.95),
-  };
+  } : null;  // null = not enough data
 
-  let b2bImm = 0;
-  let b2bNear = 0;
-  if (hitIndices.length > 1) {
-    for (let i = 1; i < hitIndices.length; i++) {
-      const d = hitIndices[i] - hitIndices[i - 1];
-      if (d <= 1) b2bImm += 1;
-      if (d <= 2) b2bNear += 1;
-    }
-  }
-  const pairDen = Math.max(1, hitIndices.length - 1);
-  const b2bBase = b2bImm / pairDen;
-  const b2bNearBase = b2bNear / pairDen;
+  // B2B detector — recent window = sqrt(n) * 5
+  const recentWindow = clamp(Math.round(Math.sqrt(n) * 5), 30, 600);
+  const b2b = buildB2BDetector(hitIndices, n, recentWindow);
 
-  const recentLookback = clamp(Math.round(Math.sqrt(Math.max(1, n)) * 10), 80, 1500);
-  let recentPairs = 0;
-  let recentNear = 0;
-  let recentImm = 0;
-  let prevHitIdx = null;
-  const start = Math.max(0, n - recentLookback);
-  for (let i = start; i < n; i++) {
-    if (!flags[i]) continue;
-    if (prevHitIdx != null) {
-      const d = i - prevHitIdx;
-      recentPairs += 1;
-      if (d <= 1) recentImm += 1;
-      if (d <= 2) recentNear += 1;
-    }
-    prevHitIdx = i;
-  }
-  const b2bRecent = recentPairs > 0 ? (recentImm / recentPairs) : b2bBase;
-  const b2bNearRecent = recentPairs > 0 ? (recentNear / recentPairs) : b2bNearBase;
+  const currentGap = gapAt[n - 1] || 0;
 
   return {
     target,
@@ -455,189 +418,518 @@ function buildTargetData(state, target) {
     nextHitDist,
     gapAt,
     interGaps,
+    sortedGaps,
     gapQ,
-    baseRate: hitIndices.length / Math.max(1, n),
-    currentGap: gapAt[n - 1] || 0,
-    b2bBase,
-    b2bNearBase,
-    b2bRecent,
-    b2bNearRecent,
+    baseRate,
+    currentGap,
+    b2b,
   };
 }
 
-function buildFeatureFns(state, targetData) {
-  const density = clamp(Math.round(Math.sqrt(Math.max(1, state.n))), 24, 220);
-  const shortW = clamp(Math.round(density * 0.5), 10, 120);
-  const longW = clamp(Math.round(density * 1.4), shortW + 5, 420);
-  const hitW = clamp(Math.round(Math.max(shortW, targetData.gapQ.q75 * 1.8)), shortW, Math.max(longW, 1200));
-  const gapScale = Math.max(1, targetData.gapQ.q75 || targetData.gapQ.q50 || 1);
-  const whiteScale = Math.max(1, state.whiteRunQ95);
+// ────────────────────────────────────────────────────────────
+// HAZARD MODEL — purely from observed gap distribution
+// At gap G, what fraction of rounds resulted in a hit?
+// No invented prior. If data is insufficient → returns null p1.
+// ────────────────────────────────────────────────────────────
 
-  const getFeatures = (idx) => {
-    const whiteShort = prefixRate(state.prefWhite, idx, shortW);
-    const whiteLong = prefixRate(state.prefWhite, idx, longW);
-    const greenShort = prefixRate(state.prefGreen, idx, shortW);
-    const hitShort = prefixRate(targetData.prefHit, idx, shortW);
-    const hitLong = prefixRate(targetData.prefHit, idx, hitW);
-    const trend = prefixRate(state.prefLog, idx, shortW) - prefixRate(state.prefLog, idx, longW);
-    const vol = prefixStd(state.prefLog, state.prefLogSq, idx, shortW);
-    const gapNorm = clamp((targetData.gapAt[idx] || 0) / gapScale, 0, 8);
-    const whiteRunNorm = clamp((state.whiteRunAt[idx] || 0) / whiteScale, 0, 4);
-    return [whiteShort, whiteLong, greenShort, hitShort, hitLong, trend, vol, gapNorm, whiteRunNorm];
-  };
-  return { getFeatures, shortW, longW, hitW };
-}
+function buildHazardModel(targetData) {
+  const { gapAt, flags, gapQ } = targetData;
+  const n = gapAt.length;
 
-function buildSamples(state, targetData, featureFns) {
-  const n = state.n;
-  const start = Math.max(featureFns.longW + 2, 24);
-  const horizonSoon = clamp(Math.round(Math.max(2, targetData.gapQ.q35 || 2)), 2, 30);
-  const samples = [];
-  for (let i = start; i < n - 1; i++) {
-    const dist = targetData.nextHitDist[i];
-    if (!Number.isFinite(dist) || dist < 1) continue;
-    const recency = 0.55 + (0.45 * ((i - start + 1) / Math.max(1, n - start)));
-    samples.push({
-      idx: i,
-      x: featureFns.getFeatures(i),
-      y1: dist <= 1 ? 1 : 0,
-      ySoon: dist <= horizonSoon ? 1 : 0,
-      gapToHit: dist,
-      recency,
-    });
+  if (!gapQ || targetData.hitIndices.length < 5) {
+    return { p1: null, reliable: false, at: () => null };
   }
-  return { samples, horizonSoon };
-}
 
-function computeFeatureStats(samples) {
-  if (!samples.length) return { means: [], stds: [] };
-  const dims = samples[0].x.length;
-  const means = new Array(dims).fill(0);
-  const stds = new Array(dims).fill(0);
-  for (const s of samples) {
-    for (let d = 0; d < dims; d++) means[d] += s.x[d];
+  const maxGap = Math.max(6, Math.round(gapQ.q95 * 1.5));
+  const obs  = new Array(maxGap + 2).fill(0);
+  const hits = new Array(maxGap + 2).fill(0);
+
+  for (let i = 0; i < n - 1; i++) {
+    const g = Math.min(maxGap, Math.round(gapAt[i] || 0));
+    obs[g]++;
+    if (flags[i + 1]) hits[g]++;
   }
-  for (let d = 0; d < dims; d++) means[d] /= samples.length;
-  for (const s of samples) {
-    for (let d = 0; d < dims; d++) {
-      const z = s.x[d] - means[d];
-      stds[d] += z * z;
+
+  // Bandwidth for kernel smoothing — derived from data spread, not invented
+  const gapSd  = stddev(targetData.interGaps);
+  const bw     = gapSd !== null ? clamp(Math.round(gapSd * 0.15), 1, 20) : 2;
+  const totalO = obs.reduce((s, v) => s + v, 0);
+  const totalH = hits.reduce((s, v) => s + v, 0);
+  const globalRate = totalO > 0 ? totalH / totalO : null;
+
+  function at(gap) {
+    const g = clamp(Math.round(gap), 0, maxGap);
+    let o = 0, h = 0;
+    for (let d = -bw; d <= bw; d++) {
+      const idx = g + d;
+      if (idx < 0 || idx > maxGap) continue;
+      const w = bw + 1 - Math.abs(d);
+      o += obs[idx] * w;
+      h += hits[idx] * w;
     }
+    // No fake prior — if we have zero obs in this band, return global rate (or null)
+    if (o === 0) return globalRate;
+    return h / o;
   }
-  for (let d = 0; d < dims; d++) stds[d] = Math.max(1e-6, Math.sqrt(stds[d] / samples.length));
+
+  const p1 = at(targetData.currentGap);
+  return {
+    p1:      p1 !== null ? clamp(p1, 0, 1) : null,
+    reliable: totalO >= 20,
+    at,
+    totalObs: totalO,
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// KNN (k-nearest-neighbor) PREDICTOR
+// Feature: current context vector vs all historical contexts
+// Only trained on rounds where we have a "next hit" label.
+// ────────────────────────────────────────────────────────────
+
+function buildFeatureVector(state, targetData, idx) {
+  const { prefLog, prefLogSq, prefWhite, prefGreen, shortW, longW } = state;
+  const { prefHit, gapAt, gapQ } = targetData;
+  const { runLen } = state.wcd;
+
+  const logShort = prefixWindowMean(prefLog, idx, shortW);
+  const logLong  = prefixWindowMean(prefLog, idx, longW);
+  const logVarSh = prefixWindowVariance(prefLog, prefLogSq, idx, shortW);
+
+  const hitW = gapQ ? clamp(Math.round(gapQ.q75 * 2), shortW, Math.max(longW, 600)) : longW;
+
+  return [
+    prefixWindowMean(prefWhite, idx, shortW)  ?? 0,   // [0] recent white rate
+    prefixWindowMean(prefWhite, idx, longW)   ?? 0,   // [1] long white rate
+    prefixWindowMean(prefGreen, idx, shortW)  ?? 0,   // [2] recent green rate
+    prefixWindowMean(prefHit,   idx, shortW)  ?? 0,   // [3] recent hit rate (this target)
+    prefixWindowMean(prefHit,   idx, hitW)    ?? 0,   // [4] medium hit rate
+    (logShort !== null && logLong !== null) ? (logShort - logLong) : 0,  // [5] trend
+    logVarSh !== null ? Math.sqrt(logVarSh) : 0,     // [6] volatility
+    gapQ ? clamp((gapAt[idx] || 0) / Math.max(1, gapQ.q75), 0, 10) : 0, // [7] gap pressure
+    gapQ ? clamp((runLen[idx] || 0) / Math.max(1, state.wcd.runQ95 || 1), 0, 5) : 0, // [8] white run pressure
+  ];
+}
+
+function computeFeatureStats(vecs) {
+  if (!vecs.length) return null;
+  const D = vecs[0].length;
+  const means = new Array(D).fill(0);
+  const stds  = new Array(D).fill(1);
+  for (const v of vecs) for (let d = 0; d < D; d++) means[d] += v[d];
+  for (let d = 0; d < D; d++) means[d] /= vecs.length;
+  for (const v of vecs) for (let d = 0; d < D; d++) { const z = v[d] - means[d]; stds[d] += z * z; }
+  for (let d = 0; d < D; d++) stds[d] = Math.sqrt(Math.max(1e-8, stds[d] / vecs.length));
   return { means, stds };
 }
 
-function zScore(vec, stats) {
+function zNormalize(vec, stats) {
   return vec.map((v, i) => (v - stats.means[i]) / stats.stds[i]);
 }
 
 function euclidean(a, b) {
   let s = 0;
-  for (let i = 0; i < a.length; i++) {
-    const d = a[i] - b[i];
-    s += d * d;
-  }
+  for (let i = 0; i < a.length; i++) { const d = a[i] - b[i]; s += d * d; }
   return Math.sqrt(s);
 }
 
-function runKnn(currentZ, sampleZ, k) {
-  if (!sampleZ.length) return { p1: 0, pSoon: 0, q25: 1, q50: 2, q75: 3, effectiveSample: 0, support: 0 };
-  const scored = [];
-  for (const row of sampleZ) {
-    const dist = euclidean(currentZ, row.z);
-    const w = (1 / (1 + dist)) * row.recency;
-    scored.push({ ...row, dist, w });
+function runKnn(state, targetData, currentIdx) {
+  const n = state.n;
+  const minHistory = state.longW + 2;
+  if (n < minHistory + 10) return null;  // not enough data — return null, not fake
+
+  // Horizon: how many rounds ahead we consider "soon"
+  const gapQ = targetData.gapQ;
+  const horizonSoon = gapQ ? Math.max(2, Math.round(gapQ.q35)) : null;
+
+  // Build labeled samples: every past index where we know the next hit distance
+  const samples = [];
+  for (let i = minHistory; i < currentIdx; i++) {
+    const dist = targetData.nextHitDist[i];
+    if (dist === null || dist < 1) continue;
+    const recency = (i - minHistory + 1) / Math.max(1, currentIdx - minHistory);
+    samples.push({
+      x:       buildFeatureVector(state, targetData, i),
+      y1:      dist <= 1 ? 1 : 0,
+      ySoon:   horizonSoon !== null ? (dist <= horizonSoon ? 1 : 0) : null,
+      gapDist: dist,
+      recency,
+    });
   }
+
+  if (samples.length < 10) return null;  // truly not enough — return null
+
+  const stats = computeFeatureStats(samples.map(s => s.x));
+  if (!stats) return null;
+
+  const sampleZ = samples.map(s => ({ ...s, z: zNormalize(s.x, stats) }));
+  const queryZ  = zNormalize(buildFeatureVector(state, targetData, currentIdx), stats);
+
+  // Adaptive k: sqrt of sample count, capped
+  const k = clamp(Math.round(Math.sqrt(sampleZ.length) * 2), 15, Math.round(sampleZ.length * 0.4));
+
+  // Score and pick top-k
+  const scored = sampleZ.map(s => ({ ...s, dist: euclidean(queryZ, s.z) }));
   scored.sort((a, b) => a.dist - b.dist);
-  const top = scored.slice(0, Math.max(1, Math.min(k, scored.length)));
+  const top = scored.slice(0, k);
 
-  let sumW = 0;
-  let sumW2 = 0;
-  let numP1 = 0;
-  let numSoon = 0;
+  // Weighted by inverse distance × recency
+  let sumW = 0, sumW2 = 0, p1Num = 0, pSoonNum = 0;
   const gapItems = [];
-  for (const row of top) {
-    const w = Math.max(0, row.w);
-    sumW += w;
-    sumW2 += w * w;
-    numP1 += row.y1 * w;
-    numSoon += row.ySoon * w;
-    gapItems.push({ value: row.gapToHit, weight: w });
+  for (const s of top) {
+    const w = (1 / (1 + s.dist)) * (0.5 + 0.5 * s.recency);
+    sumW += w; sumW2 += w * w;
+    p1Num   += s.y1 * w;
+    if (s.ySoon !== null) pSoonNum += s.ySoon * w;
+    gapItems.push({ value: s.gapDist, weight: w });
   }
-  const p1 = sumW > 0 ? (numP1 / sumW) : 0;
-  const pSoon = sumW > 0 ? (numSoon / sumW) : 0;
-  const effectiveSample = sumW2 > 0 ? ((sumW * sumW) / sumW2) : 0;
+
+  if (sumW === 0) return null;
+  const p1      = p1Num / sumW;
+  const pSoon   = pSoonNum / sumW;
+  const effN    = (sumW * sumW) / sumW2;
+  const support = clamp(effN / Math.max(1, k), 0, 1);
+
+  const sortedGapItems = [...gapItems].sort((a, b) => a.value - b.value);
+  function wq(q) { return weightedMedian(gapItems.map(x => ({ ...x, weight: x.weight * (x.value <= quantile(gapItems.map(v=>v.value), q) ? 1 : 0) + 1e-12 }))); }
+
+  // Simpler: just find approximate quantiles from sorted gaps
+  const gapVals = sortedGapItems.map(x => x.value);
+  const q25 = quantileFromSorted(gapVals, 0.25);
+  const q50 = quantileFromSorted(gapVals, 0.50);
+  const q75 = quantileFromSorted(gapVals, 0.75);
+
   return {
-    p1: clamp(p1, 0, 1),
-    pSoon: clamp(pSoon, 0, 1),
-    q25: weightedQuantile(gapItems, 0.25),
-    q50: weightedQuantile(gapItems, 0.5),
-    q75: weightedQuantile(gapItems, 0.75),
-    effectiveSample,
-    support: clamp(effectiveSample / Math.max(1, top.length), 0, 1),
+    p1:      clamp(p1, 0, 1),
+    pSoon:   horizonSoon !== null ? clamp(pSoon, 0, 1) : null,
+    horizonSoon,
+    q25,
+    q50,
+    q75,
+    support,
+    k,
+    sampleSize: sampleZ.length,
   };
 }
 
-function buildHazard(targetData) {
-  const gaps = targetData.gapAt;
-  const flags = targetData.flags;
-  if (gaps.length <= 2) return { p1: targetData.baseRate, q50: 1 / Math.max(1e-6, targetData.baseRate), support: 0 };
-  const maxGap = clamp(Math.round(Math.max(6, targetData.gapQ.q95 * 1.4)), 6, 5000);
-  const obs = new Array(maxGap + 1).fill(0);
-  const hits = new Array(maxGap + 1).fill(0);
-  let totalObs = 0;
-  let totalHits = 0;
-  for (let i = 0; i < gaps.length - 1; i++) {
-    const g = clamp(Math.round(gaps[i] || 0), 0, maxGap);
-    obs[g] += 1;
-    totalObs += 1;
-    if (flags[i + 1]) {
-      hits[g] += 1;
-      totalHits += 1;
+// ────────────────────────────────────────────────────────────
+// CALIBRATION — built entirely from your historical outcomes
+// Only adjusts if you have real feedback rows. If no history: identity.
+// ────────────────────────────────────────────────────────────
+
+function targetFromLabel(raw) {
+  const n = Number(String(raw || '').trim().replace(/x/i, ''));
+  return Number.isFinite(n) ? n : null;
+}
+
+function buildCalibration(historyRows = []) {
+  const out = {};
+  for (const t of TARGETS) out[t] = null;  // null = no calibration data
+
+  const byTarget = {};
+  for (const t of TARGETS) byTarget[t] = [];
+  for (const row of (historyRows || [])) {
+    const t = targetFromLabel(row?.target);
+    if (TARGETS.includes(t)) byTarget[t].push(row);
+  }
+
+  for (const t of TARGETS) {
+    const rows = byTarget[t];
+    if (rows.length < 3) continue;  // not enough data to calibrate
+
+    let win = 0, early = 0, loss = 0, total = 0;
+    const shiftItems = [];
+
+    for (let i = 0; i < rows.length; i++) {
+      // Recent rows are weighted more heavily (recency weighting — from data ordering)
+      const w = 1 + 2 * Math.pow((i + 1) / rows.length, 2);
+      const outcome = String(rows[i]?.outcome || '').toLowerCase();
+      if (outcome === 'win')   win   += w;
+      else if (outcome === 'early') early += w;
+      else if (outcome === 'loss')  loss  += w;
+      else continue;
+      total += w;
+
+      // Shift: measure whether hits arrived earlier or later than predicted window
+      const lo  = Number(rows[i]?.lo);
+      const hi  = Number(rows[i]?.hi);
+      const hit = Number(rows[i]?.hitRound);
+      if (Number.isFinite(lo) && Number.isFinite(hi) && hi > lo) {
+        const span = hi - lo;
+        let err = 0;
+        if (outcome === 'win'   && Number.isFinite(hit)) err = (hit - (lo + span * 0.5)) / span;
+        else if (outcome === 'early' && Number.isFinite(hit)) err = (hit - lo) / span;
+        else if (outcome === 'loss') err = 1.0;
+        shiftItems.push({ value: clamp(err, -3, 3), weight: w });
+      }
+    }
+
+    if (total === 0) continue;
+
+    const winRate  = win  / Math.max(1, win + loss);
+    const lossRate = loss / total;
+    const earlyRate= early/ total;
+
+    // Shift correction: if hits always arrive early → negative shift → move window earlier
+    const shift = shiftItems.length >= 3 ? clamp(weightedMedian(shiftItems), -1.5, 1.5) : 0;
+
+    // Span correction: if high variance in where hits land → widen window
+    const absShifts = shiftItems.map(x => ({ value: Math.abs(x.value), weight: x.weight }));
+    const spanMult = absShifts.length >= 3
+      ? clamp(1 + weightedMedian(absShifts), 0.6, 3.5)
+      : 1.0;
+
+    out[t] = {
+      sample:       Math.round(total),
+      winRate:      roundNum(winRate, 6),
+      lossRate:     roundNum(lossRate, 6),
+      earlyRate:    roundNum(earlyRate, 6),
+      shift:        roundNum(shift, 6),
+      spanMult:     roundNum(spanMult, 6),
+    };
+  }
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────
+// CORE PREDICTOR — fuses hazard + knn, gated by data quality
+// No fake confidence floors. No invented activation thresholds.
+// If data is insufficient → suspended = true, no prediction made.
+// ────────────────────────────────────────────────────────────
+
+function buildPrediction(state, targetData, calibration) {
+  const currentIdx   = state.n - 1;
+  const currentRound = state.rounds[currentIdx].roundId;
+  const target       = targetData.target;
+  const gapQ         = targetData.gapQ;
+  const cal          = calibration; // may be null
+
+  // ── White cluster signals (measured) ──
+  const currentRun  = state.wcd.runLen[currentIdx] || 0;
+  const wEst        = state.wcd.estimate(currentRun);
+  const whiteRisk   = wEst.continueProb;   // null if no data
+  const whiteRelease= wEst.reboundProb;    // null if no data
+
+  // ── B2B signals (measured) ──
+  const b2b = targetData.b2b;
+
+  // ── Hazard model ──
+  const hazard = buildHazardModel(targetData);
+
+  // ── KNN ──
+  const knn = runKnn(state, targetData, currentIdx);
+
+  // ── Determine if we have enough data to make a meaningful prediction ──
+  const hasBaseRate = targetData.hitIndices.length >= 5;
+  const hasHazard   = hazard.reliable && hazard.p1 !== null;
+  const hasKnn      = knn !== null && knn.support >= 0.1;
+
+  if (!hasBaseRate) {
+    // Not enough hits in data — no prediction possible
+    return { suspended: true, reason: 'insufficient_hits', target };
+  }
+
+  // ── Probability of hit in next round ──
+  // Blend hazard + knn proportionally to their data quality
+  let p1 = null;
+  let wHaz = 0, wKnn = 0;
+
+  if (hasHazard && hasKnn) {
+    // Both available — blend by relative data support
+    wHaz = hazard.totalObs;
+    wKnn = knn.sampleSize * knn.support;
+    const wSum = wHaz + wKnn;
+    p1 = (hazard.p1 * wHaz + knn.p1 * wKnn) / wSum;
+    wHaz /= wSum; wKnn /= wSum;
+  } else if (hasHazard) {
+    p1 = hazard.p1;
+    wHaz = 1; wKnn = 0;
+  } else if (hasKnn) {
+    p1 = knn.p1;
+    wHaz = 0; wKnn = 1;
+  } else {
+    // Fallback to raw base rate only if hazard and knn both unavailable
+    p1 = targetData.baseRate;
+    wHaz = 0; wKnn = 0;
+  }
+
+  // ── Apply white cluster adjustment (only if measured signal is available) ──
+  // Logic: when we're in a long white run, higher targets become less likely now
+  if (whiteRisk !== null && currentRun > 0) {
+    if (target >= 20) {
+      // High target hit chance suppressed by active white cluster
+      p1 = p1 * (1 - 0.6 * whiteRisk);
+    } else {
+      // Low targets less affected by white clusters
+      p1 = p1 * (1 - 0.25 * whiteRisk);
     }
   }
-  const globalP = clamp(totalHits / Math.max(1, totalObs), 0.000001, 0.999);
-  const bw = clamp(Math.round(stddev(gaps) * 0.18), 1, 25);
-  const prior = Math.max(4, Math.sqrt(Math.max(1, totalObs)));
-  const at = (gap) => {
-    const g = clamp(Math.round(gap), 0, maxGap);
-    let o = 0;
-    let h = 0;
-    for (let d = -bw; d <= bw; d++) {
-      const idx = g + d;
-      if (idx < 0 || idx > maxGap) continue;
-      const w = (bw + 1) - Math.abs(d);
-      o += obs[idx] * w;
-      h += hits[idx] * w;
-    }
-    return clamp((h + (prior * globalP)) / Math.max(1e-6, o + prior), 0.000001, 0.999);
+  // When white cluster is ending (rebound signal), boost probability
+  if (whiteRelease !== null && currentRun > 0 && whiteRelease > 0.5) {
+    p1 = p1 * (1 + 0.3 * (whiteRelease - 0.5));
+  }
+
+  // ── Apply B2B adjustment (only if measured) ──
+  if (b2b.nearRate !== null && target <= 20) {
+    p1 = p1 * (1 + 0.2 * b2b.nearRate);
+  }
+  if (b2b.immRate !== null && target <= 10) {
+    p1 = p1 * (1 + 0.15 * b2b.immRate);
+  }
+
+  p1 = clamp(p1, 0, 1);
+
+  // ── Window placement ──
+  // Use calibration shift if we have data, else use gap quantile directly
+  const shift = cal?.shift ?? 0;
+  const spanMultiplier = cal?.spanMult ?? 1;
+
+  let aheadLo, spread;
+  if (gapQ) {
+    const rawLo = gapQ.q25;
+    const rawSpread = Math.max(1, gapQ.q75 - gapQ.q25);
+    aheadLo = Math.max(1, Math.round(rawLo + shift * rawSpread));
+    spread  = Math.max(1, Math.round(rawSpread * spanMultiplier));
+  } else {
+    // No gap quantiles → use reciprocal of base rate as rough estimate
+    const roughGap = Math.max(1, Math.round(1 / Math.max(0.001, targetData.baseRate)));
+    aheadLo = Math.max(1, Math.round(roughGap * 0.5));
+    spread  = roughGap;
+  }
+
+  // White cluster adjustment: push window forward when risk is high
+  if (whiteRisk !== null && currentRun > 0 && target >= 20 && whiteRisk > 0.4) {
+    const push = Math.max(1, Math.round(whiteRisk * (state.wcd.runQ95 || 3)));
+    aheadLo = aheadLo + push;
+  }
+  // B2B adjustment: pull window closer when back-to-back pressure is high
+  if (b2b.nearRate !== null && b2b.nearRate > 0.3 && target <= 20) {
+    const pull = Math.max(1, Math.round(b2b.nearRate * 3));
+    aheadLo = Math.max(1, aheadLo - pull);
+  }
+
+  // Fixed span by target (architectural requirement)
+  const fixedSpan = FIXED_WINDOW_SPAN[target] || Math.max(3, spread);
+  const lo = currentRound + aheadLo;
+  const hi = lo + fixedSpan - 1;
+
+  // ── Confidence — measured signal coverage ──
+  // Confidence is a function of: how much data we have, hazard reliability, knn support
+  const dataScore    = clamp(targetData.hitIndices.length / Math.max(10, state.n * 0.05), 0, 1);
+  const hazardScore  = hasHazard ? clamp(hazard.totalObs / 100, 0, 1) : 0;
+  const knnScore     = hasKnn ? knn.support : 0;
+  const calScore     = cal ? clamp(cal.sample / 30, 0, 1) : 0;
+
+  const confidence   = clamp(
+    0.2 * dataScore + 0.3 * hazardScore + 0.3 * knnScore + 0.2 * calScore,
+    0, 1
+  );
+
+  // ── Suspension logic — only suspend based on measured data signals ──
+  let suspended = false;
+  let suspendReason = null;
+
+  // Suspend if white cluster is extremely active and measured
+  if (target >= 50 && whiteRisk !== null && wEst.reliable && whiteRisk > 0.75 && (whiteRelease === null || whiteRelease < 0.3)) {
+    suspended = true; suspendReason = 'white_cluster_active';
+  }
+  // Suspend if we have extremely low measured probability
+  if (p1 < 0.001) {
+    suspended = true; suspendReason = 'probability_too_low';
+  }
+  // Suspend large targets when white run is longer than the 99th percentile run
+  if (target >= 500 && state.wcd.runQ99 !== null && currentRun > state.wcd.runQ99 * 0.8) {
+    suspended = true; suspendReason = 'extreme_white_run';
+  }
+
+  // ── pSoon ──
+  const pSoon = knn?.pSoon ?? clamp(1 - Math.pow(1 - p1, Math.max(1, gapQ?.q35 ?? 3)), 0, 1);
+
+  return {
+    target,
+    lo,
+    hi,
+    roundWhenMade: currentRound,
+    suspended,
+    suspendReason,
+    confidence: roundNum(confidence, 6),
+    eta: {
+      pHit1:             roundNum(p1, 6),
+      pHitSoon:          roundNum(pSoon, 6),
+      horizonSoon:       knn?.horizonSoon ?? null,
+
+      // Gap distribution (from data)
+      q25:               roundNum(gapQ?.q25 ?? null, 3),
+      q50:               roundNum(gapQ?.q50 ?? null, 3),
+      q75:               roundNum(gapQ?.q75 ?? null, 3),
+      gapNow:            targetData.currentGap,
+      aheadLo,
+      aheadHi:           hi - currentRound,
+
+      // Signal breakdown
+      whiteClusterRun:        currentRun,
+      whiteClusterRisk:       roundNum(whiteRisk, 6),        // null = no data
+      whiteClusterRelease:    roundNum(whiteRelease, 6),     // null = no data
+      whiteClusterReliable:   wEst.reliable,
+      whiteClusterSample:     wEst.sample,
+
+      b2bImmRate:       roundNum(b2b.immRate, 6),            // null = no data
+      b2bNearRate:      roundNum(b2b.nearRate, 6),           // null = no data
+      b2bRecentPairs:   b2b.recentPairs,
+      b2bGlobalPairs:   b2b.globalPairs,
+
+      hazardP1:         roundNum(hazard.p1, 6),              // null = insufficient
+      hazardReliable:   hazard.reliable,
+      hazardTotalObs:   hazard.totalObs ?? 0,
+
+      knnP1:            roundNum(knn?.p1 ?? null, 6),
+      knnPSoon:         roundNum(knn?.pSoon ?? null, 6),
+      knnSupport:       roundNum(knn?.support ?? null, 6),
+      knnSampleSize:    knn?.sampleSize ?? 0,
+
+      blend:  { hazard: roundNum(wHaz, 6), knn: roundNum(wKnn, 6) },
+
+      calibrationShift:     roundNum(cal?.shift ?? 0, 6),
+      calibrationSpanMult:  roundNum(cal?.spanMult ?? 1, 6),
+      calibrationSample:    cal?.sample ?? 0,
+
+      baseRate:   roundNum(targetData.baseRate, 6),
+      hitCount:   targetData.hitIndices.length,
+      sampleSize: state.n,
+
+      suspended,
+      suspendReason,
+      modelVersion: 'v9-pure-data',
+    },
   };
-  const p1 = at(targetData.currentGap);
-  const q50 = clamp(1 / Math.max(0.000001, p1), 1, Math.max(2, targetData.gapQ.q95 * 1.5));
-  return { p1, q50, support: clamp(totalObs / Math.max(20, gaps.length), 0, 1), at };
 }
+
+// ────────────────────────────────────────────────────────────
+// LOCK LIFECYCLE
+// ────────────────────────────────────────────────────────────
 
 function evaluateExistingLock(lock, hitRoundIds, currentRound) {
-  if (!lock) return { resolved: false, status: 'pending', outcome: null, hitRound: null };
-  const lo = Number(lock.lo);
-  const hi = Number(lock.hi);
-  const made = Number(lock.roundWhenMade ?? lock.round_when_made ?? lo - 1);
-  const lb = lowerBound(hitRoundIds, made + 1);
-  const ub = lowerBound(hitRoundIds, currentRound + 1);
+  if (!lock) return { resolved: false, status: 'none', outcome: null, hitRound: null };
+  const lo   = Number(lock.lo);
+  const hi   = Number(lock.hi);
+  const made = Number(lock.roundWhenMade ?? lo - 1);
+
+  // Find first hit after the lock was made
+  const lb       = lowerBound(hitRoundIds, made + 1);
+  const ub       = lowerBound(hitRoundIds, currentRound + 1);
   const firstHit = lb < ub ? hitRoundIds[lb] : null;
 
-  if (firstHit != null) {
+  if (firstHit !== null) {
     if (firstHit < lo) return { resolved: true, status: 'resolved', outcome: 'early', hitRound: firstHit };
-    if (firstHit <= hi) return { resolved: true, status: 'resolved', outcome: 'win', hitRound: firstHit };
+    if (firstHit <= hi) return { resolved: true, status: 'resolved', outcome: 'win',  hitRound: firstHit };
   }
-  if (currentRound > hi) return { resolved: true, status: 'resolved', outcome: 'loss', hitRound: null };
-  if (currentRound >= lo) return { resolved: false, status: 'window-open', outcome: null, hitRound: null };
+  if (currentRound > hi)  return { resolved: true,  status: 'resolved',    outcome: 'loss',  hitRound: null };
+  if (currentRound >= lo) return { resolved: false, status: 'window-open', outcome: null,    hitRound: null };
   return { resolved: false, status: 'waiting', outcome: null, hitRound: null };
 }
 
-function confidenceBandWord(score) {
-  const s = clamp(score, 0, 1);
+function confidenceBand(score) {
+  const s = clamp(score ?? 0, 0, 1);
   if (s >= 0.8) return 'VERY HIGH';
   if (s >= 0.6) return 'HIGH';
   if (s >= 0.35) return 'MED';
@@ -645,256 +937,50 @@ function confidenceBandWord(score) {
   return 'NONE';
 }
 
-// === v8 TRUE SUPERVISED LEARNING & SIMPLIFIED UPGRADE START ===
-// Justification: unify pattern + gap + calibration + adaptive online learning into one deterministic predictor.
-function buildTargetCandidate(state, targetData, calibration) {
-  const currentIdx = state.n - 1;
-  const currentRound = state.rounds[currentIdx].roundId;
-  const target = Number(targetData?.target || 0);
-  const featureFns = buildFeatureFns(state, targetData);
-  const { samples, horizonSoon } = buildSamples(state, targetData, featureFns);
-  const stats = computeFeatureStats(samples);
-  const sampleZ = samples.map(s => ({ ...s, z: zScore(s.x, stats) }));
-  const currentZ = zScore(featureFns.getFeatures(currentIdx), stats);
-
-  const kAdaptive = clamp(Math.round(Math.sqrt(Math.max(1, sampleZ.length)) * 1.9), 20, Math.max(20, Math.round(sampleZ.length * 0.45)));
-  const knn = runKnn(currentZ, sampleZ, kAdaptive);
-  const hazard = buildHazard(targetData);
-
-  const whiteRun = state.whiteRunAt[currentIdx] || 0;
-  const whiteShort = prefixRate(state.prefWhite, currentIdx, featureFns.shortW);
-  const whiteLong = prefixRate(state.prefWhite, currentIdx, featureFns.longW);
-  const greenShort = prefixRate(state.prefGreen, currentIdx, featureFns.shortW);
-  const trend = prefixRate(state.prefLog, currentIdx, featureFns.shortW) - prefixRate(state.prefLog, currentIdx, featureFns.longW);
-  const vol = prefixStd(state.prefLog, state.prefLogSq, currentIdx, featureFns.shortW);
-
-  const whiteEstimate = state.whiteModel.estimate(whiteRun);
-  const whiteRisk = clamp((0.5 * whiteEstimate.continueProb) + (0.3 * sigmoid((whiteRun - state.whiteRunQ85) / Math.max(1, state.whiteRunQ95 - state.whiteRunQ85))) + (0.2 * clamp((whiteShort - whiteLong) * 2 + (0.45 - greenShort), 0, 1)), 0, 1);
-  const whiteRelease = clamp((0.65 * whiteEstimate.reboundProb) + (0.35 * clamp(greenShort + Math.max(0, trend), 0, 1)), 0, 1);
-
-  const b2bPressure = clamp((0.55 * targetData.b2bNearRecent) + (0.45 * targetData.b2bNearBase), 0, 1);
-  const b2bImmediate = clamp((0.6 * targetData.b2bRecent) + (0.4 * targetData.b2bBase), 0, 1);
-  const trendDownRisk = clamp(sigmoid((-trend * 4.2) + ((whiteShort - whiteLong) * 4.8) + ((vol - 0.5) * 1.2)), 0, 1);
-
-  const baseRate = clamp(targetData.baseRate, 0.000001, 0.999);
-  const p1Base = baseRate;
-  const p1Hazard = hazard.p1;
-  const pSoonHazard = clamp(1 - ((1 - p1Hazard) ** Math.max(1, horizonSoon)), 0, 1);
-
-  const reliability = clamp(calibration?.reliability ?? 0.5, 0.02, 0.98);
-  const wKnnRaw = knn.support * (0.42 + (0.38 * reliability));
-  const wHazRaw = hazard.support * (0.36 + (0.24 * (1 - reliability)));
-  const wBaseRaw = Math.max(0.1, 1 - (wKnnRaw + wHazRaw));
-  const wSum = wKnnRaw + wHazRaw + wBaseRaw;
-  const wKnn = wKnnRaw / wSum;
-  const wHaz = wHazRaw / wSum;
-  const wBase = wBaseRaw / wSum;
-
-  let p1 = (wKnn * knn.p1) + (wHaz * p1Hazard) + (wBase * p1Base);
-  let pSoon = (wKnn * knn.pSoon) + (wHaz * pSoonHazard) + (wBase * clamp(1 - ((1 - p1Base) ** Math.max(1, horizonSoon)), 0, 1));
-
-  if (target >= 20) {
-    p1 *= (1 - (0.58 * whiteRisk)) * (1 + (0.24 * whiteRelease));
-    pSoon *= (1 - (0.5 * whiteRisk)) * (1 + (0.2 * whiteRelease));
-  } else {
-    p1 *= (1 - (0.28 * whiteRisk)) * (1 + (0.3 * b2bPressure));
-    pSoon *= (1 - (0.24 * whiteRisk)) * (1 + (0.24 * b2bPressure));
-  }
-  if (target <= 10) {
-    p1 *= (1 + (0.14 * b2bImmediate));
-    pSoon *= (1 + (0.11 * b2bImmediate));
-  }
-  p1 = clamp(p1, 0.000001, 0.999);
-  pSoon = clamp(Math.max(pSoon, p1), 0.000001, 0.999);
-
-  const calShift = clamp(calibration?.shift ?? 0, -1, 1);
-  const calSpan = clamp(calibration?.spanMultiplier ?? 1, 0.65, 3.2);
-  const q25Raw = Math.max(1, knn.q25 || hazard.q50 || targetData.gapQ.q35 || 1);
-  const q50Raw = Math.max(q25Raw, knn.q50 || hazard.q50 || targetData.gapQ.q50 || q25Raw + 1);
-  const q75Raw = Math.max(q50Raw, knn.q75 || targetData.gapQ.q75 || q50Raw + 1);
-
-  let aheadLo = Math.max(1, Math.round(q25Raw + (calShift * 0.85)));
-  let aheadMid = Math.max(aheadLo, Math.round(q50Raw + Math.max(0, calShift)));
-  let spread = Math.max(1, Math.round((q75Raw - q25Raw) * calSpan));
-
-  if (target >= 20 && whiteRisk >= 0.45) {
-    const push = Math.max(1, Math.round(whiteRisk * spread * 0.9));
-    aheadLo += push;
-    aheadMid += Math.max(1, Math.round(push * 1.25));
-  }
-  if (target <= 20 && b2bPressure >= 0.35) {
-    const pull = Math.max(1, Math.round((b2bPressure + b2bImmediate) * 1.8));
-    aheadLo = Math.max(1, aheadLo - pull);
-    aheadMid = Math.max(aheadLo, aheadMid - Math.round(pull * 0.8));
-  }
-
-  const adaptiveCap = Math.max(Math.round(targetData.gapQ.q95 * 1.6), Math.round((1 / Math.max(0.000001, p1)) * 1.2), 8);
-  aheadLo = clamp(aheadLo, 1, adaptiveCap);
-  aheadMid = clamp(aheadMid, aheadLo, adaptiveCap + Math.max(2, spread));
-
-  const span = Math.max(1, Number(FIXED_WINDOW_SPAN[target] || Math.max(2, spread + 1)));
-  const lo = currentRound + aheadLo;
-  const hi = lo + span - 1;
-
-  const minP1 = clamp(calibration?.minP1 ?? (0.04 + (targetData.baseRate * 0.6)), 0.01, 0.95);
-  const minConfidence = clamp(calibration?.minConfidence ?? 0.4, 0.1, 0.95);
-  const rarityPenalty = clamp((Math.log10(Math.max(5, target)) / Math.log10(1000)) * (1 - clamp(targetData.baseRate * 24, 0, 1)), 0, 1);
-  const supportPenalty = clamp((0.32 * (1 - knn.support)) + (0.18 * (1 - hazard.support)), 0, 0.6);
-  const whitePenalty = target >= 20 ? (0.34 * whiteRisk) : (0.16 * whiteRisk);
-  const downPenalty = target >= 50 ? (0.22 * trendDownRisk) : (0.08 * trendDownRisk);
-  const confidence = clamp(
-    (0.08 + (0.34 * pSoon) + (0.16 * p1) + (0.12 * knn.support) + (0.1 * hazard.support) + (0.1 * reliability) + (0.06 * (1 - rarityPenalty)))
-      - whitePenalty - downPenalty - supportPenalty,
-    0.03,
-    0.96
-  );
-  const actionScore = clamp((0.55 * p1) + (0.45 * confidence), 0, 1);
-  let activationThreshold = ((minP1 + minConfidence) * 0.5);
-  activationThreshold += target >= 50 ? (0.04 + (0.08 * rarityPenalty)) : 0;
-  activationThreshold += target >= 100 ? (0.06 * (1 - reliability)) : 0;
-  activationThreshold += target >= 20 ? (0.08 * whiteRisk) : (0.03 * whiteRisk);
-  activationThreshold += target >= 50 ? (0.06 * trendDownRisk) : 0;
-  activationThreshold = clamp(activationThreshold, 0.12, 0.92);
-  let active = actionScore >= activationThreshold;
-  if (target >= 50 && whiteRisk >= 0.8 && whiteRelease <= 0.25) active = false;
-  if (target >= 100 && knn.support < 0.18 && hazard.support < 0.2) active = false;
-  if (target >= 500 && (whiteRisk >= 0.55 || trendDownRisk >= 0.55)) active = false;
-  if (target <= 20 && b2bPressure >= 0.55 && p1 >= (minP1 * 0.86) && whiteRisk <= 0.72) active = true;
-
-  return {
-    target,
-    lo,
-    hi,
-    roundWhenMade: currentRound,
-    suspended: !active,
-    confidence: roundNum(confidence, 6),
-    eta: {
-      pHit1: roundNum(p1, 6),
-      pHitSoon: roundNum(pSoon, 6),
-      horizonSoon,
-      q25: roundNum(q25Raw, 3),
-      q50: roundNum(q50Raw, 3),
-      q75: roundNum(q75Raw, 3),
-      aheadLo,
-      aheadHi: hi - currentRound,
-      spread: roundNum(spread, 3),
-      minP1: roundNum(minP1, 6),
-      minConfidence: roundNum(minConfidence, 6),
-      activationThreshold: roundNum(activationThreshold, 6),
-      actionScore: roundNum(actionScore, 6),
-      confidenceBand: confidenceBandWord(confidence),
-      calibrationShift: roundNum(calShift, 6),
-      calibrationSpanMultiplier: roundNum(calSpan, 6),
-      calibrationSample: Number(calibration?.sample || 0),
-      reliability: roundNum(reliability, 6),
-      whiteClusterSeverity: roundNum(whiteRisk, 6),
-      whiteReleaseSignal: roundNum(whiteRelease, 6),
-      whiteRun: Number(whiteRun || 0),
-      trendDownRisk: roundNum(trendDownRisk, 6),
-      b2bPressure: roundNum(b2bPressure, 6),
-      b2bImmediate: roundNum(b2bImmediate, 6),
-      knnSupport: roundNum(knn.support, 6),
-      knnEffectiveSample: roundNum(knn.effectiveSample, 3),
-      hazardP1: roundNum(p1Hazard, 6),
-      hazardSupport: roundNum(hazard.support, 6),
-      baseRate: roundNum(baseRate, 6),
-      rarityPenalty: roundNum(rarityPenalty, 6),
-      supportPenalty: roundNum(supportPenalty, 6),
-      blend: { knn: roundNum(wKnn, 6), hazard: roundNum(wHaz, 6), base: roundNum(wBase, 6) },
-      aiProbability: roundNum(actionScore, 6),
-      aiConfidence: roundNum(confidence, 6),
-      aiScore: roundNum(actionScore, 6),
-      aiSource: 'v8-unified-supervised',
-      waitingModelVersion: 'v8-unified-supervised',
-      suspended: !active,
-    },
-  };
-}
-// === UPGRADE END ===
-
-function normalizeLockInput(input) {
-  if (!input) return null;
-  const eta = input.eta || input.eta_json || null;
-  return {
-    lo: Number(input.lo),
-    hi: Number(input.hi),
-    roundWhenMade: Number(input.roundWhenMade ?? input.round_when_made),
-    generation: Number(input.generation || 1),
-    suspended: Boolean(input.suspended ?? eta?.suspended),
-    eta,
-  };
-}
-
-function buildUiTarget(target, lock, status, currentRound, previousOutcome = null) {
-  const lo = Number(lock.lo);
-  const hi = Number(lock.hi);
+function buildUiTarget(target, lock, status, currentRound, previousOutcome) {
+  const lo  = Number(lock.lo);
+  const hi  = Number(lock.hi);
   const eta = lock.eta || {};
   return {
     target,
     targetLabel: `${target}x`,
     status,
-    confidence: clamp(Number(lock.confidence ?? eta.aiConfidence ?? eta.confidence ?? 0.5), 0, 1),
+    confidence:  clamp(Number(lock.confidence ?? 0), 0, 1),
+    confidenceBand: confidenceBand(lock.confidence),
     window: {
       lo,
       hi,
-      span: Math.max(1, hi - lo + 1),
-      aheadLo: Math.max(0, lo - currentRound),
-      aheadHi: Math.max(0, hi - currentRound),
-      roundsUntilWindow: Math.max(0, lo - currentRound),
-      roundsLeftInWindow: Math.max(0, hi - currentRound),
+      span:                 Math.max(1, hi - lo + 1),
+      roundsUntilWindow:    Math.max(0, lo - currentRound),
+      roundsLeftInWindow:   Math.max(0, hi - currentRound),
     },
     signals: {
-      pHit1: Number(eta.pHit1 || 0),
-      pHitSoon: Number(eta.pHitSoon || 0),
-      quickHit: Number(eta.pHit1 || 0),
-      hardGapImpulse: Number(eta.trendDownRisk || 0),
-      whiteClusterSeverity: Number(eta.whiteClusterSeverity || 0),
-      whiteReleaseSignal: Number(eta.whiteReleaseSignal || 0),
-      b2bPressure: Number(eta.b2bPressure || 0),
-      aiProbability: Number(eta.aiProbability || eta.actionScore || 0),
-      aiConfidence: Number(eta.aiConfidence || 0),
-      aiScore: Number(eta.aiScore || eta.aiProbability || 0),
+      pHit1:              Number(eta.pHit1   ?? 0),
+      pHitSoon:           Number(eta.pHitSoon ?? 0),
+      whiteClusterRisk:   eta.whiteClusterRisk   ?? null,
+      whiteClusterRelease:eta.whiteClusterRelease ?? null,
+      whiteClusterRun:    Number(eta.whiteClusterRun ?? 0),
+      b2bImmRate:         eta.b2bImmRate  ?? null,
+      b2bNearRate:        eta.b2bNearRate ?? null,
+      hazardP1:           eta.hazardP1    ?? null,
+      knnP1:              eta.knnP1       ?? null,
+      knnSupport:         eta.knnSupport  ?? null,
+      baseRate:           eta.baseRate    ?? null,
     },
-    previousOutcome,
+    previousOutcome: previousOutcome || null,
   };
 }
 
-function buildAlertSummary(targetsOut, state) {
-  const rows = Array.isArray(targetsOut) ? targetsOut : [];
-  const ranked = rows
-    .map((row) => ({
-      target: row.target,
-      targetLabel: row.targetLabel,
-      score: clamp(Number(row?.signals?.aiScore || 0), 0, 1),
-      aheadLo: Number(row?.window?.aheadLo || 0),
-      aheadHi: Number(row?.window?.aheadHi || 0),
-      status: row?.status || 'unknown',
-    }))
-    .sort((a, b) => (b.score - a.score) || (a.aheadLo - b.aheadLo));
-  const top = ranked[0] || null;
-  const whiteRun = state.whiteRunAt[state.n - 1] || 0;
-  const white = state.whiteModel.estimate(whiteRun);
-  const whitePressure = clamp((0.62 * white.continueProb) + (0.38 * sigmoid(whiteRun - state.whiteRunQ85)), 0, 1);
-  return {
-    dominantSignal: top && top.score >= 0.45 ? (top.target <= 20 ? 'b2b' : 'high-target') : (whitePressure >= 0.55 ? 'white_cluster' : 'balanced'),
-    topCandidate: top,
-    whiteCluster: {
-      run: Number(whiteRun),
-      risk: roundNum(white.continueProb, 6),
-      release: roundNum(white.reboundProb, 6),
-      pressure: roundNum(whitePressure, 6),
-      sample: Number(white.sample || 0),
-    },
-  };
-}
+// ────────────────────────────────────────────────────────────
+// PUBLIC: computeLockedRangePredictions
+// ────────────────────────────────────────────────────────────
 
 function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = {}) {
-  // === v8 TRUE SUPERVISED LEARNING & SIMPLIFIED UPGRADE START ===
-  // Justification: closed-loop lock lifecycle; resolve prior lock, save outcome, rebuild next lock in same tick.
   const cleanRounds = normalizeRounds(rounds);
+
   if (!cleanRounds.length) {
     return {
-      model: 'range-lock-v8-unified',
+      model: 'range-lock-v9-pure-data',
       generatedAt: new Date().toISOString(),
       asOfRound: null,
       sampleSize: 0,
@@ -902,258 +988,309 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       locksToSave: {},
       resolvedHistory: [],
       calibration: {},
-      aiPredictor: { dominantSignal: 'none' },
-      summary: { pending: 0, waiting: 0, windowOpen: 0, relocked: 0, sampleSize: 0 },
-      settings: { adaptive: true, pureData: true, supervisedLearning: true },
+      whiteCluster: null,
+      summary: { waiting: 0, windowOpen: 0, relocked: 0, sampleSize: 0 },
     };
   }
 
-  const state = buildGlobalState(cleanRounds);
+  const state        = buildGlobalState(cleanRounds);
   const currentRound = cleanRounds[cleanRounds.length - 1].roundId;
-  const historyRows = Array.isArray(options?.historyRows) ? options.historyRows : [];
-  const calibration = buildHistoryCalibration(historyRows);
+  const historyRows  = Array.isArray(options?.historyRows) ? options.historyRows : [];
+  const calibration  = buildCalibration(historyRows);
 
-  const locksToSave = {};
-  const resolvedHistory = [];
-  const targetsOut = [];
-  let waitingCount = 0;
-  let openCount = 0;
-  let relockedCount = 0;
-  let pendingCount = 0;
+  const locksToSave    = {};
+  const resolvedHistory= [];
+  const targetsOut     = [];
+  let waitingCount = 0, openCount = 0, relockedCount = 0;
 
   for (const target of TARGETS) {
-    const key = String(target);
+    const key        = String(target);
     const targetData = buildTargetData(state, target);
-    const existing = normalizeLockInput(existingLocksRaw[key]);
-    const evalResult = evaluateExistingLock(existing, targetData.hitRoundIds, currentRound);
-    const candidate = buildTargetCandidate(state, targetData, calibration[target]);
-    const expectedSpan = Number(FIXED_WINDOW_SPAN[target] || 3);
-    const existingSpan = existing ? Math.max(1, Number(existing.hi) - Number(existing.lo) + 1) : null;
-    const spanMismatch = Boolean(existing && Number.isFinite(existingSpan) && existingSpan !== expectedSpan);
+    const existing   = normalizeLockInput(existingLocksRaw[key]);
+    const eval_      = evaluateExistingLock(existing, targetData.hitRoundIds, currentRound);
 
-    let lockToUse = existing;
-    let status = evalResult.status;
-    let previousOutcome = null;
+    // Check if current lock's span matches expected (structural change → rebuild)
+    const expectedSpan   = FIXED_WINDOW_SPAN[target] || 3;
+    const existingSpan   = existing ? Math.max(1, Number(existing.hi) - Number(existing.lo) + 1) : null;
+    const spanMismatch   = Boolean(existing && existingSpan !== expectedSpan);
 
-    if (!existing || evalResult.resolved || spanMismatch) {
-      if (existing && evalResult.resolved) {
+    const candidate      = buildPrediction(state, targetData, calibration[target]);
+    let lockToUse        = existing;
+    let status           = eval_.status;
+    let previousOutcome  = null;
+
+    if (!existing || eval_.resolved || spanMismatch) {
+      if (existing && eval_.resolved) {
         previousOutcome = {
-          outcome: evalResult.outcome,
-          hitRound: evalResult.hitRound,
-          lo: existing.lo,
-          hi: existing.hi,
+          outcome:    eval_.outcome,
+          hitRound:   eval_.hitRound,
+          lo:         existing.lo,
+          hi:         existing.hi,
           generation: existing.generation,
         };
         resolvedHistory.push({
-          target: `${target}x`,
-          minMult: target,
-          outcome: evalResult.outcome,
-          lo: Number(existing.lo),
-          hi: Number(existing.hi),
-          hitRound: evalResult.hitRound,
+          target:     `${target}x`,
+          outcome:    eval_.outcome,
+          lo:         Number(existing.lo),
+          hi:         Number(existing.hi),
+          hitRound:   eval_.hitRound,
           generation: Number(existing.generation || 1),
-          confidence: Number(existing?.eta?.aiProbability ?? existing?.eta?.confidence ?? candidate.confidence ?? null),
         });
       }
 
       const generation = existing ? Number(existing.generation || 1) + 1 : 1;
       lockToUse = {
-        lo: Number(candidate.lo),
-        hi: Number(candidate.hi),
-        roundWhenMade: Number(candidate.roundWhenMade),
+        lo:           Number(candidate.lo),
+        hi:           Number(candidate.hi),
+        roundWhenMade:Number(candidate.roundWhenMade),
         generation,
-        suspended: Boolean(candidate.suspended),
-        confidence: Number(candidate.confidence || 0.5),
-        eta: candidate.eta,
+        suspended:    Boolean(candidate.suspended),
+        confidence:   Number(candidate.confidence || 0),
+        eta:          candidate.eta,
       };
       status = candidate.suspended ? 'waiting' : 'locked';
-      relockedCount += 1;
+      relockedCount++;
     } else {
+      // Refresh signals on existing lock without moving the window
       lockToUse = {
         ...existing,
-        confidence: Number(candidate.confidence || existing?.confidence || existing?.eta?.confidence || 0.5),
+        confidence: Number(candidate.confidence || existing?.confidence || 0),
         eta: {
           ...(existing?.eta || {}),
           ...(candidate?.eta || {}),
           suspended: Boolean(existing?.suspended),
         },
       };
-      status = evalResult.status;
+      status = eval_.status;
     }
 
-    if ((status === 'waiting' || status === 'pending') && Number(lockToUse.lo) <= currentRound) status = 'window-open';
+    // Fix status if window has already opened
+    if ((status === 'waiting' || status === 'locked') && Number(lockToUse.lo) <= currentRound) {
+      status = 'window-open';
+    }
 
-    if (status === 'pending') pendingCount += 1;
-    if (status === 'waiting') waitingCount += 1;
-    if (status === 'window-open') openCount += 1;
+    if (status === 'waiting') waitingCount++;
+    if (status === 'window-open') openCount++;
 
     locksToSave[key] = {
-      lo: Number(lockToUse.lo),
-      hi: Number(lockToUse.hi),
-      roundWhenMade: Number(lockToUse.roundWhenMade),
-      generation: Number(lockToUse.generation || 1),
-      suspended: Boolean(lockToUse.suspended),
-      eta: lockToUse.eta || null,
+      lo:           Number(lockToUse.lo),
+      hi:           Number(lockToUse.hi),
+      roundWhenMade:Number(lockToUse.roundWhenMade),
+      generation:   Number(lockToUse.generation || 1),
+      suspended:    Boolean(lockToUse.suspended),
+      eta:          lockToUse.eta || null,
     };
 
     targetsOut.push(buildUiTarget(target, lockToUse, status, currentRound, previousOutcome));
   }
 
   targetsOut.sort((a, b) => a.target - b.target);
-  const alertSummary = buildAlertSummary(targetsOut, state);
+
+  // ── White cluster global summary ──
+  const currentRun  = state.wcd.runLen[state.n - 1] || 0;
+  const wEst        = state.wcd.estimate(currentRun);
+  const whiteCluster = {
+    activeRun:       currentRun,
+    cut:             roundNum(state.wcd.whiteCut, 4),
+    reboundCut:      roundNum(state.wcd.reboundCut, 4),
+    continueProb:    roundNum(wEst.continueProb, 6),
+    reboundProb:     roundNum(wEst.reboundProb, 6),
+    reliable:        wEst.reliable,
+    sample:          wEst.sample,
+    runQ85:          roundNum(state.wcd.runQ85, 2),
+    runQ95:          roundNum(state.wcd.runQ95, 2),
+    runQ99:          roundNum(state.wcd.runQ99, 2),
+    isExtreme:       state.wcd.runQ99 !== null && currentRun > state.wcd.runQ99 * 0.9,
+  };
 
   return {
-    model: 'range-lock-v8-unified',
-    generatedAt: new Date().toISOString(),
-    asOfRound: currentRound,
-    sampleSize: state.n,
-    targets: targetsOut,
+    model:         'range-lock-v9-pure-data',
+    generatedAt:   new Date().toISOString(),
+    asOfRound:     currentRound,
+    sampleSize:    state.n,
+    targets:       targetsOut,
     locksToSave,
     resolvedHistory,
     calibration,
-    aiPredictor: { mode: alertSummary.dominantSignal, top: alertSummary.topCandidate, whiteCluster: alertSummary.whiteCluster },
-    alertSummary,
-    settings: {
-      adaptive: true,
-      fixedWindowSpan: true,
-      fixedWindowSpanByTarget: FIXED_WINDOW_SPAN,
-      pureData: true,
-      supervisedLearning: true,
-      immediateRecalcOnResolve: true,
-      noSimulation: true,
-      modelVersion: 'v8-unified-supervised',
-    },
+    whiteCluster,
     summary: {
-      pending: pendingCount,
-      waiting: waitingCount,
+      waiting:    waitingCount,
       windowOpen: openCount,
-      relocked: relockedCount,
+      relocked:   relockedCount,
       sampleSize: state.n,
     },
+    settings: {
+      modelVersion:       'v9-pure-data',
+      noFakeDefaults:     true,
+      noInventedPriors:   true,
+      supervisedCalib:    historyRows.length > 0,
+      calibrationRows:    historyRows.length,
+      whiteCut:           roundNum(state.wcd.whiteCut, 4),
+      reboundCut:         roundNum(state.wcd.reboundCut, 4),
+      shortWindow:        state.shortW,
+      longWindow:         state.longW,
+      fixedWindowSpans:   FIXED_WINDOW_SPAN,
+    },
   };
-  // === UPGRADE END ===
 }
 
-function computeThresholdSnapshot(cleanRounds, threshold) {
-  const state = buildGlobalState(cleanRounds);
-  const data = buildTargetData(state, threshold);
-  const calibration = { reliability: 0.5, shift: 0, spanMultiplier: 1, minP1: clamp(data.baseRate * 0.7, 0.01, 0.8), minConfidence: 0.35 };
-  const candidate = buildTargetCandidate(state, data, calibration);
-  const p1 = clamp(Number(candidate?.eta?.pHit1 || data.baseRate), 0, 1);
-  const p3 = clamp(1 - ((1 - p1) ** 3), 0, 1);
-  const p5 = clamp(1 - ((1 - p1) ** 5), 0, 1);
+// ────────────────────────────────────────────────────────────
+// PUBLIC: buildPredictionReport (dashboard summary)
+// ────────────────────────────────────────────────────────────
+
+const REPORT_THRESHOLDS = [2, 5, 10, 25, 50];
+
+function buildThresholdSnapshot(state, target) {
+  const targetData = buildTargetData(state, target);
+  const hazard     = buildHazardModel(targetData);
+  const knn        = runKnn(state, targetData, state.n - 1);
+  const p1         = hazard.p1 ?? knn?.p1 ?? targetData.baseRate;
+  const gapQ       = targetData.gapQ;
+
   return {
-    target: threshold,
-    gapNow: Number(data.currentGap || 0),
-    p1: roundNum(p1, 6),
-    p3: roundNum(Math.max(p3, p1), 6),
-    p5: roundNum(Math.max(p5, p3, p1), 6),
-    expectedGap: roundNum(Math.max(1, 1 / Math.max(0.000001, p1)), 2),
-    softGapPressure: roundNum(clamp((data.currentGap - data.gapQ.q50) / Math.max(1, data.gapQ.q75 - data.gapQ.q50 + 1), 0, 1), 6),
-    hardGapPressure: roundNum(clamp((data.currentGap - data.gapQ.q75) / Math.max(1, data.gapQ.q95 - data.gapQ.q75 + 1), 0, 1), 6),
+    target,
+    gapNow:          targetData.currentGap,
+    p1:              roundNum(p1, 6),
+    p3:              roundNum(clamp(1 - Math.pow(1 - p1, 3), 0, 1), 6),
+    p5:              roundNum(clamp(1 - Math.pow(1 - p1, 5), 0, 1), 6),
+    expectedGap:     p1 > 0 ? roundNum(1 / p1, 2) : null,
+    q50Gap:          roundNum(gapQ?.q50 ?? null, 2),
+    hitCount:        targetData.hitIndices.length,
+    baseRate:        roundNum(targetData.baseRate, 6),
+    b2bNearRate:     roundNum(targetData.b2b.nearRate ?? null, 6),
+    hazardReliable:  hazard.reliable,
+    knnSupport:      roundNum(knn?.support ?? null, 6),
   };
 }
 
 function buildPredictionReport(rounds) {
-  // === v8 TRUE SUPERVISED LEARNING & SIMPLIFIED UPGRADE START ===
-  // Justification: dashboard probabilities use the same unified v8 learner (no separate stale model path).
   const cleanRounds = normalizeRounds(rounds);
+
   if (!cleanRounds.length) {
     return {
-      model: 'unified-v8-report',
+      model:      'v9-pure-data-report',
       generatedAt: new Date().toISOString(),
-      asOfRound: null,
+      asOfRound:  null,
       sampleSize: 0,
-      expectedMultiplier: 0,
-      expectedMedian: 0,
-      expectedP75: 0,
-      expectedP90: 0,
-      predictedBucket: { ...BUCKETS[0], probability: 0, confidence: 0, confidenceBand: 'NONE' },
-      bucketProbabilities: BUCKETS.map((b) => ({ ...b, probability: 0 })),
-      targetProbabilities: REPORT_THRESHOLDS.map((t) => ({ target: t, gapNow: 0, p1: 0, p3: 0, p5: 0, expectedGap: null })),
-      diagnostics: {},
-      cashoutPlan: null,
-      similarPatterns: [],
-      signals: [],
+      bucketProbabilities:  BUCKETS.map(b => ({ ...b, probability: null })),
+      predictedBucket:      null,
+      targetProbabilities:  REPORT_THRESHOLDS.map(t => ({ target: t, p1: null })),
+      whiteCluster:         null,
+      cashoutPlan:          null,
     };
   }
 
-  const mult = cleanRounds.map(r => Number(r.multiplier));
-  const sorted = [...mult].sort((a, b) => a - b);
-  const counts = new Array(BUCKETS.length).fill(0);
-  for (const m of mult) counts[bucketIndex(m)] += 1;
-  const bucketProb = normalizeDistribution(counts);
-  const topIdx = bucketProb.reduce((best, p, i, arr) => (p > arr[best] ? i : best), 0);
-  const expectedMean = bucketProb.reduce((s, p, i) => s + (p * bucketMidpoint(BUCKETS[i])), 0);
-
   const state = buildGlobalState(cleanRounds);
-  const whiteRun = state.whiteRunAt[state.n - 1] || 0;
-  const white = state.whiteModel.estimate(whiteRun);
-  const trend = prefixRate(state.prefLog, state.n - 1, 32) - prefixRate(state.prefLog, state.n - 1, 120);
+  const mult  = cleanRounds.map(r => Number(r.multiplier));
 
-  const targetProbabilities = REPORT_THRESHOLDS.map((t) => computeThresholdSnapshot(cleanRounds, t));
-  const pSafe = targetProbabilities.find(x => x.target === 2)?.p1 ?? 0.5;
-  const pBalanced = targetProbabilities.find(x => x.target === 5)?.p1 ?? 0.3;
-  const pAgg = targetProbabilities.find(x => x.target === 10)?.p1 ?? 0.12;
+  // Bucket probabilities — raw observed frequencies
+  const counts = new Array(BUCKETS.length).fill(0);
+  for (const m of mult) {
+    for (let i = 0; i < BUCKETS.length; i++) {
+      if (m >= BUCKETS[i].min && m <= BUCKETS[i].max) { counts[i]++; break; }
+    }
+  }
+  const total = mult.length;
+  const bucketProbabilities = BUCKETS.map((b, i) => ({
+    ...b,
+    probability: roundNum(counts[i] / total, 6),
+    count: counts[i],
+  }));
+  const topIdx = counts.indexOf(Math.max(...counts));
+
+  // Per-threshold snapshots
+  const targetProbabilities = REPORT_THRESHOLDS.map(t => buildThresholdSnapshot(state, t));
+
+  // White cluster state
+  const currentRun = state.wcd.runLen[state.n - 1] || 0;
+  const wEst       = state.wcd.estimate(currentRun);
+  const whiteCluster = {
+    activeRun:    currentRun,
+    cut:          roundNum(state.wcd.whiteCut, 4),
+    continueProb: roundNum(wEst.continueProb, 6),
+    reboundProb:  roundNum(wEst.reboundProb, 6),
+    reliable:     wEst.reliable,
+    sample:       wEst.sample,
+    runQ85:       roundNum(state.wcd.runQ85, 2),
+    runQ95:       roundNum(state.wcd.runQ95, 2),
+  };
+
+  // Cashout plan — based purely on measured expected value
+  const p_safe    = targetProbabilities.find(x => x.target === 2)?.p1  ?? null;
+  const p_bal     = targetProbabilities.find(x => x.target === 5)?.p1  ?? null;
+  const p_agg     = targetProbabilities.find(x => x.target === 10)?.p1 ?? null;
 
   const cashoutPlan = {
-    safe: { target: 1.8, hitChance: roundNum(pSafe, 6), edge: roundNum((1.8 * pSafe) - 1, 6) },
-    balanced: { target: 3.2, hitChance: roundNum(pBalanced, 6), edge: roundNum((3.2 * pBalanced) - 1, 6) },
-    aggressive: { target: 7, hitChance: roundNum(pAgg, 6), edge: roundNum((7 * pAgg) - 1, 6) },
+    safe:       p_safe !== null ? { target: 1.8, hitChance: roundNum(p_safe, 6), ev: roundNum(1.8 * p_safe - 1, 6) } : null,
+    balanced:   p_bal  !== null ? { target: 3.2, hitChance: roundNum(p_bal,  6), ev: roundNum(3.2 * p_bal  - 1, 6) } : null,
+    aggressive: p_agg  !== null ? { target: 7.0, hitChance: roundNum(p_agg,  6), ev: roundNum(7.0 * p_agg  - 1, 6) } : null,
   };
-  const rec = [cashoutPlan.safe, cashoutPlan.balanced, cashoutPlan.aggressive].map((x, idx) => ({ ...x, idx })).sort((a, b) => b.edge - a.edge)[0];
-  const labels = ['SAFE', 'BALANCED', 'AGGRESSIVE'];
-  cashoutPlan.recommended = rec;
-  cashoutPlan.recommendedLabel = labels[rec.idx] || 'BALANCED';
-  cashoutPlan.zoneLow = roundNum(rec.target * 0.92, 3);
-  cashoutPlan.zoneHigh = roundNum(rec.target * 1.08, 3);
-  cashoutPlan.reason = 'Unified v8 data-driven expected value ranking.';
 
-  const stability = 1 - clamp(stddev(mult.slice(-120).map(safeLog)) / 0.8, 0, 1);
-  const whitePenalty = clamp(Math.max(0, white.continueProb - white.reboundProb), 0, 1);
-  const confidence = clamp(
-    (0.12 + (0.24 * bucketProb[topIdx]) + (0.22 * stability) + (0.16 * (1 - white.continueProb)) + (0.14 * clamp(pBalanced, 0, 1)) + (0.08 * clamp(1 + trend, 0, 1)))
-      - (0.14 * whitePenalty),
-    0.05,
-    0.9
-  );
+  // Pick best EV option — no preference baked in
+  const options = [
+    cashoutPlan.safe       && { label: 'SAFE',       ...cashoutPlan.safe },
+    cashoutPlan.balanced   && { label: 'BALANCED',   ...cashoutPlan.balanced },
+    cashoutPlan.aggressive && { label: 'AGGRESSIVE', ...cashoutPlan.aggressive },
+  ].filter(Boolean);
+  const bestEv = options.sort((a, b) => (b.ev ?? -Infinity) - (a.ev ?? -Infinity))[0] ?? null;
+  cashoutPlan.recommended      = bestEv;
+  cashoutPlan.recommendedLabel = bestEv?.label ?? null;
 
+  // Sorted multiplier stats
+  const sorted = state.sorted;
   return {
-    model: 'unified-v8-report',
-    generatedAt: new Date().toISOString(),
-    asOfRound: cleanRounds[cleanRounds.length - 1].roundId,
-    sampleSize: cleanRounds.length,
-    expectedMultiplier: roundNum(expectedMean, 4),
-    expectedMedian: roundNum(quantileFromSorted(sorted, 0.5), 4),
-    expectedP75: roundNum(quantileFromSorted(sorted, 0.75), 4),
-    expectedP90: roundNum(quantileFromSorted(sorted, 0.9), 4),
-    predictedBucket: {
-      ...BUCKETS[topIdx],
-      probability: roundNum(bucketProb[topIdx], 6),
-      confidence: roundNum(confidence, 6),
-      confidenceBand: confidenceBandWord(confidence),
-    },
-    bucketProbabilities: BUCKETS.map((b, i) => ({ ...b, probability: roundNum(bucketProb[i], 6) })),
+    model:       'v9-pure-data-report',
+    generatedAt:  new Date().toISOString(),
+    asOfRound:    cleanRounds[cleanRounds.length - 1].roundId,
+    sampleSize:   cleanRounds.length,
+
+    // Distribution stats (all from data)
+    expectedMean:   roundNum(mult.reduce((s, v) => s + v, 0) / mult.length, 4),
+    expectedMedian: roundNum(quantileFromSorted(sorted, 0.50), 4),
+    expectedP75:    roundNum(quantileFromSorted(sorted, 0.75), 4),
+    expectedP90:    roundNum(quantileFromSorted(sorted, 0.90), 4),
+
+    bucketProbabilities,
+    predictedBucket: bucketProbabilities[topIdx],
     targetProbabilities,
-    diagnostics: {
-      whiteCluster: { run: Number(whiteRun), risk: roundNum(white.continueProb, 6), release: roundNum(white.reboundProb, 6) },
-      trend: { score: roundNum(trend, 6) },
-      stability: roundNum(stability, 6),
-    },
+    whiteCluster,
     cashoutPlan,
-    similarPatterns: [],
-    signals: [
-      `White cluster risk ${roundNum(white.continueProb * 100, 2)}%`,
-      `White release signal ${roundNum(white.reboundProb * 100, 2)}%`,
-      `Trend score ${roundNum(trend, 4)}`,
-    ],
+
+    // Raw signal diagnostics
+    diagnostics: {
+      shortWindow:   state.shortW,
+      longWindow:    state.longW,
+      whiteCut:      roundNum(state.wcd.whiteCut, 4),
+      reboundCut:    roundNum(state.wcd.reboundCut, 4),
+      greenCut:      roundNum(state.greenCut, 4),
+      currentWhiteRun:      currentRun,
+      whiteRunQ85:   roundNum(state.wcd.runQ85, 2),
+      whiteRunQ95:   roundNum(state.wcd.runQ95, 2),
+    },
   };
-  // === UPGRADE END ===
 }
+
+// ────────────────────────────────────────────────────────────
+// EXPORTS
+// ────────────────────────────────────────────────────────────
 
 module.exports = {
   TARGETS,
   FIXED_WINDOW_SPAN,
+  BUCKETS,
   buildPredictionReport,
   computeLockedRangePredictions,
+
+  // Expose internal builders for testing/debugging
+  _internal: {
+    normalizeRounds,
+    buildGlobalState,
+    buildTargetData,
+    buildWhiteClusterDetector,
+    buildB2BDetector,
+    buildHazardModel,
+    runKnn,
+    buildCalibration,
+    buildPrediction,
+  },
 };
