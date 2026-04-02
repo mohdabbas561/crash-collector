@@ -88,6 +88,53 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+function extractAdminSecretFromRequest(req) {
+  const headerSecret = normalizeSecretValue(req.headers['x-admin-secret']);
+  const authHeader = String(req.headers.authorization || '');
+  const bearerSecret = normalizeSecretValue(authHeader.replace(/^Bearer\s+/i, ''));
+  return headerSecret || bearerSecret;
+}
+
+async function authorizeAccessCode(req) {
+  const code = String(req.headers['x-access-code'] || req.body?.accessCode || '').trim();
+  if (!code) return { ok: false, error: 'ACCESS_CODE_MISSING' };
+  const row = await getAccessCode(code);
+  if (!row) return { ok: false, error: 'ACCESS_CODE_INVALID' };
+  if (new Date(row.expires_at) < new Date()) return { ok: false, error: 'ACCESS_CODE_EXPIRED' };
+
+  const ip = getIP(req);
+  const sameIP = row.ip && row.ip === ip;
+  if (row.use_count >= row.max_uses && !sameIP) {
+    return { ok: false, error: 'ACCESS_CODE_USED_UP' };
+  }
+  if (!row.ip || (!sameIP && row.use_count < row.max_uses)) {
+    await updateAccessCodeIP(code, ip);
+  }
+
+  return { ok: true, code, row };
+}
+
+async function requireAdminOrAccess(req, res, next) {
+  const secret = extractAdminSecretFromRequest(req);
+  if (ADMIN_SECRET && secret && secret === ADMIN_SECRET) {
+    req.authMode = 'admin';
+    return next();
+  }
+  try {
+    const access = await authorizeAccessCode(req);
+    if (!access.ok) {
+      const status = access.error === 'ACCESS_CODE_EXPIRED' || access.error === 'ACCESS_CODE_USED_UP' ? 403 : 401;
+      return res.status(status).json({ ok: false, error: access.error });
+    }
+    req.authMode = 'access';
+    req.accessCode = access.code;
+    return next();
+  } catch (e) {
+    setDatabaseAvailability(false, e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+}
+
 function getIP(req) {
   return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.headers['x-real-ip'] || req.socket?.remoteAddress || 'unknown';
 }
@@ -1000,7 +1047,7 @@ app.get('/wallets', requireDatabase, requireAdmin, rateLimit(20), async (req,res
   }
 });
 
-app.post('/wallets', requireDatabase, requireAdmin, rateLimit(20), async (req, res) => {
+app.post('/wallets', requireDatabase, requireAdminOrAccess, rateLimit(20), async (req, res) => {
   try {
     const { privateKey, rpcUrl, playerAccountPDA, pubkey } = req.body;
     if (!privateKey) return res.status(400).json({ ok:false, error:'privateKey required' });
