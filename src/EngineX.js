@@ -12,6 +12,15 @@
 */
 
 const TARGETS = [5, 10, 20, 50, 100, 500, 1000];
+const FIXED_WINDOW_SPAN = Object.freeze({
+  5: 3,
+  10: 6,
+  20: 10,
+  50: 18,
+  100: 27,
+  500: 50,
+  1000: 75,
+});
 const REPORT_THRESHOLDS = [2, 5, 10, 25, 50];
 
 const DEFAULT_CONFIG = Object.freeze({
@@ -1477,9 +1486,10 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg, o
   const band = estimateAheadBand(state, targetResult);
   const regimeWindowMult = clamp(Number(live?.regime?.windowMult ?? 1), 1, 1.35);
   const aheadLo = Math.max(1, Math.round(band.aheadLo * regimeWindowMult));
-  const aheadHi = Math.max(aheadLo, Math.round(band.aheadHi * regimeWindowMult));
+  const fixedSpan = Number(FIXED_WINDOW_SPAN[targetResult.target] || 3);
+  const aheadHi = Math.max(aheadLo, aheadLo + fixedSpan - 1);
   const lo = currentRound + aheadLo;
-  const hi = currentRound + aheadHi;
+  const hi = lo + fixedSpan - 1;
   const p = Number.isFinite(live.pFinal) ? live.pFinal : live.pAdj;
   const pSoon = clamp(1 - Math.pow(1 - p, 3), 0, 1);
   const suspended = forceLock ? false : !live.actionable;
@@ -1563,9 +1573,10 @@ function buildIdleLock(state, targetResult, currentRound, generation, cfg) {
   const band = estimateAheadBand(state, targetResult);
   const regimeWindowMult = clamp(Number(live?.regime?.windowMult ?? 1), 1, 1.35);
   const aheadLo = Math.max(1, Math.round(band.aheadLo * regimeWindowMult));
-  const aheadHi = Math.max(aheadLo, Math.round(band.aheadHi * regimeWindowMult));
+  const fixedSpan = Number(FIXED_WINDOW_SPAN[targetResult.target] || 3);
+  const aheadHi = Math.max(aheadLo, aheadLo + fixedSpan - 1);
   const lo = currentRound + aheadLo;
-  const hi = currentRound + aheadHi;
+  const hi = lo + fixedSpan - 1;
   const baselineP = 1 / targetResult.target;
   return {
     lo,
@@ -1849,7 +1860,8 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       modelVersion: 'EngineX-v1-edge',
       mode: 'edge-detection',
       baselineFormula: 'P(x)=1/x',
-      noFixedWindows: true,
+      noFixedWindows: false,
+      fixedWindowSpans: FIXED_WINDOW_SPAN,
       immutableLocks: true,
       relockOnlyAfterResolved: true,
       perRoundPrediction: false,
@@ -1970,7 +1982,8 @@ function buildPredictionReport(rounds, options = {}) {
     diagnostics: {
       baselineFormula: 'P(x)=1/x',
       mode: 'edge-detection',
-      noFixedWindows: true,
+      noFixedWindows: false,
+      fixedWindowSpans: FIXED_WINDOW_SPAN,
       walkForwardValidation: true,
       noFutureLeakage: true,
     },
