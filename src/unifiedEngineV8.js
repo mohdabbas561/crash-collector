@@ -923,7 +923,9 @@ function evaluateExistingLock(lock, hitRoundIds, currentRound) {
     if (firstHit < lo) return { resolved: true, status: 'resolved', outcome: 'early', hitRound: firstHit };
     if (firstHit <= hi) return { resolved: true, status: 'resolved', outcome: 'win',  hitRound: firstHit };
   }
-  if (currentRound > hi)  return { resolved: true,  status: 'resolved',    outcome: 'loss',  hitRound: null };
+  // Resolve loss as soon as we have reached the final round of the window
+  // with no hit recorded (collector rounds are completed rounds).
+  if (currentRound >= hi) return { resolved: true,  status: 'resolved',    outcome: 'loss',  hitRound: null };
   if (currentRound >= lo) return { resolved: false, status: 'window-open', outcome: null,    hitRound: null };
   return { resolved: false, status: 'waiting', outcome: null, hitRound: null };
 }
