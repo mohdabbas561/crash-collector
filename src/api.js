@@ -131,12 +131,12 @@ const LOCKED_BACKGROUND_INTERVAL_MS = toPositiveInt(process.env.LOCKED_BACKGROUN
 const BOT_RPC_URL = String(
   process.env.BOT_RPC_URL ||
   process.env.CRASH_BOT_RPC_URL ||
-  'https://mainnet.helius-rpc.com/?api-key=14a95398-c1a2-425f-aca6-dadc58b319c8'
+  ''
 ).trim();
 const BOT_PLAYER_ACCOUNT_PDA = String(
   process.env.BOT_PLAYER_ACCOUNT_PDA ||
   process.env.CRASH_BOT_PLAYER_ACCOUNT_PDA ||
-  '9PKoSP4k2uzkCCWMi1x6iUzPPBsK5RZbVpEaz1CS2Vnk'
+  ''
 ).trim();
 const BOT_WALLET_AUTH_API = String(
   process.env.BOT_WALLET_AUTH_API ||
@@ -647,6 +647,13 @@ app.get('/health', (req,res) => {
 });
 
 app.get('/bot/config', rateLimit(60), (req, res) => {
+  if (!BOT_RPC_URL || !BOT_PLAYER_ACCOUNT_PDA) {
+    return res.status(503).json({
+      ok: false,
+      error: 'BOT_CONFIG_MISSING',
+      message: 'Set BOT_RPC_URL and BOT_PLAYER_ACCOUNT_PDA on backend env.',
+    });
+  }
   res.json({
     ok: true,
     config: {
@@ -950,7 +957,17 @@ app.post('/wallets', requireDatabase, requireAdmin, rateLimit(20), async (req, r
   try {
     const { privateKey, rpcUrl, playerAccountPDA, pubkey } = req.body;
     if (!privateKey) return res.status(400).json({ ok:false, error:'privateKey required' });
-    res.json({ ok:true, wallet: await saveWallet({ privateKey, rpcUrl, playerAccountPDA, pubkey }) });
+    const wallet = await saveWallet({ privateKey, rpcUrl, playerAccountPDA, pubkey });
+    res.json({
+      ok: true,
+      wallet: {
+        id: wallet?.id ?? null,
+        rpc_url: wallet?.rpc_url ?? null,
+        player_account_pda: wallet?.player_account_pda ?? null,
+        pubkey: wallet?.pubkey ?? null,
+        updated_at: wallet?.updated_at ?? null,
+      },
+    });
   } catch(e) {
     setDatabaseAvailability(false, e.message);
     res.status(500).json({ ok:false, error:e.message });
