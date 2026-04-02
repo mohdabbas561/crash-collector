@@ -801,7 +801,8 @@ function confidenceFromComponents(p, baseline, weights, entropyInfo, extras = {}
 
 function evaluateExistingLock(lock, hitRoundIds, currentRound) {
   if (!lock) return { resolved: false, status: 'idle', outcome: null, hitRound: null };
-  if (Boolean(lock.suspended) || String(lock?.eta?.lockStatus || '') === 'IDLE') {
+  const lifecycle = String(lock?.eta?.lockStatus || '').toUpperCase();
+  if (lifecycle === 'IDLE' || Boolean(lock?.suspended)) {
     return { resolved: false, status: 'idle', outcome: null, hitRound: null };
   }
   const lo = Number(lock.lo);
@@ -835,8 +836,9 @@ function buildUiTarget(target, lock, status, currentRound, previousOutcome) {
   const lo = Number(lock?.lo);
   const hi = Number(lock?.hi);
   const eta = lock?.eta || {};
-  const aheadLo = Number.isFinite(lo) ? Math.max(0, lo - currentRound) : 0;
-  const aheadHi = Number.isFinite(hi) ? Math.max(0, hi - currentRound) : 0;
+  const isIdle = status === 'idle';
+  const aheadLo = isIdle ? null : (Number.isFinite(lo) ? Math.max(0, lo - currentRound) : null);
+  const aheadHi = isIdle ? null : (Number.isFinite(hi) ? Math.max(0, hi - currentRound) : null);
   const lockCreatedAtRound = Number(lock?.roundWhenMade ?? eta.lockCreatedAtRound ?? currentRound);
   const roundsSinceLock = Math.max(0, currentRound - lockCreatedAtRound);
   const lockStatus = (
@@ -854,9 +856,9 @@ function buildUiTarget(target, lock, status, currentRound, previousOutcome) {
     confidence: clamp(Number(lock?.confidence ?? eta.aiConfidence ?? 0), 0, 1),
     confidenceBand: confidenceBand(lock?.confidence ?? eta.aiConfidence ?? 0),
     window: {
-      lo,
-      hi,
-      span: Math.max(1, hi - lo + 1),
+      lo: isIdle ? null : lo,
+      hi: isIdle ? null : hi,
+      span: (isIdle || !Number.isFinite(lo) || !Number.isFinite(hi)) ? null : Math.max(1, hi - lo + 1),
       roundsUntilWindow: aheadLo,
       roundsLeftInWindow: aheadHi,
       aheadLo,
@@ -1705,7 +1707,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       status = evalExisting.status;
     } else {
       if (existing && evalExisting.resolved) {
-        const existingWasIdle = Boolean(existing?.suspended || String(existing?.eta?.lockStatus || '') === 'IDLE');
+        const existingWasIdle = String(existing?.eta?.lockStatus || '').toUpperCase() === 'IDLE';
         previousOutcome = existingWasIdle ? null : {
           outcome: evalExisting.outcome,
           hitRound: evalExisting.hitRound,
