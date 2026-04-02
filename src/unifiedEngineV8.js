@@ -1032,6 +1032,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
         // for calibration on future calls (via options.historyRows)
         resolvedHistory.push({
           target:     `${target}x`,          // e.g. "50x" — matches targetFromLabel()
+          minMult:    Number(target),
           outcome:    eval_.outcome,          // 'win' | 'early' | 'loss'
           lo:         Number(existing.lo),
           hi:         Number(existing.hi),

@@ -418,7 +418,7 @@ async function computeAndPersistLockedPrediction({ latestRound, limit, limitKey 
 
   let savedResolvedCount = 0;
   if (resolvedRowsToPersist.length) {
-    await Promise.all(resolvedRowsToPersist.map((row) => savePrediction({
+    const results = await Promise.allSettled(resolvedRowsToPersist.map((row) => savePrediction({
       target: row.target,
       minMult: row.minMult,
       outcome: row.outcome,
@@ -429,7 +429,20 @@ async function computeAndPersistLockedPrediction({ latestRound, limit, limitKey 
       source: 'range_lock_v1',
       probW: row.confidence ?? null,
     })));
-    savedResolvedCount = resolvedRowsToPersist.length;
+    const failures = results
+      .map((r, idx) => ({ r, row: resolvedRowsToPersist[idx] }))
+      .filter(({ r }) => r.status === 'rejected');
+    if (failures.length) {
+      for (const f of failures.slice(0, 5)) {
+        console.error(
+          '[predict/locked] savePrediction failed:',
+          `target=${f.row?.target} lo=${f.row?.lo} hi=${f.row?.hi} gen=${f.row?.generation}`,
+          String(f.r.reason?.message || f.r.reason || 'unknown')
+        );
+      }
+      console.error(`[predict/locked] savePrediction failures: ${failures.length}/${results.length}`);
+    }
+    savedResolvedCount = results.length - failures.length;
   }
 
   const fullHistory = savedResolvedCount > 0
