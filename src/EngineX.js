@@ -2022,6 +2022,11 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
     const existing = normalizeLockInput(existingLocksRaw[key]);
     const hitRoundIds = getHitRoundIds(target);
     const evalExisting = evaluateExistingLock(existing, hitRoundIds, currentRound);
+    const expectedSpan = Number(FIXED_WINDOW_SPAN[target] || 3);
+    const existingSpan = existing
+      ? Math.max(1, Number(existing.hi) - Number(existing.lo) + 1)
+      : null;
+    const spanMismatch = existing && Number.isFinite(existingSpan) && existingSpan !== expectedSpan;
 
     let previousOutcome = null;
     let lockToUse = existing;
@@ -2029,7 +2034,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
 
     // STRICT LOCK LIFECYCLE:
     // If an existing lock is still active, freeze it completely (no mutation, no drift).
-    if (existing && !evalExisting.resolved && evalExisting.status !== 'idle') {
+    if (existing && !evalExisting.resolved && evalExisting.status !== 'idle' && !spanMismatch) {
       lockToUse = existing;
       status = evalExisting.status;
     } else {
