@@ -1,0 +1,1349 @@
+'use strict';
+
+/*
+  Edge-first crash engine.
+  Statistical assumptions:
+  1) Fair baseline for threshold target x is P(hit next round) = 1 / x.
+  2) We detect edge as p_model - p_baseline.
+  3) Decision layer uses EV = p * x - 1 and only activates when EV exceeds threshold.
+  4) Model blending is inverse-error weighted by rolling Brier score, not sample size.
+  5) White-cluster effect is intentionally weak and only uses (reboundProb - continueProb).
+  6) Walk-forward evaluation is used for reliability/backtest to avoid future leakage.
+*/
+
+const TARGETS = [5, 10, 20, 50, 100, 500, 1000];
+const REPORT_THRESHOLDS = [2, 5, 10, 25, 50];
+
+const DEFAULT_CONFIG = Object.freeze({
+  // Minimum history before we trust adaptive models.
+  minTrainingRounds: 240,
+
+  // Feature windows for KNN representation.
+  featureShortWindow: 24,
+  featureLongWindow: 96,
+  featureVolWindow: 64,
+
+  // KNN search scope.
+  knnLookback: 1800,
+  knnMaxCandidates: 900,
+  knnKMin: 24,
+  knnKMax: 120,
+
+  // Hazard model uses rates first; gap only as weak, bounded modifier.
+  hazardRecentWindow: 120,
+  hazardGapInfluence: 0.12,
+
+  // White cluster thresholds from data quantiles.
+  whiteCutQuantile: 0.40,
+  reboundCutQuantile: 0.75,
+
+  // White effect must remain weak.
+  whiteModifierStrength: 0.08,
+
+  // Rolling Brier memory.
+  brierWindow: 600,
+
+  // Blend constraints.
+  maxHazardBlend: 0.25,
+  minBaselineBlend: 0.15,
+  modelErrorEps: 1e-6,
+
+  // EV gating.
+  evThreshold: 0.0,
+
+  // Entropy/random regime detection.
+  entropyRecentWindow: 300,
+  entropyStep: 12,
+  entropyQuantile: 0.35,
+  entropyAutoDisable: true,
+
+  // Walk-forward range used both for reliability and backtest.
+  walkForwardWindow: 3000,
+});
+
+const BUCKETS = [
+  { id: 'micro', label: 'Micro', min: 1, max: 1.99, color: '#ff4560' },
+  { id: 'low', label: 'Low', min: 2, max: 4.99, color: '#ffd84d' },
+  { id: 'mid', label: 'Mid', min: 5, max: 9.99, color: '#00ff88' },
+  { id: 'high', label: 'High', min: 10, max: 24.99, color: '#00d4ff' },
+  { id: 'moon', label: 'Moon', min: 25, max: Number.POSITIVE_INFINITY, color: '#c084fc' },
+];
+
+function clamp(v, lo, hi) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return lo;
+  if (n < lo) return lo;
+  if (n > hi) return hi;
+  return n;
+}
+
+function roundNum(v, digits = 6) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Number(n.toFixed(digits)) : null;
+}
+
+function mean(arr) {
+  if (!Array.isArray(arr) || arr.length === 0) return null;
+  let s = 0;
+  for (let i = 0; i < arr.length; i += 1) s += Number(arr[i]) || 0;
+  return s / arr.length;
+}
+
+function variance(arr, avg) {
+  if (!Array.isArray(arr) || arr.length < 2) return null;
+  const m = Number.isFinite(avg) ? avg : mean(arr);
+  if (m === null) return null;
+  let s = 0;
+  for (let i = 0; i < arr.length; i += 1) {
+    const d = (Number(arr[i]) || 0) - m;
+    s += d * d;
+  }
+  return s / arr.length;
+}
+
+function stddev(arr, avg) {
+  const v = variance(arr, avg);
+  return v === null ? null : Math.sqrt(v);
+}
+
+function sortedCopy(arr) {
+  return [...arr].sort((a, b) => a - b);
+}
+
+function quantileFromSorted(sorted, q) {
+  if (!sorted.length) return null;
+  const qq = clamp(q, 0, 1);
+  const idx = (sorted.length - 1) * qq;
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  if (lo === hi) return sorted[lo];
+  const t = idx - lo;
+  return sorted[lo] * (1 - t) + sorted[hi] * t;
+}
+
+function quantile(arr, q) {
+  if (!Array.isArray(arr) || arr.length === 0) return null;
+  return quantileFromSorted(sortedCopy(arr), q);
+}
+
+function lowerBound(arr, v) {
+  let lo = 0;
+  let hi = arr.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (arr[mid] < v) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+function sigmoid(z) {
+  const x = clamp(z, -30, 30);
+  return 1 / (1 + Math.exp(-x));
+}
+
+function tanh(z) {
+  const x = clamp(z, -30, 30);
+  const e2 = Math.exp(2 * x);
+  return (e2 - 1) / (e2 + 1);
+}
+
+function normalizeRounds(rounds) {
+  const clean = (rounds || [])
+    .map((r) => ({
+      roundId: Number(r.roundId),
+      multiplier: Number(r.multiplier),
+      timestamp: Number(r.timestamp) || 0,
+    }))
+    .filter((r) => Number.isFinite(r.roundId) && Number.isFinite(r.multiplier) && r.multiplier > 0)
+    .sort((a, b) => a.roundId - b.roundId);
+
+  const dedup = [];
+  let last = null;
+  for (let i = 0; i < clean.length; i += 1) {
+    const r = clean[i];
+    if (r.roundId === last) dedup[dedup.length - 1] = r;
+    else {
+      dedup.push(r);
+      last = r.roundId;
+    }
+  }
+  return dedup;
+}
+
+function normalizeLockInput(input) {
+  if (!input) return null;
+  return {
+    lo: Number(input.lo),
+    hi: Number(input.hi),
+    roundWhenMade: Number(input.roundWhenMade ?? input.round_when_made),
+    generation: Number(input.generation || 1),
+    suspended: Boolean(input.suspended ?? input.eta?.suspended),
+    confidence: Number(input.confidence ?? input.eta?.aiConfidence ?? 0),
+    eta: input.eta || null,
+  };
+}
+
+function buildPrefix(values) {
+  const out = new Array(values.length + 1).fill(0);
+  for (let i = 0; i < values.length; i += 1) out[i + 1] = out[i] + (Number(values[i]) || 0);
+  return out;
+}
+
+function windowSum(prefix, left, right) {
+  const l = Math.max(0, left);
+  const r = Math.max(l, right);
+  return prefix[r + 1] - prefix[l];
+}
+
+function windowMean(prefix, left, right) {
+  if (right < left) return null;
+  const n = right - left + 1;
+  if (n <= 0) return null;
+  return windowSum(prefix, left, right) / n;
+}
+
+function computeGapSeries(hits) {
+  const n = hits.length;
+  const gap = new Array(n).fill(0);
+  const hitIdx = [];
+  let lastHit = -1;
+  for (let i = 0; i < n; i += 1) {
+    if (hits[i]) {
+      lastHit = i;
+      hitIdx.push(i);
+      gap[i] = 0;
+    } else {
+      gap[i] = lastHit >= 0 ? i - lastHit : i + 1;
+    }
+  }
+  const intervals = [];
+  for (let i = 1; i < hitIdx.length; i += 1) intervals.push(hitIdx[i] - hitIdx[i - 1]);
+  const intervalPrefix = buildPrefix(intervals);
+  const intervalSqPrefix = buildPrefix(intervals.map((v) => v * v));
+  return { gap, hitIdx, intervals, intervalPrefix, intervalSqPrefix };
+}
+
+function buildWhiteFlags(multipliers, whiteCut) {
+  const flags = new Array(multipliers.length).fill(0);
+  const run = new Array(multipliers.length).fill(0);
+  for (let i = 0; i < multipliers.length; i += 1) {
+    flags[i] = multipliers[i] < whiteCut ? 1 : 0;
+    run[i] = flags[i] ? (i > 0 ? run[i - 1] + 1 : 1) : 0;
+  }
+  return { flags, run, prefix: buildPrefix(flags) };
+}
+
+function histogram(values, bins) {
+  const counts = new Array(Math.max(1, bins.length - 1)).fill(0);
+  if (!values.length) return counts;
+  for (let i = 0; i < values.length; i += 1) {
+    const v = values[i];
+    let idx = counts.length - 1;
+    for (let j = 0; j < bins.length - 1; j += 1) {
+      if (v >= bins[j] && v < bins[j + 1]) {
+        idx = j;
+        break;
+      }
+    }
+    counts[idx] += 1;
+  }
+  return counts;
+}
+
+function normalizeProb(counts) {
+  const total = counts.reduce((s, x) => s + x, 0);
+  if (total <= 0) return counts.map(() => 0);
+  return counts.map((x) => x / total);
+}
+
+function klDiv(p, q) {
+  let s = 0;
+  for (let i = 0; i < p.length; i += 1) {
+    const pi = p[i];
+    const qi = q[i];
+    if (pi <= 0) continue;
+    const qSafe = qi <= 0 ? 1e-12 : qi;
+    s += pi * Math.log(pi / qSafe);
+  }
+  return s;
+}
+
+function jensenShannon(p, q) {
+  if (!p.length || p.length !== q.length) return 0;
+  const m = p.map((x, i) => 0.5 * (x + q[i]));
+  return 0.5 * klDiv(p, m) + 0.5 * klDiv(q, m);
+}
+
+function lag1Correlation(series, start, end) {
+  const s = Math.max(1, start);
+  const e = Math.max(s, end);
+  const x = [];
+  const y = [];
+  for (let i = s; i <= e; i += 1) {
+    x.push(series[i - 1] || 0);
+    y.push(series[i] || 0);
+  }
+  if (x.length < 3) return 0;
+  const mx = mean(x);
+  const my = mean(y);
+  if (mx === null || my === null) return 0;
+  let num = 0;
+  let dx2 = 0;
+  let dy2 = 0;
+  for (let i = 0; i < x.length; i += 1) {
+    const dx = x[i] - mx;
+    const dy = y[i] - my;
+    num += dx * dy;
+    dx2 += dx * dx;
+    dy2 += dy * dy;
+  }
+  if (dx2 <= 0 || dy2 <= 0) return 0;
+  return num / Math.sqrt(dx2 * dy2);
+}
+
+function buildEntropyBins(multipliers) {
+  const qs = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.97];
+  const points = [1];
+  for (let i = 0; i < qs.length; i += 1) {
+    const qv = quantile(multipliers, qs[i]);
+    if (Number.isFinite(qv)) points.push(qv);
+  }
+  const maxV = quantile(multipliers, 0.999);
+  if (Number.isFinite(maxV)) points.push(maxV * 1.05);
+  points.push(Number.POSITIVE_INFINITY);
+  const uniq = [];
+  for (let i = 0; i < points.length; i += 1) {
+    const v = points[i];
+    if (!Number.isFinite(v) && v !== Number.POSITIVE_INFINITY) continue;
+    if (!uniq.length || v > uniq[uniq.length - 1]) uniq.push(v);
+  }
+  if (uniq.length < 4) return [1, 2, 3, 5, 10, Number.POSITIVE_INFINITY];
+  uniq[0] = 1;
+  uniq[uniq.length - 1] = Number.POSITIVE_INFINITY;
+  return uniq;
+}
+
+function buildGlobalState(cleanRounds, cfg) {
+  const multipliers = cleanRounds.map((r) => Number(r.multiplier));
+  const roundIds = cleanRounds.map((r) => Number(r.roundId));
+  const n = cleanRounds.length;
+  const whiteCutRaw = quantile(multipliers, cfg.whiteCutQuantile);
+  const reboundCutRaw = quantile(multipliers, cfg.reboundCutQuantile);
+  const whiteCut = clamp(whiteCutRaw, 1.6, 4.0);
+  const reboundCut = clamp(Math.max(reboundCutRaw, whiteCut + 0.4), whiteCut + 0.4, Math.max(whiteCut + 0.4, 1000));
+  const logM = multipliers.map((m) => Math.log(Math.max(1, m)));
+  const logPrefix = buildPrefix(logM);
+  const logSqPrefix = buildPrefix(logM.map((v) => v * v));
+  const white = buildWhiteFlags(multipliers, whiteCut);
+  const bins = buildEntropyBins(multipliers);
+  return {
+    rounds: cleanRounds,
+    multipliers,
+    roundIds,
+    n,
+    whiteCut,
+    reboundCut,
+    whiteFlags: white.flags,
+    whiteRun: white.run,
+    whitePrefix: white.prefix,
+    logM,
+    logPrefix,
+    logSqPrefix,
+    entropyBins: bins,
+  };
+}
+
+function makeTargetState(state, target) {
+  const hits = state.multipliers.map((m) => (m >= target ? 1 : 0));
+  const hitPrefix = buildPrefix(hits);
+  const gap = computeGapSeries(hits);
+  return {
+    target,
+    hits,
+    hitPrefix,
+    gap: gap.gap,
+    hitIdx: gap.hitIdx,
+    intervals: gap.intervals,
+    intervalPrefix: gap.intervalPrefix,
+    intervalSqPrefix: gap.intervalSqPrefix,
+    featureCache: new Map(),
+  };
+}
+
+function rateInWindow(prefix, idx, window) {
+  const right = idx;
+  const left = Math.max(0, right - window + 1);
+  const n = right - left + 1;
+  if (n <= 0) return 0;
+  return windowSum(prefix, left, right) / n;
+}
+
+function featureAtIndex(state, targetState, idx, cfg) {
+  if (targetState.featureCache.has(idx)) return targetState.featureCache.get(idx);
+  const n = state.n;
+  const i = clamp(idx, 0, n - 1);
+  const shortW = cfg.featureShortWindow;
+  const longW = cfg.featureLongWindow;
+  const volW = cfg.featureVolWindow;
+
+  const shortL = Math.max(0, i - shortW + 1);
+  const longL = Math.max(0, i - longW + 1);
+  const volL = Math.max(0, i - volW + 1);
+
+  const shortLogMean = windowMean(state.logPrefix, shortL, i) ?? 0;
+  const longLogMean = windowMean(state.logPrefix, longL, i) ?? shortLogMean;
+  const volN = i - volL + 1;
+  const volMean = windowMean(state.logPrefix, volL, i) ?? shortLogMean;
+  const volSq = volN > 0 ? windowSum(state.logSqPrefix, volL, i) / volN : 0;
+  const vol = Math.sqrt(Math.max(0, volSq - volMean * volMean));
+
+  const lowRateShort = (windowSum(state.whitePrefix, shortL, i) || 0) / Math.max(1, i - shortL + 1);
+  const lowRateLong = (windowSum(state.whitePrefix, longL, i) || 0) / Math.max(1, i - longL + 1);
+  const hitRateLong = rateInWindow(targetState.hitPrefix, i, longW);
+  const gapNorm = Math.min(1, (targetState.gap[i] || 0) / Math.max(10, longW));
+  const whiteRunNorm = Math.min(1, (state.whiteRun[i] || 0) / 20);
+  const prev = Math.log(Math.max(1, state.multipliers[i] || 1));
+  const prev2 = Math.log(Math.max(1, state.multipliers[i - 1] || state.multipliers[i] || 1));
+
+  const f = [
+    prev,
+    prev2,
+    shortLogMean,
+    longLogMean,
+    vol,
+    lowRateShort,
+    lowRateLong,
+    hitRateLong,
+    gapNorm,
+    whiteRunNorm,
+  ];
+  targetState.featureCache.set(idx, f);
+  return f;
+}
+
+function distance(a, b) {
+  let s = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    const d = (a[i] || 0) - (b[i] || 0);
+    s += d * d;
+  }
+  return Math.sqrt(s);
+}
+
+function hazardPredictAt(state, targetState, idx, cfg) {
+  if (idx < 1) return null;
+  const hitsSoFar = targetState.hitPrefix[idx + 1];
+  if (hitsSoFar < 3) return null;
+
+  const globalRate = hitsSoFar / (idx + 1);
+  const recentRate = rateInWindow(targetState.hitPrefix, idx, cfg.hazardRecentWindow);
+  let p = 0.65 * recentRate + 0.35 * globalRate;
+
+  const m = lowerBound(targetState.hitIdx, idx + 1);
+  if (m >= 2) {
+    const cnt = m - 1;
+    const sum = targetState.intervalPrefix[cnt];
+    const sumSq = targetState.intervalSqPrefix[cnt];
+    const gapMean = sum / cnt;
+    const gapVar = Math.max(0, (sumSq / cnt) - (gapMean * gapMean));
+    const gapStd = Math.sqrt(gapVar) || Math.max(1, gapMean * 0.35);
+    const currentGap = targetState.gap[idx] || 0;
+    const z = (currentGap - gapMean) / Math.max(1e-6, gapStd);
+    const lift = tanh(z);
+    p *= (1 + cfg.hazardGapInfluence * lift);
+  }
+
+  return clamp(p, 0, 1);
+}
+
+function knnPredictAt(state, targetState, idx, cfg) {
+  if (idx < cfg.minTrainingRounds) return null;
+  const query = featureAtIndex(state, targetState, idx, cfg);
+  const left = Math.max(cfg.minTrainingRounds - 1, idx - cfg.knnLookback);
+  const right = idx - 1;
+  if (right < left) return null;
+
+  const range = right - left + 1;
+  const stride = Math.max(1, Math.ceil(range / cfg.knnMaxCandidates));
+  const pairs = [];
+  for (let j = left; j <= right; j += stride) {
+    if (j + 1 >= state.n) break;
+    const candidate = featureAtIndex(state, targetState, j, cfg);
+    const d = distance(query, candidate);
+    const y = targetState.hits[j + 1] ? 1 : 0;
+    pairs.push({ d, y });
+  }
+  if (pairs.length < cfg.knnKMin) return null;
+
+  pairs.sort((a, b) => a.d - b.d);
+  const k = clamp(Math.round(Math.sqrt(pairs.length)), cfg.knnKMin, Math.min(cfg.knnKMax, pairs.length));
+  let wSum = 0;
+  let ySum = 0;
+  let dSum = 0;
+  for (let i = 0; i < k; i += 1) {
+    const item = pairs[i];
+    const w = 1 / Math.max(1e-6, item.d);
+    wSum += w;
+    ySum += w * item.y;
+    dSum += item.d;
+  }
+  if (wSum <= 0) return null;
+  const p = clamp(ySum / wSum, 0, 1);
+  const avgD = dSum / k;
+  const support = 1 / (1 + avgD);
+  return {
+    p,
+    support: clamp(support, 0, 1),
+    k,
+    candidates: pairs.length,
+  };
+}
+
+function makeRollingBrier(maxLen) {
+  const q = [];
+  let sum = 0;
+  return {
+    add(v) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return;
+      q.push(n);
+      sum += n;
+      if (q.length > maxLen) {
+        const old = q.shift();
+        sum -= old;
+      }
+    },
+    mean() {
+      if (!q.length) return null;
+      return sum / q.length;
+    },
+    count() {
+      return q.length;
+    },
+  };
+}
+
+function blendWeightsFromBrier(brier, cfg, availability) {
+  const eps = cfg.modelErrorEps;
+  const prior = 0.25; // Neutral Bernoulli uncertainty baseline.
+  const vals = {
+    baseline: Number.isFinite(brier.baseline) ? brier.baseline : prior,
+    hazard: Number.isFinite(brier.hazard) ? brier.hazard : prior,
+    knn: Number.isFinite(brier.knn) ? brier.knn : prior,
+  };
+
+  const w = {
+    baseline: 1 / Math.max(eps, vals.baseline),
+    hazard: availability.hazard ? (1 / Math.max(eps, vals.hazard)) : 0,
+    knn: availability.knn ? (1 / Math.max(eps, vals.knn)) : 0,
+  };
+
+  let total = w.baseline + w.hazard + w.knn;
+  if (total <= 0) return { baseline: 1, hazard: 0, knn: 0 };
+  w.baseline /= total;
+  w.hazard /= total;
+  w.knn /= total;
+
+  if (w.hazard > cfg.maxHazardBlend) {
+    const excess = w.hazard - cfg.maxHazardBlend;
+    w.hazard = cfg.maxHazardBlend;
+    const redistributeBase = w.baseline + w.knn;
+    if (redistributeBase > 0) {
+      w.baseline += excess * (w.baseline / redistributeBase);
+      w.knn += excess * (w.knn / redistributeBase);
+    } else {
+      w.baseline += excess;
+    }
+  }
+
+  if (w.baseline < cfg.minBaselineBlend) {
+    const need = cfg.minBaselineBlend - w.baseline;
+    w.baseline = cfg.minBaselineBlend;
+    const donor = w.hazard + w.knn;
+    if (donor > 0) {
+      w.hazard -= need * (w.hazard / donor);
+      w.knn -= need * (w.knn / donor);
+    }
+  }
+
+  total = w.baseline + w.hazard + w.knn;
+  if (total <= 0) return { baseline: 1, hazard: 0, knn: 0 };
+  w.baseline /= total;
+  w.hazard /= total;
+  w.knn /= total;
+  return w;
+}
+
+function createWhiteTransitionStats(maxRun = 40) {
+  return {
+    maxRun,
+    obs: new Array(maxRun + 1).fill(0),
+    cont: new Array(maxRun + 1).fill(0),
+    reb: new Array(maxRun + 1).fill(0),
+    totalObs: 0,
+    totalCont: 0,
+    totalReb: 0,
+  };
+}
+
+function whiteUpdate(stats, runLen, isContinue, isRebound) {
+  if (!runLen || runLen <= 0) return;
+  const r = Math.min(stats.maxRun, Math.max(1, Math.round(runLen)));
+  stats.obs[r] += 1;
+  stats.totalObs += 1;
+  if (isContinue) {
+    stats.cont[r] += 1;
+    stats.totalCont += 1;
+  }
+  if (isRebound) {
+    stats.reb[r] += 1;
+    stats.totalReb += 1;
+  }
+}
+
+function whiteEstimate(stats, runLen) {
+  const r = Math.min(stats.maxRun, Math.max(1, Math.round(runLen || 0)));
+  const localObs = stats.obs[r] || 0;
+  const globalCont = stats.totalObs > 0 ? stats.totalCont / stats.totalObs : null;
+  const globalReb = stats.totalObs > 0 ? stats.totalReb / stats.totalObs : null;
+  if (localObs <= 0) {
+    return {
+      continueProb: globalCont,
+      reboundProb: globalReb,
+      sample: stats.totalObs,
+      reliable: stats.totalObs >= 20,
+    };
+  }
+  return {
+    continueProb: stats.cont[r] / localObs,
+    reboundProb: stats.reb[r] / localObs,
+    sample: localObs,
+    reliable: localObs >= 8,
+  };
+}
+
+function deriveEntropyThresholds(state, targetState, cfg, trainEnd) {
+  const w = cfg.entropyRecentWindow;
+  const step = Math.max(1, cfg.entropyStep);
+  const base = 1 / targetState.target;
+  const jsSeries = [];
+  const driftSeries = [];
+  const lagSeries = [];
+
+  if (trainEnd < (2 * w)) return { js: null, drift: null, lag: null, sample: 0 };
+
+  for (let end = (2 * w); end <= trainEnd; end += step) {
+    const recent = state.multipliers.slice(end - w + 1, end + 1);
+    const prev = state.multipliers.slice(end - (2 * w) + 1, end - w + 1);
+    if (!recent.length || !prev.length) continue;
+    const pr = normalizeProb(histogram(recent, state.entropyBins));
+    const pp = normalizeProb(histogram(prev, state.entropyBins));
+    jsSeries.push(jensenShannon(pr, pp));
+    driftSeries.push(Math.abs(rateInWindow(targetState.hitPrefix, end, w) - base));
+    lagSeries.push(Math.abs(lag1Correlation(targetState.hits, end - w + 1, end)));
+  }
+
+  if (!jsSeries.length) return { js: null, drift: null, lag: null, sample: 0 };
+  return {
+    js: quantile(jsSeries, cfg.entropyQuantile),
+    drift: quantile(driftSeries, cfg.entropyQuantile),
+    lag: quantile(lagSeries, cfg.entropyQuantile),
+    sample: jsSeries.length,
+  };
+}
+
+function entropyAtIndex(state, targetState, idx, thresholds, cfg) {
+  const w = cfg.entropyRecentWindow;
+  if (idx < (2 * w)) {
+    return {
+      js: null,
+      drift: null,
+      lagCorr: null,
+      randomLike: false,
+      disabled: false,
+      thresholdSample: thresholds.sample || 0,
+    };
+  }
+
+  const recent = state.multipliers.slice(idx - w + 1, idx + 1);
+  const prev = state.multipliers.slice(idx - (2 * w) + 1, idx - w + 1);
+  const pr = normalizeProb(histogram(recent, state.entropyBins));
+  const pp = normalizeProb(histogram(prev, state.entropyBins));
+  const js = jensenShannon(pr, pp);
+  const drift = Math.abs(rateInWindow(targetState.hitPrefix, idx, w) - (1 / targetState.target));
+  const lagCorr = Math.abs(lag1Correlation(targetState.hits, idx - w + 1, idx));
+
+  const hasThresholds = Number.isFinite(thresholds.js) && Number.isFinite(thresholds.drift) && Number.isFinite(thresholds.lag);
+  const randomLike = hasThresholds
+    ? (js <= thresholds.js && drift <= thresholds.drift && lagCorr <= thresholds.lag)
+    : false;
+
+  return {
+    js: roundNum(js, 8),
+    drift: roundNum(drift, 8),
+    lagCorr: roundNum(lagCorr, 8),
+    randomLike,
+    disabled: Boolean(cfg.entropyAutoDisable && randomLike),
+    thresholdSample: thresholds.sample || 0,
+  };
+}
+
+function confidenceFromComponents(p, baseline, weights, entropyInfo) {
+  const edge = Math.abs((p ?? baseline ?? 0) - (baseline ?? 0));
+  const edgeScore = clamp(edge / Math.max(0.01, baseline || 0.01), 0, 1);
+  const modelBalance = clamp((weights.knn || 0) + (weights.hazard || 0.5 * (weights.baseline || 0)), 0, 1);
+  const entropyPenalty = entropyInfo?.disabled ? 0.35 : 1.0;
+  const entropyNoisePenalty = entropyInfo?.randomLike ? 0.65 : 1.0;
+  return clamp((0.55 * edgeScore + 0.45 * modelBalance) * entropyPenalty * entropyNoisePenalty, 0, 1);
+}
+
+function evaluateExistingLock(lock, hitRoundIds, currentRound) {
+  if (!lock) return { resolved: false, status: 'none', outcome: null, hitRound: null };
+  const lo = Number(lock.lo);
+  const hi = Number(lock.hi);
+  const madeRaw = Number(lock.roundWhenMade ?? (lo - 1));
+  const made = Number.isFinite(madeRaw) ? madeRaw : (Number.isFinite(lo) ? lo - 1 : currentRound);
+
+  const lb = lowerBound(hitRoundIds, made + 1);
+  const ub = lowerBound(hitRoundIds, currentRound + 1);
+  const firstHit = lb < ub ? hitRoundIds[lb] : null;
+
+  if (firstHit !== null) {
+    if (firstHit < lo) return { resolved: true, status: 'resolved', outcome: 'early', hitRound: firstHit };
+    if (firstHit <= hi) return { resolved: true, status: 'resolved', outcome: 'win', hitRound: firstHit };
+  }
+  if (currentRound >= hi) return { resolved: true, status: 'resolved', outcome: 'loss', hitRound: null };
+  if (currentRound >= lo) return { resolved: false, status: 'window-open', outcome: null, hitRound: null };
+  return { resolved: false, status: 'waiting', outcome: null, hitRound: null };
+}
+
+function confidenceBand(score) {
+  const s = clamp(score ?? 0, 0, 1);
+  if (s >= 0.8) return 'VERY HIGH';
+  if (s >= 0.6) return 'HIGH';
+  if (s >= 0.35) return 'MED';
+  if (s >= 0.15) return 'LOW';
+  return 'NONE';
+}
+
+function buildUiTarget(target, lock, status, currentRound, previousOutcome) {
+  const lo = Number(lock.lo);
+  const hi = Number(lock.hi);
+  const eta = lock.eta || {};
+  const aheadLo = Math.max(0, lo - currentRound);
+  const aheadHi = Math.max(0, hi - currentRound);
+  return {
+    target,
+    targetLabel: `${target}x`,
+    status,
+    confidence: clamp(Number(lock.confidence ?? eta.aiConfidence ?? 0), 0, 1),
+    confidenceBand: confidenceBand(lock.confidence ?? eta.aiConfidence ?? 0),
+    window: {
+      lo,
+      hi,
+      span: Math.max(1, hi - lo + 1),
+      roundsUntilWindow: aheadLo,
+      roundsLeftInWindow: aheadHi,
+      aheadLo,
+      aheadHi,
+    },
+    signals: {
+      pHit1: Number(eta.pHit1 ?? 0),
+      pHitSoon: Number(eta.pHitSoon ?? eta.pHit1 ?? 0),
+      quickHit: Number(eta.quickHit ?? eta.pHit1 ?? 0),
+      whiteClusterRisk: eta.whiteClusterRisk ?? null,
+      whiteClusterRelease: eta.whiteClusterRelease ?? null,
+      whiteClusterRun: Number(eta.whiteClusterRun ?? 0),
+      b2bImmRate: eta.b2bImmRate ?? null,
+      b2bNearRate: eta.b2bNearRate ?? null,
+      hazardP1: eta.hazardP1 ?? null,
+      knnP1: eta.knnP1 ?? null,
+      knnSupport: eta.knnSupport ?? null,
+      baseRate: eta.baseRate ?? null,
+      edge: eta.edge ?? null,
+      ev: eta.ev ?? null,
+      entropyRandomLike: eta.entropyRandomLike ?? null,
+    },
+    previousOutcome: previousOutcome || null,
+  };
+}
+
+function runTargetWalkForward(state, target, cfg) {
+  const targetState = makeTargetState(state, target);
+  const n = state.n;
+  const evalStartBase = Math.max(
+    cfg.minTrainingRounds,
+    cfg.featureLongWindow + 2,
+    cfg.entropyRecentWindow * 2
+  );
+  const evalStart = Math.max(evalStartBase, n - cfg.walkForwardWindow - 1);
+  const evalEnd = n - 2;
+
+  const brierHaz = makeRollingBrier(cfg.brierWindow);
+  const brierKnn = makeRollingBrier(cfg.brierWindow);
+  const brierBase = makeRollingBrier(cfg.brierWindow);
+
+  const whiteStats = createWhiteTransitionStats();
+  for (let j = 0; j < Math.max(0, evalStart - 1); j += 1) {
+    const runLen = state.whiteRun[j] || 0;
+    const nextIsWhite = Boolean(state.whiteFlags[j + 1]);
+    const nextIsRebound = Number(state.multipliers[j + 1]) >= state.reboundCut;
+    whiteUpdate(whiteStats, runLen, nextIsWhite, nextIsRebound);
+  }
+
+  const entropyThresholds = deriveEntropyThresholds(state, targetState, cfg, Math.max(evalStart, n - 2));
+
+  let bets = 0;
+  let wins = 0;
+  let pnl = 0;
+  let peak = 0;
+  let maxDrawdown = 0;
+  let evSum = 0;
+
+  function predictAt(idx) {
+    const baselineP = 1 / target;
+    const pHaz = hazardPredictAt(state, targetState, idx, cfg);
+    const knn = knnPredictAt(state, targetState, idx, cfg);
+    const pKnn = knn?.p ?? null;
+    const availability = { hazard: Number.isFinite(pHaz), knn: Number.isFinite(pKnn) };
+    const brierMeans = {
+      baseline: brierBase.mean(),
+      hazard: brierHaz.mean(),
+      knn: brierKnn.mean(),
+    };
+    const weights = blendWeightsFromBrier(brierMeans, cfg, availability);
+    const h = Number.isFinite(pHaz) ? pHaz : baselineP;
+    const k = Number.isFinite(pKnn) ? pKnn : baselineP;
+    const pBlend = clamp(
+      weights.baseline * baselineP +
+      weights.hazard * h +
+      weights.knn * k,
+      0,
+      1
+    );
+
+    const whiteRunNow = state.whiteRun[idx] || 0;
+    const whiteEst = whiteEstimate(whiteStats, whiteRunNow);
+    const continueProb = Number.isFinite(whiteEst.continueProb) ? whiteEst.continueProb : 0;
+    const reboundProb = Number.isFinite(whiteEst.reboundProb) ? whiteEst.reboundProb : 0;
+    const whiteDelta = clamp(reboundProb - continueProb, -1, 1);
+    const pAdj = clamp(pBlend * (1 + cfg.whiteModifierStrength * whiteDelta), 0, 1);
+
+    const edge = pAdj - baselineP;
+    const ev = (pAdj * target) - 1;
+    const entropy = entropyAtIndex(state, targetState, idx, entropyThresholds, cfg);
+    const actionable = !entropy.disabled && ev > cfg.evThreshold;
+    const confidence = confidenceFromComponents(pAdj, baselineP, weights, entropy);
+
+    const b2bImm = rateInWindow(targetState.hitPrefix, idx, 2);
+    const b2bNear = rateInWindow(targetState.hitPrefix, idx, 5);
+
+    return {
+      baselineP,
+      pHaz,
+      pKnn,
+      pBlend,
+      pAdj,
+      edge,
+      ev,
+      actionable,
+      entropy,
+      confidence,
+      weights,
+      knnSupport: knn?.support ?? null,
+      whiteRun: whiteRunNow,
+      whiteContinue: whiteEst.continueProb,
+      whiteRebound: whiteEst.reboundProb,
+      whiteSample: whiteEst.sample,
+      b2bImm,
+      b2bNear,
+    };
+  }
+
+  if (evalEnd >= evalStart) {
+    for (let i = evalStart; i <= evalEnd; i += 1) {
+      const pred = predictAt(i);
+      const y = targetState.hits[i + 1] ? 1 : 0;
+
+      brierBase.add((pred.baselineP - y) ** 2);
+      if (Number.isFinite(pred.pHaz)) brierHaz.add((pred.pHaz - y) ** 2);
+      if (Number.isFinite(pred.pKnn)) brierKnn.add((pred.pKnn - y) ** 2);
+
+      if (pred.actionable) {
+        bets += 1;
+        wins += y;
+        pnl += y ? (target - 1) : -1;
+        peak = Math.max(peak, pnl);
+        maxDrawdown = Math.max(maxDrawdown, peak - pnl);
+        evSum += pred.ev;
+      }
+
+      const runLen = state.whiteRun[i] || 0;
+      const nextWhite = Boolean(state.whiteFlags[i + 1]);
+      const nextRebound = Number(state.multipliers[i + 1]) >= state.reboundCut;
+      whiteUpdate(whiteStats, runLen, nextWhite, nextRebound);
+    }
+  }
+
+  const liveIdx = n - 1;
+  const live = predictAt(liveIdx);
+  const empiricalHitRate = evalEnd >= evalStart
+    ? rateInWindow(targetState.hitPrefix, evalEnd + 1, evalEnd - evalStart + 1)
+    : null;
+
+  return {
+    target,
+    targetState,
+    live,
+    brier: {
+      baseline: brierBase.mean(),
+      hazard: brierHaz.mean(),
+      knn: brierKnn.mean(),
+      baselineCount: brierBase.count(),
+      hazardCount: brierHaz.count(),
+      knnCount: brierKnn.count(),
+    },
+    backtest: {
+      rounds: Math.max(0, evalEnd - evalStart + 1),
+      bets,
+      wins,
+      losses: Math.max(0, bets - wins),
+      winRate: bets > 0 ? wins / bets : null,
+      avgEV: bets > 0 ? evSum / bets : null,
+      totalEV: evSum,
+      maxDrawdown,
+      randomBaseline: {
+        empiricalHitRate: empiricalHitRate,
+        evPerBet: Number.isFinite(empiricalHitRate) ? (empiricalHitRate * target) - 1 : null,
+        expectedTotalEVAtSameBets: (Number.isFinite(empiricalHitRate) && bets > 0)
+          ? (((empiricalHitRate * target) - 1) * bets)
+          : null,
+      },
+      walkForward: true,
+      noFutureLeakage: true,
+    },
+    entropyThresholds,
+  };
+}
+
+function buildLockFromLive(state, targetResult, currentRound, generation, cfg) {
+  const live = targetResult.live;
+  const lo = currentRound + 1;
+  const hi = currentRound + 1;
+  const p = live.pAdj;
+  const pSoon = clamp(1 - Math.pow(1 - p, 3), 0, 1);
+  const suspended = !live.actionable;
+
+  return {
+    lo,
+    hi,
+    roundWhenMade: currentRound,
+    generation,
+    suspended,
+    confidence: live.confidence,
+    eta: {
+      modelVersion: 'EngineX-v1-edge',
+      baselineFormula: 'P(x)=1/x',
+      pHit1: roundNum(p, 6),
+      pHitSoon: roundNum(pSoon, 6),
+      quickHit: roundNum(p, 6),
+      edge: roundNum(live.edge, 6),
+      ev: roundNum(live.ev, 6),
+      targetEVThreshold: roundNum(cfg.evThreshold, 6),
+      baseRate: roundNum(live.baselineP, 6),
+      hazardP1: roundNum(live.pHaz, 6),
+      knnP1: roundNum(live.pKnn, 6),
+      knnSupport: roundNum(live.knnSupport, 6),
+      blend: {
+        baseline: roundNum(live.weights.baseline, 6),
+        hazard: roundNum(live.weights.hazard, 6),
+        knn: roundNum(live.weights.knn, 6),
+      },
+      whiteClusterRun: Number(live.whiteRun || 0),
+      whiteClusterRisk: roundNum(live.whiteContinue, 6),
+      whiteClusterRelease: roundNum(live.whiteRebound, 6),
+      whiteClusterDelta: roundNum((live.whiteRebound ?? 0) - (live.whiteContinue ?? 0), 6),
+      whiteClusterSample: Number(live.whiteSample || 0),
+      b2bImmRate: roundNum(live.b2bImm, 6),
+      b2bNearRate: roundNum(live.b2bNear, 6),
+      entropyRandomLike: Boolean(live.entropy.randomLike),
+      entropyDisabled: Boolean(live.entropy.disabled),
+      entropyJs: live.entropy.js,
+      entropyDrift: live.entropy.drift,
+      entropyLag: live.entropy.lagCorr,
+      entropyThresholdSample: Number(live.entropy.thresholdSample || 0),
+      aiConfidence: roundNum(live.confidence, 6),
+      aheadLo: 1,
+      aheadHi: 1,
+      q25: 1,
+      q50: 1,
+      q75: 1,
+      gapNow: Number(targetResult.targetState.gap[state.n - 1] || 0),
+      suspended,
+      suspendReason: live.entropy.disabled ? 'entropy_random_regime' : (!live.actionable ? 'ev_below_threshold' : null),
+      walkForwardNoLeakage: true,
+    },
+  };
+}
+
+function summarizeBacktests(results) {
+  const rows = [];
+  let totalBets = 0;
+  let totalWins = 0;
+  let totalEv = 0;
+  let maxDd = 0;
+  let randomExpected = 0;
+  for (let i = 0; i < results.length; i += 1) {
+    const r = results[i];
+    rows.push({
+      target: r.target,
+      bets: r.backtest.bets,
+      wins: r.backtest.wins,
+      losses: r.backtest.losses,
+      winRate: roundNum(r.backtest.winRate, 6),
+      avgEV: roundNum(r.backtest.avgEV, 6),
+      totalEV: roundNum(r.backtest.totalEV, 6),
+      maxDrawdown: roundNum(r.backtest.maxDrawdown, 6),
+      randomEVPerBet: roundNum(r.backtest.randomBaseline.evPerBet, 6),
+      randomExpectedTotalEVAtSameBets: roundNum(r.backtest.randomBaseline.expectedTotalEVAtSameBets, 6),
+      walkForward: true,
+      noFutureLeakage: true,
+    });
+    totalBets += r.backtest.bets;
+    totalWins += r.backtest.wins;
+    totalEv += r.backtest.totalEV || 0;
+    maxDd = Math.max(maxDd, r.backtest.maxDrawdown || 0);
+    randomExpected += r.backtest.randomBaseline.expectedTotalEVAtSameBets || 0;
+  }
+  return {
+    perTarget: rows,
+    aggregate: {
+      bets: totalBets,
+      wins: totalWins,
+      losses: Math.max(0, totalBets - totalWins),
+      winRate: totalBets > 0 ? roundNum(totalWins / totalBets, 6) : null,
+      totalEV: roundNum(totalEv, 6),
+      avgEV: totalBets > 0 ? roundNum(totalEv / totalBets, 6) : null,
+      maxDrawdown: roundNum(maxDd, 6),
+      randomExpectedTotalEVAtSameBets: roundNum(randomExpected, 6),
+      walkForward: true,
+      noFutureLeakage: true,
+    },
+  };
+}
+
+function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = {}) {
+  const cfg = { ...DEFAULT_CONFIG, ...(options.config || {}) };
+  const cleanRounds = normalizeRounds(rounds);
+
+  if (!cleanRounds.length) {
+    return {
+      model: 'EngineX-v1-edge',
+      generatedAt: new Date().toISOString(),
+      asOfRound: null,
+      sampleSize: 0,
+      targets: [],
+      locksToSave: {},
+      resolvedHistory: [],
+      whiteCluster: null,
+      summary: { waiting: 0, windowOpen: 0, relocked: 0, sampleSize: 0 },
+      settings: {
+        mode: 'edge-detection',
+        baselineFormula: 'P(x)=1/x',
+        evThreshold: cfg.evThreshold,
+      },
+    };
+  }
+
+  const state = buildGlobalState(cleanRounds, cfg);
+  const currentRound = cleanRounds[cleanRounds.length - 1].roundId;
+  const targetResults = TARGETS.map((t) => runTargetWalkForward(state, t, cfg));
+
+  const locksToSave = {};
+  const resolvedHistory = [];
+  const targetsOut = [];
+  let waitingCount = 0;
+  let openCount = 0;
+  let relockedCount = 0;
+
+  for (let i = 0; i < TARGETS.length; i += 1) {
+    const target = TARGETS[i];
+    const key = String(target);
+    const result = targetResults[i];
+    const existing = normalizeLockInput(existingLocksRaw[key]);
+    const hitRoundIds = result.targetState.hitIdx.map((ix) => state.roundIds[ix]);
+    const evalExisting = evaluateExistingLock(existing, hitRoundIds, currentRound);
+    const existingSpan = existing ? (Number(existing.hi) - Number(existing.lo) + 1) : null;
+    const existingLead = existing ? (Number(existing.lo) - Number(existing.roundWhenMade)) : null;
+    const legacyWindow = Boolean(existing) && (
+      !Number.isFinite(existingSpan) ||
+      existingSpan !== 1 ||
+      !Number.isFinite(existingLead) ||
+      existingLead !== 1
+    );
+
+    let previousOutcome = null;
+    let lockToUse = existing;
+    let status = evalExisting.status;
+
+    if (!existing || evalExisting.resolved || legacyWindow) {
+      if (existing && evalExisting.resolved) {
+        previousOutcome = {
+          outcome: evalExisting.outcome,
+          hitRound: evalExisting.hitRound,
+          lo: existing.lo,
+          hi: existing.hi,
+          generation: existing.generation,
+        };
+        resolvedHistory.push({
+          target: `${target}x`,
+          minMult: Number(target),
+          outcome: evalExisting.outcome,
+          lo: Number(existing.lo),
+          hi: Number(existing.hi),
+          hitRound: evalExisting.hitRound,
+          generation: Number(existing.generation || 1),
+          probW: existing?.eta?.pHit1 ?? null,
+          confidence: existing?.confidence ?? existing?.eta?.aiConfidence ?? null,
+          roundWhenMade: Number(existing.roundWhenMade),
+        });
+      }
+      const generation = existing ? Number(existing.generation || 1) + 1 : 1;
+      lockToUse = buildLockFromLive(state, result, currentRound, generation, cfg);
+      status = lockToUse.suspended ? 'waiting' : 'locked';
+      relockedCount += 1;
+    } else {
+      lockToUse = {
+        ...existing,
+        confidence: Number(result.live.confidence || existing.confidence || 0),
+        eta: {
+          ...(existing.eta || {}),
+          ...(buildLockFromLive(state, result, currentRound, existing.generation || 1, cfg).eta || {}),
+          suspended: Boolean(existing.suspended),
+        },
+      };
+      status = evalExisting.status;
+    }
+
+    if ((status === 'waiting' || status === 'locked') && Number(lockToUse.lo) <= currentRound) {
+      status = 'window-open';
+    }
+    if (status === 'waiting') waitingCount += 1;
+    if (status === 'window-open') openCount += 1;
+
+    locksToSave[key] = {
+      lo: Number(lockToUse.lo),
+      hi: Number(lockToUse.hi),
+      roundWhenMade: Number(lockToUse.roundWhenMade),
+      generation: Number(lockToUse.generation || 1),
+      suspended: Boolean(lockToUse.suspended),
+      confidence: Number(lockToUse.confidence || 0),
+      eta: lockToUse.eta || null,
+    };
+
+    targetsOut.push(buildUiTarget(target, lockToUse, status, currentRound, previousOutcome));
+  }
+
+  targetsOut.sort((a, b) => a.target - b.target);
+  const whiteRunNow = state.whiteRun[state.n - 1] || 0;
+  const whiteGlobalContinue = mean(targetResults.map((r) => r.live.whiteContinue).filter((v) => Number.isFinite(v)));
+  const whiteGlobalRebound = mean(targetResults.map((r) => r.live.whiteRebound).filter((v) => Number.isFinite(v)));
+  const randomSignals = targetResults.map((r) => Boolean(r.live.entropy.randomLike));
+
+  return {
+    model: 'EngineX-v1-edge',
+    generatedAt: new Date().toISOString(),
+    asOfRound: currentRound,
+    sampleSize: state.n,
+    targets: targetsOut,
+    locksToSave,
+    resolvedHistory,
+    whiteCluster: {
+      activeRun: whiteRunNow,
+      cut: roundNum(state.whiteCut, 4),
+      reboundCut: roundNum(state.reboundCut, 4),
+      continueProb: roundNum(whiteGlobalContinue, 6),
+      reboundProb: roundNum(whiteGlobalRebound, 6),
+      delta: roundNum((whiteGlobalRebound ?? 0) - (whiteGlobalContinue ?? 0), 6),
+      weakModifierOnly: true,
+    },
+    summary: {
+      waiting: waitingCount,
+      windowOpen: openCount,
+      relocked: relockedCount,
+      sampleSize: state.n,
+      randomLikeTargets: randomSignals.filter(Boolean).length,
+    },
+    backtest: summarizeBacktests(targetResults),
+    settings: {
+      modelVersion: 'EngineX-v1-edge',
+      mode: 'edge-detection',
+      baselineFormula: 'P(x)=1/x',
+      noFixedWindows: true,
+      perRoundPrediction: true,
+      hazardAsWeakSignal: true,
+      gapPressurePrimarySignal: false,
+      blendByInverseBrier: true,
+      entropyAutoDisable: Boolean(cfg.entropyAutoDisable),
+      evThreshold: roundNum(cfg.evThreshold, 6),
+      walkForwardValidation: true,
+      noFutureLeakage: true,
+    },
+  };
+}
+
+function buildThresholdSnapshot(cleanRounds, threshold) {
+  const n = cleanRounds.length;
+  if (!n) {
+    return { target: threshold, p1: null, baseline: roundNum(1 / threshold, 6), edge: null, ev: null };
+  }
+  const m = cleanRounds.map((r) => Number(r.multiplier));
+  const hit = m.map((x) => (x >= threshold ? 1 : 0));
+  const prefix = buildPrefix(hit);
+  const recentWindow = Math.min(800, Math.max(100, Math.floor(n * 0.25)));
+  const idx = n - 1;
+  const recentRate = rateInWindow(prefix, idx, recentWindow);
+  const baseline = 1 / threshold;
+  const edge = recentRate - baseline;
+  const ev = (recentRate * threshold) - 1;
+  return {
+    target: threshold,
+    p1: roundNum(recentRate, 6),
+    baseline: roundNum(baseline, 6),
+    edge: roundNum(edge, 6),
+    ev: roundNum(ev, 6),
+    expectedGap: recentRate > 0 ? roundNum(1 / recentRate, 3) : null,
+  };
+}
+
+function buildPredictionReport(rounds, options = {}) {
+  const cfg = { ...DEFAULT_CONFIG, ...(options.config || {}) };
+  const cleanRounds = normalizeRounds(rounds);
+  if (!cleanRounds.length) {
+    return {
+      model: 'EngineX-v1-edge-report',
+      generatedAt: new Date().toISOString(),
+      asOfRound: null,
+      sampleSize: 0,
+      bucketProbabilities: BUCKETS.map((b) => ({ ...b, probability: null })),
+      predictedBucket: null,
+      targetProbabilities: REPORT_THRESHOLDS.map((t) => ({
+        target: t,
+        p1: null,
+        baseline: roundNum(1 / t, 6),
+        edge: null,
+        ev: null,
+      })),
+      whiteCluster: null,
+      edgeSummary: null,
+      backtest: null,
+    };
+  }
+
+  const multipliers = cleanRounds.map((r) => Number(r.multiplier));
+  const counts = new Array(BUCKETS.length).fill(0);
+  for (let i = 0; i < multipliers.length; i += 1) {
+    const m = multipliers[i];
+    for (let j = 0; j < BUCKETS.length; j += 1) {
+      const b = BUCKETS[j];
+      if (m >= b.min && m <= b.max) {
+        counts[j] += 1;
+        break;
+      }
+    }
+  }
+  const total = multipliers.length;
+  const bucketProbabilities = BUCKETS.map((b, i) => ({
+    ...b,
+    count: counts[i],
+    probability: roundNum(counts[i] / Math.max(1, total), 6),
+  }));
+  const topIdx = counts.indexOf(Math.max(...counts));
+
+  const targetProbabilities = REPORT_THRESHOLDS.map((t) => buildThresholdSnapshot(cleanRounds, t));
+  const edgeSummary = targetProbabilities.map((x) => ({
+    target: x.target,
+    edge: x.edge,
+    ev: x.ev,
+    actionable: Number.isFinite(x.ev) ? (x.ev > cfg.evThreshold) : false,
+  }));
+
+  const state = buildGlobalState(cleanRounds, cfg);
+  const whiteRunNow = state.whiteRun[state.n - 1] || 0;
+  const whiteSeries = state.whiteRun.filter((x) => x > 0);
+  const backtest = backtestEdgeEngine(cleanRounds, { config: cfg });
+
+  return {
+    model: 'EngineX-v1-edge-report',
+    generatedAt: new Date().toISOString(),
+    asOfRound: cleanRounds[cleanRounds.length - 1].roundId,
+    sampleSize: cleanRounds.length,
+    expectedMean: roundNum(mean(multipliers), 4),
+    expectedMedian: roundNum(quantile(multipliers, 0.5), 4),
+    expectedP75: roundNum(quantile(multipliers, 0.75), 4),
+    expectedP90: roundNum(quantile(multipliers, 0.90), 4),
+    bucketProbabilities,
+    predictedBucket: bucketProbabilities[topIdx],
+    targetProbabilities,
+    whiteCluster: {
+      activeRun: whiteRunNow,
+      cut: roundNum(state.whiteCut, 4),
+      reboundCut: roundNum(state.reboundCut, 4),
+      runQ85: roundNum(quantile(whiteSeries, 0.85), 3),
+      runQ95: roundNum(quantile(whiteSeries, 0.95), 3),
+    },
+    edgeSummary,
+    backtest,
+    diagnostics: {
+      baselineFormula: 'P(x)=1/x',
+      mode: 'edge-detection',
+      noFixedWindows: true,
+      walkForwardValidation: true,
+      noFutureLeakage: true,
+    },
+  };
+}
+
+function backtestEdgeEngine(rounds, options = {}) {
+  const cfg = { ...DEFAULT_CONFIG, ...(options.config || {}) };
+  const clean = normalizeRounds(rounds);
+  if (!clean.length) {
+    return {
+      perTarget: [],
+      aggregate: {
+        bets: 0,
+        wins: 0,
+        losses: 0,
+        winRate: null,
+        totalEV: null,
+        avgEV: null,
+        maxDrawdown: null,
+        randomExpectedTotalEVAtSameBets: null,
+        walkForward: true,
+        noFutureLeakage: true,
+      },
+    };
+  }
+  const state = buildGlobalState(clean, cfg);
+  const targetResults = TARGETS.map((t) => runTargetWalkForward(state, t, cfg));
+  return summarizeBacktests(targetResults);
+}
+
+module.exports = {
+  TARGETS,
+  BUCKETS,
+  DEFAULT_CONFIG,
+  computeLockedRangePredictions,
+  buildPredictionReport,
+  backtestEdgeEngine,
+  _internal: {
+    normalizeRounds,
+    buildGlobalState,
+    makeTargetState,
+    hazardPredictAt,
+    knnPredictAt,
+    blendWeightsFromBrier,
+    backtestEdgeEngine,
+  },
+};
