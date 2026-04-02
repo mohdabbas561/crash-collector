@@ -769,6 +769,84 @@ function buildUiTarget(target, lock, status, currentRound, previousOutcome) {
   };
 }
 
+function geometricQuantile(p, q) {
+  const pp = clamp(p, 1e-6, 1 - 1e-6);
+  const qq = clamp(q, 1e-6, 1 - 1e-6);
+  return Math.max(1, Math.ceil(Math.log(1 - qq) / Math.log(1 - pp)));
+}
+
+function estimateAheadBand(state, targetResult) {
+  const live = targetResult.live;
+  const ts = targetResult.targetState;
+  const intervals = ts.intervals || [];
+  const gapNow = Number(ts.gap[state.n - 1] || 0);
+  const p = clamp(Number(live.pAdj || live.baselineP || (1 / targetResult.target)), 1e-6, 0.999);
+
+  const geoLo = geometricQuantile(p, 0.20);
+  const geoHi = geometricQuantile(p, 0.55);
+
+  let lo = geoLo;
+  let hi = Math.max(lo, geoHi);
+  let q20 = null;
+  let q50 = null;
+  let q55 = null;
+  let q75 = null;
+  let q90 = null;
+  let q95 = null;
+
+  if (intervals.length >= 20) {
+    q20 = quantile(intervals, 0.20);
+    q50 = quantile(intervals, 0.50);
+    q55 = quantile(intervals, 0.55);
+    q75 = quantile(intervals, 0.75);
+    q90 = quantile(intervals, 0.90);
+    q95 = quantile(intervals, 0.95);
+    lo = Math.max(1, Math.round(0.50 * geoLo + 0.50 * q20));
+    hi = Math.max(lo, Math.round(0.45 * geoHi + 0.55 * q55));
+  } else {
+    q50 = quantile(intervals, 0.50);
+    q75 = quantile(intervals, 0.75);
+    q90 = quantile(intervals, 0.90);
+    q95 = quantile(intervals, 0.95);
+  }
+
+  const ref = Number.isFinite(q50) ? q50 : Math.max(1, geoLo);
+  const overdue = clamp((gapNow - ref) / Math.max(1, ref), -0.8, 1.5);
+  lo = Math.max(1, Math.round(lo * (1 - 0.22 * overdue)));
+  hi = Math.max(lo, Math.round(hi * (1 - 0.16 * overdue)));
+
+  const edgeNorm = clamp(
+    (Number(live.edge || 0)) / Math.max(1e-6, Number(live.baselineP || (1 / targetResult.target))),
+    -1,
+    2
+  );
+  lo = Math.max(1, Math.round(lo * (1 - 0.15 * edgeNorm)));
+  hi = Math.max(lo, Math.round(hi * (1 - 0.10 * edgeNorm)));
+
+  if (live.entropy?.randomLike) {
+    lo = Math.max(1, Math.round(lo * 1.10));
+    hi = Math.max(lo, Math.round(hi * 1.30));
+  }
+
+  const intervalCap = Number.isFinite(q95)
+    ? Math.max(hi, Math.round(q95 * 2.5))
+    : Math.max(hi, Math.round(geoHi * 1.8));
+  const absoluteCap = Math.max(40, intervalCap);
+  hi = Math.min(absoluteCap, hi);
+  lo = Math.min(lo, hi);
+
+  return {
+    aheadLo: Math.max(1, lo),
+    aheadHi: Math.max(lo, hi),
+    gapNow,
+    q20: roundNum(q20, 3),
+    q50: roundNum(q50, 3),
+    q75: roundNum(q75, 3),
+    q90: roundNum(q90, 3),
+    q95: roundNum(q95, 3),
+  };
+}
+
 function runTargetWalkForward(state, target, cfg) {
   const targetState = makeTargetState(state, target);
   const n = state.n;
@@ -929,8 +1007,9 @@ function runTargetWalkForward(state, target, cfg) {
 
 function buildLockFromLive(state, targetResult, currentRound, generation, cfg) {
   const live = targetResult.live;
-  const lo = currentRound + 1;
-  const hi = currentRound + 1;
+  const band = estimateAheadBand(state, targetResult);
+  const lo = currentRound + band.aheadLo;
+  const hi = currentRound + band.aheadHi;
   const p = live.pAdj;
   const pSoon = clamp(1 - Math.pow(1 - p, 3), 0, 1);
   const suspended = !live.actionable;
@@ -974,12 +1053,14 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg) {
       entropyLag: live.entropy.lagCorr,
       entropyThresholdSample: Number(live.entropy.thresholdSample || 0),
       aiConfidence: roundNum(live.confidence, 6),
-      aheadLo: 1,
-      aheadHi: 1,
-      q25: 1,
-      q50: 1,
-      q75: 1,
-      gapNow: Number(targetResult.targetState.gap[state.n - 1] || 0),
+      aheadLo: band.aheadLo,
+      aheadHi: band.aheadHi,
+      q25: band.q20,
+      q50: band.q50,
+      q75: band.q75,
+      q90: band.q90,
+      q95: band.q95,
+      gapNow: band.gapNow,
       suspended,
       suspendReason: live.entropy.disabled ? 'entropy_random_regime' : (!live.actionable ? 'ev_below_threshold' : null),
       walkForwardNoLeakage: true,
@@ -1080,7 +1161,8 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       !Number.isFinite(existingSpan) ||
       existingSpan !== 1 ||
       !Number.isFinite(existingLead) ||
-      existingLead !== 1
+      existingLead !== 1 ||
+      String(existing?.eta?.modelVersion || '') !== 'EngineX-v1-edge'
     );
 
     let previousOutcome = null;
