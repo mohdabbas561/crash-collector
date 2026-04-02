@@ -1028,13 +1028,18 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
           hi:         existing.hi,
           generation: existing.generation,
         };
+        // Save ALL fields needed so this row can be passed back as a historyRow
+        // for calibration on future calls (via options.historyRows)
         resolvedHistory.push({
-          target:     `${target}x`,
-          outcome:    eval_.outcome,
+          target:     `${target}x`,          // e.g. "50x" — matches targetFromLabel()
+          outcome:    eval_.outcome,          // 'win' | 'early' | 'loss'
           lo:         Number(existing.lo),
           hi:         Number(existing.hi),
-          hitRound:   eval_.hitRound,
+          hitRound:   eval_.hitRound,         // null on loss
           generation: Number(existing.generation || 1),
+          probW:      existing?.eta?.pHit1 ?? existing?.eta?.hazardP1 ?? null, // predicted probability when lock was made
+          confidence: existing?.eta?.aiConfidence ?? existing?.confidence ?? null,
+          roundWhenMade: Number(existing.roundWhenMade),
         });
       }
 
