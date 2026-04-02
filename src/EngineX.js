@@ -818,8 +818,8 @@ function evaluateExistingLock(lock, hitRoundIds, currentRound) {
     if (firstHit < lo) return { resolved: true, status: 'resolved', outcome: 'early', hitRound: firstHit };
     if (firstHit <= hi) return { resolved: true, status: 'resolved', outcome: 'win', hitRound: firstHit };
   }
-  // Loss is only final once we are strictly past hi.
-  if (currentRound > hi) return { resolved: true, status: 'resolved', outcome: 'loss', hitRound: null };
+  // Close unresolved window immediately at hi boundary so history persists without a one-round lag.
+  if (currentRound >= hi) return { resolved: true, status: 'resolved', outcome: 'loss', hitRound: null };
   if (currentRound >= lo) return { resolved: false, status: 'window-open', outcome: null, hitRound: null };
   return { resolved: false, status: 'locked', outcome: null, hitRound: null };
 }
