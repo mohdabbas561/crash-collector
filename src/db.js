@@ -482,29 +482,6 @@ async function saveWallet({ privateKey, rpcUrl, playerAccountPDA, pubkey }) {
   const cleanPubkey = String(pubkey || '').trim() || null;
   const cleanRpcUrl = String(rpcUrl || '').trim() || null;
   const cleanPlayerPda = String(playerAccountPDA || '').trim() || null;
-
-  if (cleanPubkey) {
-    const existing = await pool.query(
-      `SELECT id FROM saved_wallets WHERE pubkey = $1 ORDER BY updated_at DESC LIMIT 1`,
-      [cleanPubkey]
-    );
-    const existingId = existing.rows?.[0]?.id;
-    if (existingId) {
-      const updated = await pool.query(
-        `UPDATE saved_wallets
-            SET private_key = $1,
-                rpc_url = $2,
-                player_account_pda = $3,
-                pubkey = $4,
-                updated_at = NOW()
-          WHERE id = $5
-        RETURNING *`,
-        [privateKey, cleanRpcUrl, cleanPlayerPda, cleanPubkey, existingId]
-      );
-      return updated.rows[0];
-    }
-  }
-
   const inserted = await pool.query(
     `INSERT INTO saved_wallets (private_key, rpc_url, player_account_pda, pubkey, updated_at)
      VALUES ($1, $2, $3, $4, NOW())
