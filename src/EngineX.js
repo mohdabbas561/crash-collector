@@ -836,9 +836,8 @@ function buildUiTarget(target, lock, status, currentRound, previousOutcome) {
   const lo = Number(lock?.lo);
   const hi = Number(lock?.hi);
   const eta = lock?.eta || {};
-  const isIdle = status === 'idle';
-  const aheadLo = isIdle ? null : (Number.isFinite(lo) ? Math.max(0, lo - currentRound) : null);
-  const aheadHi = isIdle ? null : (Number.isFinite(hi) ? Math.max(0, hi - currentRound) : null);
+  const aheadLo = Number.isFinite(lo) ? Math.max(0, lo - currentRound) : null;
+  const aheadHi = Number.isFinite(hi) ? Math.max(0, hi - currentRound) : null;
   const lockCreatedAtRound = Number(lock?.roundWhenMade ?? eta.lockCreatedAtRound ?? currentRound);
   const roundsSinceLock = Math.max(0, currentRound - lockCreatedAtRound);
   const lockStatus = (
@@ -856,9 +855,9 @@ function buildUiTarget(target, lock, status, currentRound, previousOutcome) {
     confidence: clamp(Number(lock?.confidence ?? eta.aiConfidence ?? 0), 0, 1),
     confidenceBand: confidenceBand(lock?.confidence ?? eta.aiConfidence ?? 0),
     window: {
-      lo: isIdle ? null : lo,
-      hi: isIdle ? null : hi,
-      span: (isIdle || !Number.isFinite(lo) || !Number.isFinite(hi)) ? null : Math.max(1, hi - lo + 1),
+      lo: Number.isFinite(lo) ? lo : null,
+      hi: Number.isFinite(hi) ? hi : null,
+      span: (!Number.isFinite(lo) || !Number.isFinite(hi)) ? null : Math.max(1, hi - lo + 1),
       roundsUntilWindow: aheadLo,
       roundsLeftInWindow: aheadHi,
       aheadLo,
@@ -1537,12 +1536,18 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg) {
   };
 }
 
-function buildIdleLock(targetResult, currentRound, generation) {
+function buildIdleLock(state, targetResult, currentRound, generation, cfg) {
   const live = targetResult.live;
+  const band = estimateAheadBand(state, targetResult);
+  const regimeWindowMult = clamp(Number(live?.regime?.windowMult ?? 1), 1, 1.35);
+  const aheadLo = Math.max(1, Math.round(band.aheadLo * regimeWindowMult));
+  const aheadHi = Math.max(aheadLo, Math.round(band.aheadHi * regimeWindowMult));
+  const lo = currentRound + aheadLo;
+  const hi = currentRound + aheadHi;
   const baselineP = 1 / targetResult.target;
   return {
-    lo: currentRound + 1,
-    hi: currentRound + 1,
+    lo,
+    hi,
     roundWhenMade: currentRound,
     generation,
     suspended: true,
@@ -1558,6 +1563,8 @@ function buildIdleLock(targetResult, currentRound, generation) {
       baseRate: roundNum(baselineP, 6),
       aiConfidence: roundNum(live?.confidence, 6),
       edgeConfidenceScore: roundNum(live?.edgeConfidenceScore, 6),
+      aheadLo,
+      aheadHi,
       lockCreatedAtRound: Number(currentRound),
       lockStatus: 'IDLE',
       isMutable: false,
@@ -1739,7 +1746,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
         lockToUse = existing;
         status = 'idle';
       } else {
-        lockToUse = buildIdleLock(result, currentRound, generation);
+        lockToUse = buildIdleLock(state, result, currentRound, generation, cfg);
         status = 'idle';
       }
     }
