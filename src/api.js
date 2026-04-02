@@ -1052,8 +1052,11 @@ app.post('/wallets', requireDatabase, requireAdminOrAccess, rateLimit(20), async
     const { privateKey, rpcUrl, playerAccountPDA, pubkey } = req.body;
     if (!privateKey) return res.status(400).json({ ok:false, error:'privateKey required' });
     const wallet = await saveWallet({ privateKey, rpcUrl, playerAccountPDA, pubkey });
+    const walletCount = (await getWallets())?.length || 0;
     res.json({
       ok: true,
+      saveMode: 'append_v2',
+      walletCount,
       wallet: {
         id: wallet?.id ?? null,
         rpc_url: wallet?.rpc_url ?? null,
