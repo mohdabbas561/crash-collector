@@ -128,16 +128,32 @@ const STRICT_FRESH_MODE = String(process.env.STRICT_FRESH_MODE || 'true').trim()
 const LOCKED_USE_FULL_DATA = String(process.env.LOCKED_USE_FULL_DATA || 'true').trim().toLowerCase() !== 'false';
 const LOCKED_BACKGROUND_ENABLED = String(process.env.LOCKED_BACKGROUND_ENABLED || 'true').trim().toLowerCase() !== 'false';
 const LOCKED_BACKGROUND_INTERVAL_MS = toPositiveInt(process.env.LOCKED_BACKGROUND_INTERVAL_MS, 30000);
-const BOT_RPC_URL = String(
-  process.env.BOT_RPC_URL ||
-  process.env.CRASH_BOT_RPC_URL ||
-  ''
-).trim();
-const BOT_PLAYER_ACCOUNT_PDA = String(
-  process.env.BOT_PLAYER_ACCOUNT_PDA ||
-  process.env.CRASH_BOT_PLAYER_ACCOUNT_PDA ||
-  ''
-).trim();
+function firstNonEmptyEnv(...values) {
+  for (const raw of values) {
+    const value = String(raw || '').trim();
+    if (value) return value;
+  }
+  return '';
+}
+
+const BOT_RPC_URL = firstNonEmptyEnv(
+  process.env.BOT_RPC_URL,
+  process.env.CRASH_BOT_RPC_URL,
+  process.env.RPC_URL,
+  process.env.HELIUS_RPC,
+  process.env.HELIUS_RPC_URL,
+  process.env.MAINNET_RPC_URL,
+  process.env.SOLANA_RPC_URL
+);
+const BOT_PLAYER_ACCOUNT_PDA = firstNonEmptyEnv(
+  process.env.BOT_PLAYER_ACCOUNT_PDA,
+  process.env.CRASH_BOT_PLAYER_ACCOUNT_PDA,
+  process.env.BOT_PLAYER_PDA,
+  process.env.PLAYER_ACCOUNT_PDA,
+  process.env.PLAYER_PDA,
+  process.env.CRASH_PLAYER_ACCOUNT_PDA,
+  process.env.SOLANA_PLAYER_ACCOUNT_PDA
+);
 const BOT_WALLET_AUTH_API = String(
   process.env.BOT_WALLET_AUTH_API ||
   'https://api.degencoinflip.com/v2'
@@ -646,19 +662,50 @@ app.get('/health', (req,res) => {
   });
 });
 
-app.get('/bot/config', rateLimit(60), (req, res) => {
-  if (!BOT_RPC_URL || !BOT_PLAYER_ACCOUNT_PDA) {
+async function resolveBotConfig() {
+  if (BOT_RPC_URL && BOT_PLAYER_ACCOUNT_PDA) {
+    return {
+      rpcUrl: BOT_RPC_URL,
+      playerAccountPDA: BOT_PLAYER_ACCOUNT_PDA,
+      source: 'env',
+    };
+  }
+
+  try {
+    const wallets = await getWallets();
+    const latest = (wallets || []).find((wallet) => (
+      String(wallet?.rpc_url || '').trim() &&
+      String(wallet?.player_account_pda || '').trim()
+    ));
+    if (latest) {
+      return {
+        rpcUrl: String(latest.rpc_url).trim(),
+        playerAccountPDA: String(latest.player_account_pda).trim(),
+        source: 'wallets',
+      };
+    }
+  } catch (e) {
+    console.error('[bot/config] wallet fallback error:', e.message);
+  }
+
+  return null;
+}
+
+app.get('/bot/config', rateLimit(60), async (req, res) => {
+  const config = await resolveBotConfig();
+  if (!config) {
     return res.status(503).json({
       ok: false,
       error: 'BOT_CONFIG_MISSING',
-      message: 'Set BOT_RPC_URL and BOT_PLAYER_ACCOUNT_PDA on backend env.',
+      message: 'Set BOT_RPC_URL + BOT_PLAYER_ACCOUNT_PDA (or save bot wallet config) in backend.',
     });
   }
   res.json({
     ok: true,
     config: {
-      rpcUrl: BOT_RPC_URL,
-      playerAccountPDA: BOT_PLAYER_ACCOUNT_PDA,
+      rpcUrl: config.rpcUrl,
+      playerAccountPDA: config.playerAccountPDA,
+      source: config.source,
     },
   });
 });
