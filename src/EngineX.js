@@ -1761,6 +1761,11 @@ function adjustAheadByRegime(baseAheadLo, fixedSpan, live, target = 0) {
   const momentumPressure = normalizePressure(live?.momentumScore, live?.momentumThreshold);
 
   const whiteDelta = clamp(whiteRisk - whiteRelease, 0, 1);
+  const softWhiteCaution = clamp(
+    (whiteDelta * 1.25) + (Math.max(0, -soonPressure) * 1.10),
+    0,
+    1.8
+  );
   const signalQuality = clamp(
     (
       clamp(Number(live?.edgeConfidenceScore ?? 0.5), 0, 1) * 0.45 +
@@ -1798,7 +1803,7 @@ function adjustAheadByRegime(baseAheadLo, fixedSpan, live, target = 0) {
             : 0.32
     );
     const whiteDrive = clamp(
-      ((whitePressure * 0.55) + (whiteDelta * 0.9)) * (0.55 + (signalQuality * 0.45)),
+      ((whitePressure * 0.50) + (whiteDelta * 0.80) + (softWhiteCaution * 0.35)) * (0.55 + (signalQuality * 0.45)),
       0,
       1.6
     );
@@ -1835,6 +1840,15 @@ function adjustAheadByRegime(baseAheadLo, fixedSpan, live, target = 0) {
             : 0.35
     );
     adjusted = Math.max(adjusted, Math.max(2, Math.round(base + (span * whiteFloorScale))));
+  }
+  // Soft delay floor even in NEUTRAL if white/downtrend pressure is building.
+  if (preState === 'NEUTRAL' && t <= 100 && softWhiteCaution >= 0.22) {
+    const neutralWhiteFloor = (
+      t <= 10 ? 0.55
+        : t <= 20 ? 0.46
+          : 0.34
+    );
+    adjusted = Math.max(adjusted, Math.max(2, Math.round(base + (span * neutralWhiteFloor))));
   }
   if (preState === 'RELEASE_PHASE' || preState === 'MOMENTUM') {
     // Pull closer during release/momentum so b2b/high phases are not missed.
@@ -2007,6 +2021,28 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
     trend = 'on_track';
   }
 
+  // Watch layer: show momentum/pressure drift even when not strong enough for hard earlier/later.
+  // This keeps banner informative between hard directional flips.
+  if (trend === 'on_track') {
+    const whiteWatch = (
+      Math.max(0, whiteRisk - whiteRelease) > 0.08 &&
+      soonPressure < 0.03
+    );
+    const releaseWatch = (
+      Math.max(0, soonPressure) > 0.04 ||
+      Math.max(0, b2bMomentum) > 0.06 ||
+      Number(aheadAdjust.releaseMomentum || 0) > 0.35
+    );
+
+    if (whiteWatch && !releaseWatch) {
+      trend = 'later_watch';
+      deltaRounds = Math.max(1, Math.round(Math.max(1, Math.abs(rawDelta) * 0.35)));
+    } else if (releaseWatch && !whiteWatch) {
+      trend = 'earlier_watch';
+      deltaRounds = -Math.max(1, Math.round(Math.max(1, Math.abs(rawDelta) * 0.35)));
+    }
+  }
+
   const absDelta = Math.abs(deltaRounds);
 
   let severity = 'low';
@@ -2020,8 +2056,12 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
   let message = `${target}x no change (as per lock).`;
   if (trend === 'earlier') {
     message = `${target}x may come earlier by ~${absDelta} rounds (around +${suggestedAheadLo}).`;
+  } else if (trend === 'earlier_watch') {
+    message = `${target}x early pressure building (watch ~${absDelta} rounds sooner, around +${suggestedAheadLo}).`;
   } else if (trend === 'later') {
     message = `${target}x may come later by ~${absDelta} rounds (around +${suggestedAheadLo}).`;
+  } else if (trend === 'later_watch') {
+    message = `${target}x delay pressure building (watch ~${absDelta} rounds later, around +${suggestedAheadLo}).`;
   } else if (preconditionState === 'RELEASE_PHASE' || preconditionState === 'MOMENTUM') {
     message = `${target}x no shift yet (as per lock), but ${preconditionState === 'MOMENTUM' ? 'momentum' : 'release'} is building.`;
   } else if (preconditionState === 'WHITE_DOMINANT') {
@@ -2041,13 +2081,13 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
   const reasonParts = [];
   reasonParts.push(`regime ${regimeLabel}`);
   reasonParts.push(`state ${preconditionState}`);
-  if (trend === 'earlier') {
+  if (trend === 'earlier' || trend === 'earlier_watch') {
     if (soonPressure > 0.04) reasonParts.push(`near-hit pressure above baseline (${roundNum(soonPressure, 3)})`);
     if (b2bMomentum > 0.05) reasonParts.push(`b2b momentum rising (${roundNum(b2bMomentum, 3)})`);
     if (Number(aheadAdjust.releaseMomentum || 0) > 0.35) {
       reasonParts.push(`release momentum active (${roundNum(aheadAdjust.releaseMomentum, 3)})`);
     }
-  } else if (trend === 'later') {
+  } else if (trend === 'later' || trend === 'later_watch') {
     if (Number(aheadAdjust.whitePressure || 0) > 0.15) {
       reasonParts.push(`white pressure elevated (${roundNum(aheadAdjust.whitePressure, 3)})`);
     }
