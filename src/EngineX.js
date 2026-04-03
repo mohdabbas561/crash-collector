@@ -1791,12 +1791,18 @@ function adjustAheadByRegime(baseAheadLo, fixedSpan, live, target = 0) {
 
   let delayBoost = 0;
   if (whitePressure > 0 || whiteDelta > 0 || preState === 'WHITE_DOMINANT') {
+    const delaySpanScale = (
+      t <= 10 ? 0.72
+        : t <= 20 ? 0.62
+          : t <= 100 ? 0.46
+            : 0.32
+    );
     const whiteDrive = clamp(
       ((whitePressure * 0.55) + (whiteDelta * 0.9)) * (0.55 + (signalQuality * 0.45)),
       0,
       1.6
     );
-    delayBoost = Math.round((span * 0.28) * whiteDrive);
+    delayBoost = Math.round((span * delaySpanScale) * whiteDrive);
   }
   let nearPull = 0;
   if (releaseMomentum > 0 || preState === 'RELEASE_PHASE' || preState === 'MOMENTUM') {
@@ -1821,8 +1827,14 @@ function adjustAheadByRegime(baseAheadLo, fixedSpan, live, target = 0) {
   let adjusted = Math.max(1, base + delayBoost - nearPull);
 
   if (preState === 'WHITE_DOMINANT') {
-    // Extend on white regime, but keep moderate (avoid over-restrictive far locks).
-    adjusted = Math.max(adjusted, Math.max(2, Math.round(base + (span * 0.35))));
+    // Extend on white regime with target-aware floor so low targets do not reopen too early.
+    const whiteFloorScale = (
+      t <= 10 ? 0.75
+        : t <= 20 ? 0.68
+          : t <= 100 ? 0.52
+            : 0.35
+    );
+    adjusted = Math.max(adjusted, Math.max(2, Math.round(base + (span * whiteFloorScale))));
   }
   if (preState === 'RELEASE_PHASE' || preState === 'MOMENTUM') {
     // Pull closer during release/momentum so b2b/high phases are not missed.
@@ -1922,8 +1934,7 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
   const suggestedLoRaw = currentRound + calibratedAheadLo;
   const rawDelta = Math.round(suggestedLoRaw - lockedLo);
   const scaledDelta = Math.round(rawDelta * (0.40 + (hintReliability * 0.60)));
-  const deltaRounds = scaledDelta;
-  const absDelta = Math.abs(deltaRounds);
+  let deltaRounds = scaledDelta;
 
   let trend = 'on_track';
   // Conservative thresholds (especially for low targets) to prevent noisy false alerts.
@@ -1948,6 +1959,41 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
     (whiteRisk - whiteRelease) > 0.06
   );
 
+  // Regime-aware directional nudges:
+  // if white pressure is genuinely dominating, force a bounded delay hint;
+  // if release/momentum is genuinely dominating, force a bounded early hint.
+  const whiteDominantNow = preconditionState === 'WHITE_DOMINANT';
+  const releaseOrMomentumNow = preconditionState === 'RELEASE_PHASE' || preconditionState === 'MOMENTUM';
+  const whiteDrive = (
+    (Number(aheadAdjust.whitePressure || 0) * 0.60) +
+    (Math.max(0, whiteRisk - whiteRelease) * 1.10) -
+    (Math.max(0, soonPressure) * 0.70) -
+    (Math.max(0, b2bMomentum) * 0.45)
+  );
+  const releaseDrive = (
+    (Number(aheadAdjust.releaseMomentum || 0) * 0.75) +
+    (Math.max(0, soonPressure) * 2.20) +
+    (Math.max(0, b2bMomentum) * 1.10) -
+    (Math.max(0, whiteRisk - whiteRelease) * 0.75)
+  );
+  const delayMinShift = (
+    target <= 20 ? 2
+      : target <= 100 ? 3
+        : 6
+  );
+  const earlyMinShift = (
+    target <= 20 ? 1
+      : target <= 100 ? 2
+        : 4
+  );
+  if (whiteDominantNow && whiteDrive >= 0.20 && trend !== 'earlier') {
+    trend = 'later';
+    deltaRounds = Math.max(deltaRounds, delayMinShift);
+  } else if (releaseOrMomentumNow && releaseDrive >= 0.18 && trend !== 'later') {
+    trend = 'earlier';
+    deltaRounds = Math.min(deltaRounds, -earlyMinShift);
+  }
+
   // Low-quality signal gate: avoid directional hints unless evidence is strong.
   if (directionalReliability < 0.50 && !(strongEarlierEvidence || strongLaterEvidence)) {
     trend = 'on_track';
@@ -1960,6 +2006,8 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
   if (target <= 10 && trend === 'later' && Math.max(0, b2bMomentum) > 0.08) {
     trend = 'on_track';
   }
+
+  const absDelta = Math.abs(deltaRounds);
 
   let severity = 'low';
   if (absDelta >= 8) severity = 'high';
