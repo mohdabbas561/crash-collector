@@ -1863,6 +1863,8 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
   const target = Number(targetResult?.target || 0);
   const fixedSpan = Number(FIXED_WINDOW_SPAN[target] || 3);
   const live = targetResult.live;
+  const regimeLabel = String(live?.regime?.label || 'NEUTRAL').toUpperCase();
+  const preconditionState = String(live?.preconditionState || 'NEUTRAL').toUpperCase();
   const band = estimateAheadBand(state, targetResult);
   const regimeWindowMult = clamp(Number(live?.regime?.windowMult ?? 1), 1, 1.35);
   const baseAheadLo = Math.max(1, Math.round(band.aheadLo * regimeWindowMult));
@@ -1972,9 +1974,25 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
     message = `${target}x may come earlier by ~${absDelta} rounds (around +${suggestedAheadLo}).`;
   } else if (trend === 'later') {
     message = `${target}x may come later by ~${absDelta} rounds (around +${suggestedAheadLo}).`;
+  } else if (preconditionState === 'RELEASE_PHASE' || preconditionState === 'MOMENTUM') {
+    message = `${target}x no shift yet (as per lock), but ${preconditionState === 'MOMENTUM' ? 'momentum' : 'release'} is building.`;
+  } else if (preconditionState === 'WHITE_DOMINANT') {
+    message = `${target}x no shift yet (as per lock), white pressure is elevated.`;
+  } else if (regimeLabel === 'TRENDING') {
+    message = `${target}x no change (as per lock), trend regime is stable.`;
+  } else if (regimeLabel === 'VOLATILE') {
+    message = `${target}x no change (as per lock), volatility regime is elevated.`;
+  } else if (regimeLabel === 'CLUSTERED') {
+    message = `${target}x no change (as per lock), clustered flow is active.`;
+  } else if (regimeLabel === 'RANDOM') {
+    message = `${target}x no change (as per lock), random/noise regime is active.`;
+  } else if (Math.abs(soonPressure) >= 0.02) {
+    message = `${target}x no change (as per lock), near-hit pressure is slightly ${soonPressure > 0 ? 'up' : 'down'}.`;
   }
 
   const reasonParts = [];
+  reasonParts.push(`regime ${regimeLabel}`);
+  reasonParts.push(`state ${preconditionState}`);
   if (trend === 'earlier') {
     if (soonPressure > 0.04) reasonParts.push(`near-hit pressure above baseline (${roundNum(soonPressure, 3)})`);
     if (b2bMomentum > 0.05) reasonParts.push(`b2b momentum rising (${roundNum(b2bMomentum, 3)})`);
@@ -1994,6 +2012,17 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
   } else {
     reasonParts.push(`pressures are balanced`);
     reasonParts.push(`no strong early/delay edge`);
+    if (Math.abs(soonPressure) >= 0.02) {
+      reasonParts.push(`near-hit pressure ${soonPressure > 0 ? 'above' : 'below'} baseline (${roundNum(soonPressure, 3)})`);
+    }
+    if (Math.abs(b2bMomentum) >= 0.04) {
+      reasonParts.push(`b2b momentum ${b2bMomentum > 0 ? 'up' : 'down'} (${roundNum(b2bMomentum, 3)})`);
+    }
+    if (Number(aheadAdjust.whitePressure || 0) >= 0.12 || Math.abs(whiteRisk - whiteRelease) >= 0.04) {
+      reasonParts.push(
+        `white pressure ${roundNum(Number(aheadAdjust.whitePressure || 0), 3)} | continue-release ${roundNum(whiteRisk - whiteRelease, 3)}`
+      );
+    }
   }
   reasonParts.push(`signal quality ${Math.round(directionalReliability * 100)}%`);
   const reason = reasonParts.join(' | ');
