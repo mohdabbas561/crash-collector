@@ -1957,13 +1957,13 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
   const whiteRelease = clamp(Number(live?.whiteRebound ?? 0), 0, 1);
 
   const delayBias = (
-    clamp(Number(aheadAdjust.whitePressure || 0), 0, 3) * 1.20 +
-    Math.max(0, whiteRisk - whiteRelease) * 2.00
+    clamp(Number(aheadAdjust.whitePressure || 0), 0, 3) * 1.00 +
+    Math.max(0, whiteRisk - whiteRelease) * 1.55
   );
   const earlyBias = (
-    clamp(Number(aheadAdjust.releaseMomentum || 0), 0, 3) * 0.90 +
-    Math.max(0, b2bMomentum) * 1.20 +
-    Math.max(0, soonPressure) * 4.00
+    clamp(Number(aheadAdjust.releaseMomentum || 0), 0, 3) * 1.00 +
+    Math.max(0, b2bMomentum) * 1.30 +
+    Math.max(0, soonPressure) * 4.20
   );
 
   let calibratedAheadLo = dynamicAheadLo + Math.round(delayBias - earlyBias);
@@ -2052,6 +2052,21 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
   // Watch layer: show momentum/pressure drift even when not strong enough for hard earlier/later.
   // This keeps banner informative between hard directional flips.
   if (trend === 'on_track') {
+    const watchThreshold = (
+      target <= 20 ? 0.14
+        : target <= 100 ? 0.12
+          : 0.10
+    );
+    const watchDominanceGap = (
+      target <= 20 ? 0.05
+        : target <= 100 ? 0.04
+          : 0.03
+    );
+    const minWatchDelta = (
+      target <= 20 ? 2
+        : target <= 100 ? 2
+          : 3
+    );
     const whiteWatchScore = clamp(
       (Math.max(0, whiteRisk - whiteRelease) * 1.25) +
       (Number(aheadAdjust.whitePressure || 0) * 0.35) +
@@ -2066,17 +2081,19 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
       0,
       3
     );
-    const whiteWatch = whiteWatchScore >= 0.08;
-    const releaseWatch = releaseWatchScore >= 0.08;
+    const whiteWatch = whiteWatchScore >= watchThreshold;
+    const releaseWatch = releaseWatchScore >= watchThreshold;
+    const maxWatchScore = Math.max(whiteWatchScore, releaseWatchScore);
+    const weakNearShift = Math.abs(rawDelta) < minWatchDelta && maxWatchScore < (watchThreshold + 0.08);
 
-    if (whiteWatch && releaseWatch) {
-      if ((whiteWatchScore - releaseWatchScore) >= 0.03) {
+    if (!weakNearShift && whiteWatch && releaseWatch) {
+      if ((whiteWatchScore - releaseWatchScore) >= watchDominanceGap) {
         trend = 'later_watch';
         deltaRounds = Math.max(1, Math.round(Math.max(1, Math.abs(rawDelta) * 0.35)));
-      } else if ((releaseWatchScore - whiteWatchScore) >= 0.03) {
+      } else if ((releaseWatchScore - whiteWatchScore) >= watchDominanceGap) {
         trend = 'earlier_watch';
         deltaRounds = -Math.max(1, Math.round(Math.max(1, Math.abs(rawDelta) * 0.35)));
-      } else if (Math.max(whiteWatchScore, releaseWatchScore) >= 0.20) {
+      } else if (maxWatchScore >= (watchThreshold + 0.08)) {
         if (whiteWatchScore >= releaseWatchScore) {
           trend = 'later_watch';
           deltaRounds = Math.max(1, Math.round(Math.max(1, Math.abs(rawDelta) * 0.30)));
@@ -2085,19 +2102,32 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
           deltaRounds = -Math.max(1, Math.round(Math.max(1, Math.abs(rawDelta) * 0.30)));
         }
       }
-    } else if (whiteWatch) {
+    } else if (!weakNearShift && whiteWatch) {
       trend = 'later_watch';
       deltaRounds = Math.max(1, Math.round(Math.max(1, Math.abs(rawDelta) * 0.35)));
-    } else if (releaseWatch) {
+    } else if (!weakNearShift && releaseWatch) {
       trend = 'earlier_watch';
       deltaRounds = -Math.max(1, Math.round(Math.max(1, Math.abs(rawDelta) * 0.35)));
     }
   }
-  if (trend === 'on_track' && Math.abs(rawDelta) >= 2 && directionalReliability >= 0.28) {
+  if (trend === 'on_track' && Math.abs(rawDelta) >= 4 && directionalReliability >= 0.42) {
     trend = rawDelta > 0 ? 'later_watch' : 'earlier_watch';
     deltaRounds = rawDelta > 0
       ? Math.max(1, Math.round(Math.abs(rawDelta) * 0.30))
       : -Math.max(1, Math.round(Math.abs(rawDelta) * 0.30));
+  }
+
+  if ((trend === 'later_watch' || trend === 'earlier_watch') && Math.abs(deltaRounds) <= 1) {
+    const watchStrength = Math.max(
+      Number(aheadAdjust.whitePressure || 0),
+      Number(aheadAdjust.releaseMomentum || 0),
+      Math.max(0, Math.abs(soonPressure)),
+      Math.max(0, Math.abs(b2bMomentum))
+    );
+    if (directionalReliability < 0.50 && watchStrength < 0.22) {
+      trend = 'on_track';
+      deltaRounds = 0;
+    }
   }
 
   const absDelta = Math.abs(deltaRounds);
