@@ -1926,18 +1926,28 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
   let trend = 'on_track';
   // Conservative thresholds (especially for low targets) to prevent noisy false alerts.
   const reliabilityPenalty = Math.max(0, 0.60 - directionalReliability);
-  const reliabilityBoost = Math.round(reliabilityPenalty * 6);
+  const reliabilityBoost = Math.round(reliabilityPenalty * 4);
   const trendThreshold = (
-    target <= 20 ? 4
-    : target <= 100 ? 3
+    target <= 20 ? 3
+    : target <= 100 ? 2
     : 2
   ) + (hintReliability < 0.5 ? 1 : 0) + reliabilityBoost;
 
   if (deltaRounds <= -trendThreshold) trend = 'earlier';
   if (deltaRounds >= trendThreshold) trend = 'later';
 
-  // Low-quality signal gate: avoid directional hints unless quality is adequate.
-  if (directionalReliability < 0.50) {
+  const strongEarlierEvidence = (
+    soonPressure > (target <= 100 ? 0.05 : 0.03) ||
+    Math.max(0, b2bMomentum) > (target <= 100 ? 0.08 : 0.05) ||
+    Number(aheadAdjust.releaseMomentum || 0) > 0.55
+  );
+  const strongLaterEvidence = (
+    Number(aheadAdjust.whitePressure || 0) > 0.45 &&
+    (whiteRisk - whiteRelease) > 0.06
+  );
+
+  // Low-quality signal gate: avoid directional hints unless evidence is strong.
+  if (directionalReliability < 0.50 && !(strongEarlierEvidence || strongLaterEvidence)) {
     trend = 'on_track';
   }
 
@@ -2008,13 +2018,26 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
 
 function buildLockFromLive(state, targetResult, currentRound, generation, cfg, options = {}) {
   const forceLock = Boolean(options?.forceLock);
+  const previousOutcome = options?.previousOutcome || null;
   const live = targetResult.live;
   const band = estimateAheadBand(state, targetResult);
   const regimeWindowMult = clamp(Number(live?.regime?.windowMult ?? 1), 1, 1.35);
   const fixedSpan = Number(FIXED_WINDOW_SPAN[targetResult.target] || 3);
   const baseAheadLo = Math.max(1, Math.round(band.aheadLo * regimeWindowMult));
   const aheadAdjust = adjustAheadByRegime(baseAheadLo, fixedSpan, live, targetResult.target);
-  const aheadLo = aheadAdjust.adjustedAheadLo;
+  let aheadLo = aheadAdjust.adjustedAheadLo;
+  if (previousOutcome && String(previousOutcome.outcome || '').toLowerCase() === 'early') {
+    const prevLo = Number(previousOutcome.lo);
+    const prevHit = Number(previousOutcome.hitRound);
+    if (Number.isFinite(prevLo) && Number.isFinite(prevHit)) {
+      const earlyBy = Math.max(1, prevLo - prevHit);
+      const quality = clamp(Number(live?.edgeConfidenceScore ?? 0.5), 0, 1);
+      const pull = Math.round(Math.min(earlyBy, fixedSpan * 2) * (0.45 + (quality * 0.35)));
+      aheadLo = Math.max(1, aheadLo - Math.max(1, pull));
+    } else {
+      aheadLo = Math.max(1, aheadLo - Math.max(1, Math.round(fixedSpan * 0.35)));
+    }
+  }
   const aheadHi = Math.max(aheadLo, aheadLo + fixedSpan - 1);
   const lo = currentRound + aheadLo;
   const hi = lo + fixedSpan - 1;
@@ -2378,7 +2401,10 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
         lockToUse = existing;
         status = 'idle';
       } else if (liveResult.live.actionable || cfg.alwaysEmitLocks) {
-        lockToUse = buildLockFromLive(state, liveResult, currentRound, generation, cfg, { forceLock: Boolean(cfg.alwaysEmitLocks) });
+        lockToUse = buildLockFromLive(state, liveResult, currentRound, generation, cfg, {
+          forceLock: Boolean(cfg.alwaysEmitLocks),
+          previousOutcome,
+        });
         status = lockToUse?.suspended ? 'idle' : 'locked';
         relockedCount += 1;
       } else {
