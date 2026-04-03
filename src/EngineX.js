@@ -1750,36 +1750,52 @@ function adjustAheadByRegime(baseAheadLo, fixedSpan, live) {
   const preState = String(live?.preconditionState || 'NEUTRAL').toUpperCase();
   const whiteRisk = clamp(Number(live?.whiteContinue || 0), 0, 1);
   const whiteRelease = clamp(Number(live?.whiteRebound || 0), 0, 1);
+  const b2bMomentum = clamp(Number(live?.b2bMomentum || 0), -1, 1);
+  const pHitSoon = clamp(Number(live?.pHitSoon ?? live?.pFinal ?? live?.pAdj ?? 0), 0, 1);
+  const baselineP = clamp(Number(live?.baselineP ?? 0), 0, 1);
+  const soonPressure = clamp(pHitSoon - baselineP, -1, 1);
 
   const whitePressure = normalizePressure(live?.whiteRegimeScore, live?.whiteRegimeThreshold);
   const releasePressure = normalizePressure(live?.releaseScore, live?.releaseThreshold);
   const momentumPressure = normalizePressure(live?.momentumScore, live?.momentumThreshold);
 
   const whiteDelta = clamp(whiteRisk - whiteRelease, 0, 1);
-  const releaseMomentum = Math.max(releasePressure, momentumPressure, clamp(whiteRelease - whiteRisk, 0, 1));
+  const releaseMomentum = Math.max(
+    releasePressure,
+    momentumPressure,
+    clamp(whiteRelease - whiteRisk, 0, 1),
+    Math.max(0, b2bMomentum),
+    Math.max(0, soonPressure)
+  );
 
   let delayBoost = 0;
   if (whitePressure > 0 || whiteDelta > 0 || preState === 'WHITE_DOMINANT') {
-    delayBoost = Math.round((span * 0.65) * (1 + whitePressure + whiteDelta));
+    const whiteDrive = clamp((whitePressure * 0.55) + (whiteDelta * 0.9), 0, 1.6);
+    delayBoost = Math.round((span * 0.28) * whiteDrive);
   }
   let nearPull = 0;
   if (releaseMomentum > 0 || preState === 'RELEASE_PHASE' || preState === 'MOMENTUM') {
-    nearPull = Math.round((span * 0.45) * Math.min(1.5, 0.5 + releaseMomentum));
+    const releaseDrive = clamp((releaseMomentum * 0.85) + (Math.max(0, b2bMomentum) * 0.45), 0, 1.8);
+    nearPull = Math.round((span * 0.52) * releaseDrive);
   }
 
   let adjusted = Math.max(1, base + delayBoost - nearPull);
 
   if (preState === 'WHITE_DOMINANT') {
-    adjusted = Math.max(adjusted, Math.max(4, Math.round(span * 2.5)));
+    // Extend on white regime, but keep moderate (avoid over-restrictive far locks).
+    adjusted = Math.max(adjusted, Math.max(2, Math.round(base + (span * 0.35))));
   }
   if (preState === 'RELEASE_PHASE' || preState === 'MOMENTUM') {
-    adjusted = Math.min(adjusted, Math.max(1, Math.round(span * 0.35)));
+    // Pull closer during release/momentum so b2b/high phases are not missed.
+    adjusted = Math.min(adjusted, Math.max(1, Math.round(base * 0.72)));
   }
 
   return {
     adjustedAheadLo: adjusted,
     whitePressure: roundNum(whitePressure, 6),
     releaseMomentum: roundNum(releaseMomentum, 6),
+    soonPressure: roundNum(soonPressure, 6),
+    b2bMomentum: roundNum(b2bMomentum, 6),
     delayBoost,
     nearPull,
     preState,
@@ -1875,7 +1891,7 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
   const suggestedHi = suggestedLo + fixedSpan - 1;
   const suggestedAheadLo = Math.max(1, suggestedLo - currentRound);
 
-  let message = `${target}x on-track with current lock timing.`;
+  let message = `${target}x no change (as per lock).`;
   if (trend === 'earlier') {
     message = `${target}x may come earlier by ~${absDelta} rounds (around +${suggestedAheadLo}).`;
   } else if (trend === 'later') {
