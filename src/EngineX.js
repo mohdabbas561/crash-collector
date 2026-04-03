@@ -1273,16 +1273,17 @@ function estimateAheadBand(state, targetResult) {
 
   const ref = Number.isFinite(q50) ? q50 : Math.max(1, geoLo);
   const overdue = clamp((gapNow - ref) / Math.max(1, ref), -0.8, 1.5);
-  lo = Math.max(1, Math.round(lo * (1 - 0.22 * overdue)));
-  hi = Math.max(lo, Math.round(hi * (1 - 0.16 * overdue)));
+  // Keep gap influence weak to avoid gambler's-fallacy style drift.
+  lo = Math.max(1, Math.round(lo * (1 - 0.08 * overdue)));
+  hi = Math.max(lo, Math.round(hi * (1 - 0.06 * overdue)));
 
   const edgeNorm = clamp(
     (Number(live.edge || 0)) / Math.max(1e-6, Number(live.baselineP || (1 / targetResult.target))),
     -1,
     2
   );
-  lo = Math.max(1, Math.round(lo * (1 - 0.15 * edgeNorm)));
-  hi = Math.max(lo, Math.round(hi * (1 - 0.10 * edgeNorm)));
+  lo = Math.max(1, Math.round(lo * (1 - 0.12 * edgeNorm)));
+  hi = Math.max(lo, Math.round(hi * (1 - 0.08 * edgeNorm)));
 
   if (live.entropy?.randomLike) {
     lo = Math.max(1, Math.round(lo * 1.10));
@@ -1469,8 +1470,15 @@ function runTargetWalkForward(state, target, cfg) {
       Number.isFinite(brierMeans.hazard) &&
       Number.isFinite(brierMeans.baseline)
     );
-    if (hazardEligible && (brierMeans.hazard >= (brierMeans.baseline + Math.max(0, cfg.hazardDisableTolerance)))) {
-      hazardDisabled = true;
+    if (hazardEligible) {
+      const tol = Math.max(0, cfg.hazardDisableTolerance);
+      if (brierMeans.hazard >= (brierMeans.baseline + tol)) {
+        hazardDisabled = true;
+      } else if (brierMeans.hazard < brierMeans.baseline) {
+        // Re-enable hazard when rolling evidence says it adds value again.
+        // This keeps all engines participating when they are actually useful.
+        hazardDisabled = false;
+      }
     }
 
     const pHaz = hazardDisabled ? null : hazardPredictAt(state, targetState, idx, cfg);
@@ -1766,6 +1774,13 @@ function adjustAheadByRegime(baseAheadLo, fixedSpan, live, target = 0) {
     0,
     1.8
   );
+  const downtrendPressure = clamp(
+    (softWhiteCaution * 0.75) +
+    (Math.max(0, -soonPressure) * 1.05) +
+    (Number(live?.entropy?.randomLike) ? 0.35 : 0),
+    0,
+    2
+  );
   const signalQuality = clamp(
     (
       clamp(Number(live?.edgeConfidenceScore ?? 0.5), 0, 1) * 0.45 +
@@ -1809,6 +1824,15 @@ function adjustAheadByRegime(baseAheadLo, fixedSpan, live, target = 0) {
     );
     delayBoost = Math.round((span * delaySpanScale) * whiteDrive);
   }
+  if (downtrendPressure > 0.15) {
+    const downtrendScale = (
+      t <= 10 ? 0.58
+        : t <= 20 ? 0.48
+          : t <= 100 ? 0.36
+            : 0.24
+    );
+    delayBoost += Math.round((span * downtrendScale) * clamp(downtrendPressure, 0, 1.8));
+  }
   let nearPull = 0;
   if (releaseMomentum > 0 || preState === 'RELEASE_PHASE' || preState === 'MOMENTUM') {
     const releaseDrive = clamp(
@@ -1827,6 +1851,10 @@ function adjustAheadByRegime(baseAheadLo, fixedSpan, live, target = 0) {
       ))
     );
     nearPull = Math.min(nearPullRaw, maxPullCap);
+    // Guard against bullish bias during low/downtrend pressure:
+    // keep early pull small when white/downtrend evidence is elevated.
+    const pullSuppression = clamp(downtrendPressure * 0.55, 0, 0.85);
+    nearPull = Math.max(0, Math.round(nearPull * (1 - pullSuppression)));
   }
 
   let adjusted = Math.max(1, base + delayBoost - nearPull);
@@ -1952,25 +1980,25 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
 
   let trend = 'on_track';
   // Conservative thresholds (especially for low targets) to prevent noisy false alerts.
-  const reliabilityPenalty = Math.max(0, 0.60 - directionalReliability);
-  const reliabilityBoost = Math.round(reliabilityPenalty * 4);
+  const reliabilityPenalty = Math.max(0, 0.45 - directionalReliability);
+  const reliabilityBoost = Math.round(reliabilityPenalty * 2);
   const trendThreshold = (
-    target <= 20 ? 3
+    target <= 20 ? 2
     : target <= 100 ? 2
-    : 2
+    : 3
   ) + (hintReliability < 0.5 ? 1 : 0) + reliabilityBoost;
 
   if (deltaRounds <= -trendThreshold) trend = 'earlier';
   if (deltaRounds >= trendThreshold) trend = 'later';
 
   const strongEarlierEvidence = (
-    soonPressure > (target <= 100 ? 0.05 : 0.03) ||
-    Math.max(0, b2bMomentum) > (target <= 100 ? 0.08 : 0.05) ||
-    Number(aheadAdjust.releaseMomentum || 0) > 0.55
+    soonPressure > (target <= 100 ? 0.035 : 0.025) ||
+    Math.max(0, b2bMomentum) > (target <= 100 ? 0.06 : 0.04) ||
+    Number(aheadAdjust.releaseMomentum || 0) > 0.45
   );
   const strongLaterEvidence = (
-    Number(aheadAdjust.whitePressure || 0) > 0.45 &&
-    (whiteRisk - whiteRelease) > 0.06
+    Number(aheadAdjust.whitePressure || 0) > 0.30 &&
+    (whiteRisk - whiteRelease) > 0.04
   );
 
   // Regime-aware directional nudges:
@@ -2009,7 +2037,7 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
   }
 
   // Low-quality signal gate: avoid directional hints unless evidence is strong.
-  if (directionalReliability < 0.50 && !(strongEarlierEvidence || strongLaterEvidence)) {
+  if (directionalReliability < 0.35 && !(strongEarlierEvidence || strongLaterEvidence)) {
     trend = 'on_track';
   }
 
@@ -2038,14 +2066,14 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
       0,
       3
     );
-    const whiteWatch = whiteWatchScore >= 0.12;
-    const releaseWatch = releaseWatchScore >= 0.12;
+    const whiteWatch = whiteWatchScore >= 0.08;
+    const releaseWatch = releaseWatchScore >= 0.08;
 
     if (whiteWatch && releaseWatch) {
-      if ((whiteWatchScore - releaseWatchScore) >= 0.04) {
+      if ((whiteWatchScore - releaseWatchScore) >= 0.03) {
         trend = 'later_watch';
         deltaRounds = Math.max(1, Math.round(Math.max(1, Math.abs(rawDelta) * 0.35)));
-      } else if ((releaseWatchScore - whiteWatchScore) >= 0.04) {
+      } else if ((releaseWatchScore - whiteWatchScore) >= 0.03) {
         trend = 'earlier_watch';
         deltaRounds = -Math.max(1, Math.round(Math.max(1, Math.abs(rawDelta) * 0.35)));
       } else if (Math.max(whiteWatchScore, releaseWatchScore) >= 0.20) {
@@ -2064,6 +2092,12 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
       trend = 'earlier_watch';
       deltaRounds = -Math.max(1, Math.round(Math.max(1, Math.abs(rawDelta) * 0.35)));
     }
+  }
+  if (trend === 'on_track' && Math.abs(rawDelta) >= 2 && directionalReliability >= 0.28) {
+    trend = rawDelta > 0 ? 'later_watch' : 'earlier_watch';
+    deltaRounds = rawDelta > 0
+      ? Math.max(1, Math.round(Math.abs(rawDelta) * 0.30))
+      : -Math.max(1, Math.round(Math.abs(rawDelta) * 0.30));
   }
 
   const absDelta = Math.abs(deltaRounds);
@@ -2166,6 +2200,33 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg, o
   const baseAheadLo = Math.max(1, Math.round(band.aheadLo * regimeWindowMult));
   const aheadAdjust = adjustAheadByRegime(baseAheadLo, fixedSpan, live, targetResult.target);
   let aheadLo = aheadAdjust.adjustedAheadLo;
+  const preState = String(live?.preconditionState || 'NEUTRAL').toUpperCase();
+  const regimeLabel = String(live?.regime?.label || 'RANDOM').toUpperCase();
+  const whiteRisk = clamp(Number(live?.whiteContinue || 0), 0, 1);
+  const whiteRelease = clamp(Number(live?.whiteRebound || 0), 0, 1);
+  const whiteDelta = Math.max(0, whiteRisk - whiteRelease);
+  const pHitSoon = clamp(Number(live?.pHitSoon ?? live?.pFinal ?? live?.pAdj ?? 0), 0, 1);
+  const baselineP = clamp(Number(live?.baselineP ?? (targetResult?.target > 0 ? (1 / targetResult.target) : 0)), 0, 1);
+  const soonPressure = pHitSoon - baselineP;
+  const entropyRandomLike = Boolean(live?.entropy?.randomLike || live?.entropy?.disabled);
+  const lowTrendStrength = clamp(
+    (Number(aheadAdjust?.whitePressure || 0) * 0.60) +
+    (whiteDelta * 1.15) +
+    (entropyRandomLike ? 0.40 : 0) +
+    (regimeLabel === 'RANDOM' ? 0.35 : 0) +
+    (regimeLabel === 'VOLATILE' ? 0.18 : 0) +
+    (preState === 'WHITE_DOMINANT' ? 0.45 : 0) +
+    (Math.max(0, -soonPressure) * 1.20),
+    0,
+    3
+  );
+  const lowTrendMode = (
+    preState === 'WHITE_DOMINANT' ||
+    regimeLabel === 'RANDOM' ||
+    entropyRandomLike ||
+    whiteDelta > 0.06 ||
+    lowTrendStrength >= 0.45
+  );
   if (previousOutcome && String(previousOutcome.outcome || '').toLowerCase() === 'early') {
     const prevLo = Number(previousOutcome.lo);
     const prevHit = Number(previousOutcome.hitRound);
@@ -2173,40 +2234,23 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg, o
       const earlyBy = Math.max(1, prevLo - prevHit);
       const quality = clamp(Number(live?.edgeConfidenceScore ?? 0.5), 0, 1);
       const pull = Math.round(Math.min(earlyBy, fixedSpan * 2) * (0.45 + (quality * 0.35)));
-      aheadLo = Math.max(1, aheadLo - Math.max(1, pull));
+      const adjustedPull = lowTrendMode
+        ? Math.max(0, Math.round(Math.max(1, pull) * clamp(1 - (lowTrendStrength * 0.35), 0.15, 0.75)))
+        : Math.max(1, pull);
+      aheadLo = Math.max(1, aheadLo - adjustedPull);
     } else {
-      aheadLo = Math.max(1, aheadLo - Math.max(1, Math.round(fixedSpan * 0.35)));
+      const fallbackPull = Math.max(1, Math.round(fixedSpan * 0.35));
+      const adjustedFallbackPull = lowTrendMode
+        ? Math.max(0, Math.round(fallbackPull * clamp(1 - (lowTrendStrength * 0.30), 0.20, 0.80)))
+        : fallbackPull;
+      aheadLo = Math.max(1, aheadLo - adjustedFallbackPull);
+    }
+    if (lowTrendMode) {
+      // Prevent instant re-open after EARLY during low/downtrend pressure.
+      aheadLo += Math.max(1, Math.round(fixedSpan * 0.22));
     }
   } else if (previousOutcome && String(previousOutcome.outcome || '').toLowerCase() === 'loss') {
     // After LOSS, apply cooldown in low/downtrend regimes so locks do not reopen too aggressively.
-    const preState = String(live?.preconditionState || 'NEUTRAL').toUpperCase();
-    const regimeLabel = String(live?.regime?.label || 'RANDOM').toUpperCase();
-    const whiteRisk = clamp(Number(live?.whiteContinue || 0), 0, 1);
-    const whiteRelease = clamp(Number(live?.whiteRebound || 0), 0, 1);
-    const whiteDelta = Math.max(0, whiteRisk - whiteRelease);
-    const pHitSoon = clamp(Number(live?.pHitSoon ?? live?.pFinal ?? live?.pAdj ?? 0), 0, 1);
-    const baselineP = clamp(Number(live?.baselineP ?? (targetResult?.target > 0 ? (1 / targetResult.target) : 0)), 0, 1);
-    const soonPressure = pHitSoon - baselineP;
-    const entropyRandomLike = Boolean(live?.entropy?.randomLike || live?.entropy?.disabled);
-
-    const lowTrendStrength = clamp(
-      (Number(aheadAdjust?.whitePressure || 0) * 0.60) +
-      (whiteDelta * 1.15) +
-      (entropyRandomLike ? 0.40 : 0) +
-      (regimeLabel === 'RANDOM' ? 0.35 : 0) +
-      (regimeLabel === 'VOLATILE' ? 0.18 : 0) +
-      (preState === 'WHITE_DOMINANT' ? 0.45 : 0) +
-      (Math.max(0, -soonPressure) * 1.20),
-      0,
-      3
-    );
-    const lowTrendMode = (
-      preState === 'WHITE_DOMINANT' ||
-      regimeLabel === 'RANDOM' ||
-      entropyRandomLike ||
-      whiteDelta > 0.06 ||
-      lowTrendStrength >= 0.45
-    );
     if (lowTrendMode) {
       const t = Number(targetResult?.target || 0);
       const baseCooldown = (
@@ -2218,6 +2262,12 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg, o
       const scaledCooldown = Math.round(baseCooldown * clamp(0.55 + (lowTrendStrength * 0.35), 0.55, 1.65));
       const cooldown = Math.max(2, scaledCooldown);
       aheadLo += cooldown;
+    }
+  } else if (previousOutcome && String(previousOutcome.outcome || '').toLowerCase() === 'win') {
+    if (lowTrendMode) {
+      // Even after WIN, avoid reopening too tightly while low/downtrend pressure persists.
+      const softCooldown = Math.max(1, Math.round(fixedSpan * clamp(0.16 + (lowTrendStrength * 0.08), 0.16, 0.40)));
+      aheadLo += softCooldown;
     }
   }
   const aheadHi = Math.max(aheadLo, aheadLo + fixedSpan - 1);
