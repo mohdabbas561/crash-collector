@@ -1006,7 +1006,7 @@ function confidenceBand(score) {
   return 'NONE';
 }
 
-function buildUiTarget(target, lock, status, currentRound, previousOutcome) {
+function buildUiTarget(target, lock, status, currentRound, previousOutcome, timingHint = null) {
   const lo = Number(lock?.lo);
   const hi = Number(lock?.hi);
   const eta = lock?.eta || {};
@@ -1081,6 +1081,7 @@ function buildUiTarget(target, lock, status, currentRound, previousOutcome) {
       },
     },
     previousOutcome: previousOutcome || null,
+    timingHint: timingHint || null,
   };
 }
 
@@ -1785,6 +1786,54 @@ function adjustAheadByRegime(baseAheadLo, fixedSpan, live) {
   };
 }
 
+function buildTimingHint(lock, currentRound, targetResult, state) {
+  if (!lock || !targetResult) return null;
+  const lockStatus = String(lock?.eta?.lockStatus || '').toUpperCase();
+  if (lockStatus === 'IDLE' || Boolean(lock?.suspended)) return null;
+
+  const fixedSpan = Number(FIXED_WINDOW_SPAN[targetResult.target] || 3);
+  const live = targetResult.live;
+  const band = estimateAheadBand(state, targetResult);
+  const regimeWindowMult = clamp(Number(live?.regime?.windowMult ?? 1), 1, 1.35);
+  const baseAheadLo = Math.max(1, Math.round(band.aheadLo * regimeWindowMult));
+  const aheadAdjust = adjustAheadByRegime(baseAheadLo, fixedSpan, live);
+  const dynamicAheadLo = Math.max(1, Number(aheadAdjust.adjustedAheadLo || 1));
+
+  const lockedLo = Number(lock.lo);
+  if (!Number.isFinite(lockedLo)) return null;
+  const suggestedLo = currentRound + dynamicAheadLo;
+  const suggestedHi = suggestedLo + fixedSpan - 1;
+  const deltaRounds = Math.round(suggestedLo - lockedLo);
+  const absDelta = Math.abs(deltaRounds);
+
+  let trend = 'on_track';
+  if (deltaRounds <= -2) trend = 'earlier';
+  if (deltaRounds >= 2) trend = 'later';
+
+  let severity = 'low';
+  if (absDelta >= 8) severity = 'high';
+  else if (absDelta >= 4) severity = 'med';
+
+  let message = `${targetResult.target}x on-track with current lock timing.`;
+  if (trend === 'earlier') {
+    message = `${targetResult.target}x may come earlier by ~${absDelta} rounds (around +${dynamicAheadLo}).`;
+  } else if (trend === 'later') {
+    message = `${targetResult.target}x may come later by ~${absDelta} rounds (around +${dynamicAheadLo}).`;
+  }
+
+  return {
+    trend,
+    severity,
+    deltaRounds,
+    suggestedAheadLo: dynamicAheadLo,
+    suggestedLo,
+    suggestedHi,
+    whitePressure: aheadAdjust.whitePressure,
+    releaseMomentum: aheadAdjust.releaseMomentum,
+    message,
+  };
+}
+
 function buildLockFromLive(state, targetResult, currentRound, generation, cfg, options = {}) {
   const forceLock = Boolean(options?.forceLock);
   const live = targetResult.live;
@@ -2087,6 +2136,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
   const locksToSave = {};
   const resolvedHistory = [];
   const targetsOut = [];
+  const timingAlerts = [];
   let waitingCount = 0;
   let openCount = 0;
   let relockedCount = 0;
@@ -2106,16 +2156,20 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
     let previousOutcome = null;
     let lockToUse = existing;
     let status = evalExisting.status;
+    let liveResult = null;
+    let timingHint = null;
 
     // STRICT LOCK LIFECYCLE:
     // If an existing lock is still active, freeze it completely (no mutation, no drift).
     if (existing && !evalExisting.resolved && evalExisting.status !== 'idle' && !spanMismatch) {
       lockToUse = existing;
       status = evalExisting.status;
+      liveResult = getTargetResult(target);
+      timingHint = buildTimingHint(existing, currentRound, liveResult, state);
     } else {
       // Recompute target model only when we are about to create a new decision
       // (fresh target OR after resolution OR idle monitor update).
-      const result = getTargetResult(target);
+      liveResult = getTargetResult(target);
       const existingWasIdle = existing
         ? (
             String(existing?.eta?.lockStatus || '').toUpperCase() === 'IDLE' ||
@@ -2148,16 +2202,20 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       const generation = existing ? Number(existing.generation || 1) + 1 : 1;
 
       // Freeze IDLE locks while signal remains non-actionable to prevent +1 sliding drift.
-      if (existingWasIdle && !evalExisting.resolved && !spanMismatch && !result.live.actionable && !cfg.alwaysEmitLocks) {
+      if (existingWasIdle && !evalExisting.resolved && !spanMismatch && !liveResult.live.actionable && !cfg.alwaysEmitLocks) {
         lockToUse = existing;
         status = 'idle';
-      } else if (result.live.actionable || cfg.alwaysEmitLocks) {
-        lockToUse = buildLockFromLive(state, result, currentRound, generation, cfg, { forceLock: Boolean(cfg.alwaysEmitLocks) });
+      } else if (liveResult.live.actionable || cfg.alwaysEmitLocks) {
+        lockToUse = buildLockFromLive(state, liveResult, currentRound, generation, cfg, { forceLock: Boolean(cfg.alwaysEmitLocks) });
         status = lockToUse?.suspended ? 'idle' : 'locked';
         relockedCount += 1;
       } else {
-        lockToUse = buildIdleLock(state, result, currentRound, generation, cfg);
+        lockToUse = buildIdleLock(state, liveResult, currentRound, generation, cfg);
         status = 'idle';
+      }
+
+      if (!timingHint && liveResult && lockToUse && !lockToUse.suspended) {
+        timingHint = buildTimingHint(lockToUse, currentRound, liveResult, state);
       }
     }
 
@@ -2177,7 +2235,20 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
       eta: lockToUse.eta || null,
     };
 
-    targetsOut.push(buildUiTarget(target, lockToUse, status, currentRound, previousOutcome));
+    if (timingHint && String(timingHint.trend).toLowerCase() !== 'on_track') {
+      timingAlerts.push({
+        target,
+        targetLabel: `${target}x`,
+        trend: timingHint.trend,
+        severity: timingHint.severity,
+        deltaRounds: timingHint.deltaRounds,
+        message: timingHint.message,
+        suggestedLo: timingHint.suggestedLo,
+        suggestedHi: timingHint.suggestedHi,
+      });
+    }
+
+    targetsOut.push(buildUiTarget(target, lockToUse, status, currentRound, previousOutcome, timingHint));
   }
 
   targetsOut.sort((a, b) => a.target - b.target);
@@ -2204,6 +2275,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
     asOfRound: currentRound,
     sampleSize: state.n,
     targets: targetsOut,
+    timingAlerts,
     locksToSave,
     resolvedHistory,
     whiteCluster: {
