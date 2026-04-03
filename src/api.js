@@ -228,11 +228,12 @@ const LOCKED_HISTORY_PREFETCH_LIMIT = Math.max(
   toPositiveInt(process.env.LOCKED_HISTORY_PREFETCH_LIMIT, 3000)
 );
 const LOCKED_CATCHUP_MAX_ITERS = toPositiveInt(process.env.LOCKED_CATCHUP_MAX_ITERS, 240);
-const RESPONSE_CACHE_ENABLED = String(process.env.RESPONSE_CACHE_ENABLED || 'false').trim().toLowerCase() === 'true';
-const STRICT_FRESH_MODE = String(process.env.STRICT_FRESH_MODE || 'true').trim().toLowerCase() !== 'false';
+const LOCKED_COMPUTE_BUDGET_MS = toPositiveInt(process.env.LOCKED_COMPUTE_BUDGET_MS, 2500);
+const RESPONSE_CACHE_ENABLED = String(process.env.RESPONSE_CACHE_ENABLED || 'true').trim().toLowerCase() === 'true';
+const STRICT_FRESH_MODE = String(process.env.STRICT_FRESH_MODE || 'false').trim().toLowerCase() !== 'false';
 const LOCKED_USE_FULL_DATA = String(process.env.LOCKED_USE_FULL_DATA || 'true').trim().toLowerCase() !== 'false';
 const LOCKED_BACKGROUND_ENABLED = String(process.env.LOCKED_BACKGROUND_ENABLED || 'true').trim().toLowerCase() !== 'false';
-const LOCKED_BACKGROUND_INTERVAL_MS = toPositiveInt(process.env.LOCKED_BACKGROUND_INTERVAL_MS, 30000);
+const LOCKED_BACKGROUND_INTERVAL_MS = toPositiveInt(process.env.LOCKED_BACKGROUND_INTERVAL_MS, 8000);
 function firstNonEmptyEnv(...values) {
   for (const raw of values) {
     const value = String(raw || '').trim();
@@ -510,6 +511,7 @@ async function computeAndPersistLockedPrediction({ latestRound, limit, limitKey 
   let liveLocks = locked || {};
   let liveHistoryRows = Array.isArray(historyRows) ? [...historyRows] : [];
   const resolvedRowsToPersist = [];
+  const computeStartedAt = Date.now();
 
   // Catch-up mode: if rounds advanced while frontend/server was offline,
   // process multiple lock generations in one compute pass so history is not skipped.
@@ -531,6 +533,8 @@ async function computeAndPersistLockedPrediction({ latestRound, limit, limitKey 
     if (!resolvedNow.length) break;
     // Safety: if locks no longer move, avoid a pathological loop.
     if (!lockDelta) break;
+    // Hard latency guard: keep API responses quick and continue catch-up on next tick.
+    if ((Date.now() - computeStartedAt) >= LOCKED_COMPUTE_BUDGET_MS) break;
   }
 
   if (Object.keys(liveLocks || {}).length && locksNeedSave(locked, liveLocks)) {
@@ -1007,7 +1011,23 @@ app.get('/predict/locked', requireDatabase, rateLimit(20), async (req, res) => {
       return res.json(withHistoryFilter(payload, historyTarget));
     }
 
-    const computedPayload = await ensureLockedPredictionFresh({ limit, limitKey });
+    let computedPayload;
+    try {
+      computedPayload = await ensureLockedPredictionFresh({ limit, limitKey });
+    } catch (e) {
+      const isTimeout = /timeout/i.test(String(e?.message || ''));
+      if (isTimeout && hasCacheForLimit) {
+        ensureLockedPredictionComputed({ latestRound, limit, limitKey })
+          .catch((err) => console.error('[predict/locked] post-timeout async refresh error:', err.message));
+        const stalePayload = await attachLiveLockedHistory(lockedCache.basePayload);
+        return res.json(withHistoryFilter({
+          ...stalePayload,
+          warning: 'stale_snapshot_due_to_compute_timeout',
+        }, historyTarget));
+      }
+      throw e;
+    }
+
     const basePayload = await attachLiveLockedHistory(computedPayload);
     markDbHealthy();
     return res.json(withHistoryFilter(basePayload, historyTarget));
