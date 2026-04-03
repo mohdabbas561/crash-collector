@@ -503,6 +503,16 @@ async function getWallets() {
   return res.rows;
 }
 
+async function getWalletByPubkey(pubkey) {
+  const cleanPubkey = String(pubkey || '').trim();
+  if (!cleanPubkey) return null;
+  const res = await pool.query(
+    `SELECT * FROM saved_wallets WHERE pubkey = $1 ORDER BY updated_at DESC LIMIT 1`,
+    [cleanPubkey]
+  );
+  return res.rows[0] || null;
+}
+
 async function deleteWallet(id) {
   await pool.query(`DELETE FROM saved_wallets WHERE id = $1`, [id]);
 }
@@ -737,7 +747,7 @@ module.exports = {
   saveLockedPreds, getLockedPreds,
   saveLockedAdvPreds, getLockedAdvPreds,
   saveLockedConsensusPreds, getLockedConsensusPreds,
-  initWalletStorage, saveWallet, getWallets, deleteWallet,
+  initWalletStorage, saveWallet, getWallets, getWalletByPubkey, deleteWallet,
   savePrediction, getPredictions, clearPredictions, clearAllLocks,
   initAccessCodes, createAccessCode, getAccessCode,
   updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,
