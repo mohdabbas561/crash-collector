@@ -131,11 +131,18 @@ async function initDB() {
     BEGIN
       IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
-        WHERE conname = 'uq_predictions_source_target_window'
+        WHERE conname = 'uq_predictions_source_target_window_gen'
       ) THEN
+        IF EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'uq_predictions_source_target_window'
+        ) THEN
+          ALTER TABLE predictions
+            DROP CONSTRAINT uq_predictions_source_target_window;
+        END IF;
         ALTER TABLE predictions
-          ADD CONSTRAINT uq_predictions_source_target_window
-          UNIQUE (source, target, window_lo, window_hi);
+          ADD CONSTRAINT uq_predictions_source_target_window_gen
+          UNIQUE (source, target, window_lo, window_hi, generation);
       END IF;
     END
     $$;
@@ -171,7 +178,7 @@ async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, gene
   await pool.query(
     `INSERT INTO predictions (target, min_mult, outcome, window_lo, window_hi, hit_round, generation, source, prob_w)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-     ON CONFLICT (source, target, window_lo, window_hi) DO UPDATE
+     ON CONFLICT (source, target, window_lo, window_hi, generation) DO UPDATE
        SET hit_round  = CASE
                           WHEN predictions.hit_round IS NULL THEN EXCLUDED.hit_round
                           WHEN EXCLUDED.hit_round IS NULL THEN predictions.hit_round
