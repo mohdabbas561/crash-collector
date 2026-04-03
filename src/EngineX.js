@@ -1742,12 +1742,9 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg, o
   const live = targetResult.live;
   const band = estimateAheadBand(state, targetResult);
   const regimeWindowMult = clamp(Number(live?.regime?.windowMult ?? 1), 1, 1.35);
-  // Execution window policy:
-  // - start immediately on next round (no long deferred waits)
-  // - keep fixed span by target
-  const aheadLo = 1;
+  const aheadLo = Math.max(1, Math.round(band.aheadLo * regimeWindowMult));
   const fixedSpan = Number(FIXED_WINDOW_SPAN[targetResult.target] || 3);
-  const aheadHi = fixedSpan;
+  const aheadHi = Math.max(aheadLo, aheadLo + fixedSpan - 1);
   const lo = currentRound + aheadLo;
   const hi = lo + fixedSpan - 1;
   const p = Number.isFinite(live.pFinal) ? live.pFinal : live.pAdj;
@@ -1763,7 +1760,13 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg, o
     live?.preconditionPass &&
     Number(live?.confidence || 0) >= Number(cfg.forceLockMinConfidence || 0)
   );
-  const shouldOpen = Boolean(live?.actionable || allowForcedLock);
+  const shouldOpen = Boolean(
+    (
+      live?.actionable &&
+      Number(live?.confidence || 0) >= Number(cfg.forceLockMinConfidence || 0)
+    ) ||
+    allowForcedLock
+  );
   const suspended = !shouldOpen;
 
   return {
@@ -1860,9 +1863,9 @@ function buildIdleLock(state, targetResult, currentRound, generation, cfg) {
   const live = targetResult.live;
   const band = estimateAheadBand(state, targetResult);
   const regimeWindowMult = clamp(Number(live?.regime?.windowMult ?? 1), 1, 1.35);
-  const aheadLo = 1;
+  const aheadLo = Math.max(1, Math.round(band.aheadLo * regimeWindowMult));
   const fixedSpan = Number(FIXED_WINDOW_SPAN[targetResult.target] || 3);
-  const aheadHi = fixedSpan;
+  const aheadHi = Math.max(aheadLo, aheadLo + fixedSpan - 1);
   const lo = currentRound + aheadLo;
   const hi = lo + fixedSpan - 1;
   const baselineP = 1 / targetResult.target;
@@ -2106,7 +2109,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
         status = 'idle';
       } else if (result.live.actionable || cfg.alwaysEmitLocks) {
         lockToUse = buildLockFromLive(state, result, currentRound, generation, cfg, { forceLock: Boolean(cfg.alwaysEmitLocks) });
-        status = 'locked';
+        status = lockToUse?.suspended ? 'idle' : 'locked';
         relockedCount += 1;
       } else {
         lockToUse = buildIdleLock(state, result, currentRound, generation, cfg);
