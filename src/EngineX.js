@@ -126,8 +126,6 @@ const DEFAULT_CONFIG = Object.freeze({
   // true => always emit lock windows (quick prediction mode),
   // false => strict pre-condition gate can keep targets idle.
   alwaysEmitLocks: true,
-  // Even in quick mode, never force-open weak/unsafe setups.
-  forceLockMinConfidence: 0.42,
 });
 
 const BUCKETS = [
@@ -1749,24 +1747,8 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg, o
   const hi = lo + fixedSpan - 1;
   const p = Number.isFinite(live.pFinal) ? live.pFinal : live.pAdj;
   const pSoon = clamp(1 - Math.pow(1 - p, 3), 0, 1);
-  const hardBlocked = Boolean(
-    live?.entropy?.disabled ||
-    live?.entropy?.randomLike ||
-    String(live?.preconditionState || '').toUpperCase() === 'WHITE_DOMINANT'
-  );
-  const allowForcedLock = Boolean(
-    forceLock &&
-    !hardBlocked &&
-    live?.preconditionPass &&
-    Number(live?.confidence || 0) >= Number(cfg.forceLockMinConfidence || 0)
-  );
-  const shouldOpen = Boolean(
-    (
-      live?.actionable &&
-      Number(live?.confidence || 0) >= Number(cfg.forceLockMinConfidence || 0)
-    ) ||
-    allowForcedLock
-  );
+  const allowForcedLock = Boolean(forceLock);
+  const shouldOpen = Boolean(live?.actionable || allowForcedLock);
   const suspended = !shouldOpen;
 
   return {
@@ -1847,11 +1829,7 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg, o
       roundsSinceLock: 0,
       suspended,
       suspendReason: suspended
-        ? (
-          hardBlocked
-            ? 'precondition_blocked'
-            : (!live.actionable ? 'ev_below_threshold' : 'low_confidence_force_block')
-        )
+        ? (!live.actionable ? 'ev_below_threshold' : null)
         : null,
       forcedLock: forceLock,
       walkForwardNoLeakage: true,
