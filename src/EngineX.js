@@ -1882,6 +1882,30 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
     message = `${target}x may come later by ~${absDelta} rounds (around +${suggestedAheadLo}).`;
   }
 
+  const reasonParts = [];
+  if (trend === 'earlier') {
+    if (soonPressure > 0.04) reasonParts.push(`near-hit pressure above baseline (${roundNum(soonPressure, 3)})`);
+    if (b2bMomentum > 0.05) reasonParts.push(`b2b momentum rising (${roundNum(b2bMomentum, 3)})`);
+    if (Number(aheadAdjust.releaseMomentum || 0) > 0.35) {
+      reasonParts.push(`release momentum active (${roundNum(aheadAdjust.releaseMomentum, 3)})`);
+    }
+  } else if (trend === 'later') {
+    if (Number(aheadAdjust.whitePressure || 0) > 0.15) {
+      reasonParts.push(`white pressure elevated (${roundNum(aheadAdjust.whitePressure, 3)})`);
+    }
+    if ((whiteRisk - whiteRelease) > 0.02) {
+      reasonParts.push(`white continue > release (${roundNum(whiteRisk - whiteRelease, 3)})`);
+    }
+    if (soonPressure < -0.03) {
+      reasonParts.push(`near-hit pressure below baseline (${roundNum(soonPressure, 3)})`);
+    }
+  } else {
+    reasonParts.push(`pressures are balanced`);
+    reasonParts.push(`no strong early/delay edge`);
+  }
+  reasonParts.push(`hint reliability ${Math.round(hintReliability * 100)}%`);
+  const reason = reasonParts.join(' | ');
+
   return {
     trend,
     severity,
@@ -1895,6 +1919,7 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
     soonPressure: roundNum(soonPressure, 6),
     b2bMomentum: roundNum(b2bMomentum, 6),
     message,
+    reason,
   };
 }
 
@@ -2307,6 +2332,7 @@ function computeLockedRangePredictions(rounds, existingLocksRaw = {}, options = 
         severity: timingHint.severity,
         deltaRounds: timingHint.deltaRounds,
         message: timingHint.message,
+        reason: timingHint.reason,
         suggestedLo: timingHint.suggestedLo,
         suggestedHi: timingHint.suggestedHi,
       });
