@@ -2024,20 +2024,43 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
   // Watch layer: show momentum/pressure drift even when not strong enough for hard earlier/later.
   // This keeps banner informative between hard directional flips.
   if (trend === 'on_track') {
-    const whiteWatch = (
-      Math.max(0, whiteRisk - whiteRelease) > 0.08 &&
-      soonPressure < 0.03
+    const whiteWatchScore = clamp(
+      (Math.max(0, whiteRisk - whiteRelease) * 1.25) +
+      (Number(aheadAdjust.whitePressure || 0) * 0.35) +
+      (Math.max(0, -soonPressure) * 0.95),
+      0,
+      3
     );
-    const releaseWatch = (
-      Math.max(0, soonPressure) > 0.04 ||
-      Math.max(0, b2bMomentum) > 0.06 ||
-      Number(aheadAdjust.releaseMomentum || 0) > 0.35
+    const releaseWatchScore = clamp(
+      (Math.max(0, soonPressure) * 2.0) +
+      (Math.max(0, b2bMomentum) * 1.1) +
+      (Number(aheadAdjust.releaseMomentum || 0) * 0.65),
+      0,
+      3
     );
+    const whiteWatch = whiteWatchScore >= 0.12;
+    const releaseWatch = releaseWatchScore >= 0.12;
 
-    if (whiteWatch && !releaseWatch) {
+    if (whiteWatch && releaseWatch) {
+      if ((whiteWatchScore - releaseWatchScore) >= 0.04) {
+        trend = 'later_watch';
+        deltaRounds = Math.max(1, Math.round(Math.max(1, Math.abs(rawDelta) * 0.35)));
+      } else if ((releaseWatchScore - whiteWatchScore) >= 0.04) {
+        trend = 'earlier_watch';
+        deltaRounds = -Math.max(1, Math.round(Math.max(1, Math.abs(rawDelta) * 0.35)));
+      } else if (Math.max(whiteWatchScore, releaseWatchScore) >= 0.20) {
+        if (whiteWatchScore >= releaseWatchScore) {
+          trend = 'later_watch';
+          deltaRounds = Math.max(1, Math.round(Math.max(1, Math.abs(rawDelta) * 0.30)));
+        } else {
+          trend = 'earlier_watch';
+          deltaRounds = -Math.max(1, Math.round(Math.max(1, Math.abs(rawDelta) * 0.30)));
+        }
+      }
+    } else if (whiteWatch) {
       trend = 'later_watch';
       deltaRounds = Math.max(1, Math.round(Math.max(1, Math.abs(rawDelta) * 0.35)));
-    } else if (releaseWatch && !whiteWatch) {
+    } else if (releaseWatch) {
       trend = 'earlier_watch';
       deltaRounds = -Math.max(1, Math.round(Math.max(1, Math.abs(rawDelta) * 0.35)));
     }
@@ -2153,6 +2176,48 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg, o
       aheadLo = Math.max(1, aheadLo - Math.max(1, pull));
     } else {
       aheadLo = Math.max(1, aheadLo - Math.max(1, Math.round(fixedSpan * 0.35)));
+    }
+  } else if (previousOutcome && String(previousOutcome.outcome || '').toLowerCase() === 'loss') {
+    // After LOSS, apply cooldown in low/downtrend regimes so locks do not reopen too aggressively.
+    const preState = String(live?.preconditionState || 'NEUTRAL').toUpperCase();
+    const regimeLabel = String(live?.regime?.label || 'RANDOM').toUpperCase();
+    const whiteRisk = clamp(Number(live?.whiteContinue || 0), 0, 1);
+    const whiteRelease = clamp(Number(live?.whiteRebound || 0), 0, 1);
+    const whiteDelta = Math.max(0, whiteRisk - whiteRelease);
+    const pHitSoon = clamp(Number(live?.pHitSoon ?? live?.pFinal ?? live?.pAdj ?? 0), 0, 1);
+    const baselineP = clamp(Number(live?.baselineP ?? (targetResult?.target > 0 ? (1 / targetResult.target) : 0)), 0, 1);
+    const soonPressure = pHitSoon - baselineP;
+    const entropyRandomLike = Boolean(live?.entropy?.randomLike || live?.entropy?.disabled);
+
+    const lowTrendStrength = clamp(
+      (Number(aheadAdjust?.whitePressure || 0) * 0.60) +
+      (whiteDelta * 1.15) +
+      (entropyRandomLike ? 0.40 : 0) +
+      (regimeLabel === 'RANDOM' ? 0.35 : 0) +
+      (regimeLabel === 'VOLATILE' ? 0.18 : 0) +
+      (preState === 'WHITE_DOMINANT' ? 0.45 : 0) +
+      (Math.max(0, -soonPressure) * 1.20),
+      0,
+      3
+    );
+    const lowTrendMode = (
+      preState === 'WHITE_DOMINANT' ||
+      regimeLabel === 'RANDOM' ||
+      entropyRandomLike ||
+      whiteDelta > 0.06 ||
+      lowTrendStrength >= 0.45
+    );
+    if (lowTrendMode) {
+      const t = Number(targetResult?.target || 0);
+      const baseCooldown = (
+        t <= 10 ? Math.max(3, Math.round(fixedSpan * 0.95))
+          : t <= 20 ? Math.max(3, Math.round(fixedSpan * 0.80))
+            : t <= 100 ? Math.max(4, Math.round(fixedSpan * 0.62))
+              : Math.max(6, Math.round(fixedSpan * 0.45))
+      );
+      const scaledCooldown = Math.round(baseCooldown * clamp(0.55 + (lowTrendStrength * 0.35), 0.55, 1.65));
+      const cooldown = Math.max(2, scaledCooldown);
+      aheadLo += cooldown;
     }
   }
   const aheadHi = Math.max(aheadLo, aheadLo + fixedSpan - 1);
