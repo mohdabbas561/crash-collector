@@ -1761,6 +1761,15 @@ function adjustAheadByRegime(baseAheadLo, fixedSpan, live, target = 0) {
   const momentumPressure = normalizePressure(live?.momentumScore, live?.momentumThreshold);
 
   const whiteDelta = clamp(whiteRisk - whiteRelease, 0, 1);
+  const signalQuality = clamp(
+    (
+      clamp(Number(live?.edgeConfidenceScore ?? 0.5), 0, 1) * 0.45 +
+      clamp(Number(live?.modelAgreement ?? 0.5), 0, 1) * 0.30 +
+      clamp(Number(live?.confidence ?? 0.5), 0, 1) * 0.25
+    ),
+    0,
+    1
+  );
   // Target-aware normalization: near-term pressure should impact low targets more than moon targets.
   const soonBoost = (
     t <= 20 ? Math.max(0, soonPressure)
@@ -1782,12 +1791,20 @@ function adjustAheadByRegime(baseAheadLo, fixedSpan, live, target = 0) {
 
   let delayBoost = 0;
   if (whitePressure > 0 || whiteDelta > 0 || preState === 'WHITE_DOMINANT') {
-    const whiteDrive = clamp((whitePressure * 0.55) + (whiteDelta * 0.9), 0, 1.6);
+    const whiteDrive = clamp(
+      ((whitePressure * 0.55) + (whiteDelta * 0.9)) * (0.55 + (signalQuality * 0.45)),
+      0,
+      1.6
+    );
     delayBoost = Math.round((span * 0.28) * whiteDrive);
   }
   let nearPull = 0;
   if (releaseMomentum > 0 || preState === 'RELEASE_PHASE' || preState === 'MOMENTUM') {
-    const releaseDrive = clamp((releaseMomentum * 0.85) + (Math.max(0, b2bMomentum) * 0.45), 0, 1.8);
+    const releaseDrive = clamp(
+      ((releaseMomentum * 0.85) + (Math.max(0, b2bMomentum) * 0.45)) * (0.55 + (signalQuality * 0.45)),
+      0,
+      1.8
+    );
     const nearPullRaw = Math.round((span * 0.52) * releaseDrive);
     // Prevent collapse-to-1 across all targets.
     const maxPullCap = Math.max(
@@ -1866,6 +1883,12 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
     0,
     1
   );
+  const edgeAccuracy = clamp(Number(targetResult?.backtest?.performance?.edgeAccuracy ?? 0.5), 0, 1);
+  const directionalReliability = clamp(
+    (hintReliability * 0.65) + (edgeAccuracy * 0.35),
+    0,
+    1
+  );
 
   // Neutralization layer:
   // - Reduce delay bias when near-term hit pressure/momentum is rising.
@@ -1902,14 +1925,21 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
 
   let trend = 'on_track';
   // Conservative thresholds (especially for low targets) to prevent noisy false alerts.
+  const reliabilityPenalty = Math.max(0, 0.60 - directionalReliability);
+  const reliabilityBoost = Math.round(reliabilityPenalty * 6);
   const trendThreshold = (
     target <= 20 ? 4
     : target <= 100 ? 3
     : 2
-  ) + (hintReliability < 0.5 ? 1 : 0);
+  ) + (hintReliability < 0.5 ? 1 : 0) + reliabilityBoost;
 
   if (deltaRounds <= -trendThreshold) trend = 'earlier';
   if (deltaRounds >= trendThreshold) trend = 'later';
+
+  // Low-quality signal gate: avoid directional hints unless quality is adequate.
+  if (directionalReliability < 0.50) {
+    trend = 'on_track';
+  }
 
   // If near-term pressure is strong for low targets, suppress "later" hints.
   if (target <= 20 && trend === 'later' && soonPressure > 0.06) {
@@ -1955,7 +1985,7 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
     reasonParts.push(`pressures are balanced`);
     reasonParts.push(`no strong early/delay edge`);
   }
-  reasonParts.push(`hint reliability ${Math.round(hintReliability * 100)}%`);
+  reasonParts.push(`signal quality ${Math.round(directionalReliability * 100)}%`);
   const reason = reasonParts.join(' | ');
 
   return {
@@ -1968,6 +1998,7 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
     whitePressure: aheadAdjust.whitePressure,
     releaseMomentum: aheadAdjust.releaseMomentum,
     hintReliability: roundNum(hintReliability, 6),
+    directionalReliability: roundNum(directionalReliability, 6),
     soonPressure: roundNum(soonPressure, 6),
     b2bMomentum: roundNum(b2bMomentum, 6),
     message,
