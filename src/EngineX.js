@@ -126,6 +126,8 @@ const DEFAULT_CONFIG = Object.freeze({
   // true => always emit lock windows (quick prediction mode),
   // false => strict pre-condition gate can keep targets idle.
   alwaysEmitLocks: true,
+  // Even in quick mode, never force-open weak/unsafe setups.
+  forceLockMinConfidence: 0.42,
 });
 
 const BUCKETS = [
@@ -1740,14 +1742,29 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg, o
   const live = targetResult.live;
   const band = estimateAheadBand(state, targetResult);
   const regimeWindowMult = clamp(Number(live?.regime?.windowMult ?? 1), 1, 1.35);
-  const aheadLo = Math.max(1, Math.round(band.aheadLo * regimeWindowMult));
+  // Execution window policy:
+  // - start immediately on next round (no long deferred waits)
+  // - keep fixed span by target
+  const aheadLo = 1;
   const fixedSpan = Number(FIXED_WINDOW_SPAN[targetResult.target] || 3);
-  const aheadHi = Math.max(aheadLo, aheadLo + fixedSpan - 1);
+  const aheadHi = fixedSpan;
   const lo = currentRound + aheadLo;
   const hi = lo + fixedSpan - 1;
   const p = Number.isFinite(live.pFinal) ? live.pFinal : live.pAdj;
   const pSoon = clamp(1 - Math.pow(1 - p, 3), 0, 1);
-  const suspended = forceLock ? false : !live.actionable;
+  const hardBlocked = Boolean(
+    live?.entropy?.disabled ||
+    live?.entropy?.randomLike ||
+    String(live?.preconditionState || '').toUpperCase() === 'WHITE_DOMINANT'
+  );
+  const allowForcedLock = Boolean(
+    forceLock &&
+    !hardBlocked &&
+    live?.preconditionPass &&
+    Number(live?.confidence || 0) >= Number(cfg.forceLockMinConfidence || 0)
+  );
+  const shouldOpen = Boolean(live?.actionable || allowForcedLock);
+  const suspended = !shouldOpen;
 
   return {
     lo,
@@ -1827,7 +1844,11 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg, o
       roundsSinceLock: 0,
       suspended,
       suspendReason: suspended
-        ? (live.entropy.disabled ? 'entropy_random_regime' : (!live.actionable ? 'ev_below_threshold' : null))
+        ? (
+          hardBlocked
+            ? 'precondition_blocked'
+            : (!live.actionable ? 'ev_below_threshold' : 'low_confidence_force_block')
+        )
         : null,
       forcedLock: forceLock,
       walkForwardNoLeakage: true,
@@ -1839,9 +1860,9 @@ function buildIdleLock(state, targetResult, currentRound, generation, cfg) {
   const live = targetResult.live;
   const band = estimateAheadBand(state, targetResult);
   const regimeWindowMult = clamp(Number(live?.regime?.windowMult ?? 1), 1, 1.35);
-  const aheadLo = Math.max(1, Math.round(band.aheadLo * regimeWindowMult));
+  const aheadLo = 1;
   const fixedSpan = Number(FIXED_WINDOW_SPAN[targetResult.target] || 3);
-  const aheadHi = Math.max(aheadLo, aheadLo + fixedSpan - 1);
+  const aheadHi = fixedSpan;
   const lo = currentRound + aheadLo;
   const hi = lo + fixedSpan - 1;
   const baselineP = 1 / targetResult.target;
