@@ -949,27 +949,81 @@ function entropyAtIndex(state, targetState, idx, thresholds, cfg) {
 }
 
 function confidenceFromComponents(p, baseline, weights, entropyInfo, extras = {}) {
-  const edge = Math.abs((p ?? baseline ?? 0) - (baseline ?? 0));
-  const edgeScore = clamp(edge / Math.max(0.01, baseline || 0.01), 0, 1);
-  const modelBalance = clamp((weights.knn || 0) + (weights.hazard || (0.5 * (weights.baseline || 0))), 0, 1);
+  const safeP = Number(p ?? baseline ?? 0);
+  const safeBaseline = Number(baseline ?? 0);
+  const edge = Math.max(0, safeP - safeBaseline);
+  // Confidence should not spike just because fair baseline is tiny.
+  // Require a modest absolute lift above baseline before calling the edge strong.
+  const edgeScore = clamp(edge / Math.max(0.03, safeBaseline + 0.03), 0, 1);
+  const ev = Number(extras.ev ?? 0);
+  const evThreshold = Number(extras.evThreshold ?? 0);
+  // EV confidence must come from margin above the trade gate, not just barely crossing it.
+  const evMargin = Math.max(0, ev - evThreshold);
+  const evScale = Math.max(0.12, Math.abs(evThreshold) + 0.18);
+  const evScore = clamp(evMargin / evScale, 0, 1);
   const agreement = clamp(Number(extras.modelAgreement ?? 0.5), 0, 1);
   const edgeConfidenceScore = clamp(Number(extras.edgeConfidenceScore ?? 1), 0, 1.2);
+  const edgeValidationCount = Math.max(0, Number(extras.edgeValidationCount ?? 0));
+  const edgeValidationMinTrades = Math.max(1, Number(extras.edgeValidationMinTrades ?? 20));
+  const edgeNegativeErrorRatio = clamp(Number(extras.edgeNegativeErrorRatio ?? 0.5), 0, 1);
   const entropyTrend = Number(extras.entropyTrend || 0);
   const disagreement = clamp(Number(extras.modelDisagreement || 0), 0, 1);
-  const disagreementPenalty = clamp(1 - disagreement, 0.45, 1);
+  const disagreementPenalty = clamp(1 - disagreement, 0.35, 1);
   const entropyPenalty = entropyInfo?.disabled ? 0.35 : 1.0;
   const entropyNoisePenalty = entropyInfo?.randomLike ? 0.65 : 1.0;
   const entropySpikePenalty = extras.entropySpike ? 0.70 : 1.0;
   const entropyTrendPenalty = entropyTrend > 0
     ? clamp(1 - (entropyTrend * 4), 0.45, 1)
     : 1;
-  const core = (
-    0.35 * edgeScore +
-    0.25 * modelBalance +
-    0.25 * agreement +
-    0.15 * clamp(edgeConfidenceScore, 0, 1)
+  const knnReliability = clamp(Number(extras.knnReliability ?? 0), 0, 1);
+  const knnSupport = clamp(Number(extras.knnSupport ?? 0), 0, 1);
+  const hazardActive = Boolean(extras.hazardActive);
+  const knnActive = Boolean(extras.knnActive);
+  const baselineBrier = Number(extras.baselineBrier);
+  const hazardBrier = Number(extras.hazardBrier);
+  const baselineQuality = 0.42;
+  const hazardQuality = (Number.isFinite(baselineBrier) && Number.isFinite(hazardBrier) && hazardActive)
+    ? clamp((baselineBrier - hazardBrier + 0.02) / Math.max(0.02, baselineBrier + 0.02), 0.25, 1)
+    : (hazardActive ? 0.40 : 0);
+  const knnQuality = knnActive
+    ? clamp((knnReliability * 0.65) + (knnSupport * 0.35), 0, 1)
+    : 0;
+  const weightedModelQuality = clamp(
+    ((weights.baseline || 0) * baselineQuality) +
+    ((weights.hazard || 0) * hazardQuality) +
+    ((weights.knn || 0) * knnQuality),
+    0,
+    1
   );
-  return clamp(core * disagreementPenalty * entropyPenalty * entropyNoisePenalty * entropySpikePenalty * entropyTrendPenalty, 0, 1);
+  const edgeSampleScore = edgeValidationCount >= edgeValidationMinTrades
+    ? 1
+    : clamp(0.50 + (edgeValidationCount / (edgeValidationMinTrades * 2)), 0.50, 0.90);
+  const edgeStability = edgeValidationCount >= edgeValidationMinTrades
+    ? clamp(
+      clamp(edgeConfidenceScore, 0, 1) *
+      clamp(1 - Math.max(0, edgeNegativeErrorRatio - 0.50) * 1.25, 0.35, 1),
+      0,
+      1
+    )
+    : clamp(0.55 + (clamp(edgeConfidenceScore, 0, 1) * 0.20), 0.55, 0.75);
+  const core = (
+    0.26 * evScore +
+    0.18 * edgeScore +
+    0.24 * weightedModelQuality +
+    0.20 * agreement +
+    0.12 * edgeStability
+  );
+  return clamp(
+    core *
+    edgeSampleScore *
+    disagreementPenalty *
+    entropyPenalty *
+    entropyNoisePenalty *
+    entropySpikePenalty *
+    entropyTrendPenalty,
+    0,
+    1
+  );
 }
 
 function evaluateExistingLock(lock, hitRoundIds, currentRound) {
@@ -999,10 +1053,10 @@ function evaluateExistingLock(lock, hitRoundIds, currentRound) {
 
 function confidenceBand(score) {
   const s = clamp(score ?? 0, 0, 1);
-  if (s >= 0.8) return 'VERY HIGH';
-  if (s >= 0.6) return 'HIGH';
-  if (s >= 0.35) return 'MED';
-  if (s >= 0.15) return 'LOW';
+  if (s >= 0.82) return 'VERY HIGH';
+  if (s >= 0.66) return 'HIGH';
+  if (s >= 0.44) return 'MED';
+  if (s >= 0.22) return 'LOW';
   return 'NONE';
 }
 
@@ -1576,11 +1630,22 @@ function runTargetWalkForward(state, target, cfg) {
       1
     );
     const confidenceRaw = confidenceFromComponents(pFinal, baselineP, weights, entropy, {
+      ev,
+      evThreshold,
       modelAgreement,
       edgeConfidenceScore,
+      edgeValidationCount: edgeVal.count,
+      edgeValidationMinTrades: cfg.edgeValidationMinTrades,
+      edgeNegativeErrorRatio: edgeVal.negativeErrorRatio,
       entropyTrend,
       modelDisagreement,
       entropySpike,
+      knnReliability: knn?.reliability,
+      knnSupport: knn?.support,
+      hazardActive: availability.hazard,
+      knnActive: availability.knn,
+      baselineBrier: brierMeans.baseline,
+      hazardBrier: brierMeans.hazard,
     });
     const confidence = preconditionPass ? confidenceRaw : clamp(confidenceRaw * 0.45, 0, 0.45);
     const recommendedBetFraction = kellyFraction(pFinal, target, confidence, cfg.maxRiskFraction);
