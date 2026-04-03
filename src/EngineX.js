@@ -1744,9 +1744,10 @@ function normalizePressure(score, threshold) {
   return clamp((s - t) / denom, 0, 3);
 }
 
-function adjustAheadByRegime(baseAheadLo, fixedSpan, live) {
+function adjustAheadByRegime(baseAheadLo, fixedSpan, live, target = 0) {
   const base = Math.max(1, Number(baseAheadLo || 1));
   const span = Math.max(1, Number(fixedSpan || 1));
+  const t = Number(target || 0);
   const preState = String(live?.preconditionState || 'NEUTRAL').toUpperCase();
   const whiteRisk = clamp(Number(live?.whiteContinue || 0), 0, 1);
   const whiteRelease = clamp(Number(live?.whiteRebound || 0), 0, 1);
@@ -1760,12 +1761,23 @@ function adjustAheadByRegime(baseAheadLo, fixedSpan, live) {
   const momentumPressure = normalizePressure(live?.momentumScore, live?.momentumThreshold);
 
   const whiteDelta = clamp(whiteRisk - whiteRelease, 0, 1);
+  // Target-aware normalization: near-term pressure should impact low targets more than moon targets.
+  const soonBoost = (
+    t <= 20 ? Math.max(0, soonPressure)
+    : t <= 100 ? Math.max(0, soonPressure * 0.40)
+    : Math.max(0, soonPressure * 0.15)
+  );
+  const b2bBoost = (
+    t <= 20 ? Math.max(0, b2bMomentum)
+    : t <= 100 ? Math.max(0, b2bMomentum * 0.55)
+    : Math.max(0, b2bMomentum * 0.25)
+  );
   const releaseMomentum = Math.max(
     releasePressure,
     momentumPressure,
     clamp(whiteRelease - whiteRisk, 0, 1),
-    Math.max(0, b2bMomentum),
-    Math.max(0, soonPressure)
+    b2bBoost,
+    soonBoost
   );
 
   let delayBoost = 0;
@@ -1776,7 +1788,17 @@ function adjustAheadByRegime(baseAheadLo, fixedSpan, live) {
   let nearPull = 0;
   if (releaseMomentum > 0 || preState === 'RELEASE_PHASE' || preState === 'MOMENTUM') {
     const releaseDrive = clamp((releaseMomentum * 0.85) + (Math.max(0, b2bMomentum) * 0.45), 0, 1.8);
-    nearPull = Math.round((span * 0.52) * releaseDrive);
+    const nearPullRaw = Math.round((span * 0.52) * releaseDrive);
+    // Prevent collapse-to-1 across all targets.
+    const maxPullCap = Math.max(
+      1,
+      Math.round(base * (
+        t <= 20 ? 0.70
+        : t <= 100 ? 0.55
+        : 0.40
+      ))
+    );
+    nearPull = Math.min(nearPullRaw, maxPullCap);
   }
 
   let adjusted = Math.max(1, base + delayBoost - nearPull);
@@ -1789,6 +1811,20 @@ function adjustAheadByRegime(baseAheadLo, fixedSpan, live) {
     // Pull closer during release/momentum so b2b/high phases are not missed.
     adjusted = Math.min(adjusted, Math.max(1, Math.round(base * 0.72)));
   }
+
+  // Keep target spacing sane: do not let higher targets collapse to 1 round.
+  const baseFloorRatio = (
+    t <= 20 ? 0.18
+    : t <= 100 ? 0.28
+    : 0.38
+  );
+  const releaseFloorRatio = (
+    preState === 'RELEASE_PHASE' || preState === 'MOMENTUM'
+      ? baseFloorRatio * 0.75
+      : baseFloorRatio
+  );
+  const minAhead = Math.max(1, Math.round(base * releaseFloorRatio));
+  adjusted = Math.max(minAhead, adjusted);
 
   return {
     adjustedAheadLo: adjusted,
@@ -1813,7 +1849,7 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
   const band = estimateAheadBand(state, targetResult);
   const regimeWindowMult = clamp(Number(live?.regime?.windowMult ?? 1), 1, 1.35);
   const baseAheadLo = Math.max(1, Math.round(band.aheadLo * regimeWindowMult));
-  const aheadAdjust = adjustAheadByRegime(baseAheadLo, fixedSpan, live);
+  const aheadAdjust = adjustAheadByRegime(baseAheadLo, fixedSpan, live, target);
   const dynamicAheadLo = Math.max(1, Number(aheadAdjust.adjustedAheadLo || 1));
 
   const lockedLo = Number(lock.lo);
@@ -1946,7 +1982,7 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg, o
   const regimeWindowMult = clamp(Number(live?.regime?.windowMult ?? 1), 1, 1.35);
   const fixedSpan = Number(FIXED_WINDOW_SPAN[targetResult.target] || 3);
   const baseAheadLo = Math.max(1, Math.round(band.aheadLo * regimeWindowMult));
-  const aheadAdjust = adjustAheadByRegime(baseAheadLo, fixedSpan, live);
+  const aheadAdjust = adjustAheadByRegime(baseAheadLo, fixedSpan, live, targetResult.target);
   const aheadLo = aheadAdjust.adjustedAheadLo;
   const aheadHi = Math.max(aheadLo, aheadLo + fixedSpan - 1);
   const lo = currentRound + aheadLo;
@@ -2055,7 +2091,7 @@ function buildIdleLock(state, targetResult, currentRound, generation, cfg) {
   const regimeWindowMult = clamp(Number(live?.regime?.windowMult ?? 1), 1, 1.35);
   const fixedSpan = Number(FIXED_WINDOW_SPAN[targetResult.target] || 3);
   const baseAheadLo = Math.max(1, Math.round(band.aheadLo * regimeWindowMult));
-  const aheadAdjust = adjustAheadByRegime(baseAheadLo, fixedSpan, live);
+  const aheadAdjust = adjustAheadByRegime(baseAheadLo, fixedSpan, live, targetResult.target);
   const aheadLo = aheadAdjust.adjustedAheadLo;
   const aheadHi = Math.max(aheadLo, aheadLo + fixedSpan - 1);
   const lo = currentRound + aheadLo;
