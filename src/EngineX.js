@@ -1735,13 +1735,65 @@ function runTargetWalkForward(state, target, cfg) {
   };
 }
 
+function normalizePressure(score, threshold) {
+  const s = Number(score);
+  const t = Number(threshold);
+  if (!Number.isFinite(s) || !Number.isFinite(t)) return 0;
+  const denom = Math.max(1e-6, Math.abs(t));
+  return clamp((s - t) / denom, 0, 3);
+}
+
+function adjustAheadByRegime(baseAheadLo, fixedSpan, live) {
+  const base = Math.max(1, Number(baseAheadLo || 1));
+  const span = Math.max(1, Number(fixedSpan || 1));
+  const preState = String(live?.preconditionState || 'NEUTRAL').toUpperCase();
+  const whiteRisk = clamp(Number(live?.whiteContinue || 0), 0, 1);
+  const whiteRelease = clamp(Number(live?.whiteRebound || 0), 0, 1);
+
+  const whitePressure = normalizePressure(live?.whiteRegimeScore, live?.whiteRegimeThreshold);
+  const releasePressure = normalizePressure(live?.releaseScore, live?.releaseThreshold);
+  const momentumPressure = normalizePressure(live?.momentumScore, live?.momentumThreshold);
+
+  const whiteDelta = clamp(whiteRisk - whiteRelease, 0, 1);
+  const releaseMomentum = Math.max(releasePressure, momentumPressure, clamp(whiteRelease - whiteRisk, 0, 1));
+
+  let delayBoost = 0;
+  if (whitePressure > 0 || whiteDelta > 0 || preState === 'WHITE_DOMINANT') {
+    delayBoost = Math.round((span * 0.65) * (1 + whitePressure + whiteDelta));
+  }
+  let nearPull = 0;
+  if (releaseMomentum > 0 || preState === 'RELEASE_PHASE' || preState === 'MOMENTUM') {
+    nearPull = Math.round((span * 0.45) * Math.min(1.5, 0.5 + releaseMomentum));
+  }
+
+  let adjusted = Math.max(1, base + delayBoost - nearPull);
+
+  if (preState === 'WHITE_DOMINANT') {
+    adjusted = Math.max(adjusted, Math.max(4, Math.round(span * 2.5)));
+  }
+  if (preState === 'RELEASE_PHASE' || preState === 'MOMENTUM') {
+    adjusted = Math.min(adjusted, Math.max(1, Math.round(span * 0.35)));
+  }
+
+  return {
+    adjustedAheadLo: adjusted,
+    whitePressure: roundNum(whitePressure, 6),
+    releaseMomentum: roundNum(releaseMomentum, 6),
+    delayBoost,
+    nearPull,
+    preState,
+  };
+}
+
 function buildLockFromLive(state, targetResult, currentRound, generation, cfg, options = {}) {
   const forceLock = Boolean(options?.forceLock);
   const live = targetResult.live;
   const band = estimateAheadBand(state, targetResult);
   const regimeWindowMult = clamp(Number(live?.regime?.windowMult ?? 1), 1, 1.35);
-  const aheadLo = Math.max(1, Math.round(band.aheadLo * regimeWindowMult));
   const fixedSpan = Number(FIXED_WINDOW_SPAN[targetResult.target] || 3);
+  const baseAheadLo = Math.max(1, Math.round(band.aheadLo * regimeWindowMult));
+  const aheadAdjust = adjustAheadByRegime(baseAheadLo, fixedSpan, live);
+  const aheadLo = aheadAdjust.adjustedAheadLo;
   const aheadHi = Math.max(aheadLo, aheadLo + fixedSpan - 1);
   const lo = currentRound + aheadLo;
   const hi = lo + fixedSpan - 1;
@@ -1815,6 +1867,12 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg, o
       modelAgreement: roundNum(live.modelAgreement, 6),
       modelDisagreement: roundNum(live.modelDisagreement, 6),
       recommendedBetFraction: roundNum(live.recommendedBetFraction, 6),
+      baseAheadLo: roundNum(baseAheadLo, 3),
+      regimeAdjustedAheadLo: roundNum(aheadLo, 3),
+      whitePressure: aheadAdjust.whitePressure,
+      releaseMomentumPressure: aheadAdjust.releaseMomentum,
+      delayBoostRounds: Number(aheadAdjust.delayBoost || 0),
+      nearPullRounds: Number(aheadAdjust.nearPull || 0),
       aheadLo,
       aheadHi,
       q25: band.q20,
@@ -1841,8 +1899,10 @@ function buildIdleLock(state, targetResult, currentRound, generation, cfg) {
   const live = targetResult.live;
   const band = estimateAheadBand(state, targetResult);
   const regimeWindowMult = clamp(Number(live?.regime?.windowMult ?? 1), 1, 1.35);
-  const aheadLo = Math.max(1, Math.round(band.aheadLo * regimeWindowMult));
   const fixedSpan = Number(FIXED_WINDOW_SPAN[targetResult.target] || 3);
+  const baseAheadLo = Math.max(1, Math.round(band.aheadLo * regimeWindowMult));
+  const aheadAdjust = adjustAheadByRegime(baseAheadLo, fixedSpan, live);
+  const aheadLo = aheadAdjust.adjustedAheadLo;
   const aheadHi = Math.max(aheadLo, aheadLo + fixedSpan - 1);
   const lo = currentRound + aheadLo;
   const hi = lo + fixedSpan - 1;
@@ -1874,6 +1934,12 @@ function buildIdleLock(state, targetResult, currentRound, generation, cfg) {
       releaseThreshold: roundNum(live?.releaseThreshold, 6),
       momentumScore: roundNum(live?.momentumScore, 6),
       momentumThreshold: roundNum(live?.momentumThreshold, 6),
+      baseAheadLo: roundNum(baseAheadLo, 3),
+      regimeAdjustedAheadLo: roundNum(aheadLo, 3),
+      whitePressure: aheadAdjust.whitePressure,
+      releaseMomentumPressure: aheadAdjust.releaseMomentum,
+      delayBoostRounds: Number(aheadAdjust.delayBoost || 0),
+      nearPullRounds: Number(aheadAdjust.nearPull || 0),
       aheadLo,
       aheadHi,
       lockCreatedAtRound: Number(currentRound),
