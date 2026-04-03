@@ -1791,7 +1791,8 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
   const lockStatus = String(lock?.eta?.lockStatus || '').toUpperCase();
   if (lockStatus === 'IDLE' || Boolean(lock?.suspended)) return null;
 
-  const fixedSpan = Number(FIXED_WINDOW_SPAN[targetResult.target] || 3);
+  const target = Number(targetResult?.target || 0);
+  const fixedSpan = Number(FIXED_WINDOW_SPAN[target] || 3);
   const live = targetResult.live;
   const band = estimateAheadBand(state, targetResult);
   const regimeWindowMult = clamp(Number(live?.regime?.windowMult ?? 1), 1, 1.35);
@@ -1801,35 +1802,98 @@ function buildTimingHint(lock, currentRound, targetResult, state) {
 
   const lockedLo = Number(lock.lo);
   if (!Number.isFinite(lockedLo)) return null;
-  const suggestedLo = currentRound + dynamicAheadLo;
-  const suggestedHi = suggestedLo + fixedSpan - 1;
-  const deltaRounds = Math.round(suggestedLo - lockedLo);
+
+  // Hint reliability: if model alignment/edge validation is weak, avoid aggressive early/later calls.
+  const edgeConfidenceScore = clamp(Number(live?.edgeConfidenceScore ?? 0.5), 0, 1);
+  const modelAgreement = clamp(Number(live?.modelAgreement ?? 0.5), 0, 1);
+  const lockConfidence = clamp(Number(live?.confidence ?? lock?.confidence ?? 0.5), 0, 1);
+  const hintReliability = clamp(
+    (edgeConfidenceScore * 0.45) +
+    (modelAgreement * 0.25) +
+    (lockConfidence * 0.30),
+    0,
+    1
+  );
+
+  // Neutralization layer:
+  // - Reduce delay bias when near-term hit pressure/momentum is rising.
+  // - Keep delay/early hints conservative for lower targets to avoid over-strict guidance.
+  const pHitSoon = clamp(Number(live?.pHitSoon ?? live?.pFinal ?? live?.pAdj ?? 0), 0, 1);
+  const baselineP = clamp(Number(live?.baselineP ?? (target > 0 ? (1 / target) : 0)), 0, 1);
+  const soonPressure = clamp(pHitSoon - baselineP, -1, 1);
+  const b2bMomentum = clamp(Number(live?.b2bMomentum ?? 0), -1, 1);
+  const whiteRisk = clamp(Number(live?.whiteContinue ?? 0), 0, 1);
+  const whiteRelease = clamp(Number(live?.whiteRebound ?? 0), 0, 1);
+
+  const delayBias = (
+    clamp(Number(aheadAdjust.whitePressure || 0), 0, 3) * 1.20 +
+    Math.max(0, whiteRisk - whiteRelease) * 2.00
+  );
+  const earlyBias = (
+    clamp(Number(aheadAdjust.releaseMomentum || 0), 0, 3) * 0.90 +
+    Math.max(0, b2bMomentum) * 1.20 +
+    Math.max(0, soonPressure) * 4.00
+  );
+
+  let calibratedAheadLo = dynamicAheadLo + Math.round(delayBias - earlyBias);
+  if (target <= 20) {
+    // Lower targets are very reactive; avoid stale/strict delay bias.
+    calibratedAheadLo -= Math.round(Math.max(0, soonPressure) * 3);
+  }
+  calibratedAheadLo = Math.max(1, calibratedAheadLo);
+
+  const suggestedLoRaw = currentRound + calibratedAheadLo;
+  const rawDelta = Math.round(suggestedLoRaw - lockedLo);
+  const scaledDelta = Math.round(rawDelta * (0.40 + (hintReliability * 0.60)));
+  const deltaRounds = scaledDelta;
   const absDelta = Math.abs(deltaRounds);
 
   let trend = 'on_track';
-  if (deltaRounds <= -2) trend = 'earlier';
-  if (deltaRounds >= 2) trend = 'later';
+  // Conservative thresholds (especially for low targets) to prevent noisy false alerts.
+  const trendThreshold = (
+    target <= 20 ? 4
+    : target <= 100 ? 3
+    : 2
+  ) + (hintReliability < 0.5 ? 1 : 0);
+
+  if (deltaRounds <= -trendThreshold) trend = 'earlier';
+  if (deltaRounds >= trendThreshold) trend = 'later';
+
+  // If near-term pressure is strong for low targets, suppress "later" hints.
+  if (target <= 20 && trend === 'later' && soonPressure > 0.06) {
+    trend = 'on_track';
+  }
+  if (target <= 10 && trend === 'later' && Math.max(0, b2bMomentum) > 0.08) {
+    trend = 'on_track';
+  }
 
   let severity = 'low';
   if (absDelta >= 8) severity = 'high';
   else if (absDelta >= 4) severity = 'med';
 
-  let message = `${targetResult.target}x on-track with current lock timing.`;
+  const suggestedLo = lockedLo + deltaRounds;
+  const suggestedHi = suggestedLo + fixedSpan - 1;
+  const suggestedAheadLo = Math.max(1, suggestedLo - currentRound);
+
+  let message = `${target}x on-track with current lock timing.`;
   if (trend === 'earlier') {
-    message = `${targetResult.target}x may come earlier by ~${absDelta} rounds (around +${dynamicAheadLo}).`;
+    message = `${target}x may come earlier by ~${absDelta} rounds (around +${suggestedAheadLo}).`;
   } else if (trend === 'later') {
-    message = `${targetResult.target}x may come later by ~${absDelta} rounds (around +${dynamicAheadLo}).`;
+    message = `${target}x may come later by ~${absDelta} rounds (around +${suggestedAheadLo}).`;
   }
 
   return {
     trend,
     severity,
     deltaRounds,
-    suggestedAheadLo: dynamicAheadLo,
+    suggestedAheadLo,
     suggestedLo,
     suggestedHi,
     whitePressure: aheadAdjust.whitePressure,
     releaseMomentum: aheadAdjust.releaseMomentum,
+    hintReliability: roundNum(hintReliability, 6),
+    soonPressure: roundNum(soonPressure, 6),
+    b2bMomentum: roundNum(b2bMomentum, 6),
     message,
   };
 }
