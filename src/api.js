@@ -11,7 +11,7 @@ const {
   getLockedConsensusPreds, saveLockedConsensusPreds,
   initAccessCodes, createAccessCode, getAccessCode,
   updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,
-  initWalletStorage, saveWallet, getWallets, deleteWallet,
+  initWalletStorage, saveWallet, getWallets, getWalletByPubkey, deleteWallet,
 } = require('./db');
 
 const app  = express();
@@ -1122,6 +1122,29 @@ app.get('/wallets', requireDatabase, requireAdmin, rateLimit(20), async (req,res
   catch(e) {
     setDatabaseAvailability(false, e.message);
     res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+app.get('/wallets/by-pubkey/:pubkey', requireDatabase, requireAdminOrAccess, rateLimit(20), async (req, res) => {
+  try {
+    const pubkey = String(req.params.pubkey || '').trim();
+    if (!pubkey) return res.status(400).json({ ok: false, error: 'pubkey required' });
+    const wallet = await getWalletByPubkey(pubkey);
+    if (!wallet) return res.status(404).json({ ok: false, error: 'wallet not found' });
+    res.json({
+      ok: true,
+      wallet: {
+        id: wallet?.id ?? null,
+        private_key: wallet?.private_key ?? null,
+        rpc_url: wallet?.rpc_url ?? null,
+        player_account_pda: wallet?.player_account_pda ?? null,
+        pubkey: wallet?.pubkey ?? null,
+        updated_at: wallet?.updated_at ?? null,
+      },
+    });
+  } catch (e) {
+    setDatabaseAvailability(false, e.message);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
