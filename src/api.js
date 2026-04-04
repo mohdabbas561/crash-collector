@@ -4,6 +4,12 @@ const cors       = require('cors');
 const { buildPredictionReport } = require('./predictionEngine');
 const { computeLockedRangePredictions } = require('./lockedRangeEngine');
 const {
+  buildTimingAnalyticsReport,
+  normalizeTimingWindowKey,
+  normalizeTimingTarget,
+  normalizeTimingTimeZone,
+} = require('./timingAnalytics');
+const {
   pool,
   getLatestRoundId, getRoundCount,
   getRounds, getStats, getStorageStats,
@@ -292,6 +298,7 @@ const dashboardCache = {
   createdAt: 0,
   payload: null,
 };
+const timingAnalyticsCache = new Map();
 let predictComputeInFlight = null;
 let lockedComputeInFlight = null;
 let lockedBackgroundTimer = null;
@@ -734,6 +741,49 @@ app.get('/dashboard', requireDatabase, rateLimit(60), async (req, res) => {
   } catch (e) {
     if (isLikelyDbError(e)) setDatabaseAvailability(false, e.message);
     console.error('[dashboard] error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/analytics/timing', requireDatabase, rateLimit(20), async (req, res) => {
+  try {
+    const windowKey = normalizeTimingWindowKey(req.query.window);
+    const focusTarget = normalizeTimingTarget(req.query.focusTarget);
+    const timeZone = normalizeTimingTimeZone(req.query.tz);
+    const includeOutlook = ['1', 'true', 'yes'].includes(String(req.query.includeOutlook || '').trim().toLowerCase());
+    const latestRound = await getLatestRoundId();
+    markDbHealthy();
+
+    const cacheRoundKey = latestRound == null ? 'empty' : String(latestRound);
+    const cacheKey = `${cacheRoundKey}|${windowKey}|${focusTarget}|${timeZone}|${includeOutlook ? '1' : '0'}`;
+    const cached = timingAnalyticsCache.get(cacheKey);
+    if (cached && (!RESPONSE_CACHE_ENABLED || (Date.now() - cached.createdAt) < DASHBOARD_CACHE_TTL_MS)) {
+      return res.json(cached.payload);
+    }
+
+    const totalRounds = latestRound == null ? 0 : await getRoundCount();
+    const rounds = totalRounds > 0 ? await getRounds({ limit: totalRounds, order: 'ASC' }) : [];
+    markDbHealthy();
+
+    const payload = buildTimingAnalyticsReport(rounds, {
+      windowKey,
+      focusTarget,
+      timeZone,
+      includeOutlook,
+    });
+
+    if (!timingAnalyticsCache.has(cacheKey) && timingAnalyticsCache.size >= 80) {
+      timingAnalyticsCache.delete(timingAnalyticsCache.keys().next().value);
+    }
+    timingAnalyticsCache.set(cacheKey, {
+      createdAt: Date.now(),
+      payload,
+    });
+
+    res.json(payload);
+  } catch (e) {
+    if (isLikelyDbError(e)) setDatabaseAvailability(false, e.message);
+    console.error('[analytics/timing] error:', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
