@@ -23,6 +23,8 @@ const TIMING_DEFAULT_TARGET = 5;
 const TIMING_HISTORY_LOOKBACK_MS = TIMING_WINDOWS['30d'].ms;
 const TIMING_ANALOG_MATCHES = 36;
 const TIMING_MIN_ANALOG_WINDOWS = 6;
+const TIME_SLOT_MINUTES = 5;
+const SLOTS_PER_DAY = (24 * 60) / TIME_SLOT_MINUTES;
 
 const TIMING_BUCKETS = [
   { key: 'lt2', label: '<2x', min: 0, max: 2, color: '#ff4560' },
@@ -35,6 +37,16 @@ const TIMING_BUCKETS = [
   { key: 'b500_1000', label: '500-1000x', min: 500, max: 1000, color: '#c084fc' },
   { key: 'gt1000', label: '1000x+', min: 1000, max: Number.POSITIVE_INFINITY, color: '#ff66c4' },
 ];
+
+const CHASE_WINDOW_SLOT_RANGES = {
+  5: [1, 6],
+  10: [1, 8],
+  20: [2, 10],
+  50: [3, 14],
+  100: [4, 18],
+  500: [6, 24],
+  1000: [8, 24],
+};
 
 function roundNum(value, digits = 4) {
   const n = Number(value);
@@ -338,6 +350,193 @@ function buildHourlyHistory(rounds, timeZone) {
   };
 }
 
+function createTimePartsFormatter(timeZone) {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+    hourCycle: 'h23',
+  });
+}
+
+function createDayPartsFormatter(timeZone) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+}
+
+function getSlotIndexFromTimestamp(timestamp, formatter) {
+  const parts = formatter.formatToParts(new Date(timestamp));
+  const hour = Number(parts.find((part) => part.type === 'hour')?.value || 0);
+  const minute = Number(parts.find((part) => part.type === 'minute')?.value || 0);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return 0;
+  return Math.min(SLOTS_PER_DAY - 1, Math.max(0, (hour * (60 / TIME_SLOT_MINUTES)) + Math.floor(minute / TIME_SLOT_MINUTES)));
+}
+
+function slotIndexToLabel(slotIndex) {
+  const totalMinutes = slotIndex * TIME_SLOT_MINUTES;
+  const hour = Math.floor(totalMinutes / 60) % 24;
+  const minute = totalMinutes % 60;
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+}
+
+function formatDisplayTime(slotIndex) {
+  const totalMinutes = slotIndex * TIME_SLOT_MINUTES;
+  const hour24 = Math.floor(totalMinutes / 60) % 24;
+  const minute = totalMinutes % 60;
+  const suffix = hour24 >= 12 ? 'PM' : 'AM';
+  const hour12 = hour24 % 12 || 12;
+  if (minute === 0) return `${hour12}${suffix}`;
+  return `${hour12}:${String(minute).padStart(2, '0')}${suffix}`;
+}
+
+function windowLabelFromSlots(startSlot, slotLength) {
+  const endSlotExclusive = (startSlot + slotLength) % SLOTS_PER_DAY;
+  const start = formatDisplayTime(startSlot);
+  const end = formatDisplayTime(endSlotExclusive);
+  return `${start} - ${end}`;
+}
+
+function listWindowSlots(startSlot, slotLength) {
+  const slots = [];
+  for (let offset = 0; offset < slotLength; offset += 1) {
+    slots.push((startSlot + offset) % SLOTS_PER_DAY);
+  }
+  return slots;
+}
+
+function computeWindowStats(slotTotals, slotHits, startSlot, slotLength, baselineRate, dayCount) {
+  const slots = listWindowSlots(startSlot, slotLength);
+  let totalRounds = 0;
+  let totalHits = 0;
+
+  for (const slot of slots) {
+    totalRounds += Number(slotTotals[slot] || 0);
+    totalHits += Number(slotHits[slot] || 0);
+  }
+
+  if (totalRounds <= 0) return null;
+
+  const priorRounds = 120;
+  const rawRate = totalHits / totalRounds;
+  const smoothedRate = (totalHits + (baselineRate * priorRounds)) / (totalRounds + priorRounds);
+  const avgRoundsPerDay = dayCount > 0 ? totalRounds / dayCount : 0;
+  const anyHitChance = avgRoundsPerDay > 0 ? 1 - Math.pow(Math.max(0, 1 - smoothedRate), avgRoundsPerDay) : 0;
+  const lift = baselineRate > 0 ? smoothedRate / baselineRate : 0;
+  const durationMinutes = slotLength * TIME_SLOT_MINUTES;
+  const score = (smoothedRate - baselineRate) * Math.log1p(totalRounds) * Math.pow(Math.max(anyHitChance, 0.0001), 0.7) / Math.pow(slotLength, 0.28);
+
+  return {
+    startSlot,
+    endSlotExclusive: (startSlot + slotLength) % SLOTS_PER_DAY,
+    slotLength,
+    durationMinutes,
+    totalRounds,
+    totalHits,
+    avgRoundsPerDay: roundNum(avgRoundsPerDay, 2),
+    rawRate: roundNum(rawRate, 4),
+    smoothedRate: roundNum(smoothedRate, 4),
+    anyHitChance: roundNum(anyHitChance, 4),
+    lift: roundNum(lift, 4),
+    score: roundNum(score, 6),
+    slotLabel: `${slotIndexToLabel(startSlot)} - ${slotIndexToLabel((startSlot + slotLength) % SLOTS_PER_DAY)}`,
+    displayLabel: windowLabelFromSlots(startSlot, slotLength),
+  };
+}
+
+function buildChaseWindows(rounds, timeZone) {
+  if (!rounds.length) return [];
+
+  const timeFormatter = createTimePartsFormatter(timeZone);
+  const dayFormatter = createDayPartsFormatter(timeZone);
+  const dayKeys = new Set();
+  const slotTotals = new Array(SLOTS_PER_DAY).fill(0);
+  const perTargetSlotHits = Object.fromEntries(TIMING_TARGETS.map((target) => [target, new Array(SLOTS_PER_DAY).fill(0)]));
+  const baselineHitCounts = Object.fromEntries(TIMING_TARGETS.map((target) => [target, 0]));
+
+  for (const round of rounds) {
+    const slotIndex = getSlotIndexFromTimestamp(round.timestamp, timeFormatter);
+    const dayKey = dayFormatter.format(new Date(round.timestamp));
+    dayKeys.add(dayKey);
+    slotTotals[slotIndex] += 1;
+
+    for (const target of TIMING_TARGETS) {
+      if (round.multiplier >= target) {
+        perTargetSlotHits[target][slotIndex] += 1;
+        baselineHitCounts[target] += 1;
+      }
+    }
+  }
+
+  const dayCount = Math.max(dayKeys.size, 1);
+
+  return TIMING_TARGETS.map((target) => {
+    const baselineRate = rounds.length > 0 ? baselineHitCounts[target] / rounds.length : 0;
+    const [minSlots, maxSlots] = CHASE_WINDOW_SLOT_RANGES[target] || [1, 12];
+    const candidates = [];
+
+    for (let slotLength = minSlots; slotLength <= maxSlots; slotLength += 1) {
+      for (let startSlot = 0; startSlot < SLOTS_PER_DAY; startSlot += 1) {
+        const stats = computeWindowStats(
+          slotTotals,
+          perTargetSlotHits[target],
+          startSlot,
+          slotLength,
+          baselineRate,
+          dayCount
+        );
+        if (!stats) continue;
+        if (stats.totalRounds < Math.max(100, dayCount * 2)) continue;
+        if (stats.smoothedRate <= baselineRate) continue;
+        candidates.push(stats);
+      }
+    }
+
+    const topWindows = candidates
+      .sort((a, b) => (b.score - a.score) || (b.lift - a.lift) || (a.durationMinutes - b.durationMinutes))
+      .slice(0, 3);
+
+    const best = topWindows[0] || null;
+    return {
+      target,
+      label: toLabel(target),
+      baselineRate: roundNum(baselineRate, 4),
+      bestWindow: best ? {
+        startSlot: best.startSlot,
+        endSlotExclusive: best.endSlotExclusive,
+        slotLength: best.slotLength,
+        durationMinutes: best.durationMinutes,
+        label: best.displayLabel,
+        rawLabel: best.slotLabel,
+        anyHitChance: best.anyHitChance,
+        roundHitRate: best.smoothedRate,
+        lift: best.lift,
+        totalRounds: best.totalRounds,
+        totalHits: best.totalHits,
+        avgRoundsPerDay: best.avgRoundsPerDay,
+      } : null,
+      topWindows: topWindows.map((item) => ({
+        startSlot: item.startSlot,
+        endSlotExclusive: item.endSlotExclusive,
+        slotLength: item.slotLength,
+        durationMinutes: item.durationMinutes,
+        label: item.displayLabel,
+        rawLabel: item.slotLabel,
+        anyHitChance: item.anyHitChance,
+        roundHitRate: item.smoothedRate,
+        lift: item.lift,
+        totalRounds: item.totalRounds,
+        totalHits: item.totalHits,
+        avgRoundsPerDay: item.avgRoundsPerDay,
+      })),
+    };
+  });
+}
+
 function buildSegmentWindows(rounds, windowMs, focusTarget) {
   if (!rounds.length || !(windowMs > 0)) return [];
   const windows = [];
@@ -555,6 +754,7 @@ function buildTimingAnalyticsReport(rawRounds, options = {}) {
   const comparison = buildComparison(currentSummary, baselineSummary);
   const hourlyHistory = buildHourlyHistory(historyRounds, timeZone);
   const targetCards = buildTargetCards(currentSummary, baselineSummary);
+  const chaseWindows = buildChaseWindows(rounds, timeZone);
 
   return {
     ok: true,
@@ -584,6 +784,7 @@ function buildTimingAnalyticsReport(rawRounds, options = {}) {
     },
     comparison,
     targetCards,
+    chaseWindows,
     hourlyHistory: {
       ...hourlyHistory,
       lookbackLabel: 'Last 30 Days',
