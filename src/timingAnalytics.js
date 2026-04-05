@@ -1032,6 +1032,176 @@ function buildPatternPrediction({ focusTarget, windowLabel, latestRoundId, curre
   const currentEvidenceWeight = clamp(expectedCurrentHits / (isLowTarget ? 10 : isMidTarget ? 4 : 2.5), 0.12, 1);
   const effectiveCurrentLift  = 1 + (currentLift - 1) * currentEvidenceWeight;
 
+  {
+    const rules = focusTarget <= 5
+      ? { minMatches: 6, playRate: 0.62, strongRate: 0.78 }
+      : focusTarget <= 10
+        ? { minMatches: 6, playRate: 0.48, strongRate: 0.64 }
+        : focusTarget <= 20
+          ? { minMatches: 6, playRate: 0.30, strongRate: 0.46 }
+          : focusTarget <= 50
+            ? { minMatches: 5, playRate: 0.16, strongRate: 0.30 }
+            : focusTarget <= 100
+              ? { minMatches: 5, playRate: 0.09, strongRate: 0.18 }
+              : focusTarget <= 500
+                ? { minMatches: 4, playRate: 0.03, strongRate: 0.07 }
+                : { minMatches: 4, playRate: 0.015, strongRate: 0.04 };
+
+    if (!patternMatch?.available) {
+      return {
+        action: 'SKIP',
+        tone: 'bad',
+        confidence: 0,
+        confidenceLabel: 'Not Strong',
+        dataQuality: 'insufficient',
+        accuracyRate: 0,
+        accuracyPercent: 0,
+        strengthLabel: 'Not Strong',
+        predictsLabel: `Current ${windowLabel}`,
+        inputLabel: `Closed Previous ${windowLabel}`,
+        inputSlotLabel: '-',
+        currentSlotLabel: currentSlot?.label || '-',
+        currentHitRate,
+        baselineHitRate,
+        baselineCurrentWindowHitRate: baselineCWHitRate,
+        currentLift,
+        effectiveCurrentLift,
+        currentEvidenceWeight,
+        currentSlotChance: safeNumber(currentSlot?.anyHitChance, 0),
+        currentWindowHitRate: 0,
+        currentWindowLift: 1,
+        remainingHitRate: 0,
+        remainingLift: 1,
+        baselineRemainingHitRate: 0,
+        matchedWindows: 0,
+        sameWeekdayMatches: 0,
+        lookbackDaysUsed: 0,
+        alreadyHitInCurrentWindow: (currentSummary.hitCounts?.[focusTarget] || 0) > 0,
+        hitsSoFar: currentSummary.hitCounts?.[focusTarget] || 0,
+        expectedRoundIdFrom: null,
+        expectedRoundIdTo: null,
+        expectedRoundIdLabel: '-',
+        expectedRoundIdBasis: 'Round IDs are only shown on PLAY.',
+        summary: patternMatch?.reason || `Skip ${labelForTarget(focusTarget)} in this live ${windowLabel.toLowerCase()} because there is not enough matching time-slot history yet.`,
+        reasons: [
+          'Accuracy 0.0%.',
+          patternMatch?.reason || 'No matched same-time history was available.',
+        ].filter(Boolean),
+      };
+    }
+
+    const cwHitRate = safeNumber(patternMatch.currentWindow?.anyHitRate, 0);
+    const cwLift = safeNumber(patternMatch.currentWindow?.lift, 1);
+    const remHitRate = safeNumber(patternMatch.remainingWindow?.anyHitRate, 0);
+    const remBaseline = safeNumber(patternMatch.remainingWindow?.baselineAnyHitRate, 0);
+    const remLift = safeNumber(patternMatch.remainingWindow?.lift, 1);
+    const matchedWins = safeNumber(patternMatch.usedMatches, 0);
+    const sameWdMatches = safeNumber(patternMatch.sameWeekdayMatches, 0);
+    const lookbackDays = safeNumber(patternMatch.lookbackDaysUsed, 0);
+    const safeLatestId = safeNumber(latestRoundId, 0);
+    const alreadyHit = Boolean(patternMatch.progress?.alreadyHit || (currentSummary.hitCounts?.[focusTarget] || 0) > 0);
+    const hitsSoFar = currentSummary.hitCounts?.[focusTarget] || 0;
+    const averageDistance = safeNumber(patternMatch.averageDistance, 1.25);
+    const enoughHistory = matchedWins >= rules.minMatches;
+    const sameWeekdayShare = ratio(sameWdMatches, matchedWins);
+
+    const rateScore = clamp(remHitRate / Math.max(rules.strongRate, 0.0001), 0, 1);
+    const sampleScore = clamp(matchedWins / Math.max(rules.minMatches + 8, 10), 0, 1);
+    const distanceScore = clamp(1 - (averageDistance / 1.8), 0, 1);
+    const weekdayScore = clamp(sameWeekdayShare, 0, 1);
+    const signalAccuracy = clamp(
+      (rateScore * 0.55)
+      + (sampleScore * 0.20)
+      + (distanceScore * 0.15)
+      + (weekdayScore * 0.10),
+      0,
+      1,
+    );
+    const accuracyPercent = Number((signalAccuracy * 100).toFixed(1));
+    const strengthLabel = signalAccuracy >= 0.78 ? 'Strong' : signalAccuracy >= 0.58 ? 'Medium' : 'Not Strong';
+    const dataQuality = signalAccuracy >= 0.78 ? 'good' : signalAccuracy >= 0.58 ? 'moderate' : 'limited';
+    const shouldPlay = enoughHistory
+      && remHitRate >= rules.playRate
+      && signalAccuracy >= 0.58
+      && (!alreadyHit || (remHitRate >= rules.strongRate && signalAccuracy >= 0.72));
+
+    let action = 'SKIP';
+    let tone = 'bad';
+    let summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. Historical same-time matches from this point are not strong enough.`;
+
+    if (shouldPlay) {
+      action = 'PLAY';
+      tone = 'good';
+      summary = `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. Historical same-time matches from this point support it.`;
+    } else if (!enoughHistory) {
+      summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. There are not enough matched same-time setups yet.`;
+    } else if (alreadyHit) {
+      summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. It already hit, and the remaining matched history is not strong enough for another one.`;
+    }
+
+    const expectedRoundIdFrom = patternMatch.expectedRoundRange && safeLatestId > 0
+      ? safeLatestId + patternMatch.expectedRoundRange.firstRemainingHitOffsetFrom
+      : null;
+    const expectedRoundIdTo = patternMatch.expectedRoundRange && safeLatestId > 0
+      ? safeLatestId + patternMatch.expectedRoundRange.firstRemainingHitOffsetTo
+      : null;
+    const rawExpectedRoundIdLabel = (expectedRoundIdFrom && expectedRoundIdTo) ? `#${expectedRoundIdFrom} - #${expectedRoundIdTo}` : '-';
+    const rawExpectedRoundIdBasis = patternMatch.expectedRoundRange
+      ? `Based on ${patternMatch.expectedRoundRange.hitMatchCount} matched hits still ahead from this point.`
+      : '';
+    const expectedRoundIdLabel = action === 'PLAY' ? rawExpectedRoundIdLabel : '-';
+    const expectedRoundIdBasis = action === 'PLAY'
+      ? rawExpectedRoundIdBasis
+      : 'Round IDs are only shown on PLAY.';
+
+    return {
+      action,
+      tone,
+      confidence: signalAccuracy,
+      confidenceLabel: strengthLabel,
+      dataQuality,
+      accuracyRate: remHitRate,
+      accuracyPercent,
+      strengthLabel,
+      predictsLabel: `Current ${windowLabel}`,
+      inputLabel: `Closed Previous ${windowLabel}`,
+      inputSlotLabel: patternMatch.inputSlotLabel,
+      currentSlotLabel: patternMatch.currentSlotLabel,
+      currentHitRate,
+      baselineHitRate,
+      baselineCurrentWindowHitRate: baselineCWHitRate,
+      currentLift,
+      effectiveCurrentLift,
+      currentEvidenceWeight,
+      currentSlotChance: safeNumber(currentSlot?.anyHitChance, 0),
+      currentWindowHitRate: cwHitRate,
+      currentWindowLift: cwLift,
+      remainingHitRate: remHitRate,
+      remainingLift: remLift,
+      baselineRemainingHitRate: remBaseline,
+      matchedWindows: matchedWins,
+      sameWeekdayMatches: sameWdMatches,
+      lookbackDaysUsed: lookbackDays,
+      alreadyHitInCurrentWindow: alreadyHit,
+      hitsSoFar,
+      expectedRoundIdFrom,
+      expectedRoundIdTo,
+      expectedRoundIdLabel,
+      expectedRoundIdBasis,
+      summary,
+      reasons: [
+        `Accuracy ${accuracyPercent.toFixed(1)}%.`,
+        `Historical hit rate from now: ${pctString(remHitRate)} across ${matchedWins} matched setups.`,
+        `Normal hit rate from now: ${pctString(remBaseline)}.`,
+        `Pattern quality: ${strengthLabel}.`,
+        alreadyHit
+          ? `${labelForTarget(focusTarget)} already hit ${hitsSoFar} time(s) in this live window.`
+          : `${labelForTarget(focusTarget)} has not hit yet in this live window.`,
+        expectedRoundIdBasis ? `Expected ${labelForTarget(focusTarget)} around rounds ${expectedRoundIdLabel}. ${expectedRoundIdBasis}` : null,
+      ].filter(Boolean),
+    };
+  }
+
   if (!patternMatch?.available) {
     return {
       action: 'SKIP', tone: 'bad',
