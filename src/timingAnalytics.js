@@ -1157,11 +1157,13 @@ function buildPatternPrediction({ focusTarget, windowLabel, latestRoundId, curre
   const enoughHistory = matchedWins >= minMatchesNeeded;
   const veryStrongFromNow = remHitRate >= strongPlayChance;
   const solidFromNow = remHitRate >= absolutePlayChance;
-  const patternAligned = remLift >= 1.02 || remEdge >= -baselineSlack || slotLift >= 1;
-  const liveAligned = cwLift >= 0.97 || effectiveCurrentLift >= 0.97 || cwHitRate >= Math.max(0, baselineCWHitRate - baselineSlack);
+  const patternAligned = remLift >= 1.01 || remEdge >= -baselineSlack || slotLift >= 0.98;
+  const liveAligned = cwLift >= 0.94 || effectiveCurrentLift >= 0.94 || cwHitRate >= Math.max(0, baselineCWHitRate - baselineSlack);
+  const mediumPlayChance = (absolutePlayChance + strongPlayChance) / 2;
   const shouldPlayNow = enoughHistory && (
-    (veryStrongFromNow && (slotLift >= 0.95 || cwLift >= 0.95 || effectiveCurrentLift >= 0.95))
+    veryStrongFromNow
     || (solidFromNow && patternAligned && liveAligned)
+    || (remHitRate >= mediumPlayChance && remLift >= 1.01 && matchedWins >= (minMatchesNeeded + 2))
     || (remSig && remLift >= 1.03 && remHitRate >= absolutePlayChance * 0.85)
   );
 
@@ -1182,7 +1184,7 @@ function buildPatternPrediction({ focusTarget, windowLabel, latestRoundId, curre
   } else if (veryStrongFromNow || solidFromNow || remLift >= 1 || cwLift >= 1 || effectiveCurrentLift >= 1 || slotLift >= 1) {
     action = 'SKIP';
     tone = 'bad';
-    summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window because the timing match is only normal, not strong enough to play.`;
+    summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window because the timing match is close, but still not strong enough to play.`;
   } else {
     action = 'SKIP';
     tone = 'bad';
