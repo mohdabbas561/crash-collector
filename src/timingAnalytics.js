@@ -170,6 +170,13 @@ function normalizeTimingTimeZone(raw) {
 
 function clamp(value, min, max)         { return Math.min(max, Math.max(min, value)); }
 function ratio(num, den, fallback = 0)  { return den > 0 ? num / den : fallback; }
+function liftAgainstBaseline(rate, baselineRate, positiveFallback = 1.25) {
+  const observed = safeNumber(rate, 0);
+  const baseline = safeNumber(baselineRate, 0);
+  if (baseline > 0) return observed / baseline;
+  if (observed > 0) return positiveFallback;
+  return 1;
+}
 
 function average(values) {
   if (!values.length) return 0;
@@ -634,7 +641,7 @@ function buildSlotAnalytics(slotWindows, slotMinutes, windowMs, focusTarget, lat
         ? slot.weightedHitWindows / slot.weightedSamples
         : ratio(slot.hitWindows, slot.sampleCount);
       const roundHitRate = ratio(slot.totalHits, slot.totalRounds);
-      const lift         = ratio(anyHitChance, baselineAnyHitRate, 1);
+      const lift         = liftAgainstBaseline(anyHitChance, baselineAnyHitRate);
       const sigTest      = chiSquareTest(slot.hitWindows, slot.sampleCount, baselineAnyHitRate);
       const classification = classifyLift(lift, slot.sampleCount, slot.hitWindows, slot.sampleCount, baselineAnyHitRate);
 
@@ -902,7 +909,7 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
   const inputHistoryAnyHitRate   = ratio(ihAnyHit, sameSetupCandidates.length);
   const inputHistoryPerRoundRate = ratio(ihHits, ihRounds);
   const inputBaselineAnyHitRate  = baselineStats.windowAnyHitRates[focusTarget];
-  const inputHistoryLift         = ratio(inputHistoryAnyHitRate, inputBaselineAnyHitRate, 1);
+  const inputHistoryLift         = liftAgainstBaseline(inputHistoryAnyHitRate, inputBaselineAnyHitRate);
 
   const currentWindowAnyHitRate = weightedAverage(
     matchRows, (m) => ((m.matchedCurrentWindow.summary.hitCounts[focusTarget] || 0) > 0 ? 1 : 0),
@@ -912,7 +919,7 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
     matchRows, (m) => ratio(m.matchedCurrentWindow.summary.hitCounts[focusTarget] || 0, m.matchedCurrentWindow.summary.roundCount),
     (m) => m.weight, ratio(cwHits, cwRounds),
   );
-  const currentWindowLift = ratio(currentWindowAnyHitRate, inputBaselineAnyHitRate, 1);
+  const currentWindowLift = liftAgainstBaseline(currentWindowAnyHitRate, inputBaselineAnyHitRate);
 
   const remainingBaselineAnyHitRate  = ratio(rhAnyHit, sameSetupCandidates.length);
   const remainingBaselinePerRoundRate = ratio(rhHits, rhRounds);
@@ -924,7 +931,7 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
     matchRows, (m) => ratio(m.matchedRemainingSummary.hitCounts[focusTarget] || 0, m.matchedRemainingSummary.roundCount),
     (m) => m.weight, ratio(rwHits, rwRounds),
   );
-  const remainingLift = ratio(remainingAnyHitRate, remainingBaselineAnyHitRate, 1);
+  const remainingLift = liftAgainstBaseline(remainingAnyHitRate, remainingBaselineAnyHitRate);
 
   const remainingSigTest    = chiSquareTest(rwAnyHit, matches.length, remainingBaselineAnyHitRate);
   const currentWindowSigTest = chiSquareTest(cwAnyHit, matches.length, inputBaselineAnyHitRate);
@@ -1019,7 +1026,7 @@ function buildPatternPrediction({ focusTarget, windowLabel, latestRoundId, curre
   const currentHitRate        = currentSummary.hitRates[focusTarget] || 0;
   const baselineHitRate       = baselineStats.perRoundHitRates[focusTarget] || 0;
   const baselineCWHitRate     = baselineStats.windowAnyHitRates[focusTarget] || 0;
-  const currentLift           = ratio(currentHitRate, baselineHitRate, baselineHitRate > 0 ? 1 : 0);
+  const currentLift           = liftAgainstBaseline(currentHitRate, baselineHitRate);
   const slotLift              = safeNumber(currentSlot?.lift, 1);
   const slotSignificant       = Boolean(currentSlot?.liftSignificant);
   const isLowTarget           = focusTarget <= 20;
@@ -1080,13 +1087,19 @@ function buildPatternPrediction({ focusTarget, windowLabel, latestRoundId, curre
   // BUG-FIX 6 cont.: action and tone are now derived from the SAME significance logic
   // that the UI signal cards use — no more contradiction.
   let action = 'SKIP', tone = 'bad';
-  let summary = `Mixed signals for ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window.`;
+  let summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window because the pattern is not strong enough.`;
 
-  if (!alreadyHit && remSig && remLift >= 1.05 && remEdge >= 0
-      && (cwSig ? cwLift >= 1 : true) && (slotSignificant ? slotLift >= 1 : true)) {
+  if (!alreadyHit
+      && (
+        (remSig && remLift >= 1.05 && remEdge >= 0)
+        || (!remSig && remLift >= (isLowTarget ? 1.12 : isMidTarget ? 1.16 : 1.20) && matchedWins >= (PATTERN_MIN_CANDIDATES + 2) && remHitRate >= (isLowTarget ? 0.42 : isMidTarget ? 0.12 : 0.04))
+      )
+      && (cwSig ? cwLift >= 1 : currentWindowHitRate >= baselineCurrentWindowHitRate || effectiveCurrentLift >= 1)
+      && (slotSignificant ? slotLift >= 1 : slotLift >= 0.98)) {
     action  = 'PLAY';
     tone    = 'good';
     summary = `Remaining-window pattern is significantly stronger (${pctString(remHitRate)} vs ${pctString(remBaseline)} baseline, lift ${remLift.toFixed(2)}x, p<0.05) — supports ${labelForTarget(focusTarget)}.`;
+    summary = `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. Timing, cluster match, and live read all support this setup.`;
   } else if (!alreadyHit && (
     (remLift >= 1.05 && matchedWins >= PATTERN_MIN_CANDIDATES)
     || (cwSig && cwLift >= 1.05)
@@ -1100,10 +1113,12 @@ function buildPatternPrediction({ focusTarget, windowLabel, latestRoundId, curre
     action  = 'SKIP';
     tone    = 'bad';
     summary = `${labelForTarget(focusTarget)} already hit and remaining pattern is significantly weaker — another hit soon is unlikely.`;
+    summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window because it already hit and the remaining pattern is weaker than normal.`;
   } else if (remSig && remLift <= 0.95 && cwSig && cwLift <= 0.95) {
     action  = 'SKIP';
     tone    = 'bad';
     summary = `Both full-window and remaining patterns are significantly below baseline — skip ${labelForTarget(focusTarget)} for now.`;
+    summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window because both the full-window and remaining pattern are below baseline.`;
   } else if (remLift >= 1 || cwLift >= 1 || effectiveCurrentLift >= 1 || slotLift >= 1) {
     action  = 'SKIP';
     tone    = 'neutral';
@@ -1652,20 +1667,20 @@ function buildEmptyReport(windowConfig, focusTarget, timeZone) {
     patternPrediction: {
       action: 'SKIP', tone: 'bad', confidence: 0, confidenceLabel: 'Low', dataQuality: 'insufficient',
       predictsLabel: `Current ${windowConfig.label}`, inputLabel: `Closed Previous ${windowConfig.label}`,
-      inputSlotLabel: '—', currentSlotLabel: '—',
+      inputSlotLabel: '-', currentSlotLabel: '-',
       currentHitRate: 0, baselineHitRate: 0, baselineCurrentWindowHitRate: 0,
       currentLift: 1, effectiveCurrentLift: 1, currentEvidenceWeight: 0, currentSlotChance: 0,
       currentWindowHitRate: 0, currentWindowLift: 1, remainingHitRate: 0, remainingLift: 1, baselineRemainingHitRate: 0,
       matchedWindows: 0, sameWeekdayMatches: 0, lookbackDaysUsed: 0,
       alreadyHitInCurrentWindow: false, hitsSoFar: 0,
-      expectedRoundIdFrom: null, expectedRoundIdTo: null, expectedRoundIdLabel: '—', expectedRoundIdBasis: '',
-      summary: 'No rounds stored yet — no timing prediction available.',
+      expectedRoundIdFrom: null, expectedRoundIdTo: null, expectedRoundIdLabel: '-', expectedRoundIdBasis: 'Round IDs are only shown when the signal is strong enough to play.',
+      summary: 'No rounds stored yet, so no timing prediction is available.',
       reasons: [],
     },
-    comparison: { band: 'wait', label: 'WAIT / WATCH', message: 'No rounds stored yet.' },
+    comparison: { band: 'skip', label: 'SKIP', message: 'No rounds stored yet.' },
     targetCards: [], decision: null, targetReadiness: [], recommendationStability: null,
     bestWindowsToday: { items: [], slotMode: 'window', slotMinutes: chooseSlotMinutes(windowConfig.ms), note: '' },
-    patternMatch: { available: false, examples: [], reason: 'No rounds stored yet.', inputSlotLabel: '—', currentSlotLabel: '—' },
+    patternMatch: { available: false, examples: [], reason: 'No rounds stored yet.', inputSlotLabel: '-', currentSlotLabel: '-' },
     cooldowns: [], backtest: null,
     hourlyHistory: { timeZone, rows: [], bestHours: [] },
     dayHourHeatmap: {
