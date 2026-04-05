@@ -365,6 +365,71 @@ function summarizeRounds(rounds, focusTarget) {
   };
 }
 
+function distributionPct(summary, bandKey) {
+  const items = Array.isArray(summary?.distribution) ? summary.distribution : [];
+  const band = items.find((item) => item.key === bandKey);
+  return safeNumber(band?.pct, 0);
+}
+
+function computeSummaryDistance(candidateSummary, referenceSummary, focusTarget) {
+  if (!candidateSummary || !referenceSummary) return Number.POSITIVE_INFINITY;
+
+  let distance = 0;
+  distance += Math.abs((candidateSummary.hitRates?.[focusTarget] || 0) - (referenceSummary.hitRates?.[focusTarget] || 0)) * 5.4;
+  distance += Math.abs((candidateSummary.lowCrashRate || 0) - (referenceSummary.lowCrashRate || 0)) * 3.1;
+  distance += Math.abs((candidateSummary.hugeHitRate || 0) - (referenceSummary.hugeHitRate || 0)) * 2.3;
+  distance += Math.abs((candidateSummary.megaHitRate || 0) - (referenceSummary.megaHitRate || 0)) * 1.8;
+  distance += Math.abs((candidateSummary.avgMultiplier || 0) - (referenceSummary.avgMultiplier || 0)) / Math.max(2, referenceSummary.avgMultiplier || 2);
+  distance += Math.abs((candidateSummary.maxMultiplier || 0) - (referenceSummary.maxMultiplier || 0)) / Math.max(20, referenceSummary.maxMultiplier || 20);
+
+  for (const band of DISTRIBUTION_BANDS) {
+    distance += Math.abs(distributionPct(candidateSummary, band.key) - distributionPct(referenceSummary, band.key)) * 1.15;
+  }
+
+  return distance;
+}
+
+function splitWindowRoundsByProgress(window, progressRatio, slotMinutes) {
+  const rounds = Array.isArray(window?.rounds) ? window.rounds : [];
+  if (!rounds.length) {
+    return {
+      elapsedRounds: [],
+      remainingRounds: [],
+      elapsedCount: 0,
+    };
+  }
+
+  const safeRatio = clamp(progressRatio, 0, 1);
+  if (safeRatio <= 0) {
+    return {
+      elapsedRounds: [],
+      remainingRounds: rounds.slice(),
+      elapsedCount: 0,
+    };
+  }
+  if (safeRatio >= 0.999) {
+    return {
+      elapsedRounds: rounds.slice(),
+      remainingRounds: [],
+      elapsedCount: rounds.length,
+    };
+  }
+
+  const startTimestamp = safeNumber(window.firstTimestamp, rounds[0].timestamp);
+  const cutoffTimestamp = startTimestamp + (slotMinutes * MINUTE_MS * safeRatio);
+  let elapsedCount = rounds.findIndex((round) => round.timestamp >= cutoffTimestamp);
+  if (elapsedCount < 0) elapsedCount = rounds.length;
+
+  const expectedCount = clamp(Math.round(rounds.length * safeRatio), 0, rounds.length);
+  if (elapsedCount === 0 && expectedCount > 0) elapsedCount = expectedCount;
+
+  return {
+    elapsedRounds: rounds.slice(0, elapsedCount),
+    remainingRounds: rounds.slice(elapsedCount),
+    elapsedCount,
+  };
+}
+
 function summarizeWindowCollection(windows, focusTarget) {
   if (!windows.length) {
     return {
@@ -648,12 +713,12 @@ function buildSlotAnalytics(slotWindows, slotMinutes, windowMs, focusTarget, lat
   };
 }
 
-function buildPatternMatchReport(slotWindows, currentSummary, baselineStats, focusTarget, latestTimestamp, timeZone, slotAnalytics) {
+function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, baselineStats, focusTarget, latestTimestamp, timeZone, slotAnalytics) {
   if (!slotWindows.length) {
     return {
       available: false,
       examples: [],
-      reason: 'Not enough stored slot history yet to build a same-time pattern match.',
+      reason: 'Not enough stored slot history yet to build a past-slot pattern match.',
     };
   }
 
@@ -663,7 +728,6 @@ function buildPatternMatchReport(slotWindows, currentSummary, baselineStats, foc
   const getParts = buildZonedPartsGetter(timeZone);
   const currentParts = getParts(latestTimestamp);
   const currentSlotIndex = slotAnalytics.currentSlotIndex;
-  const currentSlotLabel = formatSlotLabel(currentSlotIndex * slotMinutes, slotMinutes, slotMode);
   const currentKey = `${currentParts.dateKey}|${currentSlotIndex}`;
   const lookbackMs = 30 * DAY_MS;
   const lookbackStart = latestTimestamp - lookbackMs;
@@ -675,55 +739,79 @@ function buildPatternMatchReport(slotWindows, currentSummary, baselineStats, foc
   });
   const indexByKey = new Map(orderedWindows.map((window, index) => [window.key, index]));
 
-  const currentVector = {
-    focusHitRate: currentSummary.hitRates[focusTarget] || 0,
-    lowCrashRate: currentSummary.lowCrashRate || 0,
-    hugeHitRate: currentSummary.hugeHitRate || 0,
-    avgMultiplier: currentSummary.avgMultiplier || 0,
-    maxMultiplier: currentSummary.maxMultiplier || 0,
-  };
+  const currentPosition = indexByKey.get(currentKey);
+  const previousWindow = Number.isInteger(currentPosition) && currentPosition > 0 ? orderedWindows[currentPosition - 1] : null;
+  const expectedPreviousSlotIndex = (currentSlotIndex - 1 + slotCount) % slotCount;
+  const inputSlotLabel = formatSlotLabel(expectedPreviousSlotIndex * slotMinutes, slotMinutes, slotMode);
+  const currentSlotLabel = formatSlotLabel(currentSlotIndex * slotMinutes, slotMinutes, slotMode);
 
-  const sameTimeCandidates = orderedWindows
+  if (!Number.isInteger(currentPosition) || !previousWindow || previousWindow.slotIndex !== expectedPreviousSlotIndex) {
+    return {
+      available: false,
+      examples: [],
+      reason: 'The last closed slot is not available yet, so the current-slot prediction cannot be built.',
+    };
+  }
+
+  const currentSlotStartMinute = currentSlotIndex * slotMinutes;
+  const currentMinuteProgress = clamp((currentParts.minuteOfDay - currentSlotStartMinute + 1) / Math.max(1, slotMinutes), 0, 1);
+  const liveEvidenceWeight = currentSummary.roundCount > 0
+    ? clamp((currentMinuteProgress * 0.85) + clamp(currentSummary.roundCount / 35, 0, 0.25), 0.12, 0.68)
+    : 0;
+  const alreadyHitCurrentWindow = (currentSummary.hitCounts?.[focusTarget] || 0) > 0;
+
+  const sameSetupCandidates = orderedWindows
     .filter((window) => (
-      window.slotIndex === currentSlotIndex
-      && window.key !== currentKey
+      window.slotIndex === previousWindow.slotIndex
+      && window.key !== previousWindow.key
       && window.firstTimestamp < latestTimestamp
       && window.firstTimestamp >= lookbackStart
     ))
     .map((window) => {
       const position = indexByKey.get(window.key);
-      const nextWindow = Number.isInteger(position) ? orderedWindows[position + 1] : null;
-      if (!nextWindow) return null;
-      const expectedNextSlotIndex = (window.slotIndex + 1) % slotCount;
-      if (nextWindow.slotIndex !== expectedNextSlotIndex) return null;
-      const weekdayMatch = window.dayIndex === currentParts.dayIndex;
-      const summary = window.summary;
-      const shapeDistance =
-        Math.abs((summary.hitRates[focusTarget] || 0) - currentVector.focusHitRate) * 5.2
-        + Math.abs((summary.lowCrashRate || 0) - currentVector.lowCrashRate) * 2.8
-        + Math.abs((summary.hugeHitRate || 0) - currentVector.hugeHitRate) * 2
-        + Math.abs((summary.avgMultiplier || 0) - currentVector.avgMultiplier) / Math.max(2, currentVector.avgMultiplier || 2)
-        + Math.abs((summary.maxMultiplier || 0) - currentVector.maxMultiplier) / Math.max(20, currentVector.maxMultiplier || 20);
+      const matchedCurrentWindow = Number.isInteger(position) ? orderedWindows[position + 1] : null;
+      if (!matchedCurrentWindow) return null;
+      const expectedCurrentSlotIndex = (window.slotIndex + 1) % slotCount;
+      if (matchedCurrentWindow.slotIndex !== expectedCurrentSlotIndex) return null;
+
+      const weekdayMatch = matchedCurrentWindow.dayIndex === currentParts.dayIndex;
+      const previousDistance = computeSummaryDistance(window.summary, previousSummary, focusTarget);
+      const split = splitWindowRoundsByProgress(matchedCurrentWindow, currentMinuteProgress, slotMinutes);
+      const matchedElapsedSummary = summarizeRounds(split.elapsedRounds, focusTarget);
+      const matchedRemainingSummary = summarizeRounds(split.remainingRounds, focusTarget);
+      const liveDistance = currentSummary.roundCount > 0 && matchedElapsedSummary.roundCount > 0
+        ? computeSummaryDistance(matchedElapsedSummary, currentSummary, focusTarget)
+        : 0;
+      const distance = (
+        previousDistance
+        + (liveDistance * liveEvidenceWeight)
+      ) / Math.max(1, 1 + liveEvidenceWeight);
 
       return {
         weekdayMatch,
-        distance: shapeDistance + (weekdayMatch ? 0 : 0.22),
-        nextWindow,
+        previousDistance,
+        liveDistance,
+        distance: distance + (weekdayMatch ? 0 : 0.18),
+        matchedCurrentWindow,
+        matchedElapsedSummary,
+        matchedRemainingSummary,
+        elapsedRounds: split.elapsedRounds,
+        remainingRounds: split.remainingRounds,
         window,
       };
     })
     .filter(Boolean);
 
-  if (sameTimeCandidates.length < 6) {
+  if (sameSetupCandidates.length < 6) {
     return {
       available: false,
       examples: [],
-      reason: 'Not enough same-time windows in the available history span to build a prediction.',
+      reason: 'Not enough matching past closed slots are stored yet to predict the current live window.',
     };
   }
 
-  const sameWeekdayPool = sameTimeCandidates.filter((item) => item.weekdayMatch);
-  const pool = sameWeekdayPool.length >= 6 ? sameWeekdayPool : sameTimeCandidates;
+  const sameWeekdayPool = sameSetupCandidates.filter((item) => item.weekdayMatch);
+  const pool = sameWeekdayPool.length >= 6 ? sameWeekdayPool : sameSetupCandidates;
   const matchMode = sameWeekdayPool.length >= 6 ? 'same-weekday' : 'same-time';
   const sampleSize = clamp(Math.round(pool.length * 0.45), 6, 18);
   const matches = [...pool]
@@ -734,129 +822,158 @@ function buildPatternMatchReport(slotWindows, currentSummary, baselineStats, foc
     return {
       available: false,
       examples: [],
-      reason: 'No same-time pattern match was found for the current window.',
+      reason: 'No usable past closed-slot pattern was found for the current live window.',
     };
   }
 
   const matchRows = matches.map((match) => {
     const daysAgo = ratio(latestTimestamp - match.window.firstTimestamp, DAY_MS);
-    const distanceWeight = 1 / (1 + (match.distance * 3.2));
+    const distanceWeight = 1 / (1 + (match.distance * 3.35));
+    const clusterWeight = 1 / (1 + (match.previousDistance * 2.15));
+    const liveWeight = liveEvidenceWeight > 0 ? 1 / (1 + (match.liveDistance * 1.75)) : 1;
     const recencyWeight = 1 / (1 + (daysAgo / 9));
-    const weekdayWeight = match.weekdayMatch ? 1.14 : 0.96;
-    const weight = distanceWeight * recencyWeight * weekdayWeight;
-    const nextRounds = Array.isArray(match.nextWindow.rounds) ? match.nextWindow.rounds : [];
-    const firstHitIndex = nextRounds.findIndex((round) => round.multiplier >= focusTarget);
-    const hitOffsets = nextRounds
-      .map((round, index) => ({ round, index }))
-      .filter((entry) => entry.round.multiplier >= focusTarget)
-      .map((entry) => entry.index);
+    const weekdayWeight = match.weekdayMatch ? 1.16 : 0.95;
+    const weight = distanceWeight * clusterWeight * liveWeight * recencyWeight * weekdayWeight;
+    const remainingRounds = Array.isArray(match.remainingRounds) ? match.remainingRounds : [];
+    const firstRemainingHitIndex = remainingRounds.findIndex((round) => round.multiplier >= focusTarget);
 
     return {
       ...match,
       daysAgo,
       weight,
-      firstHitIndex,
-      hitOffsets,
+      firstRemainingHitIndex,
     };
   });
 
-  let slotHistoryHits = 0;
-  let slotHistoryRounds = 0;
-  let slotHistoryAnyHit = 0;
-  for (const item of sameTimeCandidates) {
-    const summary = item.window.summary;
-    slotHistoryHits += summary.hitCounts[focusTarget] || 0;
-    slotHistoryRounds += summary.roundCount;
-    if ((summary.hitCounts[focusTarget] || 0) > 0) slotHistoryAnyHit += 1;
+  let inputHistoryHits = 0;
+  let inputHistoryRounds = 0;
+  let inputHistoryAnyHit = 0;
+  let remainingHistoryHits = 0;
+  let remainingHistoryRounds = 0;
+  let remainingHistoryAnyHit = 0;
+
+  for (const item of sameSetupCandidates) {
+    const inputSummary = item.window.summary;
+    inputHistoryHits += inputSummary.hitCounts[focusTarget] || 0;
+    inputHistoryRounds += inputSummary.roundCount;
+    if ((inputSummary.hitCounts[focusTarget] || 0) > 0) inputHistoryAnyHit += 1;
+
+    remainingHistoryHits += item.matchedRemainingSummary.hitCounts[focusTarget] || 0;
+    remainingHistoryRounds += item.matchedRemainingSummary.roundCount;
+    if ((item.matchedRemainingSummary.hitCounts[focusTarget] || 0) > 0) remainingHistoryAnyHit += 1;
   }
 
-  let nextWindowHits = 0;
-  let nextWindowRounds = 0;
-  let nextWindowAnyHit = 0;
-  let nextPeakSum = 0;
+  let currentWindowHits = 0;
+  let currentWindowRounds = 0;
+  let currentWindowAnyHit = 0;
+  let currentPeakSum = 0;
+  let remainingWindowHits = 0;
+  let remainingWindowRounds = 0;
+  let remainingWindowAnyHit = 0;
   let sameWeekdayMatches = 0;
 
   for (const match of matchRows) {
-    const summary = match.nextWindow.summary;
-    nextWindowHits += summary.hitCounts[focusTarget] || 0;
-    nextWindowRounds += summary.roundCount;
-    nextPeakSum += summary.maxMultiplier || 0;
-    if ((summary.hitCounts[focusTarget] || 0) > 0) nextWindowAnyHit += 1;
+    const summary = match.matchedCurrentWindow.summary;
+    currentWindowHits += summary.hitCounts[focusTarget] || 0;
+    currentWindowRounds += summary.roundCount;
+    currentPeakSum += summary.maxMultiplier || 0;
+    if ((summary.hitCounts[focusTarget] || 0) > 0) currentWindowAnyHit += 1;
+
+    const remainingSummary = match.matchedRemainingSummary;
+    remainingWindowHits += remainingSummary.hitCounts[focusTarget] || 0;
+    remainingWindowRounds += remainingSummary.roundCount;
+    if ((remainingSummary.hitCounts[focusTarget] || 0) > 0) remainingWindowAnyHit += 1;
+
     if (match.weekdayMatch) sameWeekdayMatches += 1;
   }
 
   const examples = matchRows.slice(0, 6).map((match, index) => {
-    const currentRounds = summarizeRoundRange(match.window.rounds, focusTarget);
-    const nextRounds = summarizeRoundRange(match.nextWindow.rounds, focusTarget);
+    const inputRounds = summarizeRoundRange(match.window.rounds, focusTarget);
+    const matchedCurrentRounds = summarizeRoundRange(match.matchedCurrentWindow.rounds, focusTarget);
+    const remainingRounds = summarizeRoundRange(match.remainingRounds, focusTarget);
+
     return {
       rank: index + 1,
       weekdayMatch: match.weekdayMatch,
       distance: Number(match.distance.toFixed(3)),
       weight: Number(match.weight.toFixed(3)),
-      currentWindowLabel: formatTimestampInTimeZone(match.window.firstTimestamp, timeZone),
-      currentSlotLabel: formatSlotLabel(match.window.slotStartMinute, slotMinutes, slotMode),
-      currentRoundFrom: currentRounds.fromRoundId,
-      currentRoundTo: currentRounds.toRoundId,
-      currentRoundCount: currentRounds.roundCount,
-      currentHitRate: match.window.summary.hitRates[focusTarget] || 0,
-      nextWindowLabel: formatTimestampInTimeZone(match.nextWindow.firstTimestamp, timeZone),
-      nextSlotLabel: formatSlotLabel(match.nextWindow.slotStartMinute, slotMinutes, slotMode),
-      nextRoundFrom: nextRounds.fromRoundId,
-      nextRoundTo: nextRounds.toRoundId,
-      nextRoundCount: nextRounds.roundCount,
-      nextHitCount: nextRounds.hitCount,
-      nextHitRoundIds: nextRounds.hitRoundIds,
-      firstHitOffset: match.firstHitIndex >= 0 ? match.firstHitIndex + 1 : null,
-      nextAnyHit: (match.nextWindow.summary.hitCounts[focusTarget] || 0) > 0,
-      nextPeakMultiplier: match.nextWindow.summary.maxMultiplier || 0,
+      inputWindowLabel: formatTimestampInTimeZone(match.window.firstTimestamp, timeZone),
+      inputSlotLabel: formatSlotLabel(match.window.slotStartMinute, slotMinutes, slotMode),
+      inputRoundFrom: inputRounds.fromRoundId,
+      inputRoundTo: inputRounds.toRoundId,
+      inputRoundCount: inputRounds.roundCount,
+      inputHitRate: match.window.summary.hitRates[focusTarget] || 0,
+      matchedCurrentWindowLabel: formatTimestampInTimeZone(match.matchedCurrentWindow.firstTimestamp, timeZone),
+      matchedCurrentSlotLabel: formatSlotLabel(match.matchedCurrentWindow.slotStartMinute, slotMinutes, slotMode),
+      matchedCurrentRoundFrom: matchedCurrentRounds.fromRoundId,
+      matchedCurrentRoundTo: matchedCurrentRounds.toRoundId,
+      matchedCurrentRoundCount: matchedCurrentRounds.roundCount,
+      matchedCurrentHitCount: matchedCurrentRounds.hitCount,
+      matchedCurrentHitRoundIds: matchedCurrentRounds.hitRoundIds,
+      remainingRoundFrom: remainingRounds.fromRoundId,
+      remainingRoundTo: remainingRounds.toRoundId,
+      remainingRoundCount: remainingRounds.roundCount,
+      remainingHitCount: remainingRounds.hitCount,
+      remainingHitRoundIds: remainingRounds.hitRoundIds,
+      firstRemainingHitOffset: match.firstRemainingHitIndex >= 0 ? match.firstRemainingHitIndex + 1 : null,
+      matchedCurrentAnyHit: (match.matchedCurrentWindow.summary.hitCounts[focusTarget] || 0) > 0,
+      remainingAnyHit: (match.matchedRemainingSummary.hitCounts[focusTarget] || 0) > 0,
+      matchedCurrentPeakMultiplier: match.matchedCurrentWindow.summary.maxMultiplier || 0,
     };
   });
 
-  const slotHistoryAnyHitRate = ratio(slotHistoryAnyHit, sameTimeCandidates.length);
-  const slotHistoryPerRoundRate = ratio(slotHistoryHits, slotHistoryRounds);
-  const slotHistoryLift = ratio(
-    slotHistoryAnyHitRate,
-    baselineStats.windowAnyHitRates[focusTarget],
-    baselineStats.windowAnyHitRates[focusTarget] > 0 ? 1 : 0
-  );
-  const nextAnyHitRate = weightedAverage(
+  const inputHistoryAnyHitRate = ratio(inputHistoryAnyHit, sameSetupCandidates.length);
+  const inputHistoryPerRoundRate = ratio(inputHistoryHits, inputHistoryRounds);
+  const inputBaselineAnyHitRate = baselineStats.windowAnyHitRates[focusTarget];
+  const inputHistoryLift = inputBaselineAnyHitRate > 0
+    ? ratio(inputHistoryAnyHitRate, inputBaselineAnyHitRate, 1)
+    : (inputHistoryAnyHitRate > 0 ? 1.25 : 1);
+  const currentWindowAnyHitRate = weightedAverage(
     matchRows,
-    (match) => ((match.nextWindow.summary.hitCounts[focusTarget] || 0) > 0 ? 1 : 0),
+    (match) => ((match.matchedCurrentWindow.summary.hitCounts[focusTarget] || 0) > 0 ? 1 : 0),
     (match) => match.weight,
-    ratio(nextWindowAnyHit, matches.length)
+    ratio(currentWindowAnyHit, matches.length)
   );
-  const nextPerRoundHitRate = weightedAverage(
+  const currentWindowPerRoundHitRate = weightedAverage(
     matchRows,
-    (match) => ratio(match.nextWindow.summary.hitCounts[focusTarget] || 0, match.nextWindow.summary.roundCount),
+    (match) => ratio(match.matchedCurrentWindow.summary.hitCounts[focusTarget] || 0, match.matchedCurrentWindow.summary.roundCount),
     (match) => match.weight,
-    ratio(nextWindowHits, nextWindowRounds)
+    ratio(currentWindowHits, currentWindowRounds)
   );
-  const nextLift = ratio(nextAnyHitRate, baselineStats.windowAnyHitRates[focusTarget], baselineStats.windowAnyHitRates[focusTarget] > 0 ? 1 : 0);
+  const currentWindowLift = inputBaselineAnyHitRate > 0
+    ? ratio(currentWindowAnyHitRate, inputBaselineAnyHitRate, 1)
+    : (currentWindowAnyHitRate > 0 ? 1.25 : 1);
+  const remainingBaselineAnyHitRate = ratio(remainingHistoryAnyHit, sameSetupCandidates.length);
+  const remainingBaselinePerRoundRate = ratio(remainingHistoryHits, remainingHistoryRounds);
+  const remainingAnyHitRate = weightedAverage(
+    matchRows,
+    (match) => ((match.matchedRemainingSummary.hitCounts[focusTarget] || 0) > 0 ? 1 : 0),
+    (match) => match.weight,
+    ratio(remainingWindowAnyHit, matches.length)
+  );
+  const remainingPerRoundHitRate = weightedAverage(
+    matchRows,
+    (match) => ratio(match.matchedRemainingSummary.hitCounts[focusTarget] || 0, match.matchedRemainingSummary.roundCount),
+    (match) => match.weight,
+    ratio(remainingWindowHits, remainingWindowRounds)
+  );
+  const remainingLift = remainingBaselineAnyHitRate > 0
+    ? ratio(remainingAnyHitRate, remainingBaselineAnyHitRate, 1)
+    : (remainingAnyHitRate > 0 ? 1.25 : 1);
   const weightedAvgPeakMultiplier = weightedAverage(
     matchRows,
-    (match) => match.nextWindow.summary.maxMultiplier || 0,
+    (match) => match.matchedCurrentWindow.summary.maxMultiplier || 0,
     (match) => match.weight,
-    ratio(nextPeakSum, matches.length)
+    ratio(currentPeakSum, matches.length)
   );
-  const nextWindowStartMinute = ((currentSlotIndex + 1) % slotCount) * slotMinutes;
-  const nextWindowDayOffset = currentSlotIndex + 1 >= slotCount ? 1 : 0;
-  const nextWindowTone = classifyLift(nextLift, matches.length).tone;
-  const hitMatches = matchRows.filter((match) => match.firstHitIndex >= 0);
-  const averageRoundsPerWindow = weightedAverage(
-    matchRows,
-    (match) => match.nextWindow.summary.roundCount,
-    (match) => match.weight,
-    average(matchRows.map((match) => match.nextWindow.summary.roundCount))
-  );
-  const currentSlotStartMinute = currentSlotIndex * slotMinutes;
-  const currentMinuteProgress = clamp((currentParts.minuteOfDay - currentSlotStartMinute + 1) / Math.max(1, slotMinutes), 0, 1);
-  const estimatedRoundsUntilNextWindow = Math.max(0, Math.round(averageRoundsPerWindow * (1 - currentMinuteProgress)));
-  const expectedRoundRange = hitMatches.length >= 2
+  const currentWindowTone = classifyLift(currentWindowLift, matches.length).tone;
+  const remainingWindowTone = classifyLift(remainingLift, matches.length).tone;
+  const remainingHitMatches = matchRows.filter((match) => match.firstRemainingHitIndex >= 0);
+  const expectedRoundRange = remainingHitMatches.length >= 2
     ? {
-        hitMatchCount: hitMatches.length,
-        estimatedRoundsUntilNextWindow,
-        firstHitOffsetFrom: Math.max(1, Math.round(weightedQuantile(hitMatches, (match) => match.firstHitIndex + 1, (match) => match.weight, 0.2, 1))),
-        firstHitOffsetTo: Math.max(1, Math.round(weightedQuantile(hitMatches, (match) => match.firstHitIndex + 1, (match) => match.weight, 0.8, 1))),
+        hitMatchCount: remainingHitMatches.length,
+        firstRemainingHitOffsetFrom: Math.max(1, Math.round(weightedQuantile(remainingHitMatches, (match) => match.firstRemainingHitIndex + 1, (match) => match.weight, 0.2, 1))),
+        firstRemainingHitOffsetTo: Math.max(1, Math.round(weightedQuantile(remainingHitMatches, (match) => match.firstRemainingHitIndex + 1, (match) => match.weight, 0.8, 1))),
       }
     : null;
 
@@ -864,32 +981,51 @@ function buildPatternMatchReport(slotWindows, currentSummary, baselineStats, foc
     available: true,
     matchMode,
     lookbackDaysUsed,
+    inputSlotLabel,
     currentSlotLabel,
     currentSlotIndex,
-    candidateCount: sameTimeCandidates.length,
+    currentWindowLabel: currentSlotLabel,
+    candidateCount: sameSetupCandidates.length,
     usedMatches: matches.length,
     sameWeekdayMatches,
-    note: `Built from ${matches.length} matched ${matchMode === 'same-weekday' ? 'same-weekday' : 'same-time'} windows from the last ${lookbackDaysUsed.toFixed(1)} days for ${currentSlotLabel}.`,
+    note: `Built from ${matches.length} matched ${matchMode === 'same-weekday' ? 'same-weekday' : 'same-time'} closed ${inputSlotLabel} setups from the last ${lookbackDaysUsed.toFixed(1)} days to judge the live ${currentSlotLabel} window.`,
     examples,
     averageMatchWeight: Number(weightedAverage(matchRows, (match) => match.weight, () => 1, 0).toFixed(3)),
+    averageDistance: Number(weightedAverage(matchRows, (match) => match.distance, (match) => match.weight, 0).toFixed(3)),
     expectedRoundRange,
-    currentSlotHistory: {
-      anyHitRate: slotHistoryAnyHitRate,
-      perRoundHitRate: slotHistoryPerRoundRate,
-      lift: slotHistoryLift,
-      sampleCount: sameTimeCandidates.length,
+    progress: {
+      ratio: currentMinuteProgress,
+      roundsSeen: currentSummary.roundCount || 0,
+      alreadyHit: alreadyHitCurrentWindow,
+    },
+    inputHistory: {
+      anyHitRate: inputHistoryAnyHitRate,
+      perRoundHitRate: inputHistoryPerRoundRate,
+      lift: inputHistoryLift,
+      sampleCount: sameSetupCandidates.length,
       weekdaySampleCount: sameWeekdayPool.length,
     },
-    nextWindow: {
-      occurrenceLabel: formatOccurrenceLabel(nextWindowStartMinute, slotMinutes, slotMode, nextWindowDayOffset),
-      dayOffset: nextWindowDayOffset,
-      anyHitRate: nextAnyHitRate,
-      perRoundHitRate: nextPerRoundHitRate,
+    currentWindow: {
+      occurrenceLabel: currentSlotLabel,
+      anyHitRate: currentWindowAnyHitRate,
+      perRoundHitRate: currentWindowPerRoundHitRate,
       avgPeakMultiplier: weightedAvgPeakMultiplier,
-      lift: nextLift,
-      tone: nextWindowTone,
-      label: nextLift >= 1.08 ? 'Stronger Than Normal'
-        : nextLift <= 0.94 ? 'Weaker Than Normal'
+      lift: currentWindowLift,
+      tone: currentWindowTone,
+      label: currentWindowLift >= 1.08 ? 'Stronger Than Normal'
+        : currentWindowLift <= 0.94 ? 'Weaker Than Normal'
+          : 'Near Normal',
+    },
+    remainingWindow: {
+      occurrenceLabel: currentSlotLabel,
+      anyHitRate: remainingAnyHitRate,
+      perRoundHitRate: remainingPerRoundHitRate,
+      baselineAnyHitRate: remainingBaselineAnyHitRate,
+      baselinePerRoundHitRate: remainingBaselinePerRoundRate,
+      lift: remainingLift,
+      tone: remainingWindowTone,
+      label: remainingLift >= 1.08 ? 'Stronger Than Normal'
+        : remainingLift <= 0.94 ? 'Weaker Than Normal'
           : 'Near Normal',
     },
   };
@@ -908,7 +1044,7 @@ function buildPatternPrediction({
   const currentSlot = slotItem?.currentSlot || null;
   const currentHitRate = currentSummary.hitRates[focusTarget] || 0;
   const baselineHitRate = baselineStats.perRoundHitRates[focusTarget] || 0;
-  const baselineNextWindowHitRate = baselineStats.windowAnyHitRates[focusTarget] || 0;
+  const baselineCurrentWindowHitRate = baselineStats.windowAnyHitRates[focusTarget] || 0;
   const currentLift = ratio(currentHitRate, baselineHitRate, baselineHitRate > 0 ? 1 : 0);
   const slotLift = safeNumber(currentSlot?.lift, 1);
   const currentSlotChance = safeNumber(currentSlot?.anyHitChance, 0);
@@ -924,111 +1060,137 @@ function buildPatternPrediction({
 
   if (!patternMatch?.available) {
     return {
-      action: currentLift >= 1.03 ? 'WATCH' : 'WAIT',
+      action: currentLift >= 1.03 ? 'WATCH NOW' : 'WAIT',
       tone: currentLift >= 1.05 ? 'neutral' : 'bad',
       confidence: 0.24,
       confidenceLabel: 'Low',
-      predictsLabel: `Next ${windowLabel}`,
-      inputLabel: `Current ${windowLabel}`,
+      predictsLabel: `Current ${windowLabel}`,
+      inputLabel: `Closed Previous ${windowLabel}`,
+      inputSlotLabel: '-',
       currentSlotLabel: currentSlot?.label || '-',
-      nextWindowLabel: '-',
       currentHitRate,
       baselineHitRate,
-      baselineNextWindowHitRate,
+      baselineCurrentWindowHitRate,
       currentLift,
       effectiveCurrentLift,
       currentEvidenceWeight,
       currentSlotChance,
-      nextWindowHitRate: 0,
-      nextWindowLift: 1,
+      currentWindowHitRate: 0,
+      currentWindowLift: 1,
+      remainingHitRate: 0,
+      remainingLift: 1,
+      baselineRemainingHitRate: 0,
       matchedWindows: 0,
       sameWeekdayMatches: 0,
       lookbackDaysUsed: 0,
+      alreadyHitInCurrentWindow: (currentSummary.hitCounts?.[focusTarget] || 0) > 0,
+      hitsSoFar: currentSummary.hitCounts?.[focusTarget] || 0,
       expectedRoundIdFrom: null,
       expectedRoundIdTo: null,
       expectedRoundIdLabel: '-',
       expectedRoundIdBasis: '',
-      summary: `Not enough same-time history yet to predict the next ${windowLabel.toLowerCase()} for ${labelForTarget(focusTarget)}.`,
+      summary: `Not enough matching closed ${windowLabel.toLowerCase()} history yet to judge the current live ${windowLabel.toLowerCase()} for ${labelForTarget(focusTarget)}.`,
       reasons: [
-        `Current ${windowLabel.toLowerCase()} hit rate: ${pctString(currentHitRate)} versus ${pctString(baselineHitRate)} baseline.`,
-        'Same-time pattern matcher does not have enough completed windows yet.',
+        `Live ${windowLabel.toLowerCase()} hit rate so far: ${pctString(currentHitRate)} versus ${pctString(baselineHitRate)} per-round baseline.`,
+        `The last closed ${windowLabel.toLowerCase()} does not have enough historical matches yet.`,
       ],
     };
   }
 
-  const nextWindowHitRate = safeNumber(patternMatch.nextWindow?.anyHitRate, 0);
-  const nextWindowLift = safeNumber(patternMatch.nextWindow?.lift, 1);
-  const nextWindowEdge = nextWindowHitRate - baselineNextWindowHitRate;
+  const currentWindowHitRate = safeNumber(patternMatch.currentWindow?.anyHitRate, 0);
+  const currentWindowLift = safeNumber(patternMatch.currentWindow?.lift, 1);
+  const remainingHitRate = safeNumber(patternMatch.remainingWindow?.anyHitRate, 0);
+  const baselineRemainingHitRate = safeNumber(patternMatch.remainingWindow?.baselineAnyHitRate, 0);
+  const remainingLift = safeNumber(patternMatch.remainingWindow?.lift, 1);
+  const currentWindowEdge = currentWindowHitRate - baselineCurrentWindowHitRate;
+  const remainingEdge = remainingHitRate - baselineRemainingHitRate;
   const matchedWindows = safeNumber(patternMatch.usedMatches, 0);
   const sameWeekdayMatches = safeNumber(patternMatch.sameWeekdayMatches, 0);
   const lookbackDaysUsed = safeNumber(patternMatch.lookbackDaysUsed, 0);
   const safeLatestRoundId = safeNumber(latestRoundId, 0);
+  const alreadyHitInCurrentWindow = Boolean(patternMatch.progress?.alreadyHit || (currentSummary.hitCounts?.[focusTarget] || 0) > 0);
+  const hitsSoFar = currentSummary.hitCounts?.[focusTarget] || 0;
   const confidence = clamp(
     0.3
       + (Math.min(matchedWindows, 18) / 18) * 0.35
-      + (Math.min(Math.abs(nextWindowLift - 1), 0.22) / 0.22) * 0.22
+      + (Math.min(Math.abs(remainingLift - 1), 0.22) / 0.22) * 0.22
       + (Math.min(sameWeekdayMatches, 8) / 8) * 0.09,
     0.18,
     0.96
   );
   const confidenceLabel = confidence >= 0.74 ? 'High' : confidence >= 0.52 ? 'Medium' : 'Low';
 
-  const playLiftThreshold = isLowTarget ? 1.02 : isMidTarget ? 1.06 : 1.12;
-  const playEdgeThreshold = isLowTarget ? 0.02 : isMidTarget ? 0.05 : 0.03;
-  const skipLiftThreshold = isLowTarget ? 0.88 : isMidTarget ? 0.92 : 0.94;
-  const weakCurrentThreshold = isLowTarget ? 0.84 : isMidTarget ? 0.88 : 0.9;
-  const solidCurrentThreshold = isLowTarget ? 0.94 : isMidTarget ? 0.92 : 0.9;
-  const strongAbsoluteHitRate = isLowTarget ? 0.52 : isMidTarget ? 0.22 : 0.08;
-  const permissiveCurrentThreshold = isLowTarget ? 0.85 : isMidTarget ? 0.88 : 0.9;
+  const playLiftThreshold = isLowTarget ? 1.03 : isMidTarget ? 1.08 : 1.12;
+  const playEdgeThreshold = isLowTarget ? 0.02 : isMidTarget ? 0.04 : 0.02;
+  const strongAbsoluteHitRate = isLowTarget ? 0.5 : isMidTarget ? 0.2 : 0.07;
+  const watchLiftThreshold = isLowTarget ? 0.98 : isMidTarget ? 1.01 : 1.03;
+  const weakRemainingThreshold = isLowTarget ? 0.8 : isMidTarget ? 0.84 : 0.88;
+  const skipRemainingThreshold = isLowTarget ? 0.72 : isMidTarget ? 0.78 : 0.84;
+  const solidCurrentThreshold = isLowTarget ? 0.92 : isMidTarget ? 0.9 : 0.88;
 
-  let action = 'WATCH';
+  let action = 'WATCH NOW';
   let tone = 'neutral';
-  let summary = `This predicts the next ${windowLabel.toLowerCase()}, not the current one. Matched ${patternMatch.currentSlotLabel} history says the next ${windowLabel.toLowerCase()} is close to normal for ${labelForTarget(focusTarget)}.`;
+  let summary = `Closed ${patternMatch.inputSlotLabel} matches say the live ${patternMatch.currentSlotLabel} window is near normal right now for ${labelForTarget(focusTarget)}.`;
 
   if (
-    ((nextWindowLift >= playLiftThreshold && nextWindowEdge >= playEdgeThreshold) || (nextWindowHitRate >= strongAbsoluteHitRate && nextWindowLift >= (isLowTarget ? 1.05 : 1.01)))
-    && effectiveCurrentLift >= solidCurrentThreshold
+    !alreadyHitInCurrentWindow
+    && (
+      ((remainingLift >= playLiftThreshold && remainingEdge >= playEdgeThreshold) || (remainingHitRate >= strongAbsoluteHitRate && remainingLift >= (isLowTarget ? 1.06 : 1.02)))
+      && (currentWindowLift >= watchLiftThreshold || effectiveCurrentLift >= solidCurrentThreshold || slotLift >= 1)
+    )
   ) {
-    action = 'PLAY';
+    action = 'PLAY NOW';
     tone = 'good';
-    summary = `This predicts the next ${windowLabel.toLowerCase()}. The current ${windowLabel.toLowerCase()} is holding up, and matched ${patternMatch.currentSlotLabel} history says the next ${windowLabel.toLowerCase()} is good for ${labelForTarget(focusTarget)}.`;
+    summary = `Closed ${patternMatch.inputSlotLabel} matches lean well for the live ${patternMatch.currentSlotLabel} window, and the remaining time is stronger than normal for ${labelForTarget(focusTarget)}.`;
   } else if (
-    nextWindowHitRate >= strongAbsoluteHitRate
-    && nextWindowLift >= (isLowTarget ? 1.05 : playLiftThreshold)
-    && effectiveCurrentLift >= permissiveCurrentThreshold
+    !alreadyHitInCurrentWindow
+    && (remainingLift >= watchLiftThreshold || currentWindowLift >= playLiftThreshold || currentWindowEdge >= playEdgeThreshold || effectiveCurrentLift >= 1)
   ) {
-    action = 'PLAY';
+    action = 'WATCH NOW';
     tone = 'good';
-    summary = `This predicts the next ${windowLabel.toLowerCase()}. Even though the current ${windowLabel.toLowerCase()} is only average, matched ${patternMatch.currentSlotLabel} history is strong enough to play the next ${windowLabel.toLowerCase()} for ${labelForTarget(focusTarget)}.`;
-  } else if (nextWindowLift <= skipLiftThreshold && effectiveCurrentLift <= weakCurrentThreshold && slotLift <= 0.95) {
-    action = 'SKIP';
+    summary = `Closed ${patternMatch.inputSlotLabel} matches lean positive for the live ${patternMatch.currentSlotLabel} window, but the edge is not strong enough yet for a full play call on ${labelForTarget(focusTarget)}.`;
+  } else if (
+    alreadyHitInCurrentWindow
+    && remainingLift <= weakRemainingThreshold
+  ) {
+    action = 'SKIP NOW';
     tone = 'bad';
-    summary = `This predicts the next ${windowLabel.toLowerCase()}. Current results are weak, and matched ${patternMatch.currentSlotLabel} history says the next ${windowLabel.toLowerCase()} is below normal for ${labelForTarget(focusTarget)}.`;
-  } else if (nextWindowLift >= Math.max(1.0, playLiftThreshold - 0.03) || nextWindowEdge >= (playEdgeThreshold * 0.5) || effectiveCurrentLift >= 1.02 || slotLift >= 1) {
-    action = 'WATCH';
+    summary = `A ${labelForTarget(focusTarget)} hit has already landed in the live ${patternMatch.currentSlotLabel} window, and matched history says another one from this point is weaker than normal.`;
+  } else if (
+    remainingLift <= skipRemainingThreshold
+    && currentWindowLift <= 0.94
+    && effectiveCurrentLift <= 0.92
+    && slotLift <= 0.95
+  ) {
+    action = 'SKIP NOW';
+    tone = 'bad';
+    summary = `Closed ${patternMatch.inputSlotLabel} matches and the live ${patternMatch.currentSlotLabel} read both look weak, so this current ${windowLabel.toLowerCase()} is below normal for ${labelForTarget(focusTarget)}.`;
+  } else if (
+    remainingLift >= 1
+    || currentWindowLift >= 1
+    || effectiveCurrentLift >= 1
+    || slotLift >= 1
+  ) {
+    action = 'WATCH NOW';
     tone = 'good';
-    summary = `This predicts the next ${windowLabel.toLowerCase()}. Matched ${patternMatch.currentSlotLabel} history leans positive, but not strong enough yet for a full play call on ${labelForTarget(focusTarget)}.`;
-  } else if (effectiveCurrentLift >= 1.08 && nextWindowLift >= 1) {
-    action = 'WATCH';
-    tone = 'neutral';
-    summary = `This predicts the next ${windowLabel.toLowerCase()}. The current ${windowLabel.toLowerCase()} is running hotter than normal, but matched next-window history is only average for ${labelForTarget(focusTarget)}.`;
+    summary = `The live ${patternMatch.currentSlotLabel} window is mixed, but matched ${patternMatch.inputSlotLabel} setups still lean slightly positive from here for ${labelForTarget(focusTarget)}.`;
   } else {
     action = 'WAIT';
     tone = 'neutral';
-    summary = `This predicts the next ${windowLabel.toLowerCase()}. Current results and matched ${patternMatch.currentSlotLabel} history are mixed, so it is better to wait for a clearer edge on ${labelForTarget(focusTarget)}.`;
+    summary = `Closed ${patternMatch.inputSlotLabel} matches and the live ${patternMatch.currentSlotLabel} read are mixed, so it is better to wait for a clearer edge on ${labelForTarget(focusTarget)}.`;
   }
 
   const expectedRoundIdFrom = patternMatch.expectedRoundRange && safeLatestRoundId > 0
-    ? safeLatestRoundId + patternMatch.expectedRoundRange.estimatedRoundsUntilNextWindow + patternMatch.expectedRoundRange.firstHitOffsetFrom
+    ? safeLatestRoundId + patternMatch.expectedRoundRange.firstRemainingHitOffsetFrom
     : null;
   const expectedRoundIdTo = patternMatch.expectedRoundRange && safeLatestRoundId > 0
-    ? safeLatestRoundId + patternMatch.expectedRoundRange.estimatedRoundsUntilNextWindow + patternMatch.expectedRoundRange.firstHitOffsetTo
+    ? safeLatestRoundId + patternMatch.expectedRoundRange.firstRemainingHitOffsetTo
     : null;
   const expectedRoundIdLabel = (expectedRoundIdFrom && expectedRoundIdTo)
     ? `#${expectedRoundIdFrom} - #${expectedRoundIdTo}`
     : '-';
   const expectedRoundIdBasis = patternMatch.expectedRoundRange
-    ? `Based on ${patternMatch.expectedRoundRange.hitMatchCount} matched next-window hits.`
+    ? `Based on ${patternMatch.expectedRoundRange.hitMatchCount} matched current-window hits still ahead from this point.`
     : '';
 
   return {
@@ -1036,31 +1198,38 @@ function buildPatternPrediction({
     tone,
     confidence,
     confidenceLabel,
-    predictsLabel: `Next ${windowLabel}`,
-    inputLabel: `Current ${windowLabel}`,
+    predictsLabel: `Current ${windowLabel}`,
+    inputLabel: `Closed Previous ${windowLabel}`,
+    inputSlotLabel: patternMatch.inputSlotLabel,
     currentSlotLabel: patternMatch.currentSlotLabel,
-    nextWindowLabel: patternMatch.nextWindow?.occurrenceLabel || '-',
     currentHitRate,
     baselineHitRate,
-    baselineNextWindowHitRate,
+    baselineCurrentWindowHitRate,
     currentLift,
     effectiveCurrentLift,
     currentEvidenceWeight,
     currentSlotChance,
-    nextWindowHitRate,
-    nextWindowLift,
+    currentWindowHitRate,
+    currentWindowLift,
+    remainingHitRate,
+    remainingLift,
+    baselineRemainingHitRate,
     matchedWindows,
     sameWeekdayMatches,
     lookbackDaysUsed,
+    alreadyHitInCurrentWindow,
+    hitsSoFar,
     expectedRoundIdFrom,
     expectedRoundIdTo,
     expectedRoundIdLabel,
     expectedRoundIdBasis,
     summary,
     reasons: [
-      `Input: current ${windowLabel.toLowerCase()} hit rate for ${labelForTarget(focusTarget)} is ${pctString(currentHitRate)} versus ${pctString(baselineHitRate)} per-round baseline.`,
-      `${patternMatch.currentSlotLabel} matched ${matchedWindows} past windows over ${lookbackDaysUsed.toFixed(1)} days with same-time weighting.`,
-      `Prediction: the next ${windowLabel.toLowerCase()} hit ${labelForTarget(focusTarget)} ${pctString(nextWindowHitRate)} of the time in those matches versus ${pctString(baselineNextWindowHitRate)} normal next-window baseline.`,
+      `Input: the last closed ${windowLabel.toLowerCase()} is ${patternMatch.inputSlotLabel}, and the live window being judged now is ${patternMatch.currentSlotLabel}.`,
+      `${patternMatch.inputSlotLabel} matched ${matchedWindows} past setups over ${lookbackDaysUsed.toFixed(1)} days with timing and cluster weighting.`,
+      `Full live-window history in those matches hit ${labelForTarget(focusTarget)} ${pctString(currentWindowHitRate)} of the time versus ${pctString(baselineCurrentWindowHitRate)} normal.`,
+      `From this exact point forward, matched current windows hit ${labelForTarget(focusTarget)} ${pctString(remainingHitRate)} of the time versus ${pctString(baselineRemainingHitRate)} normal from-here baseline.`,
+      alreadyHitInCurrentWindow ? `${labelForTarget(focusTarget)} has already hit ${hitsSoFar} time(s) in the current live window.` : `${labelForTarget(focusTarget)} has not hit yet in the current live window.`,
       expectedRoundIdBasis ? `Expected ${labelForTarget(focusTarget)} around rounds ${expectedRoundIdLabel}. ${expectedRoundIdBasis}` : null,
     ].filter(Boolean),
   };
@@ -1842,28 +2011,34 @@ function buildEmptyReport(windowConfig, focusTarget, timeZone) {
       endTimestamp: null,
     },
     baseline: summarizeWindowCollection([], focusTarget),
+    previousWindow: summarizeRounds([], focusTarget),
     currentWindow: summarizeRounds([], focusTarget),
     patternPrediction: {
       action: 'WAIT FOR MORE DATA',
       tone: 'neutral',
       confidence: 0,
       confidenceLabel: 'Low',
-      predictsLabel: `Next ${windowConfig.label}`,
-      inputLabel: `Current ${windowConfig.label}`,
+      predictsLabel: `Current ${windowConfig.label}`,
+      inputLabel: `Closed Previous ${windowConfig.label}`,
+      inputSlotLabel: '-',
       currentSlotLabel: '-',
-      nextWindowLabel: '-',
       currentHitRate: 0,
       baselineHitRate: 0,
-      baselineNextWindowHitRate: 0,
+      baselineCurrentWindowHitRate: 0,
       currentLift: 1,
       effectiveCurrentLift: 1,
       currentEvidenceWeight: 0,
       currentSlotChance: 0,
-      nextWindowHitRate: 0,
-      nextWindowLift: 1,
+      currentWindowHitRate: 0,
+      currentWindowLift: 1,
+      remainingHitRate: 0,
+      remainingLift: 1,
+      baselineRemainingHitRate: 0,
       matchedWindows: 0,
       sameWeekdayMatches: 0,
       lookbackDaysUsed: 0,
+      alreadyHitInCurrentWindow: false,
+      hitsSoFar: 0,
       expectedRoundIdFrom: null,
       expectedRoundIdTo: null,
       expectedRoundIdLabel: '-',
@@ -1881,7 +2056,7 @@ function buildEmptyReport(windowConfig, focusTarget, timeZone) {
     targetReadiness: [],
     recommendationStability: null,
     bestWindowsToday: { items: [], slotMode: 'window', slotMinutes: chooseSlotMinutes(windowConfig.ms), note: '' },
-    patternMatch: { available: false, examples: [], reason: 'No rounds are stored yet.' },
+    patternMatch: { available: false, examples: [], reason: 'No rounds are stored yet.', inputSlotLabel: '-', currentSlotLabel: '-' },
     cooldowns: [],
     backtest: null,
     hourlyHistory: { timeZone, rows: [], bestHours: [] },
@@ -1912,19 +2087,33 @@ function buildTimingAnalyticsReport(rounds, options = {}) {
 
   const latestRound = normalizedRounds[normalizedRounds.length - 1];
   const earliestRound = normalizedRounds[0];
-  const currentStart = latestRound.timestamp - windowConfig.ms;
-  const currentRounds = normalizedRounds.filter((round) => round.timestamp > currentStart);
-  const currentSummary = summarizeRounds(currentRounds, focusTarget);
-
-  const fixedWindows = segmentRoundsByWindow(normalizedRounds, windowConfig.ms, focusTarget);
-  const completedWindows = fixedWindows.slice(0, -1);
-  const baselineStats = completedWindows.length
-    ? summarizeWindowCollection(completedWindows, focusTarget)
-    : summarizeWindowCollection(fixedWindows, focusTarget);
-
   const slotMinutes = chooseSlotMinutes(windowConfig.ms);
   const slotWindows = buildSlotWindows(normalizedRounds, slotMinutes, timeZone, focusTarget);
   const slotAnalytics = buildSlotAnalytics(slotWindows, slotMinutes, windowConfig.ms, focusTarget, latestRound.timestamp, timeZone);
+  const currentParts = buildZonedPartsGetter(timeZone)(latestRound.timestamp);
+  const currentKey = `${currentParts.dateKey}|${slotAnalytics.currentSlotIndex}`;
+  const orderedSlotWindows = [...slotWindows].sort((a, b) => {
+    if (a.dateKey !== b.dateKey) return a.dateKey.localeCompare(b.dateKey);
+    return a.slotIndex - b.slotIndex;
+  });
+  const slotIndexByKey = new Map(orderedSlotWindows.map((window, index) => [window.key, index]));
+  const currentSlotPosition = slotIndexByKey.get(currentKey);
+  const currentSlotWindow = Number.isInteger(currentSlotPosition)
+    ? orderedSlotWindows[currentSlotPosition]
+    : (orderedSlotWindows[orderedSlotWindows.length - 1] || null);
+  const previousSlotWindow = Number.isInteger(currentSlotPosition) && currentSlotPosition > 0
+    ? orderedSlotWindows[currentSlotPosition - 1]
+    : null;
+  const currentSummary = currentSlotWindow ? currentSlotWindow.summary : summarizeRounds([], focusTarget);
+  const previousSummary = previousSlotWindow ? previousSlotWindow.summary : summarizeRounds([], focusTarget);
+
+  const fixedWindows = segmentRoundsByWindow(normalizedRounds, windowConfig.ms, focusTarget);
+  const completedWindows = fixedWindows.slice(0, -1);
+  const completedSlotWindows = slotWindows.filter((window) => window.key !== currentKey);
+  const baselineStats = completedSlotWindows.length
+    ? summarizeWindowCollection(completedSlotWindows, focusTarget)
+    : summarizeWindowCollection(slotWindows, focusTarget);
+
   const bestWindowsToday = buildBestWindowsToday(slotAnalytics, focusTarget);
   const lastHits = buildLastHitMap(normalizedRounds);
   const cooldowns = buildCooldownReport(normalizedRounds, baselineStats.perRoundHitRates, latestRound.timestamp, lastHits);
@@ -1946,6 +2135,7 @@ function buildTimingAnalyticsReport(rounds, options = {}) {
   const targetCards = buildTargetCards(currentSummary, baselineStats);
   const patternMatch = buildPatternMatchReport(
     slotWindows,
+    previousSummary,
     currentSummary,
     baselineStats,
     focusTarget,
@@ -1984,10 +2174,11 @@ function buildTimingAnalyticsReport(rounds, options = {}) {
       key: windowConfig.key,
       label: windowConfig.label,
       ms: windowConfig.ms,
-      startTimestamp: latestRound.timestamp - windowConfig.ms,
+      startTimestamp: currentSlotWindow?.firstTimestamp || (latestRound.timestamp - windowConfig.ms),
       endTimestamp: latestRound.timestamp,
     },
     baseline: baselineStats,
+    previousWindow: previousSummary,
     currentWindow: currentSummary,
     patternPrediction,
     comparison,
