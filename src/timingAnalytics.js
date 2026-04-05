@@ -1030,7 +1030,7 @@ function buildPatternPrediction({ focusTarget, windowLabel, latestRoundId, curre
 
   if (!patternMatch?.available) {
     return {
-      action: 'WAIT', tone: 'neutral',
+      action: 'SKIP', tone: 'bad',
       confidence: 0, confidenceLabel: 'Low', dataQuality: 'insufficient',
       predictsLabel: `Current ${windowLabel}`, inputLabel: `Closed Previous ${windowLabel}`,
       inputSlotLabel: '-', currentSlotLabel: currentSlot?.label || '-',
@@ -1044,7 +1044,7 @@ function buildPatternPrediction({ focusTarget, windowLabel, latestRoundId, curre
       hitsSoFar: currentSummary.hitCounts?.[focusTarget] || 0,
       expectedRoundIdFrom: null, expectedRoundIdTo: null,
       expectedRoundIdLabel: '-', expectedRoundIdBasis: '',
-      summary: patternMatch?.reason || `Not enough matching history at this time slot for ${labelForTarget(focusTarget)}.`,
+      summary: patternMatch?.reason || `Skip ${labelForTarget(focusTarget)} in this live ${windowLabel.toLowerCase()} because there is not enough matching time-slot history yet.`,
       reasons: [`Live hit rate: ${pctString(currentHitRate)} vs ${pctString(baselineHitRate)} baseline.`, patternMatch?.reason || ''].filter(Boolean),
     };
   }
@@ -1079,12 +1079,12 @@ function buildPatternPrediction({ focusTarget, windowLabel, latestRoundId, curre
 
   // BUG-FIX 6 cont.: action and tone are now derived from the SAME significance logic
   // that the UI signal cards use — no more contradiction.
-  let action = 'WATCH NOW', tone = 'neutral';
+  let action = 'SKIP', tone = 'bad';
   let summary = `Mixed signals for ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window.`;
 
   if (!alreadyHit && remSig && remLift >= 1.05 && remEdge >= 0
       && (cwSig ? cwLift >= 1 : true) && (slotSignificant ? slotLift >= 1 : true)) {
-    action  = 'PLAY NOW';
+    action  = 'PLAY';
     tone    = 'good';
     summary = `Remaining-window pattern is significantly stronger (${pctString(remHitRate)} vs ${pctString(remBaseline)} baseline, lift ${remLift.toFixed(2)}x, p<0.05) — supports ${labelForTarget(focusTarget)}.`;
   } else if (!alreadyHit && (
@@ -1093,34 +1093,38 @@ function buildPatternPrediction({ focusTarget, windowLabel, latestRoundId, curre
     || cwEdge >= 0.03
     || effectiveCurrentLift >= 1.02
   )) {
-    action  = 'WATCH NOW';
+    action  = 'SKIP';
     tone    = 'neutral';
-    summary = `Pattern leans positive for ${labelForTarget(focusTarget)} (remaining lift ${remLift.toFixed(2)}x) but significance not yet confirmed — watch, do not commit fully.`;
+    summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window because the edge is not strong enough yet.`;
   } else if (alreadyHit && remSig && remLift <= 0.95) {
-    action  = 'SKIP NOW';
+    action  = 'SKIP';
     tone    = 'bad';
     summary = `${labelForTarget(focusTarget)} already hit and remaining pattern is significantly weaker — another hit soon is unlikely.`;
   } else if (remSig && remLift <= 0.95 && cwSig && cwLift <= 0.95) {
-    action  = 'SKIP NOW';
+    action  = 'SKIP';
     tone    = 'bad';
     summary = `Both full-window and remaining patterns are significantly below baseline — skip ${labelForTarget(focusTarget)} for now.`;
   } else if (remLift >= 1 || cwLift >= 1 || effectiveCurrentLift >= 1 || slotLift >= 1) {
-    action  = 'WATCH NOW';
+    action  = 'SKIP';
     tone    = 'neutral';
-    summary = `No significant edge confirmed yet for ${labelForTarget(focusTarget)} — mixed directional signals.`;
+    summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window because no strong edge is confirmed.`;
   } else {
-    action  = 'WAIT';
+    action  = 'SKIP';
     tone    = 'neutral';
-    summary = `Pattern and live read are both below baseline — better to wait for a clearer signal for ${labelForTarget(focusTarget)}.`;
+    summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window because the live read and matched history are both below baseline.`;
   }
 
   const expectedRoundIdFrom = patternMatch.expectedRoundRange && safeLatestId > 0
     ? safeLatestId + patternMatch.expectedRoundRange.firstRemainingHitOffsetFrom : null;
   const expectedRoundIdTo   = patternMatch.expectedRoundRange && safeLatestId > 0
     ? safeLatestId + patternMatch.expectedRoundRange.firstRemainingHitOffsetTo   : null;
-  const expectedRoundIdLabel  = (expectedRoundIdFrom && expectedRoundIdTo) ? `#${expectedRoundIdFrom} - #${expectedRoundIdTo}` : '—';
-  const expectedRoundIdBasis  = patternMatch.expectedRoundRange
+  const rawExpectedRoundIdLabel = (expectedRoundIdFrom && expectedRoundIdTo) ? `#${expectedRoundIdFrom} - #${expectedRoundIdTo}` : '-';
+  const rawExpectedRoundIdBasis = patternMatch.expectedRoundRange
     ? `Based on ${patternMatch.expectedRoundRange.hitMatchCount} matched current-window hits still ahead from this point.` : '';
+  const expectedRoundIdLabel = action === 'PLAY' ? rawExpectedRoundIdLabel : '-';
+  const expectedRoundIdBasis = action === 'PLAY'
+    ? rawExpectedRoundIdBasis
+    : 'Round IDs are only shown when the signal is strong enough to play.';
 
   return {
     action, tone,
@@ -1646,7 +1650,7 @@ function buildEmptyReport(windowConfig, focusTarget, timeZone) {
     previousWindow: summarizeRounds([], focusTarget),
     currentWindow:  summarizeRounds([], focusTarget),
     patternPrediction: {
-      action: 'WAIT FOR DATA', tone: 'neutral', confidence: 0, confidenceLabel: 'Low', dataQuality: 'insufficient',
+      action: 'SKIP', tone: 'bad', confidence: 0, confidenceLabel: 'Low', dataQuality: 'insufficient',
       predictsLabel: `Current ${windowConfig.label}`, inputLabel: `Closed Previous ${windowConfig.label}`,
       inputSlotLabel: '—', currentSlotLabel: '—',
       currentHitRate: 0, baselineHitRate: 0, baselineCurrentWindowHitRate: 0,
