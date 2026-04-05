@@ -1105,14 +1105,16 @@ function buildPatternPrediction({ focusTarget, windowLabel, latestRoundId, curre
     const enoughHistory = matchedWins >= rules.minMatches;
     const sameWeekdayShare = ratio(sameWdMatches, matchedWins);
 
-    const rateScore = clamp(remHitRate / Math.max(rules.strongRate, 0.0001), 0, 1);
+    const wholeWindowScore = clamp(cwHitRate / Math.max(rules.strongRate, 0.0001), 0, 1);
+    const tailScore = clamp(remHitRate / Math.max(rules.playRate, 0.0001), 0, 1);
     const sampleScore = clamp(matchedWins / Math.max(rules.minMatches + 8, 10), 0, 1);
     const distanceScore = clamp(1 - (averageDistance / 1.8), 0, 1);
     const weekdayScore = clamp(sameWeekdayShare, 0, 1);
     const signalAccuracy = clamp(
-      (rateScore * 0.55)
-      + (sampleScore * 0.20)
-      + (distanceScore * 0.15)
+      (wholeWindowScore * 0.45)
+      + (tailScore * 0.15)
+      + (sampleScore * 0.18)
+      + (distanceScore * 0.12)
       + (weekdayScore * 0.10),
       0,
       1,
@@ -1121,22 +1123,21 @@ function buildPatternPrediction({ focusTarget, windowLabel, latestRoundId, curre
     const strengthLabel = signalAccuracy >= 0.78 ? 'Strong' : signalAccuracy >= 0.58 ? 'Medium' : 'Not Strong';
     const dataQuality = signalAccuracy >= 0.78 ? 'good' : signalAccuracy >= 0.58 ? 'moderate' : 'limited';
     const shouldPlay = enoughHistory
-      && remHitRate >= rules.playRate
-      && signalAccuracy >= 0.58
-      && (!alreadyHit || (remHitRate >= rules.strongRate && signalAccuracy >= 0.72));
+      && (cwHitRate >= rules.playRate || cwLift >= 1.02 || remHitRate >= rules.playRate)
+      && signalAccuracy >= 0.58;
 
     let action = 'SKIP';
     let tone = 'bad';
-    let summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. Historical same-time matches from this point are not strong enough.`;
+    let summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. Historical same-time matches do not make this time block strong enough.`;
 
     if (shouldPlay) {
       action = 'PLAY';
       tone = 'good';
-      summary = `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. Historical same-time matches from this point support it.`;
+      summary = `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. Historical same-time matches support this time block.`;
     } else if (!enoughHistory) {
       summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. There are not enough matched same-time setups yet.`;
     } else if (alreadyHit) {
-      summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. It already hit, and the remaining matched history is not strong enough for another one.`;
+      summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. This hour already produced ${labelForTarget(focusTarget)}, and the matched history is still not strong enough.`;
     }
 
     const expectedRoundIdFrom = patternMatch.expectedRoundRange && safeLatestId > 0
@@ -1191,7 +1192,8 @@ function buildPatternPrediction({ focusTarget, windowLabel, latestRoundId, curre
       summary,
       reasons: [
         `Accuracy ${accuracyPercent.toFixed(1)}%.`,
-        `Historical hit rate from now: ${pctString(remHitRate)} across ${matchedWins} matched setups.`,
+        `Historical block hit rate: ${pctString(cwHitRate)} across ${matchedWins} matched setups.`,
+        `Tail hit rate from now: ${pctString(remHitRate)}.`,
         `Normal hit rate from now: ${pctString(remBaseline)}.`,
         `Pattern quality: ${strengthLabel}.`,
         alreadyHit
