@@ -736,10 +736,8 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
   const currentParts = getParts(latestTimestamp);
   const currentSlotIndex = slotAnalytics.currentSlotIndex;
   const currentKey   = `${currentParts.dateKey}|${currentSlotIndex}`;
-  const lookbackMs   = 30 * DAY_MS;
-  const lookbackStart = latestTimestamp - lookbackMs;
   const historySpanDays = ratio(latestTimestamp - (slotWindows[0]?.firstTimestamp || latestTimestamp), DAY_MS);
-  const lookbackDaysUsed = Math.min(30, Math.max(0, historySpanDays));
+  const lookbackDaysUsed = Math.max(0, historySpanDays);
 
   const orderedWindows = [...slotWindows].sort((a, b) =>
     a.dateKey !== b.dateKey ? a.dateKey.localeCompare(b.dateKey) : a.slotIndex - b.slotIndex);
@@ -757,7 +755,6 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
     w.slotIndex === previousWindow.slotIndex
     && w.key !== previousWindow.key
     && w.firstTimestamp < latestTimestamp
-    && w.firstTimestamp >= lookbackStart
   ));
 
   if (poolCandidates.length < PATTERN_MIN_CANDIDATES) {
@@ -831,7 +828,7 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
   const pool      = sameWeekdayPool.length >= PATTERN_MIN_CANDIDATES ? sameWeekdayPool : sameSetupCandidates;
   const matchMode = sameWeekdayPool.length >= PATTERN_MIN_CANDIDATES ? 'same-weekday' : 'same-time';
   const sampleSize = clamp(Math.round(pool.length * 0.6), PATTERN_MIN_CANDIDATES, 20); // was 0.45, now 0.6 — use more of the pool
-  const matches   = [...pool].sort((a, b) => a.distance - b.distance).slice(0, sampleSize);
+  const matches   = [...pool].sort((a, b) => a.distance - b.distance);
 
   if (!matches.length) {
     return { available: false, examples: [], reason: 'No usable past setups found for the current live window.' };
@@ -961,7 +958,7 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
     candidateCount: sameSetupCandidates.length,
     usedMatches: matches.length,
     sameWeekdayMatches: sameWdCount,
-    note: `Built from ${matches.length} matched ${matchMode === 'same-weekday' ? 'same-weekday' : 'same-time'} setups over the last ${lookbackDaysUsed.toFixed(1)} days.`,
+    note: `Built from ${matches.length} matched ${matchMode === 'same-weekday' ? 'same-weekday' : 'same-time'} setups across ${lookbackDaysUsed.toFixed(1)} stored days.`,
     examples,
     averageMatchWeight: Number(weightedAverage(matchRows, (m) => m.weight, () => 1, 0).toFixed(3)),
     averageDistance:    Number(weightedAverage(matchRows, (m) => m.distance, (m) => m.weight, 0).toFixed(3)),
@@ -1094,7 +1091,7 @@ function buildPatternPrediction({ focusTarget, windowLabel, latestRoundId, curre
         (remSig && remLift >= 1.05 && remEdge >= 0)
         || (!remSig && remLift >= (isLowTarget ? 1.12 : isMidTarget ? 1.16 : 1.20) && matchedWins >= (PATTERN_MIN_CANDIDATES + 2) && remHitRate >= (isLowTarget ? 0.42 : isMidTarget ? 0.12 : 0.04))
       )
-      && (cwSig ? cwLift >= 1 : currentWindowHitRate >= baselineCurrentWindowHitRate || effectiveCurrentLift >= 1)
+      && (cwSig ? cwLift >= 1 : cwHitRate >= baselineCWHitRate || effectiveCurrentLift >= 1)
       && (slotSignificant ? slotLift >= 1 : slotLift >= 0.98)) {
     action  = 'PLAY';
     tone    = 'good';
@@ -1127,6 +1124,69 @@ function buildPatternPrediction({ focusTarget, windowLabel, latestRoundId, curre
     action  = 'SKIP';
     tone    = 'neutral';
     summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window because the live read and matched history are both below baseline.`;
+  }
+
+  const minMatchesNeeded = focusTarget <= 20 ? 6 : focusTarget <= 100 ? 5 : 4;
+  const absolutePlayChance = focusTarget <= 5
+    ? 0.70
+    : focusTarget <= 10
+      ? 0.60
+      : focusTarget <= 20
+        ? 0.45
+        : focusTarget <= 50
+          ? 0.22
+          : focusTarget <= 100
+            ? 0.12
+            : focusTarget <= 500
+              ? 0.04
+              : 0.02;
+  const strongPlayChance = focusTarget <= 5
+    ? 0.92
+    : focusTarget <= 10
+      ? 0.85
+      : focusTarget <= 20
+        ? 0.72
+        : focusTarget <= 50
+          ? 0.40
+          : focusTarget <= 100
+            ? 0.24
+            : focusTarget <= 500
+              ? 0.08
+              : 0.04;
+  const baselineSlack = focusTarget <= 20 ? 0.06 : focusTarget <= 100 ? 0.03 : 0.015;
+  const enoughHistory = matchedWins >= minMatchesNeeded;
+  const veryStrongFromNow = remHitRate >= strongPlayChance;
+  const solidFromNow = remHitRate >= absolutePlayChance;
+  const patternAligned = remLift >= 1.02 || remEdge >= -baselineSlack || slotLift >= 1;
+  const liveAligned = cwLift >= 0.97 || effectiveCurrentLift >= 0.97 || cwHitRate >= Math.max(0, baselineCWHitRate - baselineSlack);
+  const shouldPlayNow = enoughHistory && (
+    (veryStrongFromNow && (slotLift >= 0.95 || cwLift >= 0.95 || effectiveCurrentLift >= 0.95))
+    || (solidFromNow && patternAligned && liveAligned)
+    || (remSig && remLift >= 1.03 && remHitRate >= absolutePlayChance * 0.85)
+  );
+
+  if (shouldPlayNow) {
+    action = 'PLAY';
+    tone = 'good';
+    summary = alreadyHit
+      ? `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. It already hit earlier, but full-history matches still show strong remaining hit odds from this point.`
+      : `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. Full-history timing and cluster matches support this setup from now.`;
+  } else if (alreadyHit) {
+    action = 'SKIP';
+    tone = 'bad';
+    summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window because it already hit and the remaining from-now pattern is not strong enough.`;
+  } else if (!enoughHistory) {
+    action = 'SKIP';
+    tone = 'bad';
+    summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window because there are not enough matched past setups yet.`;
+  } else if (veryStrongFromNow || solidFromNow || remLift >= 1 || cwLift >= 1 || effectiveCurrentLift >= 1 || slotLift >= 1) {
+    action = 'SKIP';
+    tone = 'bad';
+    summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window because the timing match is only normal, not strong enough to play.`;
+  } else {
+    action = 'SKIP';
+    tone = 'bad';
+    summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window because the full-history timing match is not strong enough from this point.`;
   }
 
   const expectedRoundIdFrom = patternMatch.expectedRoundRange && safeLatestId > 0
