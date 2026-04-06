@@ -9,6 +9,11 @@ const {
   normalizePatternTarget,
 } = require('./patternAnalytics');
 const {
+  buildTimingAnalyticsReport,
+  normalizeTimingWindowKey,
+  normalizeTimingTarget,
+} = require('./timingAnalytics');
+const {
   pool,
   getLatestRoundId, getRoundCount,
   getRounds, getStats, getStorageStats,
@@ -746,13 +751,14 @@ app.get('/dashboard', requireDatabase, rateLimit(60), async (req, res) => {
 
 app.get('/analytics/timing', requireDatabase, rateLimit(20), async (req, res) => {
   try {
-    const windowKey = normalizePatternWindowKey(req.query.window);
-    const focusTarget = normalizePatternTarget(req.query.focusTarget);
+    const windowKey = normalizeTimingWindowKey(req.query.window);
+    const focusTarget = normalizeTimingTarget(req.query.focusTarget);
+    const timeZone = String(req.query.timeZone || 'UTC').trim();
     const latestRound = await getLatestRoundId();
     markDbHealthy();
 
     const cacheRoundKey = latestRound == null ? 'empty' : String(latestRound);
-    const cacheKey = `${cacheRoundKey}|pattern|${windowKey}|${focusTarget}`;
+    const cacheKey = `${cacheRoundKey}|timing|${windowKey}|${focusTarget}|${timeZone}`;
     const cached = timingAnalyticsCache.get(cacheKey);
     if (cached && (!RESPONSE_CACHE_ENABLED || (Date.now() - cached.createdAt) < DASHBOARD_CACHE_TTL_MS)) {
       return res.json(cached.payload);
@@ -762,7 +768,7 @@ app.get('/analytics/timing', requireDatabase, rateLimit(20), async (req, res) =>
     const rounds = totalRounds > 0 ? await getRounds({ limit: totalRounds, order: 'ASC' }) : [];
     markDbHealthy();
 
-    const payload = buildPatternAnalyticsReport(rounds, { windowKey, focusTarget });
+    const payload = buildTimingAnalyticsReport(rounds, { windowKey, focusTarget, timeZone });
 
     if (!timingAnalyticsCache.has(cacheKey) && timingAnalyticsCache.size >= 80) {
       timingAnalyticsCache.delete(timingAnalyticsCache.keys().next().value);
