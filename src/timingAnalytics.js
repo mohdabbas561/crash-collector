@@ -262,6 +262,7 @@ function summarizeRoundRange(rounds, focusTarget, limit = 8) {
   const items = Array.isArray(rounds) ? rounds : [];
   if (!items.length) return { fromRoundId: null, toRoundId: null, roundCount: 0, hitRoundIds: [], hitCount: 0 };
   const hitRoundIds = items.filter((r) => r.multiplier >= focusTarget).map((r) => r.roundId).slice(0, limit);
+
   return {
     fromRoundId: items[0]?.roundId ?? null,
     toRoundId:   items[items.length - 1]?.roundId ?? null,
@@ -535,7 +536,7 @@ function splitWindowRoundsByProgress(window, progressRatio, slotMinutes) {
   if (safeRatio <= 0)     return { elapsedRounds: [], remainingRounds: rounds.slice(), elapsedCount: 0 };
   if (safeRatio >= 0.999) return { elapsedRounds: rounds.slice(), remainingRounds: [], elapsedCount: rounds.length };
 
-  const startTs  = safeNumber(window.firstTimestamp, rounds[0].timestamp);
+  const startTs  = safeNumber(window.startTimestamp, safeNumber(window.firstTimestamp, rounds[0].timestamp));
   const cutoffTs = startTs + slotMinutes * MINUTE_MS * safeRatio;
   let n = rounds.findIndex((r) => r.timestamp >= cutoffTs);
   if (n < 0) n = rounds.length;
@@ -625,12 +626,17 @@ function buildSlotWindows(rounds, slotMinutes, timeZone, focusTarget) {
   for (const r of rounds) {
     const parts      = getParts(r.timestamp);
     const slotIndex  = clamp(Math.floor(parts.minuteOfDay / slotMinutes), 0, slotCount - 1);
+    const millisIntoSecond = ((r.timestamp % 1000) + 1000) % 1000;
+    const millisIntoSlot = (((parts.minuteOfDay - (slotIndex * slotMinutes)) * 60) + parts.second) * 1000 + millisIntoSecond;
+    const slotStartTimestamp = r.timestamp - millisIntoSlot;
     const key = `${parts.dateKey}|${slotIndex}`;
     let entry = groups.get(key);
     if (!entry) {
       entry = {
         key, dateKey: parts.dateKey, dayIndex: parts.dayIndex,
         slotIndex, slotStartMinute: slotIndex * slotMinutes,
+        startTimestamp: slotStartTimestamp,
+        endTimestamp: slotStartTimestamp + (slotMinutes * MINUTE_MS),
         firstTimestamp: r.timestamp, rounds: [],
       };
       groups.set(key, entry);
@@ -958,13 +964,13 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
     distance:                  Number(m.distance.toFixed(3)),
     similarityPct:             Number(m.similarityPct.toFixed(1)),
     weight:                    Number(m.weight.toFixed(3)),
-    inputWindowLabel:          formatTimestampInTimeZone(m.window.firstTimestamp, timeZone),
+    inputWindowLabel:          formatTimestampInTimeZone(m.window.startTimestamp || m.window.firstTimestamp, timeZone),
     inputSlotLabel:            formatSlotLabel(m.window.slotStartMinute, slotMinutes, slotMode),
     inputRoundFrom:            summarizeRoundRange(m.window.rounds, focusTarget).fromRoundId,
     inputRoundTo:              summarizeRoundRange(m.window.rounds, focusTarget).toRoundId,
     inputRoundCount:           m.window.rounds.length,
     inputHitRate:              m.window.summary.hitRates[focusTarget] || 0,
-    matchedCurrentWindowLabel: formatTimestampInTimeZone(m.matchedCurrentWindow.firstTimestamp, timeZone),
+    matchedCurrentWindowLabel: formatTimestampInTimeZone(m.matchedCurrentWindow.startTimestamp || m.matchedCurrentWindow.firstTimestamp, timeZone),
     matchedCurrentSlotLabel:   formatSlotLabel(m.matchedCurrentWindow.slotStartMinute, slotMinutes, slotMode),
     matchedCurrentRoundFrom:   summarizeRoundRange(m.matchedCurrentWindow.rounds, focusTarget).fromRoundId,
     matchedCurrentRoundTo:     summarizeRoundRange(m.matchedCurrentWindow.rounds, focusTarget).toRoundId,
@@ -1040,6 +1046,8 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
     firstRemainingHitOffsetFrom: Math.max(1, Math.round(weightedQuantile(remainingHitMatches, (m) => m.firstRemainingHitIndex + 1, (m) => m.weight, 0.2, 1))),
     firstRemainingHitOffsetTo:   Math.max(1, Math.round(weightedQuantile(remainingHitMatches, (m) => m.firstRemainingHitIndex + 1, (m) => m.weight, 0.8, 1))),
   } : null;
+  const currentSlotStartTimestamp = Math.round(asOfTimestamp - (currentMinuteProgress * slotMinutes * MINUTE_MS));
+  const currentSlotEndTimestamp = currentSlotStartTimestamp + (slotMinutes * MINUTE_MS);
 
   return {
     available: true,
@@ -1065,6 +1073,10 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
     remainingNoTargetPeakRange,
     progress: {
       ratio:      currentMinuteProgress,
+      elapsedMs:  Math.max(0, Math.round(currentMinuteProgress * slotMinutes * MINUTE_MS)),
+      remainingMs: Math.max(0, Math.round((1 - currentMinuteProgress) * slotMinutes * MINUTE_MS)),
+      slotStartTimestamp: currentSlotStartTimestamp,
+      slotEndTimestamp: currentSlotEndTimestamp,
       roundsSeen: currentSummary.roundCount || 0,
       alreadyHit: alreadyHitCurrentWindow,
     },
@@ -1117,7 +1129,10 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
 // no more "PLAY" hero with "WATCH" signals.
 // ---------------------------------------------------------------------------
 
-function buildPatternPrediction({ focusTarget, windowLabel, latestRoundId, currentSummary, baselineStats, slotAnalytics, patternMatch }) {
+// LEGACY / UNUSED: kept only for reference while the active timing engine
+// runs through buildCurrentWindowPatternPrediction(). Do not wire UI/runtime
+// back to this function.
+function buildPatternPredictionLegacyUnused({ focusTarget, windowLabel, latestRoundId, currentSummary, baselineStats, slotAnalytics, patternMatch }) {
   const slotItem              = slotAnalytics.items.find((i) => i.target === focusTarget) || null;
   const currentSlot           = slotItem?.currentSlot || null;
   const currentHitRate        = currentSummary.hitRates[focusTarget] || 0;
@@ -1662,8 +1677,8 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
   const signalScore = enoughHistory
     ? clamp((rateScore * 0.37) + (edgeScore * 0.26) + (similarityScore * 0.14) + (historyScore * 0.09) + (liveEvidenceScore * 0.14), 0, 1)
     : clamp(historyScore * 0.35, 0, 0.35);
-  const likelySignal = enoughHistory && fromNowHitRate >= likelyRules.playRate;
-  const veryLikelySignal = enoughHistory && fromNowHitRate >= likelyRules.strongRate;
+  const absoluteLikelySignal = enoughHistory && focusTarget <= 10 && fromNowHitRate >= likelyRules.playRate;
+  const absoluteVeryLikelySignal = enoughHistory && focusTarget <= 10 && fromNowHitRate >= likelyRules.strongRate;
   const strongSignal = enoughHistory
     && fromNowHitRate >= dynamicStrongRate
     && fromNowEdge >= rules.strongEdge
@@ -1676,16 +1691,15 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
     && fromNowEdge >= rules.minEdge * 1.25
     && similarityPercent >= rules.minSimilarity
     && remainingRatio >= 0.08;
-  const shouldPlay = strongSignal || mediumSignal || likelySignal;
   const strengthLabel = strongSignal
     ? 'Strong'
     : mediumSignal
       ? 'Medium'
       : relativeSignal
         ? 'Medium'
-      : veryLikelySignal
+      : absoluteVeryLikelySignal
         ? 'Very Likely'
-        : likelySignal
+        : absoluteLikelySignal
           ? 'Likely'
           : saturatedCommonTarget
             ? 'Very Likely'
@@ -1732,7 +1746,7 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
     action = 'PLAY';
     tone = 'good';
     summary = `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. The remaining hit rate is not huge in absolute terms, but it is meaningfully above normal (${edgeLabel}) for this same-time setup.`;
-  } else if (likelySignal || saturatedCommonTarget) {
+  } else if (absoluteLikelySignal || saturatedCommonTarget) {
     action = 'PLAY';
     tone = 'good';
     summary = `${labelForTarget(focusTarget)} is very likely in the live ${patternMatch.currentSlotLabel} window from this point. Timing is ${timingEdgeLabel.toLowerCase()}, not a special edge, but the target itself is still a valid play by likelihood.`;
@@ -2419,6 +2433,7 @@ function buildTimingAnalyticsReport(rounds, options = {}) {
   const outlook             = includeOutlook ? buildOutlook(completedWindows, currentSummary, baselineStats, focusTarget) : null;
   const currentSlotElapsedMs = ((((currentParts.minuteOfDay - (slotAnalytics.currentSlotIndex * slotMinutes)) * 60) + currentParts.second) * 1000);
   const currentSlotStartTimestamp = asOfTimestamp - Math.max(0, currentSlotElapsedMs);
+  const currentSlotEndTimestamp = currentSlotStartTimestamp + windowConfig.ms;
 
   return {
     ok: true, generatedAt: Date.now(),
@@ -2430,7 +2445,14 @@ function buildTimingAnalyticsReport(rounds, options = {}) {
     availableTargets: TARGETS.map((v) => ({ value: v, label: labelForTarget(v) })),
     timeZone,
     dataset: { totalRounds: normalized.length, startTimestamp: earliest.timestamp, endTimestamp: latest.timestamp, spanDays: ratio(latest.timestamp - earliest.timestamp, DAY_MS) },
-    window: { key: windowConfig.key, label: windowConfig.label, ms: windowConfig.ms, startTimestamp: curSlotWin?.firstTimestamp || currentSlotStartTimestamp, endTimestamp: asOfTimestamp },
+    window: {
+      key: windowConfig.key,
+      label: windowConfig.label,
+      ms: windowConfig.ms,
+      startTimestamp: curSlotWin?.startTimestamp || currentSlotStartTimestamp,
+      endTimestamp: curSlotWin?.endTimestamp || currentSlotEndTimestamp,
+      asOfTimestamp,
+    },
     baseline: baselineStats,
     previousWindow: previousSummary,
     currentWindow:  currentSummary,
