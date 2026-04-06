@@ -4,14 +4,10 @@ const cors       = require('cors');
 const { buildPredictionReport } = require('./predictionEngine');
 const { computeLockedRangePredictions } = require('./lockedRangeEngine');
 const {
-  buildPatternAnalyticsReport,
-  normalizePatternWindowKey,
-  normalizePatternTarget,
-} = require('./patternAnalytics');
-const {
   buildTimingAnalyticsReport,
   normalizeTimingWindowKey,
   normalizeTimingTarget,
+  normalizeTimingTimeZone,
 } = require('./timingAnalytics');
 const {
   pool,
@@ -753,7 +749,7 @@ app.get('/analytics/timing', requireDatabase, rateLimit(20), async (req, res) =>
   try {
     const windowKey = normalizeTimingWindowKey(req.query.window);
     const focusTarget = normalizeTimingTarget(req.query.focusTarget);
-    const timeZone = String(req.query.timeZone || 'UTC').trim();
+    const timeZone = normalizeTimingTimeZone(req.query.tz || req.query.timeZone);
     const latestRound = await getLatestRoundId();
     markDbHealthy();
 
