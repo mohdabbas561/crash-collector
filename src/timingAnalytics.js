@@ -422,8 +422,8 @@ function summaryToFeatureVector(summary) {
     lowCrashRate:  summary?.lowCrashRate             || 0,
     hugeHitRate:   summary?.hugeHitRate              || 0,
     megaHitRate:   summary?.megaHitRate              || 0,
-    avgMultiplier: summary?.avgMultiplier            || 0,
-    maxMultiplier: summary?.maxMultiplier            || 0,
+    avgMultiplier: normalizePatternMultiplier(summary?.avgMultiplier || 1),
+    maxMultiplier: normalizePatternMultiplier(summary?.maxMultiplier || 1),
     distLt2:     distributionPct(summary, 'lt2'),
     dist2to5:    distributionPct(summary, '2to5'),
     dist5to10:   distributionPct(summary, '5to10'),
@@ -456,18 +456,50 @@ function buildNormalizedVectorPool(summaries) {
   return { rawVectors, zVectors };
 }
 
+const PATTERN_MULTIPLIER_BANDS = [
+  { max: 1.75, center: 1.35 },
+  { max: 2.5, center: 2.1 },
+  { max: 4, center: 3.2 },
+  { max: 7, center: 5.2 },
+  { max: 12, center: 9.0 },
+  { max: 20, center: 15.0 },
+  { max: 35, center: 27.0 },
+  { max: 70, center: 50.0 },
+  { max: 150, center: 100.0 },
+  { max: 350, center: 220.0 },
+  { max: 750, center: 500.0 },
+  { max: Infinity, center: 1000.0 },
+];
+
+function normalizePatternMultiplier(multiplier) {
+  const safeMultiplier = Math.max(1, safeNumber(multiplier, 1));
+  const band = PATTERN_MULTIPLIER_BANDS.find((item) => safeMultiplier <= item.max) || PATTERN_MULTIPLIER_BANDS[PATTERN_MULTIPLIER_BANDS.length - 1];
+  return Math.log1p(band.center) / Math.log(1001);
+}
+
+function summarizePatternSlice(rounds) {
+  const values = (Array.isArray(rounds) ? rounds : [])
+    .map((item) => normalizePatternMultiplier(item?.multiplier))
+    .filter((value) => Number.isFinite(value))
+    .sort((a, b) => a - b);
+  if (!values.length) return 0;
+  return quantile(values, 0.5);
+}
+
 function sampleWindowPattern(rounds, sampleCount = 12) {
   const items = Array.isArray(rounds) ? rounds : [];
   if (!items.length) return Array.from({ length: sampleCount }, () => 0);
   if (items.length === 1) {
-    const v = Math.log1p(Math.max(1, safeNumber(items[0]?.multiplier, 1))) / Math.log(1001);
+    const v = normalizePatternMultiplier(items[0]?.multiplier);
     return Array.from({ length: sampleCount }, () => v);
   }
   return Array.from({ length: sampleCount }, (_, index) => {
-    const ratioPos = sampleCount === 1 ? 0 : index / (sampleCount - 1);
-    const sourceIndex = clamp(Math.round(ratioPos * (items.length - 1)), 0, items.length - 1);
-    const multiplier = Math.max(1, safeNumber(items[sourceIndex]?.multiplier, 1));
-    return Math.log1p(multiplier) / Math.log(1001);
+    const start = Math.floor((index * items.length) / sampleCount);
+    const nextStart = Math.floor(((index + 1) * items.length) / sampleCount);
+    const end = Math.max(start + 1, nextStart);
+    const slice = items.slice(start, Math.min(end, items.length));
+    if (slice.length) return summarizePatternSlice(slice);
+    return normalizePatternMultiplier(items[Math.min(start, items.length - 1)]?.multiplier);
   });
 }
 
@@ -475,10 +507,12 @@ function patternSeriesDistance(a, b) {
   if (!Array.isArray(a) || !Array.isArray(b) || !a.length || a.length !== b.length) {
     return Number.POSITIVE_INFINITY;
   }
+  const tolerance = 0.045;
   let sum = 0;
   for (let i = 0; i < a.length; i += 1) {
-    const diff = safeNumber(a[i], 0) - safeNumber(b[i], 0);
-    sum += diff * diff;
+    const diff = Math.abs(safeNumber(a[i], 0) - safeNumber(b[i], 0));
+    const effectiveDiff = Math.max(0, diff - tolerance);
+    sum += effectiveDiff * effectiveDiff;
   }
   return Math.sqrt(sum / a.length);
 }
