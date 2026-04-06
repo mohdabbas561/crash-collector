@@ -1691,11 +1691,34 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
     && fromNowEdge >= rules.minEdge * 1.25
     && similarityPercent >= rules.minSimilarity
     && remainingRatio >= 0.08;
+  const supportiveEdgeFloor = focusTarget <= 20
+    ? Math.max(0.01, rules.minEdge * 0.55)
+    : focusTarget <= 100
+      ? Math.max(0.008, rules.minEdge * 0.65)
+      : Math.max(0.004, rules.minEdge * 0.75);
+  const supportiveLiftFloor = focusTarget <= 20
+    ? 1.10
+    : focusTarget <= 100
+      ? 1.14
+      : 1.18;
+  const fromNowLiftRatio = fromNowBaseline > 0 ? ratio(fromNowHitRate, fromNowBaseline, 0) : 0;
+  const supportiveSignal = enoughHistory
+    && fromNowEdge >= supportiveEdgeFloor
+    && similarityPercent >= Math.max(30, rules.minSimilarity - 4)
+    && remainingRatio >= 0.15
+    && (
+      fromNowBaseline <= 0
+        ? fromNowHitRate >= rules.playRate * 0.8
+        : fromNowLiftRatio >= supportiveLiftFloor
+          || fromNowHitRate >= fromNowBaseline + (supportiveEdgeFloor * 1.2)
+    );
   const strengthLabel = strongSignal
     ? 'Strong'
     : mediumSignal
       ? 'Medium'
       : relativeSignal
+        ? 'Medium'
+      : supportiveSignal
         ? 'Medium'
       : absoluteVeryLikelySignal
         ? 'Very Likely'
@@ -1711,6 +1734,8 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
       : mediumSignal
       ? 'Positive Edge'
       : relativeSignal
+        ? 'Positive Edge'
+      : supportiveSignal
         ? 'Positive Edge'
       : fromNowEdge > 0 && similarityPercent >= rules.minSimilarity
           ? 'Small Edge'
@@ -1746,6 +1771,10 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
     action = 'PLAY';
     tone = 'good';
     summary = `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. The remaining hit rate is not huge in absolute terms, but it is meaningfully above normal (${edgeLabel}) for this same-time setup.`;
+  } else if (supportiveSignal) {
+    action = 'PLAY';
+    tone = 'good';
+    summary = `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. This same-time setup is running above normal from this point (${edgeLabel}) with ${similarityPercent.toFixed(1)}% pattern match, so the signal is good enough even though it is not a huge spike.`;
   } else if (absoluteLikelySignal || saturatedCommonTarget) {
     action = 'PLAY';
     tone = 'good';
@@ -1758,8 +1787,6 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
     summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. From this point the matched hit rate is ${fromNowRatePercent.toFixed(1)}%, while normal is already ${pctString(fromNowBaseline)}. There is no real edge.`;
   } else if (similarityPercent < rules.minSimilarity) {
     summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. The hit rate is there, but the closed-input pattern only matches ${similarityPercent.toFixed(1)}% of past same-time setups.`;
-  } else if (noTargetPeakRangeLabel !== '-') {
-    summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. When this setup missed ${labelForTarget(focusTarget)} from this point in matched history, the remaining tail usually topped out around ${noTargetPeakRangeLabel}.`;
   } else {
     summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. Matched same-time history is ${fromNowRatePercent.toFixed(1)}% from now versus ${pctString(fromNowBaseline)} normal (${edgeLabel}), which is still below the play bar for ${labelForTarget(focusTarget)}.`;
   }
@@ -1833,7 +1860,6 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
       `Timing edge: ${timingEdgeLabel}.`,
       saturatedCommonTarget ? `${labelForTarget(focusTarget)} is almost always present in this window size, so timing cannot separate this hour from a normal hour.` : null,
       `Pattern match: ${similarityPercent.toFixed(1)}%.`,
-      noTargetPeakRangeLabel !== '-' ? `If ${labelForTarget(focusTarget)} missed from this point, the highest matched tail peak was usually around ${noTargetPeakRangeLabel}.` : null,
       matchedPeakRangeLabel !== '-' ? `Matched remaining-window peak range: ${matchedPeakRangeLabel}.` : null,
       alreadyHitInCurrentWindow
         ? `${labelForTarget(focusTarget)} already hit ${hitsSoFar} time(s) in this live window.`
