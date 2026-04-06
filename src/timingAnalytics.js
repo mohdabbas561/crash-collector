@@ -779,7 +779,7 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
     : (Number.isInteger(currentPosition) && currentPosition > 0 ? orderedWindows[currentPosition - 1] : null);
   const expectedPreviousSlotIndex = (currentSlotIndex - 1 + slotCount) % slotCount;
 
-  if (!Number.isInteger(currentPosition) || !previousWindow || previousWindow.slotIndex !== expectedPreviousSlotIndex) {
+  if (!previousWindow || previousWindow.slotIndex !== expectedPreviousSlotIndex) {
     return { available: false, examples: [], reason: 'The last closed slot is not yet available for the current live window.' };
   }
 
@@ -977,15 +977,20 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
     matchRows, (m) => m.matchedCurrentWindow.summary.maxMultiplier || 0,
     (m) => m.weight, ratio(cwPeakSum, matchRows.length),
   );
-  const matchedPeakRange = matchRows.length ? {
-    fromMultiplier: Math.max(1, weightedQuantile(matchRows, (m) => m.matchedCurrentWindow.summary.maxMultiplier || 0, (m) => m.weight, 0.2, 1)),
-    toMultiplier: Math.max(1, weightedQuantile(matchRows, (m) => m.matchedCurrentWindow.summary.maxMultiplier || 0, (m) => m.weight, 0.8, 1)),
-  } : null;
+  const buildPeakRange = (rows, peakGetter) => {
+    const validRows = rows.filter((row) => safeNumber(peakGetter(row), 0) > 0);
+    if (!validRows.length) return null;
+    return {
+      fromMultiplier: Math.max(1, weightedQuantile(validRows, peakGetter, (row) => row.weight, 0.2, 1)),
+      toMultiplier: Math.max(1, weightedQuantile(validRows, peakGetter, (row) => row.weight, 0.8, 1)),
+    };
+  };
+  const matchedPeakRange = buildPeakRange(matchRows, (m) => m.matchedCurrentWindow.summary.maxMultiplier || 0);
   const noTargetPeakRows = matchRows.filter((m) => (m.matchedCurrentWindow.summary.hitCounts[focusTarget] || 0) === 0);
-  const noTargetPeakRange = noTargetPeakRows.length ? {
-    fromMultiplier: Math.max(1, weightedQuantile(noTargetPeakRows, (m) => m.matchedCurrentWindow.summary.maxMultiplier || 0, (m) => m.weight, 0.2, 1)),
-    toMultiplier: Math.max(1, weightedQuantile(noTargetPeakRows, (m) => m.matchedCurrentWindow.summary.maxMultiplier || 0, (m) => m.weight, 0.8, 1)),
-  } : null;
+  const noTargetPeakRange = buildPeakRange(noTargetPeakRows, (m) => m.matchedCurrentWindow.summary.maxMultiplier || 0);
+  const remainingPeakRange = buildPeakRange(matchRows, (m) => m.matchedRemainingSummary.maxMultiplier || 0);
+  const remainingNoTargetPeakRows = matchRows.filter((m) => (m.matchedRemainingSummary.hitCounts[focusTarget] || 0) === 0);
+  const remainingNoTargetPeakRange = buildPeakRange(remainingNoTargetPeakRows, (m) => m.matchedRemainingSummary.maxMultiplier || 0);
 
   const currentWindowTone  = classifyLift(currentWindowLift, matchRows.length, cwAnyHit, matchRows.length, inputBaselineAnyHitRate).tone;
   const remainingWindowTone = classifyLift(remainingLift, matchRows.length, rwAnyHit, matchRows.length, remainingBaselineAnyHitRate).tone;
@@ -1017,6 +1022,8 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
     expectedRoundRange,
     matchedPeakRange,
     noTargetPeakRange,
+    remainingPeakRange,
+    remainingNoTargetPeakRange,
     progress: {
       ratio:      currentMinuteProgress,
       roundsSeen: currentSummary.roundCount || 0,
@@ -1594,8 +1601,8 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
   const lookbackDays = safeNumber(patternMatch.lookbackDaysUsed, 0);
   const safeLatestId = safeNumber(latestRoundId, 0);
   const similarityPercent = Number(safeNumber(patternMatch.averageSimilarityPct, 0).toFixed(1));
-  const matchedPeakRangeLabel = formatPeak(patternMatch.matchedPeakRange || null);
-  const noTargetPeakRangeLabel = formatPeak(patternMatch.noTargetPeakRange || null);
+  const matchedPeakRangeLabel = formatPeak(patternMatch.remainingPeakRange || null);
+  const noTargetPeakRangeLabel = formatPeak(patternMatch.remainingNoTargetPeakRange || null);
   const fromNowEdge = fromNowHitRate - fromNowBaseline;
   const saturatedCommonTarget = focusTarget <= 10 && fromNowHitRate >= 0.995 && fromNowBaseline >= 0.995;
   const remainingRatio = clamp(1 - safeNumber(patternMatch.progress?.ratio, 0), 0, 1);
@@ -1699,7 +1706,7 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
   } else if (similarityPercent < rules.minSimilarity) {
     summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. The hit rate is there, but the closed-input pattern only matches ${similarityPercent.toFixed(1)}% of past same-time setups.`;
   } else if (noTargetPeakRangeLabel !== '-') {
-    summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. When this setup missed ${labelForTarget(focusTarget)} in matched history, the live window usually topped out around ${noTargetPeakRangeLabel}.`;
+    summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. When this setup missed ${labelForTarget(focusTarget)} from this point in matched history, the remaining tail usually topped out around ${noTargetPeakRangeLabel}.`;
   } else {
     summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. Matched same-time history is ${fromNowRatePercent.toFixed(1)}% from now versus ${pctString(fromNowBaseline)} normal (${edgeLabel}), which is still below the play bar for ${labelForTarget(focusTarget)}.`;
   }
@@ -1773,8 +1780,8 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
       `Timing edge: ${timingEdgeLabel}.`,
       saturatedCommonTarget ? `${labelForTarget(focusTarget)} is almost always present in this window size, so timing cannot separate this hour from a normal hour.` : null,
       `Pattern match: ${similarityPercent.toFixed(1)}%.`,
-      noTargetPeakRangeLabel !== '-' ? `If ${labelForTarget(focusTarget)} missed, the highest matched peak was usually around ${noTargetPeakRangeLabel}.` : null,
-      matchedPeakRangeLabel !== '-' ? `Matched live-window peak range: ${matchedPeakRangeLabel}.` : null,
+      noTargetPeakRangeLabel !== '-' ? `If ${labelForTarget(focusTarget)} missed from this point, the highest matched tail peak was usually around ${noTargetPeakRangeLabel}.` : null,
+      matchedPeakRangeLabel !== '-' ? `Matched remaining-window peak range: ${matchedPeakRangeLabel}.` : null,
       alreadyHitInCurrentWindow
         ? `${labelForTarget(focusTarget)} already hit ${hitsSoFar} time(s) in this live window.`
         : `${labelForTarget(focusTarget)} has not hit yet in this live window.`,
@@ -2327,17 +2334,25 @@ function buildTimingAnalyticsReport(rounds, options = {}) {
 
   const latest   = normalized[normalized.length - 1];
   const earliest = normalized[0];
+  const requestedNow = safeNumber(options.nowTimestamp, Date.now());
+  const asOfTimestamp = Math.max(latest.timestamp, requestedNow);
   const slotMinutes  = chooseSlotMinutes(windowConfig.ms);
   const slotWindows  = buildSlotWindows(normalized, slotMinutes, timeZone, focusTarget);
-  const slotAnalytics = buildSlotAnalytics(slotWindows, slotMinutes, windowConfig.ms, focusTarget, latest.timestamp, timeZone);
+  const slotAnalytics = buildSlotAnalytics(slotWindows, slotMinutes, windowConfig.ms, focusTarget, asOfTimestamp, timeZone);
 
-  const currentParts = buildZonedPartsGetter(timeZone)(latest.timestamp);
+  const getParts = buildZonedPartsGetter(timeZone);
+  const currentParts = getParts(asOfTimestamp);
   const currentKey   = `${currentParts.dateKey}|${slotAnalytics.currentSlotIndex}`;
+  const previousParts = getParts(asOfTimestamp - slotMinutes * MINUTE_MS);
+  const previousSlotIndex = clamp(Math.floor(previousParts.minuteOfDay / slotMinutes), 0, Math.max(1, Math.floor(1440 / slotMinutes)) - 1);
+  const previousKey = `${previousParts.dateKey}|${previousSlotIndex}`;
   const ordered      = [...slotWindows].sort((a, b) => a.dateKey !== b.dateKey ? a.dateKey.localeCompare(b.dateKey) : a.slotIndex - b.slotIndex);
   const idxByKey     = new Map(ordered.map((w, i) => [w.key, i]));
   const curPos       = idxByKey.get(currentKey);
-  const curSlotWin   = Number.isInteger(curPos) ? ordered[curPos] : (ordered[ordered.length - 1] || null);
-  const prevSlotWin  = Number.isInteger(curPos) && curPos > 0 ? ordered[curPos - 1] : null;
+  const curSlotWin   = idxByKey.has(currentKey) ? ordered[idxByKey.get(currentKey)] : null;
+  const prevSlotWin  = idxByKey.has(previousKey)
+    ? ordered[idxByKey.get(previousKey)]
+    : (Number.isInteger(curPos) && curPos > 0 ? ordered[curPos - 1] : null);
 
   const currentSummary  = curSlotWin  ? curSlotWin.summary  : summarizeRounds([], focusTarget);
   const previousSummary = prevSlotWin ? prevSlotWin.summary : summarizeRounds([], focusTarget);
@@ -2351,8 +2366,8 @@ function buildTimingAnalyticsReport(rounds, options = {}) {
 
   const bestWindowsToday    = buildBestWindowsToday(slotAnalytics, focusTarget);
   const lastHits            = buildLastHitMap(normalized);
-  const cooldowns           = buildCooldownReport(normalized, baselineStats.perRoundHitRates, latest.timestamp, lastHits);
-  const targetReadiness     = buildTargetReadiness(currentSummary, baselineStats, slotAnalytics, cooldowns, latest.timestamp);
+  const cooldowns           = buildCooldownReport(normalized, baselineStats.perRoundHitRates, asOfTimestamp, lastHits);
+  const targetReadiness     = buildTargetReadiness(currentSummary, baselineStats, slotAnalytics, cooldowns, asOfTimestamp);
   const decision            = buildDecision({ focusTarget, windowLabel: windowConfig.label, currentSummary, baselineStats, slotAnalytics, cooldowns, readiness: targetReadiness });
   const recommendationStability = buildStability(completedWindows, baselineStats, slotAnalytics, timeZone, focusTarget);
   const hourlyHistory       = buildHourlyHistory(normalized, timeZone, baselineStats.perRoundHitRates);
@@ -2360,12 +2375,15 @@ function buildTimingAnalyticsReport(rounds, options = {}) {
   const backtest            = buildBacktest(slotWindows, slotAnalytics, focusTarget);
   const comparison          = buildComparison(decision, focusTarget, currentSummary, baselineStats, bestWindowsToday);
   const targetCards         = buildTargetCards(currentSummary, baselineStats);
-  const patternMatch        = buildPatternMatchReport(slotWindows, previousSummary, currentSummary, baselineStats, focusTarget, latest.timestamp, timeZone, slotAnalytics);
+  const patternMatch        = buildPatternMatchReport(slotWindows, previousSummary, currentSummary, baselineStats, focusTarget, asOfTimestamp, timeZone, slotAnalytics);
   const patternPrediction   = buildCurrentWindowPatternPrediction({ focusTarget, windowLabel: windowConfig.label, latestRoundId: latest.roundId || null, currentSummary, baselineStats, slotAnalytics, patternMatch });
   const outlook             = includeOutlook ? buildOutlook(completedWindows, currentSummary, baselineStats, focusTarget) : null;
+  const currentSlotElapsedMs = ((((currentParts.minuteOfDay - (slotAnalytics.currentSlotIndex * slotMinutes)) * 60) + currentParts.second) * 1000);
+  const currentSlotStartTimestamp = asOfTimestamp - Math.max(0, currentSlotElapsedMs);
 
   return {
     ok: true, generatedAt: Date.now(),
+    asOfTimestamp,
     latestRoundId:    latest.roundId || null,
     totalRounds:      normalized.length,
     focusTarget, focusTargetLabel: labelForTarget(focusTarget),
@@ -2373,7 +2391,7 @@ function buildTimingAnalyticsReport(rounds, options = {}) {
     availableTargets: TARGETS.map((v) => ({ value: v, label: labelForTarget(v) })),
     timeZone,
     dataset: { totalRounds: normalized.length, startTimestamp: earliest.timestamp, endTimestamp: latest.timestamp, spanDays: ratio(latest.timestamp - earliest.timestamp, DAY_MS) },
-    window: { key: windowConfig.key, label: windowConfig.label, ms: windowConfig.ms, startTimestamp: curSlotWin?.firstTimestamp || (latest.timestamp - windowConfig.ms), endTimestamp: latest.timestamp },
+    window: { key: windowConfig.key, label: windowConfig.label, ms: windowConfig.ms, startTimestamp: curSlotWin?.firstTimestamp || currentSlotStartTimestamp, endTimestamp: asOfTimestamp },
     baseline: baselineStats,
     previousWindow: previousSummary,
     currentWindow:  currentSummary,

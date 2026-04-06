@@ -299,6 +299,14 @@ const dashboardCache = {
   payload: null,
 };
 const timingAnalyticsCache = new Map();
+const TIMING_SLOT_MINUTES_BY_WINDOW = Object.freeze({
+  '5m': 5,
+  '10m': 10,
+  '30m': 30,
+  '1h': 60,
+  '2h': 120,
+  '5h': 300,
+});
 let predictComputeInFlight = null;
 let lockedComputeInFlight = null;
 let lockedBackgroundTimer = null;
@@ -324,6 +332,31 @@ function setDatabaseAvailability(available, errorMessage = '') {
       console.error('[db-state] OFFLINE:', nextError);
     }
   }
+}
+
+function getTimingCacheBucket(windowKey, timeZone, timestamp) {
+  const slotMinutes = TIMING_SLOT_MINUTES_BY_WINDOW[windowKey] || 5;
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  });
+  const parts = {};
+  for (const part of formatter.formatToParts(new Date(timestamp))) {
+    if (part.type !== 'literal') parts[part.type] = part.value;
+  }
+  const hour = Number.parseInt(parts.hour || '0', 10) || 0;
+  const minute = Number.parseInt(parts.minute || '0', 10) || 0;
+  const second = Number.parseInt(parts.second || '0', 10) || 0;
+  const minuteOfDay = hour * 60 + minute;
+  const slotIndex = Math.max(0, Math.floor(minuteOfDay / slotMinutes));
+  const liveRefreshBucket = Math.floor(second / 10);
+  return `${parts.year || '1970'}-${parts.month || '01'}-${parts.day || '01'}|${slotIndex}|${liveRefreshBucket}`;
 }
 
 function requireDatabase(req, res, next) {
@@ -751,11 +784,13 @@ app.get('/analytics/timing', requireDatabase, rateLimit(20), async (req, res) =>
     const focusTarget = normalizeTimingTarget(req.query.focusTarget);
     const timeZone = normalizeTimingTimeZone(req.query.tz);
     const includeOutlook = ['1', 'true', 'yes'].includes(String(req.query.includeOutlook || '').trim().toLowerCase());
+    const nowTimestamp = Number.parseInt(String(req.query.nowTs || req.query.nowTimestamp || Date.now()), 10) || Date.now();
     const latestRound = await getLatestRoundId();
     markDbHealthy();
 
     const cacheRoundKey = latestRound == null ? 'empty' : String(latestRound);
-    const cacheKey = `${cacheRoundKey}|${windowKey}|${focusTarget}|${timeZone}|${includeOutlook ? '1' : '0'}`;
+    const liveBucketKey = getTimingCacheBucket(windowKey, timeZone, nowTimestamp);
+    const cacheKey = `${cacheRoundKey}|${windowKey}|${focusTarget}|${timeZone}|${includeOutlook ? '1' : '0'}|${liveBucketKey}`;
     const cached = timingAnalyticsCache.get(cacheKey);
     if (cached && (!RESPONSE_CACHE_ENABLED || (Date.now() - cached.createdAt) < DASHBOARD_CACHE_TTL_MS)) {
       return res.json(cached.payload);
@@ -770,6 +805,7 @@ app.get('/analytics/timing', requireDatabase, rateLimit(20), async (req, res) =>
       focusTarget,
       timeZone,
       includeOutlook,
+      nowTimestamp,
     });
 
     if (!timingAnalyticsCache.has(cacheKey) && timingAnalyticsCache.size >= 80) {
