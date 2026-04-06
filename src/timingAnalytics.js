@@ -1201,43 +1201,47 @@ function buildPatternPrediction({
   );
   const confidenceLabel = confidence >= 0.74 ? 'High' : confidence >= 0.52 ? 'Medium' : 'Low';
 
-  const playLiftThreshold = isLowTarget ? 1.03 : isMidTarget ? 1.08 : 1.12;
-  const playEdgeThreshold = isLowTarget ? 0.02 : isMidTarget ? 0.04 : 0.02;
-  const strongAbsoluteHitRate = isLowTarget ? 0.5 : isMidTarget ? 0.2 : 0.07;
-  const watchLiftThreshold = isLowTarget ? 0.98 : isMidTarget ? 1.01 : 1.03;
-  const weakRemainingThreshold = isLowTarget ? 0.8 : isMidTarget ? 0.84 : 0.88;
-  const skipRemainingThreshold = isLowTarget ? 0.72 : isMidTarget ? 0.78 : 0.84;
-  const solidCurrentThreshold = isLowTarget ? 0.92 : isMidTarget ? 0.9 : 0.88;
+  const hitLikelihoodThreshold = focusTarget <= 5
+    ? { play: 0.68, lean: 0.52 }
+    : focusTarget <= 10
+      ? { play: 0.36, lean: 0.24 }
+      : focusTarget <= 20
+        ? { play: 0.22, lean: 0.14 }
+        : focusTarget <= 50
+          ? { play: 0.12, lean: 0.07 }
+          : focusTarget <= 100
+            ? { play: 0.07, lean: 0.035 }
+            : focusTarget <= 500
+              ? { play: 0.018, lean: 0.008 }
+              : { play: 0.006, lean: 0.0025 };
 
-  const strongPlay = (
-    !alreadyHitInCurrentWindow
+  const blendedHitChance = clamp(
+    (remainingHitRate * 0.7)
+      + (currentWindowHitRate * 0.2)
+      + (currentSlotChance * 0.1),
+    0,
+    1
+  );
+  const likelyByRemaining = remainingHitRate >= hitLikelihoodThreshold.play;
+  const likelyByBlend = blendedHitChance >= hitLikelihoodThreshold.play;
+  const likelyBySupport = (
+    remainingHitRate >= hitLikelihoodThreshold.lean
+    && currentWindowHitRate >= hitLikelihoodThreshold.lean
     && (
-      ((remainingLift >= playLiftThreshold && remainingEdge >= playEdgeThreshold) || (remainingHitRate >= strongAbsoluteHitRate && remainingLift >= (isLowTarget ? 1.06 : 1.02)))
-      && (currentWindowLift >= watchLiftThreshold || effectiveCurrentLift >= solidCurrentThreshold || slotLift >= 1)
+      remainingLift >= 0.92
+      || currentWindowLift >= 0.92
+      || effectiveCurrentLift >= 0.95
+      || slotLift >= 0.95
     )
   );
-  const supportivePlay = (
-    !alreadyHitInCurrentWindow
-    && !strongPlay
-    && (
-      remainingLift >= watchLiftThreshold
-      || currentWindowLift >= playLiftThreshold
-      || currentWindowEdge >= playEdgeThreshold
-      || effectiveCurrentLift >= 1
-      || slotLift >= 1
-    )
+  const tooWeak = (
+    remainingHitRate < (hitLikelihoodThreshold.lean * 0.6)
+    && blendedHitChance < (hitLikelihoodThreshold.lean * 0.75)
+    && currentSlotChance < hitLikelihoodThreshold.lean
   );
-  const forcedSkip = (
-    (alreadyHitInCurrentWindow && remainingLift <= weakRemainingThreshold)
-    || (
-      remainingLift <= skipRemainingThreshold
-      && currentWindowLift <= 0.94
-      && effectiveCurrentLift <= 0.92
-      && slotLift <= 0.95
-    )
-  );
-
-  const action = (strongPlay || supportivePlay) && !forcedSkip ? 'PLAY' : 'SKIP';
+  const action = matchedWindows >= 4 && (likelyByRemaining || likelyByBlend || likelyBySupport) && !tooWeak
+    ? 'PLAY'
+    : 'SKIP';
   const tone = action === 'PLAY' ? 'good' : 'bad';
 
   const fallbackRange = patternMatch.fallbackRange || null;
@@ -1257,11 +1261,9 @@ function buildPatternPrediction({
     ? `Based on ${fallbackRange.missMatchCount} matched miss cases for ${labelForTarget(focusTarget)}.`
     : '';
 
-  let summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window because matched history is below normal from this point.`;
+  let summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window because matched history only gives about ${pctString(remainingHitRate)} hit chance from this point.`;
   if (action === 'PLAY') {
-    summary = strongPlay
-      ? `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window because matched ${patternMatch.inputSlotLabel} setups lean clearly positive from here.`
-      : `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window because matched ${patternMatch.inputSlotLabel} setups still lean positive from here.`;
+    summary = `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window because matched ${patternMatch.inputSlotLabel} setups still hit about ${pctString(remainingHitRate)} from this point.`;
   } else if (fallbackRange) {
     summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. If it misses, matched fallback peaks usually top around ${fallbackPeakLabel} near rounds ${fallbackRoundIdLabel}.`;
   }
@@ -1321,8 +1323,8 @@ function buildPatternPrediction({
     reasons: [
       `Input: the last closed ${windowLabel.toLowerCase()} is ${patternMatch.inputSlotLabel}, and the live window being judged now is ${patternMatch.currentSlotLabel}.`,
       `${patternMatch.inputSlotLabel} matched ${matchedWindows} past setups over ${lookbackDaysUsed.toFixed(1)} days with timing and cluster weighting.`,
-      `Full live-window history in those matches hit ${labelForTarget(focusTarget)} ${pctString(currentWindowHitRate)} of the time versus ${pctString(baselineCurrentWindowHitRate)} normal.`,
-      `From this exact point forward, matched current windows hit ${labelForTarget(focusTarget)} ${pctString(remainingHitRate)} of the time versus ${pctString(baselineRemainingHitRate)} normal from-here baseline.`,
+      `Predicted hit chance from now: ${pctString(remainingHitRate)}. Blended hit chance: ${pctString(blendedHitChance)}.`,
+      `Normal from-now chance for ${labelForTarget(focusTarget)} is ${pctString(baselineRemainingHitRate)}. Whole-window matched hit rate is ${pctString(currentWindowHitRate)}.`,
       alreadyHitInCurrentWindow ? `${labelForTarget(focusTarget)} has already hit ${hitsSoFar} time(s) in the current live window.` : `${labelForTarget(focusTarget)} has not hit yet in the current live window.`,
       expectedRoundIdBasis ? `Expected ${labelForTarget(focusTarget)} around rounds ${expectedRoundIdLabel}. ${expectedRoundIdBasis}` : null,
       action === 'SKIP' && fallbackRoundIdBasis ? `Fallback if ${labelForTarget(focusTarget)} misses: ${fallbackPeakLabel} around rounds ${fallbackRoundIdLabel}. ${fallbackRoundIdBasis}` : null,
