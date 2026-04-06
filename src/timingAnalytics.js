@@ -15,13 +15,6 @@ const WINDOW_OPTIONS = [
   { key: '1h',  label: '1 Hour',     ms: 1  * HOUR_MS   },
   { key: '2h',  label: '2 Hours',    ms: 2  * HOUR_MS   },
   { key: '5h',  label: '5 Hours',    ms: 5  * HOUR_MS   },
-  { key: '12h', label: '12 Hours',   ms: 12 * HOUR_MS   },
-  { key: '24h', label: '24 Hours',   ms: 24 * HOUR_MS   },
-  { key: '3d',  label: '3 Days',     ms: 3  * DAY_MS    },
-  { key: '7d',  label: '7 Days',     ms: 7  * DAY_MS    },
-  { key: '10d', label: '10 Days',    ms: 10 * DAY_MS    },
-  { key: '15d', label: '15 Days',    ms: 15 * DAY_MS    },
-  { key: '30d', label: '30 Days',    ms: 30 * DAY_MS    },
 ];
 
 const WINDOW_MAP      = new Map(WINDOW_OPTIONS.map((item) => [item.key, item]));
@@ -457,6 +450,40 @@ function buildNormalizedVectorPool(summaries, focusTarget) {
   return { rawVectors, zVectors };
 }
 
+function sampleWindowPattern(rounds, sampleCount = 12) {
+  const items = Array.isArray(rounds) ? rounds : [];
+  if (!items.length) return Array.from({ length: sampleCount }, () => 0);
+  if (items.length === 1) {
+    const v = Math.log1p(Math.max(1, safeNumber(items[0]?.multiplier, 1))) / Math.log(1001);
+    return Array.from({ length: sampleCount }, () => v);
+  }
+  return Array.from({ length: sampleCount }, (_, index) => {
+    const ratioPos = sampleCount === 1 ? 0 : index / (sampleCount - 1);
+    const sourceIndex = clamp(Math.round(ratioPos * (items.length - 1)), 0, items.length - 1);
+    const multiplier = Math.max(1, safeNumber(items[sourceIndex]?.multiplier, 1));
+    return Math.log1p(multiplier) / Math.log(1001);
+  });
+}
+
+function patternSeriesDistance(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || !a.length || a.length !== b.length) {
+    return Number.POSITIVE_INFINITY;
+  }
+  let sum = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    const diff = safeNumber(a[i], 0) - safeNumber(b[i], 0);
+    sum += diff * diff;
+  }
+  return Math.sqrt(sum / a.length);
+}
+
+function similarityPctFromDistances(summaryDistance, sequenceDistance, weekdayMatch) {
+  const summaryScore = clamp(1 - (safeNumber(summaryDistance, 0) / 2.8), 0, 1);
+  const sequenceScore = clamp(1 - (safeNumber(sequenceDistance, 0) / 0.55), 0, 1);
+  const weekdayBonus = weekdayMatch ? 0.04 : 0;
+  return clamp(((summaryScore * 0.52) + (sequenceScore * 0.48) + weekdayBonus) * 100, 0, 100);
+}
+
 // ---------------------------------------------------------------------------
 // PROGRESS SPLIT
 // ---------------------------------------------------------------------------
@@ -767,12 +794,12 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
   const allSummaries = [...poolCandidates.map((w) => w.summary), previousSummary];
   const { zVectors } = buildNormalizedVectorPool(allSummaries, focusTarget);
   const referenceVec = zVectors[zVectors.length - 1];
+  const referencePattern = sampleWindowPattern(previousWindow.rounds);
 
   const currentMinuteProgress = clamp(
     (currentParts.minuteOfDay - currentSlotIndex * slotMinutes + 1) / Math.max(1, slotMinutes), 0, 1,
   );
-  const liveEvidenceWeight = currentSummary.roundCount > 0
-    ? clamp((currentMinuteProgress * 0.85) + clamp(currentSummary.roundCount / 35, 0, 0.25), 0.12, 0.68) : 0;
+  const liveEvidenceWeight = 0;
   const alreadyHitCurrentWindow = (currentSummary.hitCounts?.[focusTarget] || 0) > 0;
 
   let liveZVectors = null;
@@ -798,6 +825,8 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
 
     const weekdayMatch     = matchedCW.dayIndex === currentParts.dayIndex;
     const previousDistance = normalizedDistance(zVectors[i], referenceVec);
+    const sequenceDistance = patternSeriesDistance(sampleWindowPattern(w.rounds), referencePattern);
+    const similarityPct    = similarityPctFromDistances(previousDistance, sequenceDistance, weekdayMatch);
     const split            = splitWindowRoundsByProgress(matchedCW, currentMinuteProgress, slotMinutes);
     const matchedElapsed   = summarizeRounds(split.elapsedRounds, focusTarget);
     const matchedRemaining = summarizeRounds(split.remainingRounds, focusTarget);
@@ -808,9 +837,9 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
       liveDistance = lv ? normalizedDistance(lv, liveZVectors.currentVec) : 0;
     }
 
-    const distance = (previousDistance + liveDistance * liveEvidenceWeight) / Math.max(1, 1 + liveEvidenceWeight);
+    const distance = (previousDistance + sequenceDistance + liveDistance * liveEvidenceWeight) / Math.max(1, 2 + liveEvidenceWeight);
     return {
-      weekdayMatch, previousDistance, liveDistance,
+      weekdayMatch, previousDistance, sequenceDistance, similarityPct, liveDistance,
       distance: distance + (weekdayMatch ? 0 : 0.18),
       matchedCurrentWindow: matchedCW, matchedElapsedSummary: matchedElapsed, matchedRemainingSummary: matchedRemaining,
       elapsedRounds: split.elapsedRounds, remainingRounds: split.remainingRounds, window: w,
@@ -827,8 +856,9 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
   const sameWeekdayPool = sameSetupCandidates.filter((c) => c.weekdayMatch);
   const pool      = sameWeekdayPool.length >= PATTERN_MIN_CANDIDATES ? sameWeekdayPool : sameSetupCandidates;
   const matchMode = sameWeekdayPool.length >= PATTERN_MIN_CANDIDATES ? 'same-weekday' : 'same-time';
-  const sampleSize = clamp(Math.round(pool.length * 0.6), PATTERN_MIN_CANDIDATES, 20); // was 0.45, now 0.6 — use more of the pool
-  const matches   = [...pool].sort((a, b) => a.distance - b.distance);
+  const sortedPool = [...pool].sort((a, b) => b.similarityPct - a.similarityPct || a.distance - b.distance);
+  const strongMatches = sortedPool.filter((m) => m.similarityPct >= 62);
+  const matches = (strongMatches.length >= PATTERN_MIN_CANDIDATES ? strongMatches : sortedPool.slice(0, Math.min(20, Math.max(PATTERN_MIN_CANDIDATES, Math.ceil(sortedPool.length * 0.55)))));
 
   if (!matches.length) {
     return { available: false, examples: [], reason: 'No usable past setups found for the current live window.' };
@@ -878,6 +908,7 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
     rank:                      idx + 1,
     weekdayMatch:              m.weekdayMatch,
     distance:                  Number(m.distance.toFixed(3)),
+    similarityPct:             Number(m.similarityPct.toFixed(1)),
     weight:                    Number(m.weight.toFixed(3)),
     inputWindowLabel:          formatTimestampInTimeZone(m.window.firstTimestamp, timeZone),
     inputSlotLabel:            formatSlotLabel(m.window.slotStartMinute, slotMinutes, slotMode),
@@ -937,6 +968,15 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
     matchRows, (m) => m.matchedCurrentWindow.summary.maxMultiplier || 0,
     (m) => m.weight, ratio(cwPeakSum, matches.length),
   );
+  const matchedPeakRange = matchRows.length ? {
+    fromMultiplier: Math.max(1, weightedQuantile(matchRows, (m) => m.matchedCurrentWindow.summary.maxMultiplier || 0, (m) => m.weight, 0.2, 1)),
+    toMultiplier: Math.max(1, weightedQuantile(matchRows, (m) => m.matchedCurrentWindow.summary.maxMultiplier || 0, (m) => m.weight, 0.8, 1)),
+  } : null;
+  const noTargetPeakRows = matchRows.filter((m) => (m.matchedCurrentWindow.summary.hitCounts[focusTarget] || 0) === 0);
+  const noTargetPeakRange = noTargetPeakRows.length ? {
+    fromMultiplier: Math.max(1, weightedQuantile(noTargetPeakRows, (m) => m.matchedCurrentWindow.summary.maxMultiplier || 0, (m) => m.weight, 0.2, 1)),
+    toMultiplier: Math.max(1, weightedQuantile(noTargetPeakRows, (m) => m.matchedCurrentWindow.summary.maxMultiplier || 0, (m) => m.weight, 0.8, 1)),
+  } : null;
 
   const currentWindowTone  = classifyLift(currentWindowLift, matches.length, cwAnyHit, matches.length, inputBaselineAnyHitRate).tone;
   const remainingWindowTone = classifyLift(remainingLift, matches.length, rwAnyHit, matches.length, remainingBaselineAnyHitRate).tone;
@@ -962,7 +1002,10 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
     examples,
     averageMatchWeight: Number(weightedAverage(matchRows, (m) => m.weight, () => 1, 0).toFixed(3)),
     averageDistance:    Number(weightedAverage(matchRows, (m) => m.distance, (m) => m.weight, 0).toFixed(3)),
+    averageSimilarityPct: Number(weightedAverage(matchRows, (m) => m.similarityPct, (m) => m.weight, 0).toFixed(1)),
     expectedRoundRange,
+    matchedPeakRange,
+    noTargetPeakRange,
     progress: {
       ratio:      currentMinuteProgress,
       roundsSeen: currentSummary.roundCount || 0,
@@ -1102,58 +1145,52 @@ function buildPatternPrediction({ focusTarget, windowLabel, latestRoundId, curre
     const alreadyHit = Boolean(patternMatch.progress?.alreadyHit || (currentSummary.hitCounts?.[focusTarget] || 0) > 0);
     const hitsSoFar = currentSummary.hitCounts?.[focusTarget] || 0;
     const averageDistance = safeNumber(patternMatch.averageDistance, 1.25);
+    const averageSimilarityPct = safeNumber(patternMatch.averageSimilarityPct, 0);
+    const matchedPeakRange = patternMatch.matchedPeakRange || null;
+    const noTargetPeakRange = patternMatch.noTargetPeakRange || null;
     const enoughHistory = matchedWins >= rules.minMatches;
-    const sameWeekdayShare = ratio(sameWdMatches, matchedWins);
-    const progressRatio = clamp(safeNumber(patternMatch.progress?.ratio, 0), 0, 1);
-    const tailWeight = progressRatio <= 0.2
-      ? 0.15
-      : progressRatio >= 0.85
-        ? 0.85
-        : 0.15 + (((progressRatio - 0.2) / 0.65) * 0.70);
-    const predictedRate = (cwHitRate * (1 - tailWeight)) + (remHitRate * tailWeight);
-    const predictedBaseline = (baselineCWHitRate * (1 - tailWeight)) + (remBaseline * tailWeight);
-    const edgeThreshold = focusTarget <= 10
-      ? 0.05
-      : focusTarget <= 20
-        ? 0.04
-        : focusTarget <= 50
-          ? 0.025
-          : focusTarget <= 100
-            ? 0.015
-            : focusTarget <= 500
-              ? 0.006
-              : 0.003;
-    const edge = predictedRate - predictedBaseline;
-    const sampleScore = clamp(matchedWins / Math.max(rules.minMatches + 8, 10), 0, 1);
-    const distanceScore = clamp(1 - (averageDistance / 1.8), 0, 1);
-    const weekdayScore = clamp(sameWeekdayShare, 0, 1);
-    const patternQuality = clamp(
-      (sampleScore * 0.45)
-      + (distanceScore * 0.35)
-      + (weekdayScore * 0.20),
-      0,
-      1,
-    );
+    const predictedRate = cwHitRate;
+    const predictedBaseline = baselineCWHitRate;
     const accuracyPercent = Number((predictedRate * 100).toFixed(1));
     const signalAccuracy = predictedRate;
-    const strengthLabel = enoughHistory && predictedRate >= rules.strongRate && edge >= (edgeThreshold * 1.4) && patternQuality >= 0.55
-      ? 'Strong'
-      : enoughHistory && predictedRate >= rules.playRate && edge >= edgeThreshold && patternQuality >= 0.40
-        ? 'Medium'
-        : 'Not Strong';
-    const dataQuality = patternQuality >= 0.70 ? 'good' : patternQuality >= 0.50 ? 'moderate' : 'limited';
+    const similarityPercent = Number(averageSimilarityPct.toFixed(1));
+    const formatPeak = (range) => {
+      if (!range) return '-';
+      const from = safeNumber(range.fromMultiplier, 0);
+      const to = safeNumber(range.toMultiplier, 0);
+      if (from <= 0 && to <= 0) return '-';
+      const fromLabel = from >= 100 ? from.toFixed(1) : from >= 10 ? from.toFixed(1) : from.toFixed(2);
+      const toLabel = to >= 100 ? to.toFixed(1) : to >= 10 ? to.toFixed(1) : to.toFixed(2);
+      return `${fromLabel}x - ${toLabel}x`;
+    };
+    const matchedPeakRangeLabel = formatPeak(matchedPeakRange);
+    const noTargetPeakRangeLabel = formatPeak(noTargetPeakRange);
+    const strengthLabel = !enoughHistory
+      ? 'Not Strong'
+      : predictedRate >= rules.strongRate && similarityPercent >= 78
+        ? 'Strong'
+        : predictedRate >= rules.playRate && similarityPercent >= 62
+          ? 'Medium'
+          : 'Not Strong';
+    const dataQuality = similarityPercent >= 82 ? 'good' : similarityPercent >= 62 ? 'moderate' : 'limited';
     const shouldPlay = strengthLabel !== 'Not Strong';
 
     let action = 'SKIP';
     let tone = 'bad';
-    let summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. The current-time pattern tracker does not show enough edge.`;
+    let summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. The matched pattern is not strong enough.`;
 
     if (shouldPlay) {
       action = 'PLAY';
       tone = 'good';
-      summary = `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. The current-time pattern tracker is a ${strengthLabel.toLowerCase()} match.`;
+      summary = `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. ${accuracyPercent.toFixed(1)}% of matched next windows hit ${labelForTarget(focusTarget)} with ${similarityPercent.toFixed(1)}% pattern similarity.`;
     } else if (!enoughHistory) {
       summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. There are not enough matched same-time setups yet.`;
+    } else if (predictedRate > 0) {
+      summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. Only ${accuracyPercent.toFixed(1)}% of matched next windows hit ${labelForTarget(focusTarget)}.`;
+    } else if (noTargetPeakRangeLabel !== '-') {
+      summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. In matched next windows ${labelForTarget(focusTarget)} was not there; biggest was around ${noTargetPeakRangeLabel}.`;
+    } else if (matchedPeakRangeLabel !== '-') {
+      summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. In matched next windows ${labelForTarget(focusTarget)} was not there; biggest was around ${matchedPeakRangeLabel}.`;
     }
 
     const expectedRoundIdFrom = patternMatch.expectedRoundRange && safeLatestId > 0
@@ -1180,6 +1217,9 @@ function buildPatternPrediction({ focusTarget, windowLabel, latestRoundId, curre
       accuracyRate: predictedRate,
       accuracyPercent,
       strengthLabel,
+      similarityPercent,
+      matchedPeakRangeLabel,
+      noTargetPeakRangeLabel,
       predictsLabel: `Current ${windowLabel}`,
       inputLabel: `Closed Previous ${windowLabel}`,
       inputSlotLabel: patternMatch.inputSlotLabel,
@@ -1208,10 +1248,12 @@ function buildPatternPrediction({ focusTarget, windowLabel, latestRoundId, curre
       summary,
       reasons: [
         `Accuracy ${accuracyPercent.toFixed(1)}%.`,
-        `Prediction uses current time inside the block and ${matchedWins} matched same-time setups.`,
-        `Historical block hit rate: ${pctString(cwHitRate)}.`,
+        `Pattern similarity ${similarityPercent.toFixed(1)}% from ${matchedWins} matched same-time setups.`,
+        `Historical next-window hit rate: ${pctString(cwHitRate)}.`,
         `Tail hit rate from now: ${pctString(remHitRate)}.`,
         `Normal rate for this point: ${pctString(predictedBaseline)}.`,
+        noTargetPeakRangeLabel !== '-' ? `When ${labelForTarget(focusTarget)} missed, the matched peak was around ${noTargetPeakRangeLabel}.` : null,
+        matchedPeakRangeLabel !== '-' ? `Matched next-window peak range: ${matchedPeakRangeLabel}.` : null,
         `Pattern quality: ${strengthLabel}.`,
         alreadyHit
           ? `${labelForTarget(focusTarget)} already hit ${hitsSoFar} time(s) in this live window.`
