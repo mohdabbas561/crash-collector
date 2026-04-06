@@ -412,9 +412,13 @@ function distributionPct(summary, bandKey) {
 // Z-SCORE NORMALISED FEATURE DISTANCE
 // ---------------------------------------------------------------------------
 
-function summaryToFeatureVector(summary, focusTarget) {
+function summaryToFeatureVector(summary) {
   return {
-    focusHitRate:  summary?.hitRates?.[focusTarget] || 0,
+    hitRate5:      summary?.hitRates?.[5]           || 0,
+    hitRate10:     summary?.hitRates?.[10]          || 0,
+    hitRate20:     summary?.hitRates?.[20]          || 0,
+    hitRate100:    summary?.hitRates?.[100]         || 0,
+    hitRate500:    summary?.hitRates?.[500]         || 0,
     lowCrashRate:  summary?.lowCrashRate             || 0,
     hugeHitRate:   summary?.hugeHitRate              || 0,
     megaHitRate:   summary?.megaHitRate              || 0,
@@ -430,7 +434,8 @@ function summaryToFeatureVector(summary, focusTarget) {
 }
 
 const SUMMARY_FEATURE_KEYS = [
-  'focusHitRate','lowCrashRate','hugeHitRate','megaHitRate',
+  'hitRate5','hitRate10','hitRate20','hitRate100','hitRate500',
+  'lowCrashRate','hugeHitRate','megaHitRate',
   'avgMultiplier','maxMultiplier',
   'distLt2','dist2to5','dist5to10','dist10to20','dist20to50','dist50to100',
 ];
@@ -445,8 +450,8 @@ function normalizedDistance(vecA, vecB) {
   return Math.sqrt(sum);
 }
 
-function buildNormalizedVectorPool(summaries, focusTarget) {
-  const rawVectors = summaries.map((s) => summaryToFeatureVector(s, focusTarget));
+function buildNormalizedVectorPool(summaries) {
+  const rawVectors = summaries.map((s) => summaryToFeatureVector(s));
   const zVectors   = zScoreNormalize(rawVectors, SUMMARY_FEATURE_KEYS);
   return { rawVectors, zVectors };
 }
@@ -797,7 +802,7 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
   }
 
   const allSummaries = [...poolCandidates.map((w) => w.summary), previousSummary];
-  const { zVectors } = buildNormalizedVectorPool(allSummaries, focusTarget);
+  const { zVectors } = buildNormalizedVectorPool(allSummaries);
   const referenceVec = zVectors[zVectors.length - 1];
   const referencePattern = sampleWindowPattern(previousWindow.rounds);
 
@@ -823,7 +828,7 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
       return summarizeRounds(split.elapsedRounds, focusTarget);
     });
     const validLive = [...livePoolSummaries.filter(Boolean), currentSummary];
-    const { zVectors: lz } = buildNormalizedVectorPool(validLive, focusTarget);
+    const { zVectors: lz } = buildNormalizedVectorPool(validLive);
     liveZVectors = { summaries: livePoolSummaries, zVectors: lz, currentVec: lz[lz.length - 1] };
   }
 
@@ -2207,7 +2212,7 @@ function buildOutlook(completedWindows, currentSummary, baselineStats, focusTarg
   if (usable.length < 10) return { available: false, reason: 'Not enough completed windows yet.' };
 
   const allSummaries = [...usable.map((w) => w.summary), currentSummary];
-  const { zVectors } = buildNormalizedVectorPool(allSummaries, focusTarget);
+  const { zVectors } = buildNormalizedVectorPool(allSummaries);
   const currentVec   = zVectors[zVectors.length - 1];
 
   const candidates = usable
