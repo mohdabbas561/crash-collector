@@ -1692,23 +1692,24 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
     && similarityPercent >= rules.minSimilarity
     && remainingRatio >= 0.08;
   const supportiveEdgeFloor = focusTarget <= 20
-    ? Math.max(0.01, rules.minEdge * 0.55)
+    ? Math.max(0.006, rules.minEdge * 0.45)
     : focusTarget <= 100
-      ? Math.max(0.008, rules.minEdge * 0.65)
-      : Math.max(0.004, rules.minEdge * 0.75);
+      ? Math.max(0.004, rules.minEdge * 0.55)
+      : Math.max(0.002, rules.minEdge * 0.60);
   const supportiveLiftFloor = focusTarget <= 20
-    ? 1.10
+    ? 1.05
     : focusTarget <= 100
-      ? 1.14
-      : 1.18;
+      ? 1.10
+      : 1.14;
+  const supportiveSimilarityFloor = Math.max(26, rules.minSimilarity - 8);
   const fromNowLiftRatio = fromNowBaseline > 0 ? ratio(fromNowHitRate, fromNowBaseline, 0) : 0;
   const supportiveSignal = enoughHistory
     && fromNowEdge >= supportiveEdgeFloor
-    && similarityPercent >= Math.max(30, rules.minSimilarity - 4)
-    && remainingRatio >= 0.15
+    && similarityPercent >= supportiveSimilarityFloor
+    && remainingRatio >= 0.12
     && (
       fromNowBaseline <= 0
-        ? fromNowHitRate >= rules.playRate * 0.8
+        ? fromNowHitRate >= Math.max(rules.playRate * 0.65, supportiveEdgeFloor)
         : fromNowLiftRatio >= supportiveLiftFloor
           || fromNowHitRate >= fromNowBaseline + (supportiveEdgeFloor * 1.2)
     );
@@ -1774,7 +1775,7 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
   } else if (supportiveSignal) {
     action = 'PLAY';
     tone = 'good';
-    summary = `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. This same-time setup is running above normal from this point (${edgeLabel}) with ${similarityPercent.toFixed(1)}% pattern match, so the signal is good enough even though it is not a huge spike.`;
+    summary = `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. This same-time setup is modestly but clearly above normal from this point (${edgeLabel}) with ${similarityPercent.toFixed(1)}% pattern match, so the signal is playable even without a huge spike.`;
   } else if (absoluteLikelySignal || saturatedCommonTarget) {
     action = 'PLAY';
     tone = 'good';
