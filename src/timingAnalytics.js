@@ -1104,40 +1104,56 @@ function buildPatternPrediction({ focusTarget, windowLabel, latestRoundId, curre
     const averageDistance = safeNumber(patternMatch.averageDistance, 1.25);
     const enoughHistory = matchedWins >= rules.minMatches;
     const sameWeekdayShare = ratio(sameWdMatches, matchedWins);
-
-    const wholeWindowScore = clamp(cwHitRate / Math.max(rules.strongRate, 0.0001), 0, 1);
-    const tailScore = clamp(remHitRate / Math.max(rules.playRate, 0.0001), 0, 1);
+    const progressRatio = clamp(safeNumber(patternMatch.progress?.ratio, 0), 0, 1);
+    const tailWeight = progressRatio <= 0.2
+      ? 0.15
+      : progressRatio >= 0.85
+        ? 0.85
+        : 0.15 + (((progressRatio - 0.2) / 0.65) * 0.70);
+    const predictedRate = (cwHitRate * (1 - tailWeight)) + (remHitRate * tailWeight);
+    const predictedBaseline = (baselineCWHitRate * (1 - tailWeight)) + (remBaseline * tailWeight);
+    const edgeThreshold = focusTarget <= 10
+      ? 0.05
+      : focusTarget <= 20
+        ? 0.04
+        : focusTarget <= 50
+          ? 0.025
+          : focusTarget <= 100
+            ? 0.015
+            : focusTarget <= 500
+              ? 0.006
+              : 0.003;
+    const edge = predictedRate - predictedBaseline;
     const sampleScore = clamp(matchedWins / Math.max(rules.minMatches + 8, 10), 0, 1);
     const distanceScore = clamp(1 - (averageDistance / 1.8), 0, 1);
     const weekdayScore = clamp(sameWeekdayShare, 0, 1);
-    const signalAccuracy = clamp(
-      (wholeWindowScore * 0.45)
-      + (tailScore * 0.15)
-      + (sampleScore * 0.18)
-      + (distanceScore * 0.12)
-      + (weekdayScore * 0.10),
+    const patternQuality = clamp(
+      (sampleScore * 0.45)
+      + (distanceScore * 0.35)
+      + (weekdayScore * 0.20),
       0,
       1,
     );
-    const accuracyPercent = Number((signalAccuracy * 100).toFixed(1));
-    const strengthLabel = signalAccuracy >= 0.78 ? 'Strong' : signalAccuracy >= 0.58 ? 'Medium' : 'Not Strong';
-    const dataQuality = signalAccuracy >= 0.78 ? 'good' : signalAccuracy >= 0.58 ? 'moderate' : 'limited';
-    const shouldPlay = enoughHistory
-      && (cwHitRate >= rules.playRate || cwLift >= 1.02 || remHitRate >= rules.playRate)
-      && signalAccuracy >= 0.58;
+    const accuracyPercent = Number((predictedRate * 100).toFixed(1));
+    const signalAccuracy = predictedRate;
+    const strengthLabel = enoughHistory && predictedRate >= rules.strongRate && edge >= (edgeThreshold * 1.4) && patternQuality >= 0.55
+      ? 'Strong'
+      : enoughHistory && predictedRate >= rules.playRate && edge >= edgeThreshold && patternQuality >= 0.40
+        ? 'Medium'
+        : 'Not Strong';
+    const dataQuality = patternQuality >= 0.70 ? 'good' : patternQuality >= 0.50 ? 'moderate' : 'limited';
+    const shouldPlay = strengthLabel !== 'Not Strong';
 
     let action = 'SKIP';
     let tone = 'bad';
-    let summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. Historical same-time matches do not make this time block strong enough.`;
+    let summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. The current-time pattern tracker does not show enough edge.`;
 
     if (shouldPlay) {
       action = 'PLAY';
       tone = 'good';
-      summary = `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. Historical same-time matches support this time block.`;
+      summary = `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. The current-time pattern tracker is a ${strengthLabel.toLowerCase()} match.`;
     } else if (!enoughHistory) {
       summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. There are not enough matched same-time setups yet.`;
-    } else if (alreadyHit) {
-      summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. This hour already produced ${labelForTarget(focusTarget)}, and the matched history is still not strong enough.`;
     }
 
     const expectedRoundIdFrom = patternMatch.expectedRoundRange && safeLatestId > 0
@@ -1161,7 +1177,7 @@ function buildPatternPrediction({ focusTarget, windowLabel, latestRoundId, curre
       confidence: signalAccuracy,
       confidenceLabel: strengthLabel,
       dataQuality,
-      accuracyRate: remHitRate,
+      accuracyRate: predictedRate,
       accuracyPercent,
       strengthLabel,
       predictsLabel: `Current ${windowLabel}`,
@@ -1192,9 +1208,10 @@ function buildPatternPrediction({ focusTarget, windowLabel, latestRoundId, curre
       summary,
       reasons: [
         `Accuracy ${accuracyPercent.toFixed(1)}%.`,
-        `Historical block hit rate: ${pctString(cwHitRate)} across ${matchedWins} matched setups.`,
+        `Prediction uses current time inside the block and ${matchedWins} matched same-time setups.`,
+        `Historical block hit rate: ${pctString(cwHitRate)}.`,
         `Tail hit rate from now: ${pctString(remHitRate)}.`,
-        `Normal hit rate from now: ${pctString(remBaseline)}.`,
+        `Normal rate for this point: ${pctString(predictedBaseline)}.`,
         `Pattern quality: ${strengthLabel}.`,
         alreadyHit
           ? `${labelForTarget(focusTarget)} already hit ${hitsSoFar} time(s) in this live window.`
