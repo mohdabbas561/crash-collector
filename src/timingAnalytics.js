@@ -325,7 +325,7 @@ function createTargetMap(initialValue) {
 function buildZonedPartsGetter(timeZone) {
   const formatter = new Intl.DateTimeFormat('en-US', {
     timeZone, weekday: 'short', year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
   });
   return (timestamp) => {
     const parts = {};
@@ -335,10 +335,11 @@ function buildZonedPartsGetter(timeZone) {
     const weekday = parts.weekday || 'Mon';
     const hour    = safeNumber(parts.hour, 0);
     const minute  = safeNumber(parts.minute, 0);
+    const second  = safeNumber(parts.second, 0);
     return {
       weekday,
       dayIndex:    WEEKDAY_INDEX[weekday] ?? 0,
-      hour, minute,
+      hour, minute, second,
       minuteOfDay: hour * 60 + minute,
       dateKey:     `${parts.year || '1970'}-${parts.month || '01'}-${parts.day || '01'}`,
     };
@@ -614,10 +615,10 @@ function sampleWeight(sampleCount) {
   return clamp(sampleCount / 8, 0.25, 1); // was /12, now /8 — reaches 1.0 at 8 samples
 }
 
-function buildSlotAnalytics(slotWindows, slotMinutes, windowMs, focusTarget, latestTimestamp, timeZone) {
+function buildSlotAnalytics(slotWindows, slotMinutes, windowMs, focusTarget, asOfTimestamp, timeZone) {
   const mode         = windowMs > DAY_MS ? 'start-time' : 'window';
   const slotCount    = Math.max(1, Math.floor(1440 / slotMinutes));
-  const currentParts = buildZonedPartsGetter(timeZone)(latestTimestamp);
+  const currentParts = buildZonedPartsGetter(timeZone)(asOfTimestamp);
   const currentSlotIndex = clamp(Math.floor(currentParts.minuteOfDay / slotMinutes), 0, slotCount - 1);
 
   // BUG-FIX 3: better minSamples — log2 scale appropriate for data volume
@@ -633,7 +634,7 @@ function buildSlotAnalytics(slotWindows, slotMinutes, windowMs, focusTarget, lat
     for (const sw of slotWindows) {
       const s       = sw.summary;
       const hitCount = s.hitCounts[target] || 0;
-      const ageMs   = latestTimestamp - sw.firstTimestamp;
+      const ageMs   = asOfTimestamp - sw.firstTimestamp;
       const dw      = decayWeight(ageMs);
       baselineRounds += s.roundCount;
       baselineHits   += hitCount;
@@ -751,7 +752,7 @@ function buildSlotAnalytics(slotWindows, slotMinutes, windowMs, focusTarget, lat
 
 const PATTERN_MIN_CANDIDATES = 4; // was 6 — 4 is sufficient for chi-square validity
 
-function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, baselineStats, focusTarget, latestTimestamp, timeZone, slotAnalytics) {
+function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, baselineStats, focusTarget, asOfTimestamp, timeZone, slotAnalytics) {
   if (!slotWindows.length) {
     return { available: false, examples: [], reason: 'Not enough stored slot history yet.' };
   }
@@ -760,18 +761,22 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
   const slotCount    = Math.max(1, Math.floor(1440 / slotMinutes));
   const slotMode     = slotAnalytics.slotMode;
   const getParts     = buildZonedPartsGetter(timeZone);
-  const currentParts = getParts(latestTimestamp);
+  const currentParts = getParts(asOfTimestamp);
   const currentSlotIndex = slotAnalytics.currentSlotIndex;
   const currentKey   = `${currentParts.dateKey}|${currentSlotIndex}`;
-  const historySpanDays = ratio(latestTimestamp - (slotWindows[0]?.firstTimestamp || latestTimestamp), DAY_MS);
+  const previousProbeParts = getParts(asOfTimestamp - slotMinutes * MINUTE_MS);
+  const previousSlotIndex = clamp(Math.floor(previousProbeParts.minuteOfDay / slotMinutes), 0, slotCount - 1);
+  const previousKey = `${previousProbeParts.dateKey}|${previousSlotIndex}`;
+  const historySpanDays = ratio(asOfTimestamp - (slotWindows[0]?.firstTimestamp || asOfTimestamp), DAY_MS);
   const lookbackDaysUsed = Math.max(0, historySpanDays);
 
   const orderedWindows = [...slotWindows].sort((a, b) =>
     a.dateKey !== b.dateKey ? a.dateKey.localeCompare(b.dateKey) : a.slotIndex - b.slotIndex);
   const indexByKey      = new Map(orderedWindows.map((w, i) => [w.key, i]));
   const currentPosition = indexByKey.get(currentKey);
-  const previousWindow  = Number.isInteger(currentPosition) && currentPosition > 0
-    ? orderedWindows[currentPosition - 1] : null;
+  const previousWindow  = indexByKey.has(previousKey)
+    ? orderedWindows[indexByKey.get(previousKey)]
+    : (Number.isInteger(currentPosition) && currentPosition > 0 ? orderedWindows[currentPosition - 1] : null);
   const expectedPreviousSlotIndex = (currentSlotIndex - 1 + slotCount) % slotCount;
 
   if (!Number.isInteger(currentPosition) || !previousWindow || previousWindow.slotIndex !== expectedPreviousSlotIndex) {
@@ -781,7 +786,7 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
   const poolCandidates = orderedWindows.filter((w) => (
     w.slotIndex === previousWindow.slotIndex
     && w.key !== previousWindow.key
-    && w.firstTimestamp < latestTimestamp
+    && w.firstTimestamp < asOfTimestamp
   ));
 
   if (poolCandidates.length < PATTERN_MIN_CANDIDATES) {
@@ -797,7 +802,7 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
   const referencePattern = sampleWindowPattern(previousWindow.rounds);
 
   const currentMinuteProgress = clamp(
-    (currentParts.minuteOfDay - currentSlotIndex * slotMinutes + 1) / Math.max(1, slotMinutes), 0, 1,
+    (((currentParts.minuteOfDay - currentSlotIndex * slotMinutes) * 60) + currentParts.second) / Math.max(60, slotMinutes * 60), 0, 1,
   );
   const liveEvidenceWeight = currentMinuteProgress >= 0.7
     ? 0.9
@@ -846,7 +851,7 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
     const distance = (previousDistance + sequenceDistance + liveDistance * liveEvidenceWeight) / Math.max(1, 2 + liveEvidenceWeight);
     return {
       weekdayMatch, previousDistance, sequenceDistance, similarityPct, liveDistance,
-      distance: distance + (weekdayMatch ? 0 : 0.18),
+      distance: distance + (weekdayMatch ? 0 : 0.04),
       matchedCurrentWindow: matchedCW, matchedElapsedSummary: matchedElapsed, matchedRemainingSummary: matchedRemaining,
       elapsedRounds: split.elapsedRounds, remainingRounds: split.remainingRounds, window: w,
     };
@@ -863,11 +868,11 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
   const matchMode = sameWeekdayPool.length ? 'same-time+weekday-boost' : 'same-time';
   const sortedPool = [...sameSetupCandidates].sort((a, b) => b.similarityPct - a.similarityPct || a.distance - b.distance);
   const matchRows = sortedPool.map((match) => {
-    const ageMs      = latestTimestamp - match.window.firstTimestamp;
+    const ageMs      = asOfTimestamp - match.window.firstTimestamp;
     const dw         = decayWeight(ageMs);
     const closenessW = 1 / (1 + match.distance);
     const liveW      = liveEvidenceWeight > 0 ? 1 / (1 + match.liveDistance) : 1;
-    const weekdayW   = match.weekdayMatch ? 1.15 : 1;
+    const weekdayW   = match.weekdayMatch ? (sameWeekdayPool.length >= PATTERN_MIN_CANDIDATES ? 1.1 : 1.03) : 1;
     const weight     = closenessW * liveW * dw * weekdayW;
     const remaining  = Array.isArray(match.remainingRounds) ? match.remainingRounds : [];
     const firstHitIdx = remaining.findIndex((r) => r.multiplier >= focusTarget);
