@@ -258,6 +258,59 @@ function formatTimestampInTimeZone(timestamp, timeZone) {
   }).format(new Date(n));
 }
 
+function formatMultiplierLabel(multiplier) {
+  const value = Math.max(0, safeNumber(multiplier, 0));
+  if (!value) return '-';
+  if (value >= 100) return `${value.toFixed(1)}x`;
+  if (value >= 10) return `${value.toFixed(1)}x`;
+  return `${value.toFixed(2)}x`;
+}
+
+function findDistributionBand(multiplier) {
+  const value = safeNumber(multiplier, 0);
+  return DISTRIBUTION_BANDS.find((band) => value >= band.min && value < band.max) || DISTRIBUTION_BANDS[DISTRIBUTION_BANDS.length - 1];
+}
+
+function buildRoundPatternGrid(rounds, focusTarget) {
+  const items = Array.isArray(rounds) ? rounds : [];
+  return {
+    totalCount: items.length,
+    cells: items.map((round, index) => {
+      const multiplier = safeNumber(round?.multiplier, 0);
+      const band = findDistributionBand(multiplier);
+      return {
+        index: index + 1,
+        roundId: round?.roundId ?? null,
+        multiplier,
+        multiplierLabel: formatMultiplierLabel(multiplier),
+        bandKey: band?.key || '',
+        bandLabel: band?.label || '-',
+        hit: multiplier >= focusTarget,
+        near: multiplier >= Math.max(2, focusTarget * 0.6),
+      };
+    }),
+  };
+}
+
+function summarizePeakRound(rounds) {
+  const items = Array.isArray(rounds) ? rounds : [];
+  if (!items.length) return { roundId: null, multiplier: 0, offset: null };
+  let peak = items[0];
+  let peakIndex = 0;
+  for (let index = 1; index < items.length; index += 1) {
+    const round = items[index];
+    if (safeNumber(round?.multiplier, 0) > safeNumber(peak?.multiplier, 0)) {
+      peak = round;
+      peakIndex = index;
+    }
+  }
+  return {
+    roundId: peak?.roundId ?? null,
+    multiplier: safeNumber(peak?.multiplier, 0),
+    offset: peakIndex + 1,
+  };
+}
+
 function summarizeRoundRange(rounds, focusTarget, limit = 8) {
   const items = Array.isArray(rounds) ? rounds : [];
   if (!items.length) return { fromRoundId: null, toRoundId: null, roundCount: 0, hitRoundIds: [], hitCount: 0 };
@@ -1390,35 +1443,49 @@ function buildRollingPatternMatchReport(rounds, windowMs, focusTarget, asOfTimes
     if (match.weekdayMatch) sameWdCount += 1;
   }
 
-  const examples = exampleRows.map((match, idx) => ({
-    rank: idx + 1,
-    weekdayMatch: match.weekdayMatch,
-    distance: Number(match.distance.toFixed(3)),
-    similarityPct: Number(match.similarityPct.toFixed(1)),
-    weight: Number(match.weight.toFixed(3)),
-    inputWindowLabel: formatDateWindowLabel(match.dateKey, inputStartMinute, windowMinutes),
-    inputSlotLabel,
-    inputRoundFrom: summarizeRoundRange(match.inputWindow.rounds, focusTarget).fromRoundId,
-    inputRoundTo: summarizeRoundRange(match.inputWindow.rounds, focusTarget).toRoundId,
-    inputRoundCount: match.inputWindow.rounds.length,
-    inputHitRate: match.inputWindow.summary.hitRates[focusTarget] || 0,
-    matchedCurrentWindowLabel: formatDateWindowLabel(match.dateKey, anchorMinuteOfDay, windowMinutes),
-    matchedCurrentSlotLabel: currentSlotLabel,
-    matchedCurrentRoundFrom: summarizeRoundRange(match.matchedCurrentWindow.rounds, focusTarget).fromRoundId,
-    matchedCurrentRoundTo: summarizeRoundRange(match.matchedCurrentWindow.rounds, focusTarget).toRoundId,
-    matchedCurrentRoundCount: match.matchedCurrentWindow.rounds.length,
-    matchedCurrentHitCount: summarizeRoundRange(match.matchedCurrentWindow.rounds, focusTarget).hitCount,
-    matchedCurrentHitRoundIds: summarizeRoundRange(match.matchedCurrentWindow.rounds, focusTarget).hitRoundIds,
-    remainingRoundFrom: summarizeRoundRange(match.remainingRounds, focusTarget).fromRoundId,
-    remainingRoundTo: summarizeRoundRange(match.remainingRounds, focusTarget).toRoundId,
-    remainingRoundCount: match.remainingRounds.length,
-    remainingHitCount: summarizeRoundRange(match.remainingRounds, focusTarget).hitCount,
-    remainingHitRoundIds: summarizeRoundRange(match.remainingRounds, focusTarget).hitRoundIds,
-    firstRemainingHitOffset: match.firstRemainingHitIndex >= 0 ? match.firstRemainingHitIndex + 1 : null,
-    matchedCurrentAnyHit: (match.matchedCurrentWindow.summary.hitCounts[focusTarget] || 0) > 0,
-    remainingAnyHit: (match.matchedRemainingSummary.hitCounts[focusTarget] || 0) > 0,
-    matchedCurrentPeakMultiplier: match.matchedCurrentWindow.summary.maxMultiplier || 0,
-  }));
+  const examples = exampleRows.map((match, idx) => {
+    const inputRange = summarizeRoundRange(match.inputWindow.rounds, focusTarget);
+    const currentRange = summarizeRoundRange(match.matchedCurrentWindow.rounds, focusTarget);
+    const remainingRange = summarizeRoundRange(match.remainingRounds, focusTarget);
+    const remainingPeak = summarizePeakRound(match.remainingRounds);
+    const fallbackPeak = remainingRange.hitCount === 0 ? remainingPeak : { roundId: null, multiplier: 0, offset: null };
+
+    return {
+      rank: idx + 1,
+      weekdayMatch: match.weekdayMatch,
+      distance: Number(match.distance.toFixed(3)),
+      similarityPct: Number(match.similarityPct.toFixed(1)),
+      weight: Number(match.weight.toFixed(3)),
+      inputWindowLabel: formatDateWindowLabel(match.dateKey, inputStartMinute, windowMinutes),
+      inputSlotLabel,
+      inputRoundFrom: inputRange.fromRoundId,
+      inputRoundTo: inputRange.toRoundId,
+      inputRoundCount: match.inputWindow.rounds.length,
+      inputHitRate: match.inputWindow.summary.hitRates[focusTarget] || 0,
+      inputPatternGrid: buildRoundPatternGrid(match.inputWindow.rounds, focusTarget),
+      matchedCurrentWindowLabel: formatDateWindowLabel(match.dateKey, anchorMinuteOfDay, windowMinutes),
+      matchedCurrentSlotLabel: currentSlotLabel,
+      matchedCurrentRoundFrom: currentRange.fromRoundId,
+      matchedCurrentRoundTo: currentRange.toRoundId,
+      matchedCurrentRoundCount: match.matchedCurrentWindow.rounds.length,
+      matchedCurrentHitCount: currentRange.hitCount,
+      matchedCurrentHitRoundIds: currentRange.hitRoundIds,
+      matchedCurrentPatternGrid: buildRoundPatternGrid(match.matchedCurrentWindow.rounds, focusTarget),
+      remainingRoundFrom: remainingRange.fromRoundId,
+      remainingRoundTo: remainingRange.toRoundId,
+      remainingRoundCount: match.remainingRounds.length,
+      remainingHitCount: remainingRange.hitCount,
+      remainingHitRoundIds: remainingRange.hitRoundIds,
+      remainingPatternGrid: buildRoundPatternGrid(match.remainingRounds, focusTarget),
+      firstRemainingHitOffset: match.firstRemainingHitIndex >= 0 ? match.firstRemainingHitIndex + 1 : null,
+      matchedCurrentAnyHit: currentRange.hitCount > 0,
+      remainingAnyHit: remainingRange.hitCount > 0,
+      matchedCurrentPeakMultiplier: match.matchedCurrentWindow.summary.maxMultiplier || 0,
+      fallbackPeakRoundId: fallbackPeak.roundId,
+      fallbackPeakMultiplier: fallbackPeak.multiplier,
+      fallbackPeakOffset: fallbackPeak.offset,
+    };
+  });
 
   const inputHistoryAnyHitRate = ratio(ihAnyHit, sameSetupCandidates.length);
   const inputHistoryPerRoundRate = ratio(ihHits, ihRounds);
@@ -1487,6 +1554,17 @@ function buildRollingPatternMatchReport(rounds, windowMs, focusTarget, asOfTimes
     firstRemainingHitOffsetFrom: Math.max(1, Math.round(weightedQuantile(remainingHitMatches, (match) => match.firstRemainingHitIndex + 1, (match) => match.weight, 0.2, 1))),
     firstRemainingHitOffsetTo: Math.max(1, Math.round(weightedQuantile(remainingHitMatches, (match) => match.firstRemainingHitIndex + 1, (match) => match.weight, 0.8, 1))),
   } : null;
+  const fallbackPeakMatches = remainingNoTargetPeakRows
+    .map((match) => {
+      const peak = summarizePeakRound(match.remainingRounds);
+      return peak.roundId ? { ...match, fallbackPeakOffset: peak.offset } : null;
+    })
+    .filter(Boolean);
+  const fallbackRoundRange = fallbackPeakMatches.length >= 2 ? {
+    hitMatchCount: fallbackPeakMatches.length,
+    peakOffsetFrom: Math.max(1, Math.round(weightedQuantile(fallbackPeakMatches, (match) => match.fallbackPeakOffset, (match) => match.weight, 0.2, 1))),
+    peakOffsetTo: Math.max(1, Math.round(weightedQuantile(fallbackPeakMatches, (match) => match.fallbackPeakOffset, (match) => match.weight, 0.8, 1))),
+  } : null;
 
   return {
     available: true,
@@ -1507,10 +1585,13 @@ function buildRollingPatternMatchReport(rounds, windowMs, focusTarget, asOfTimes
     averageDistance: Number(weightedAverage(matchRows, (match) => match.distance, (match) => match.weight, 0).toFixed(3)),
     averageSimilarityPct: Number(weightedAverage(matchRows, (match) => match.similarityPct, (match) => match.weight, 0).toFixed(1)),
     expectedRoundRange,
+    fallbackRoundRange,
     matchedPeakRange,
     noTargetPeakRange,
     remainingPeakRange,
     remainingNoTargetPeakRange,
+    referenceInputPatternGrid: buildRoundPatternGrid(previousWindow.rounds, focusTarget),
+    referenceCurrentPatternGrid: buildRoundPatternGrid(currentObservedWindow.rounds, focusTarget),
     inputWindowSummary: previousWindow.summary,
     elapsedCurrentSummary: currentObservedWindow.summary,
     windowStartTimestamp: rollingStartTimestamp,
@@ -2081,6 +2162,10 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
       expectedRoundIdTo: null,
       expectedRoundIdLabel: '-',
       expectedRoundIdBasis: 'Round IDs are only shown on PLAY.',
+      fallbackRoundIdFrom: null,
+      fallbackRoundIdTo: null,
+      fallbackRoundIdLabel: '-',
+      fallbackRoundIdBasis: 'No stable fallback round band was found in matched history.',
       summary: patternMatch?.reason || `Skip ${labelForTarget(focusTarget)} in the next rolling ${windowLabel.toLowerCase()} because there is not enough same-time history yet.`,
       reasons: [
         'Matched hit rate 0.0% from this point.',
@@ -2250,6 +2335,18 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
   const expectedRoundIdBasis = action === 'PLAY'
     ? rawExpectedRoundIdBasis
     : 'Round IDs are only shown on PLAY.';
+  const fallbackRoundIdFrom = patternMatch.fallbackRoundRange && safeLatestId > 0
+    ? safeLatestId + patternMatch.fallbackRoundRange.peakOffsetFrom
+    : null;
+  const fallbackRoundIdTo = patternMatch.fallbackRoundRange && safeLatestId > 0
+    ? safeLatestId + patternMatch.fallbackRoundRange.peakOffsetTo
+    : null;
+  const fallbackRoundIdLabel = (fallbackRoundIdFrom && fallbackRoundIdTo)
+    ? `#${fallbackRoundIdFrom} - #${fallbackRoundIdTo}`
+    : '-';
+  const fallbackRoundIdBasis = patternMatch.fallbackRoundRange
+    ? `Based on ${patternMatch.fallbackRoundRange.hitMatchCount} matched miss-cases where the fallback peak showed up instead.`
+    : 'No stable fallback round band was found in matched history.';
 
   return {
     action,
@@ -2296,6 +2393,10 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
     expectedRoundIdTo,
     expectedRoundIdLabel,
     expectedRoundIdBasis,
+    fallbackRoundIdFrom,
+    fallbackRoundIdTo,
+    fallbackRoundIdLabel,
+    fallbackRoundIdBasis,
     summary,
     reasons: [
       `Previous rolling window ${patternMatch.inputSlotLabel} -> next rolling window ${patternMatch.currentSlotLabel}.`,
@@ -2824,6 +2925,7 @@ function buildEmptyReport(windowConfig, focusTarget, timeZone) {
       matchedWindows: 0, sameWeekdayMatches: 0, lookbackDaysUsed: 0,
       alreadyHitInCurrentWindow: false, hitsSoFar: 0,
       expectedRoundIdFrom: null, expectedRoundIdTo: null, expectedRoundIdLabel: '-', expectedRoundIdBasis: 'Round IDs are only shown when the signal is strong enough to play.',
+      fallbackRoundIdFrom: null, fallbackRoundIdTo: null, fallbackRoundIdLabel: '-', fallbackRoundIdBasis: 'No stable fallback round band was found in matched history.',
       summary: 'No rounds stored yet, so no timing prediction is available.',
       reasons: [],
     },
