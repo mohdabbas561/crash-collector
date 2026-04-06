@@ -11,13 +11,6 @@ const WINDOW_OPTIONS = [
   { key: '1h', label: '1 Hour', ms: 1 * HOUR_MS },
   { key: '2h', label: '2 Hours', ms: 2 * HOUR_MS },
   { key: '5h', label: '5 Hours', ms: 5 * HOUR_MS },
-  { key: '12h', label: '12 Hours', ms: 12 * HOUR_MS },
-  { key: '24h', label: '24 Hours', ms: 24 * HOUR_MS },
-  { key: '3d', label: '3 Days', ms: 3 * DAY_MS },
-  { key: '7d', label: '7 Days', ms: 7 * DAY_MS },
-  { key: '10d', label: '10 Days', ms: 10 * DAY_MS },
-  { key: '15d', label: '15 Days', ms: 15 * DAY_MS },
-  { key: '30d', label: '30 Days', ms: 30 * DAY_MS },
 ];
 
 const WINDOW_MAP = new Map(WINDOW_OPTIONS.map((item) => [item.key, item]));
@@ -156,6 +149,24 @@ function pctString(value, digits = 1) {
   return `${(numeric * 100).toFixed(digits)}%`;
 }
 
+function formatMultiplier(value) {
+  const numeric = safeNumber(value, null);
+  if (numeric == null) return '-';
+  if (numeric >= 100) return `${numeric.toFixed(1)}x`;
+  if (numeric >= 10) return `${numeric.toFixed(2)}x`;
+  return `${numeric.toFixed(2)}x`;
+}
+
+function formatMultiplierRange(minValue, maxValue) {
+  const minNumeric = safeNumber(minValue, null);
+  const maxNumeric = safeNumber(maxValue, null);
+  if (minNumeric == null && maxNumeric == null) return '-';
+  if (minNumeric == null) return formatMultiplier(maxNumeric);
+  if (maxNumeric == null) return formatMultiplier(minNumeric);
+  if (Math.abs(minNumeric - maxNumeric) < 0.01) return formatMultiplier(maxNumeric);
+  return `${formatMultiplier(minNumeric)} - ${formatMultiplier(maxNumeric)}`;
+}
+
 function formatHourLabel(hour) {
   const safeHour = ((Number(hour) % 24) + 24) % 24;
   const suffix = safeHour >= 12 ? 'PM' : 'AM';
@@ -224,6 +235,33 @@ function summarizeRoundRange(rounds, focusTarget, limit = 8) {
     roundCount: items.length,
     hitRoundIds,
     hitCount: items.filter((round) => round.multiplier >= focusTarget).length,
+  };
+}
+
+function summarizePeakRound(rounds) {
+  const items = Array.isArray(rounds) ? rounds : [];
+  if (!items.length) {
+    return {
+      peakMultiplier: 0,
+      peakRoundId: null,
+      peakOffset: null,
+    };
+  }
+
+  let bestIndex = 0;
+  let bestRound = items[0];
+  for (let index = 1; index < items.length; index += 1) {
+    const round = items[index];
+    if ((round.multiplier || 0) > (bestRound.multiplier || 0)) {
+      bestRound = round;
+      bestIndex = index;
+    }
+  }
+
+  return {
+    peakMultiplier: safeNumber(bestRound.multiplier, 0),
+    peakRoundId: bestRound.roundId || null,
+    peakOffset: bestIndex + 1,
   };
 }
 
@@ -836,12 +874,14 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
     const weight = distanceWeight * clusterWeight * liveWeight * recencyWeight * weekdayWeight;
     const remainingRounds = Array.isArray(match.remainingRounds) ? match.remainingRounds : [];
     const firstRemainingHitIndex = remainingRounds.findIndex((round) => round.multiplier >= focusTarget);
+    const fallbackPeak = summarizePeakRound(remainingRounds);
 
     return {
       ...match,
       daysAgo,
       weight,
       firstRemainingHitIndex,
+      fallbackPeak,
     };
   });
 
@@ -919,6 +959,9 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
       matchedCurrentAnyHit: (match.matchedCurrentWindow.summary.hitCounts[focusTarget] || 0) > 0,
       remainingAnyHit: (match.matchedRemainingSummary.hitCounts[focusTarget] || 0) > 0,
       matchedCurrentPeakMultiplier: match.matchedCurrentWindow.summary.maxMultiplier || 0,
+      fallbackPeakRoundId: match.fallbackPeak.peakRoundId,
+      fallbackPeakMultiplier: match.fallbackPeak.peakMultiplier,
+      fallbackPeakOffset: match.fallbackPeak.peakOffset,
     };
   });
 
@@ -969,6 +1012,11 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
   const currentWindowTone = classifyLift(currentWindowLift, matches.length).tone;
   const remainingWindowTone = classifyLift(remainingLift, matches.length).tone;
   const remainingHitMatches = matchRows.filter((match) => match.firstRemainingHitIndex >= 0);
+  const fallbackMissMatches = matchRows.filter((match) => (
+    (match.matchedRemainingSummary.hitCounts[focusTarget] || 0) <= 0
+    && match.fallbackPeak.peakOffset
+    && match.fallbackPeak.peakMultiplier > 0
+  ));
   const expectedRoundRange = remainingHitMatches.length >= 2
     ? {
         hitMatchCount: remainingHitMatches.length,
@@ -976,6 +1024,19 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
         firstRemainingHitOffsetTo: Math.max(1, Math.round(weightedQuantile(remainingHitMatches, (match) => match.firstRemainingHitIndex + 1, (match) => match.weight, 0.8, 1))),
       }
     : null;
+  const fallbackRange = fallbackMissMatches.length
+    ? {
+        missMatchCount: fallbackMissMatches.length,
+        peakMultiplierFrom: weightedQuantile(fallbackMissMatches, (match) => match.fallbackPeak.peakMultiplier, (match) => match.weight, 0.2, 0),
+        peakMultiplierTo: weightedQuantile(fallbackMissMatches, (match) => match.fallbackPeak.peakMultiplier, (match) => match.weight, 0.8, 0),
+        peakMultiplierMedian: weightedQuantile(fallbackMissMatches, (match) => match.fallbackPeak.peakMultiplier, (match) => match.weight, 0.5, 0),
+        peakOffsetFrom: Math.max(1, Math.round(weightedQuantile(fallbackMissMatches, (match) => match.fallbackPeak.peakOffset, (match) => match.weight, 0.2, 1))),
+        peakOffsetTo: Math.max(1, Math.round(weightedQuantile(fallbackMissMatches, (match) => match.fallbackPeak.peakOffset, (match) => match.weight, 0.8, 1))),
+      }
+    : null;
+  const matchedInputRounds = matchRows.reduce((sum, match) => sum + safeNumber(match.window.summary.roundCount, 0), 0);
+  const matchedLiveRounds = matchRows.reduce((sum, match) => sum + safeNumber(match.matchedCurrentWindow.summary.roundCount, 0), 0);
+  const matchedRemainingRounds = matchRows.reduce((sum, match) => sum + safeNumber(match.matchedRemainingSummary.roundCount, 0), 0);
 
   return {
     available: true,
@@ -993,6 +1054,18 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
     averageMatchWeight: Number(weightedAverage(matchRows, (match) => match.weight, () => 1, 0).toFixed(3)),
     averageDistance: Number(weightedAverage(matchRows, (match) => match.distance, (match) => match.weight, 0).toFixed(3)),
     expectedRoundRange,
+    fallbackRange,
+    roundsComputed: {
+      currentInputRounds: safeNumber(previousSummary.roundCount, 0),
+      currentLiveRounds: safeNumber(currentSummary.roundCount, 0),
+      matchedInputRounds,
+      matchedLiveRounds,
+      matchedRemainingRounds,
+      avgInputRoundsPerMatch: ratio(matchedInputRounds, matches.length),
+      avgLiveRoundsPerMatch: ratio(matchedLiveRounds, matches.length),
+      avgRemainingRoundsPerMatch: ratio(matchedRemainingRounds, matches.length),
+      sameForAllTargets: true,
+    },
     progress: {
       ratio: currentMinuteProgress,
       roundsSeen: currentSummary.roundCount || 0,
@@ -1057,11 +1130,12 @@ function buildPatternPrediction({
     1
   );
   const effectiveCurrentLift = 1 + ((currentLift - 1) * currentEvidenceWeight);
+  const safeLatestRoundId = safeNumber(latestRoundId, 0);
 
   if (!patternMatch?.available) {
     return {
-      action: currentLift >= 1.03 ? 'WATCH NOW' : 'WAIT',
-      tone: currentLift >= 1.05 ? 'neutral' : 'bad',
+      action: 'SKIP',
+      tone: 'bad',
       confidence: 0.24,
       confidenceLabel: 'Low',
       predictsLabel: `Current ${windowLabel}`,
@@ -1089,7 +1163,15 @@ function buildPatternPrediction({
       expectedRoundIdTo: null,
       expectedRoundIdLabel: '-',
       expectedRoundIdBasis: '',
-      summary: `Not enough matching closed ${windowLabel.toLowerCase()} history yet to judge the current live ${windowLabel.toLowerCase()} for ${labelForTarget(focusTarget)}.`,
+      fallbackPeakFrom: null,
+      fallbackPeakTo: null,
+      fallbackPeakMedian: null,
+      fallbackPeakLabel: '-',
+      fallbackRoundIdFrom: null,
+      fallbackRoundIdTo: null,
+      fallbackRoundIdLabel: '-',
+      fallbackRoundIdBasis: '',
+      summary: `Skip ${labelForTarget(focusTarget)} for the current ${windowLabel.toLowerCase()} because there is not enough matched closed-slot history yet.`,
       reasons: [
         `Live ${windowLabel.toLowerCase()} hit rate so far: ${pctString(currentHitRate)} versus ${pctString(baselineHitRate)} per-round baseline.`,
         `The last closed ${windowLabel.toLowerCase()} does not have enough historical matches yet.`,
@@ -1107,7 +1189,6 @@ function buildPatternPrediction({
   const matchedWindows = safeNumber(patternMatch.usedMatches, 0);
   const sameWeekdayMatches = safeNumber(patternMatch.sameWeekdayMatches, 0);
   const lookbackDaysUsed = safeNumber(patternMatch.lookbackDaysUsed, 0);
-  const safeLatestRoundId = safeNumber(latestRoundId, 0);
   const alreadyHitInCurrentWindow = Boolean(patternMatch.progress?.alreadyHit || (currentSummary.hitCounts?.[focusTarget] || 0) > 0);
   const hitsSoFar = currentSummary.hitCounts?.[focusTarget] || 0;
   const confidence = clamp(
@@ -1128,56 +1209,61 @@ function buildPatternPrediction({
   const skipRemainingThreshold = isLowTarget ? 0.72 : isMidTarget ? 0.78 : 0.84;
   const solidCurrentThreshold = isLowTarget ? 0.92 : isMidTarget ? 0.9 : 0.88;
 
-  let action = 'WATCH NOW';
-  let tone = 'neutral';
-  let summary = `Closed ${patternMatch.inputSlotLabel} matches say the live ${patternMatch.currentSlotLabel} window is near normal right now for ${labelForTarget(focusTarget)}.`;
-
-  if (
+  const strongPlay = (
     !alreadyHitInCurrentWindow
     && (
       ((remainingLift >= playLiftThreshold && remainingEdge >= playEdgeThreshold) || (remainingHitRate >= strongAbsoluteHitRate && remainingLift >= (isLowTarget ? 1.06 : 1.02)))
       && (currentWindowLift >= watchLiftThreshold || effectiveCurrentLift >= solidCurrentThreshold || slotLift >= 1)
     )
-  ) {
-    action = 'PLAY NOW';
-    tone = 'good';
-    summary = `Closed ${patternMatch.inputSlotLabel} matches lean well for the live ${patternMatch.currentSlotLabel} window, and the remaining time is stronger than normal for ${labelForTarget(focusTarget)}.`;
-  } else if (
+  );
+  const supportivePlay = (
     !alreadyHitInCurrentWindow
-    && (remainingLift >= watchLiftThreshold || currentWindowLift >= playLiftThreshold || currentWindowEdge >= playEdgeThreshold || effectiveCurrentLift >= 1)
-  ) {
-    action = 'WATCH NOW';
-    tone = 'good';
-    summary = `Closed ${patternMatch.inputSlotLabel} matches lean positive for the live ${patternMatch.currentSlotLabel} window, but the edge is not strong enough yet for a full play call on ${labelForTarget(focusTarget)}.`;
-  } else if (
-    alreadyHitInCurrentWindow
-    && remainingLift <= weakRemainingThreshold
-  ) {
-    action = 'SKIP NOW';
-    tone = 'bad';
-    summary = `A ${labelForTarget(focusTarget)} hit has already landed in the live ${patternMatch.currentSlotLabel} window, and matched history says another one from this point is weaker than normal.`;
-  } else if (
-    remainingLift <= skipRemainingThreshold
-    && currentWindowLift <= 0.94
-    && effectiveCurrentLift <= 0.92
-    && slotLift <= 0.95
-  ) {
-    action = 'SKIP NOW';
-    tone = 'bad';
-    summary = `Closed ${patternMatch.inputSlotLabel} matches and the live ${patternMatch.currentSlotLabel} read both look weak, so this current ${windowLabel.toLowerCase()} is below normal for ${labelForTarget(focusTarget)}.`;
-  } else if (
-    remainingLift >= 1
-    || currentWindowLift >= 1
-    || effectiveCurrentLift >= 1
-    || slotLift >= 1
-  ) {
-    action = 'WATCH NOW';
-    tone = 'good';
-    summary = `The live ${patternMatch.currentSlotLabel} window is mixed, but matched ${patternMatch.inputSlotLabel} setups still lean slightly positive from here for ${labelForTarget(focusTarget)}.`;
-  } else {
-    action = 'WAIT';
-    tone = 'neutral';
-    summary = `Closed ${patternMatch.inputSlotLabel} matches and the live ${patternMatch.currentSlotLabel} read are mixed, so it is better to wait for a clearer edge on ${labelForTarget(focusTarget)}.`;
+    && !strongPlay
+    && (
+      remainingLift >= watchLiftThreshold
+      || currentWindowLift >= playLiftThreshold
+      || currentWindowEdge >= playEdgeThreshold
+      || effectiveCurrentLift >= 1
+      || slotLift >= 1
+    )
+  );
+  const forcedSkip = (
+    (alreadyHitInCurrentWindow && remainingLift <= weakRemainingThreshold)
+    || (
+      remainingLift <= skipRemainingThreshold
+      && currentWindowLift <= 0.94
+      && effectiveCurrentLift <= 0.92
+      && slotLift <= 0.95
+    )
+  );
+
+  const action = (strongPlay || supportivePlay) && !forcedSkip ? 'PLAY' : 'SKIP';
+  const tone = action === 'PLAY' ? 'good' : 'bad';
+
+  const fallbackRange = patternMatch.fallbackRange || null;
+  const fallbackRoundIdFrom = fallbackRange && safeLatestRoundId > 0
+    ? safeLatestRoundId + safeNumber(fallbackRange.peakOffsetFrom, 0)
+    : null;
+  const fallbackRoundIdTo = fallbackRange && safeLatestRoundId > 0
+    ? safeLatestRoundId + safeNumber(fallbackRange.peakOffsetTo, 0)
+    : null;
+  const fallbackRoundIdLabel = (fallbackRoundIdFrom && fallbackRoundIdTo)
+    ? `#${fallbackRoundIdFrom} - #${fallbackRoundIdTo}`
+    : '-';
+  const fallbackPeakLabel = fallbackRange
+    ? formatMultiplierRange(fallbackRange.peakMultiplierFrom, fallbackRange.peakMultiplierTo)
+    : '-';
+  const fallbackRoundIdBasis = fallbackRange
+    ? `Based on ${fallbackRange.missMatchCount} matched miss cases for ${labelForTarget(focusTarget)}.`
+    : '';
+
+  let summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window because matched history is below normal from this point.`;
+  if (action === 'PLAY') {
+    summary = strongPlay
+      ? `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window because matched ${patternMatch.inputSlotLabel} setups lean clearly positive from here.`
+      : `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window because matched ${patternMatch.inputSlotLabel} setups still lean positive from here.`;
+  } else if (fallbackRange) {
+    summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. If it misses, matched fallback peaks usually top around ${fallbackPeakLabel} near rounds ${fallbackRoundIdLabel}.`;
   }
 
   const expectedRoundIdFrom = patternMatch.expectedRoundRange && safeLatestRoundId > 0
@@ -1223,6 +1309,14 @@ function buildPatternPrediction({
     expectedRoundIdTo,
     expectedRoundIdLabel,
     expectedRoundIdBasis,
+    fallbackPeakFrom: fallbackRange?.peakMultiplierFrom ?? null,
+    fallbackPeakTo: fallbackRange?.peakMultiplierTo ?? null,
+    fallbackPeakMedian: fallbackRange?.peakMultiplierMedian ?? null,
+    fallbackPeakLabel,
+    fallbackRoundIdFrom,
+    fallbackRoundIdTo,
+    fallbackRoundIdLabel,
+    fallbackRoundIdBasis,
     summary,
     reasons: [
       `Input: the last closed ${windowLabel.toLowerCase()} is ${patternMatch.inputSlotLabel}, and the live window being judged now is ${patternMatch.currentSlotLabel}.`,
@@ -1231,6 +1325,7 @@ function buildPatternPrediction({
       `From this exact point forward, matched current windows hit ${labelForTarget(focusTarget)} ${pctString(remainingHitRate)} of the time versus ${pctString(baselineRemainingHitRate)} normal from-here baseline.`,
       alreadyHitInCurrentWindow ? `${labelForTarget(focusTarget)} has already hit ${hitsSoFar} time(s) in the current live window.` : `${labelForTarget(focusTarget)} has not hit yet in the current live window.`,
       expectedRoundIdBasis ? `Expected ${labelForTarget(focusTarget)} around rounds ${expectedRoundIdLabel}. ${expectedRoundIdBasis}` : null,
+      action === 'SKIP' && fallbackRoundIdBasis ? `Fallback if ${labelForTarget(focusTarget)} misses: ${fallbackPeakLabel} around rounds ${fallbackRoundIdLabel}. ${fallbackRoundIdBasis}` : null,
     ].filter(Boolean),
   };
 }
@@ -2014,8 +2109,8 @@ function buildEmptyReport(windowConfig, focusTarget, timeZone) {
     previousWindow: summarizeRounds([], focusTarget),
     currentWindow: summarizeRounds([], focusTarget),
     patternPrediction: {
-      action: 'WAIT FOR MORE DATA',
-      tone: 'neutral',
+      action: 'SKIP',
+      tone: 'bad',
       confidence: 0,
       confidenceLabel: 'Low',
       predictsLabel: `Current ${windowConfig.label}`,
@@ -2043,12 +2138,20 @@ function buildEmptyReport(windowConfig, focusTarget, timeZone) {
       expectedRoundIdTo: null,
       expectedRoundIdLabel: '-',
       expectedRoundIdBasis: '',
+      fallbackPeakFrom: null,
+      fallbackPeakTo: null,
+      fallbackPeakMedian: null,
+      fallbackPeakLabel: '-',
+      fallbackRoundIdFrom: null,
+      fallbackRoundIdTo: null,
+      fallbackRoundIdLabel: '-',
+      fallbackRoundIdBasis: '',
       summary: 'No rounds are stored yet, so there is no timing prediction.',
       reasons: [],
     },
     comparison: {
-      band: 'wait',
-      label: 'WAIT / WATCH',
+      band: 'skip',
+      label: 'SKIP',
       message: 'No rounds are stored yet, so timing analytics cannot be computed.',
     },
     targetCards: [],
