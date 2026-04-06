@@ -799,7 +799,13 @@ function buildPatternMatchReport(slotWindows, previousSummary, currentSummary, b
   const currentMinuteProgress = clamp(
     (currentParts.minuteOfDay - currentSlotIndex * slotMinutes + 1) / Math.max(1, slotMinutes), 0, 1,
   );
-  const liveEvidenceWeight = 0;
+  const liveEvidenceWeight = currentMinuteProgress >= 0.7
+    ? 0.9
+    : currentMinuteProgress >= 0.4
+      ? 0.6
+      : currentMinuteProgress >= 0.2
+        ? 0.35
+        : 0.15;
   const alreadyHitCurrentWindow = (currentSummary.hitCounts?.[focusTarget] || 0) > 0;
 
   let liveZVectors = null;
@@ -1587,29 +1593,45 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
   const noTargetPeakRangeLabel = formatPeak(patternMatch.noTargetPeakRange || null);
   const fromNowEdge = fromNowHitRate - fromNowBaseline;
   const saturatedCommonTarget = focusTarget <= 10 && fromNowHitRate >= 0.995 && fromNowBaseline >= 0.995;
+  const remainingRatio = clamp(1 - safeNumber(patternMatch.progress?.ratio, 0), 0, 1);
   const enoughHistory = matchedWins >= rules.minMatches;
-  const rateScore = thresholdFraction(fromNowHitRate, rules.playRate, rules.strongRate);
+  const dynamicPlayRate = Math.min(
+    rules.playRate,
+    fromNowBaseline + Math.max(rules.minEdge * 1.5, fromNowBaseline * (focusTarget <= 10 ? 0.05 : focusTarget <= 50 ? 0.12 : 0.18)),
+  );
+  const dynamicStrongRate = Math.min(
+    rules.strongRate,
+    fromNowBaseline + Math.max(rules.strongEdge, fromNowBaseline * (focusTarget <= 10 ? 0.10 : focusTarget <= 50 ? 0.20 : 0.28)),
+  );
+  const rateScore = thresholdFraction(fromNowHitRate, dynamicPlayRate, dynamicStrongRate);
   const edgeScore = thresholdFraction(fromNowEdge, rules.minEdge, rules.strongEdge);
   const similarityScore = thresholdFraction(similarityPercent, rules.minSimilarity, rules.strongSimilarity);
   const historyScore = thresholdFraction(matchedWins, rules.minMatches, rules.strongMatches);
+  const liveEvidenceScore = thresholdFraction(remainingRatio, 0.05, 0.30);
   const signalScore = enoughHistory
-    ? clamp((rateScore * 0.45) + (edgeScore * 0.30) + (similarityScore * 0.15) + (historyScore * 0.10), 0, 1)
+    ? clamp((rateScore * 0.37) + (edgeScore * 0.26) + (similarityScore * 0.14) + (historyScore * 0.09) + (liveEvidenceScore * 0.14), 0, 1)
     : clamp(historyScore * 0.35, 0, 0.35);
   const likelySignal = enoughHistory && fromNowHitRate >= likelyRules.playRate;
   const veryLikelySignal = enoughHistory && fromNowHitRate >= likelyRules.strongRate;
   const strongSignal = enoughHistory
-    && fromNowHitRate >= rules.strongRate
+    && fromNowHitRate >= dynamicStrongRate
     && fromNowEdge >= rules.strongEdge
     && similarityPercent >= rules.strongSimilarity;
   const mediumSignal = enoughHistory
-    && fromNowHitRate >= rules.playRate
+    && fromNowHitRate >= dynamicPlayRate
     && fromNowEdge >= rules.minEdge
     && similarityPercent >= rules.minSimilarity;
+  const relativeSignal = enoughHistory
+    && fromNowEdge >= rules.minEdge * 1.25
+    && similarityPercent >= rules.minSimilarity
+    && remainingRatio >= 0.08;
   const shouldPlay = strongSignal || mediumSignal || likelySignal;
   const strengthLabel = strongSignal
     ? 'Strong'
     : mediumSignal
       ? 'Medium'
+      : relativeSignal
+        ? 'Medium'
       : veryLikelySignal
         ? 'Very Likely'
         : likelySignal
@@ -1622,8 +1644,10 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
     : strongSignal
       ? 'Strong Edge'
       : mediumSignal
+      ? 'Positive Edge'
+      : relativeSignal
         ? 'Positive Edge'
-        : fromNowEdge > 0 && similarityPercent >= rules.minSimilarity
+      : fromNowEdge > 0 && similarityPercent >= rules.minSimilarity
           ? 'Small Edge'
           : fromNowEdge < 0
             ? 'Below Normal'
@@ -1653,12 +1677,18 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
     action = 'PLAY';
     tone = 'good';
     summary = `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. From this point, matched same-time setups hit ${labelForTarget(focusTarget)} ${fromNowRatePercent.toFixed(1)}% of the time versus ${pctString(fromNowBaseline)} normal (${edgeLabel}) with ${similarityPercent.toFixed(1)}% pattern match.`;
+  } else if (relativeSignal) {
+    action = 'PLAY';
+    tone = 'good';
+    summary = `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. The remaining hit rate is not huge in absolute terms, but it is meaningfully above normal (${edgeLabel}) for this same-time setup.`;
   } else if (likelySignal || saturatedCommonTarget) {
     action = 'PLAY';
     tone = 'good';
     summary = `${labelForTarget(focusTarget)} is very likely in the live ${patternMatch.currentSlotLabel} window from this point. Timing is ${timingEdgeLabel.toLowerCase()}, not a special edge, but the target itself is still a valid play by likelihood.`;
   } else if (!enoughHistory) {
     summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. Only ${matchedWins} same-time setups are stored, which is not enough for a reliable call yet.`;
+  } else if (remainingRatio <= 0.12 && fromNowEdge <= rules.minEdge) {
+    summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. Only a small tail of this window is left, and the remaining same-time edge is just ${edgeLabel}. There is not enough edge left in this window.`;
   } else if (fromNowEdge <= 0) {
     summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. From this point the matched hit rate is ${fromNowRatePercent.toFixed(1)}%, while normal is already ${pctString(fromNowBaseline)}. There is no real edge.`;
   } else if (similarityPercent < rules.minSimilarity) {
