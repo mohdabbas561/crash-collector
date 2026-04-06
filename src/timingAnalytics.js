@@ -1572,6 +1572,7 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
   const matchedPeakRangeLabel = formatPeak(patternMatch.matchedPeakRange || null);
   const noTargetPeakRangeLabel = formatPeak(patternMatch.noTargetPeakRange || null);
   const fromNowEdge = fromNowHitRate - fromNowBaseline;
+  const saturatedCommonTarget = focusTarget <= 10 && fromNowHitRate >= 0.995 && fromNowBaseline >= 0.995;
   const enoughHistory = matchedWins >= rules.minMatches;
   const rateScore = thresholdFraction(fromNowHitRate, rules.playRate, rules.strongRate);
   const edgeScore = thresholdFraction(fromNowEdge, rules.minEdge, rules.strongEdge);
@@ -1589,7 +1590,13 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
     && fromNowEdge >= rules.minEdge
     && similarityPercent >= rules.minSimilarity;
   const shouldPlay = strongSignal || mediumSignal;
-  const strengthLabel = strongSignal ? 'Strong' : mediumSignal ? 'Medium' : 'Not Strong';
+  const strengthLabel = saturatedCommonTarget
+    ? 'No Edge'
+    : strongSignal
+      ? 'Strong'
+      : mediumSignal
+        ? 'Medium'
+        : 'Not Strong';
   const dataQuality = matchedWins >= rules.strongMatches
     ? 'good'
     : enoughHistory
@@ -1605,7 +1612,9 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
   let tone = 'bad';
   let summary = `Skip ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. The same-time edge from this point is not strong enough.`;
 
-  if (shouldPlay) {
+  if (saturatedCommonTarget) {
+    summary = `${labelForTarget(focusTarget)} is still very likely in the live ${patternMatch.currentSlotLabel} window, but that is already normal for this target at this window size. Timing shows no special edge, so this stays SKIP for edge-trading only.`;
+  } else if (shouldPlay) {
     action = 'PLAY';
     tone = 'good';
     summary = `Play ${labelForTarget(focusTarget)} in the live ${patternMatch.currentSlotLabel} window. From this point, matched same-time setups hit ${labelForTarget(focusTarget)} ${fromNowRatePercent.toFixed(1)}% of the time versus ${pctString(fromNowBaseline)} normal (${edgeLabel}) with ${similarityPercent.toFixed(1)}% pattern match.`;
@@ -1686,6 +1695,7 @@ function buildCurrentWindowPatternPrediction({ focusTarget, windowLabel, latestR
       `${matchedWins} same-time matches across ${lookbackDays.toFixed(1)} stored days${sameWdMatches ? `, ${sameWdMatches} on the same weekday` : ''}.`,
       `Matched current-window hit rate: ${matchedHitRatePercent.toFixed(1)}%.`,
       `From-now hit rate: ${fromNowRatePercent.toFixed(1)}% vs normal ${pctString(fromNowBaseline)} (${edgeLabel}).`,
+      saturatedCommonTarget ? `${labelForTarget(focusTarget)} is almost always present in this window size, so timing cannot separate this hour from a normal hour.` : null,
       `Pattern match: ${similarityPercent.toFixed(1)}%.`,
       noTargetPeakRangeLabel !== '-' ? `If ${labelForTarget(focusTarget)} missed, the highest matched peak was usually around ${noTargetPeakRangeLabel}.` : null,
       matchedPeakRangeLabel !== '-' ? `Matched live-window peak range: ${matchedPeakRangeLabel}.` : null,
