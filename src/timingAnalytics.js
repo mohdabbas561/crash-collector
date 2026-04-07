@@ -392,8 +392,14 @@ function buildZonePrediction(matches, coveragePct, latestRoundId, basisLabel) {
     };
   }
 
-  const offsetFrom = Math.max(1, Math.round(weightedQuantile(zoneMatches, (item) => item.nextPeakOffset, (item) => item.weight, 0.2, 1)));
-  const offsetTo = Math.max(1, Math.round(weightedQuantile(zoneMatches, (item) => item.nextPeakOffset, (item) => item.weight, 0.8, 1)));
+  const offsetFrom = Math.max(
+    1,
+    Math.round(weightedQuantile(zoneMatches, (item) => item.offset ?? item.nextPeakOffset, (item) => item.weight, 0.2, 1))
+  );
+  const offsetTo = Math.max(
+    1,
+    Math.round(weightedQuantile(zoneMatches, (item) => item.offset ?? item.nextPeakOffset, (item) => item.weight, 0.8, 1))
+  );
   const roundIdFrom = latestRoundId ? latestRoundId + offsetFrom : null;
   const roundIdTo = latestRoundId ? latestRoundId + offsetTo : null;
 
@@ -411,6 +417,31 @@ function buildZonePrediction(matches, coveragePct, latestRoundId, basisLabel) {
     basis: basisLabel,
     sampleCount: zoneMatches.length,
   };
+}
+
+function buildMatchedNextRoundRows(rounds, matches) {
+  const items = Array.isArray(rounds) ? rounds : [];
+  const rows = [];
+
+  for (const match of Array.isArray(matches) ? matches : []) {
+    const start = Math.max(0, Number(match?.nextStartIndex) || 0);
+    const end = Math.min(items.length, Number(match?.nextEndIndexExclusive) || 0);
+    const nextRoundCount = Math.max(1, end - start);
+    const perRoundWeight = safeNumber(match?.weight, 0) / nextRoundCount;
+
+    for (let index = start; index < end; index += 1) {
+      const round = items[index];
+      rows.push({
+        matchWeight: safeNumber(match?.weight, 0),
+        weight: Math.max(perRoundWeight, 0.0001),
+        multiplier: safeNumber(round?.multiplier, 0),
+        roundId: round?.roundId || null,
+        offset: (index - start) + 1,
+      });
+    }
+  }
+
+  return rows;
 }
 
 function buildPatternWindowSummary(rounds) {
@@ -704,74 +735,75 @@ function buildRangePatternReport(rounds, windowConfig, timeZone) {
     .sort((left, right) => left.distance - right.distance)
     .slice(0, clamp(Math.round(Math.sqrt(candidateRows.length)), 6, 12));
 
-  const p25 = weightedQuantile(usedMatches, (item) => item.nextPeakMultiplier, (item) => item.weight, 0.25, 0);
-  const p50 = weightedQuantile(usedMatches, (item) => item.nextPeakMultiplier, (item) => item.weight, 0.5, 0);
-  const p65 = weightedQuantile(usedMatches, (item) => item.nextPeakMultiplier, (item) => item.weight, 0.65, 0);
-  const p75 = weightedQuantile(usedMatches, (item) => item.nextPeakMultiplier, (item) => item.weight, 0.75, 0);
-  const p90 = weightedQuantile(usedMatches, (item) => item.nextPeakMultiplier, (item) => item.weight, 0.9, 0);
+  const matchedNextRoundRows = buildMatchedNextRoundRows(rounds, usedMatches);
+  const p25 = weightedQuantile(matchedNextRoundRows, (item) => item.multiplier, (item) => item.weight, 0.25, 0);
+  const p50 = weightedQuantile(matchedNextRoundRows, (item) => item.multiplier, (item) => item.weight, 0.5, 0);
+  const p65 = weightedQuantile(matchedNextRoundRows, (item) => item.multiplier, (item) => item.weight, 0.65, 0);
+  const p75 = weightedQuantile(matchedNextRoundRows, (item) => item.multiplier, (item) => item.weight, 0.75, 0);
+  const p90 = weightedQuantile(matchedNextRoundRows, (item) => item.multiplier, (item) => item.weight, 0.9, 0);
   const likelyZoneFrom = p25;
   const likelyZoneTo = p65;
   const stretchZoneFrom = p65;
   const stretchZoneTo = p90;
   const rareSpikeFrom = p90;
-  const predictedPeakOffsetFrom = Math.max(1, Math.round(weightedQuantile(usedMatches, (item) => item.nextPeakOffset, (item) => item.weight, 0.2, 1)));
-  const predictedPeakOffsetTo = Math.max(1, Math.round(weightedQuantile(usedMatches, (item) => item.nextPeakOffset, (item) => item.weight, 0.8, 1)));
-  const predictedPeakRoundIdFrom = latestRoundId ? latestRoundId + predictedPeakOffsetFrom : null;
-  const predictedPeakRoundIdTo = latestRoundId ? latestRoundId + predictedPeakOffsetTo : null;
   const matchedSetupRounds = usedMatches.reduce((sum, item) => sum + safeNumber(item.inputRoundCount, 0), 0);
   const matchedNextRounds = usedMatches.reduce((sum, item) => sum + safeNumber(item.nextRoundCount, 0), 0);
   const averageSimilarityPct = weightedAverage(usedMatches, (item) => item.similarityPct, (item) => item.weight, 0);
   const likelyZoneCoveragePct = weightedAverage(
-    usedMatches,
-    (item) => (item.nextPeakMultiplier >= likelyZoneFrom && item.nextPeakMultiplier <= likelyZoneTo ? 100 : 0),
+    matchedNextRoundRows,
+    (item) => (item.multiplier >= likelyZoneFrom && item.multiplier <= likelyZoneTo ? 100 : 0),
     (item) => item.weight,
     0
   );
   const stretchZoneCoveragePct = weightedAverage(
-    usedMatches,
-    (item) => (item.nextPeakMultiplier > likelyZoneTo && item.nextPeakMultiplier <= stretchZoneTo ? 100 : 0),
+    matchedNextRoundRows,
+    (item) => (item.multiplier > likelyZoneTo && item.multiplier <= stretchZoneTo ? 100 : 0),
     (item) => item.weight,
     0
   );
   const rareSpikeCoveragePct = weightedAverage(
-    usedMatches,
-    (item) => (item.nextPeakMultiplier >= rareSpikeFrom ? 100 : 0),
+    matchedNextRoundRows,
+    (item) => (item.multiplier >= rareSpikeFrom ? 100 : 0),
     (item) => item.weight,
     0
   );
   const belowLikelyPct = weightedAverage(
-    usedMatches,
-    (item) => (item.nextPeakMultiplier < likelyZoneFrom ? 100 : 0),
+    matchedNextRoundRows,
+    (item) => (item.multiplier < likelyZoneFrom ? 100 : 0),
     (item) => item.weight,
     0
   );
-  const likelyZoneMatches = usedMatches.filter(
-    (item) => item.nextPeakMultiplier >= likelyZoneFrom && item.nextPeakMultiplier <= likelyZoneTo
+  const likelyZoneMatches = matchedNextRoundRows.filter(
+    (item) => item.multiplier >= likelyZoneFrom && item.multiplier <= likelyZoneTo
   );
-  const stretchZoneMatches = usedMatches.filter(
-    (item) => item.nextPeakMultiplier > likelyZoneTo && item.nextPeakMultiplier <= stretchZoneTo
+  const stretchZoneMatches = matchedNextRoundRows.filter(
+    (item) => item.multiplier > likelyZoneTo && item.multiplier <= stretchZoneTo
   );
-  const rareSpikeMatches = usedMatches.filter(
-    (item) => item.nextPeakMultiplier >= rareSpikeFrom
+  const rareSpikeMatches = matchedNextRoundRows.filter(
+    (item) => item.multiplier >= rareSpikeFrom
   );
   const likelyZonePrediction = buildZonePrediction(
     likelyZoneMatches,
     likelyZoneCoveragePct,
     latestRoundId,
-    `Built from ${likelyZoneMatches.length || 0} matched next-window peaks inside the likely zone.`
+    `Built from ${likelyZoneMatches.length || 0} matched next-round outcomes inside the likely zone.`
   );
   const stretchZonePrediction = buildZonePrediction(
     stretchZoneMatches,
     stretchZoneCoveragePct,
     latestRoundId,
-    `Built from ${stretchZoneMatches.length || 0} matched next-window peaks inside the stretch zone.`
+    `Built from ${stretchZoneMatches.length || 0} matched next-round outcomes inside the upper range.`
   );
   const rareSpikePrediction = buildZonePrediction(
     rareSpikeMatches,
     rareSpikeCoveragePct,
     latestRoundId,
-    `Built from ${rareSpikeMatches.length || 0} matched next-window peaks inside the rare-spike zone.`
+    `Built from ${rareSpikeMatches.length || 0} higher matched next-round outcomes.`
   );
+  const predictedPeakOffsetFrom = likelyZonePrediction.offsetFrom;
+  const predictedPeakOffsetTo = likelyZonePrediction.offsetTo;
+  const predictedPeakRoundIdFrom = latestRoundId ? latestRoundId + predictedPeakOffsetFrom : null;
+  const predictedPeakRoundIdTo = latestRoundId ? latestRoundId + predictedPeakOffsetTo : null;
   const spreadLabel = classifySpreadLabel(p25, p90, p50);
   const spreadRatio = Math.max(0, p90 - p25) / Math.max(1, p50);
   const confidencePct = clamp(
@@ -830,13 +862,13 @@ function buildRangePatternReport(rounds, windowConfig, timeZone) {
       predictedPeakRoundIdFrom,
       predictedPeakRoundIdTo,
       predictedPeakRoundIdLabel: formatRoundRange(predictedPeakRoundIdFrom, predictedPeakRoundIdTo),
-      predictedPeakRoundIdBasis: `Built from ${usedMatches.length} matched next-window peaks.`,
+      predictedPeakRoundIdBasis: `Built from ${matchedNextRoundRows.length} matched next-round outcomes.`,
       predictedPeakOffsetFrom,
       predictedPeakOffsetTo,
       predictedPeakOffsetLabel: predictedPeakOffsetFrom === predictedPeakOffsetTo
         ? `around round ${predictedPeakOffsetFrom} of the next window`
         : `around rounds ${predictedPeakOffsetFrom}-${predictedPeakOffsetTo} of the next window`,
-      summary: `Most matched next windows peaked in ${formatMultiplierRange(likelyZoneFrom, likelyZoneTo)}. Stretch cases reached ${formatMultiplierRange(stretchZoneFrom, stretchZoneTo)}, and rare spikes started around ${formatMultiplier(rareSpikeFrom)}+.`,
+      summary: `Most matched next-round outcomes landed in ${formatMultiplierRange(likelyZoneFrom, likelyZoneTo)}. Higher but less common outcomes ran through ${formatMultiplierRange(stretchZoneFrom, stretchZoneTo)}, and the upper tail started around ${formatMultiplier(rareSpikeFrom)}+.`,
     },
     note: `Matched the latest ${windowConfig.label.toLowerCase()} pattern against ${candidateRows.length} historical patterns and kept the closest ${usedMatches.length}.`,
     support: {
@@ -848,15 +880,15 @@ function buildRangePatternReport(rounds, windowConfig, timeZone) {
       rareSpikeCoveragePct: Number(rareSpikeCoveragePct.toFixed(1)),
       belowLikelyPct: Number(belowLikelyPct.toFixed(1)),
       spreadLabel,
-      summary: `In these matched histories, ${Number(likelyZoneCoveragePct.toFixed(1))}% landed inside the likely zone, ${Number(stretchZoneCoveragePct.toFixed(1))}% stretched above it, and ${Number(rareSpikeCoveragePct.toFixed(1))}% became rare spikes.`,
+      summary: `Across the matched next-round outcomes, ${Number(likelyZoneCoveragePct.toFixed(1))}% landed inside the likely zone, ${Number(stretchZoneCoveragePct.toFixed(1))}% landed in the upper range, and ${Number(rareSpikeCoveragePct.toFixed(1))}% reached the high-end tail.`,
     },
     honesty: {
       label: spreadLabel === 'Tight' ? 'Tighter Read' : spreadLabel === 'Balanced' ? 'Usable Read' : 'Wide Read',
       note: spreadLabel === 'Tight'
-        ? 'Matched outcomes stayed fairly compact, so the range is more trustworthy than usual.'
+        ? 'Matched next-round outcomes stayed fairly compact, so the range is more trustworthy than usual.'
         : spreadLabel === 'Balanced'
-          ? 'Matched outcomes were mixed but still clustered enough to use as a guide.'
-          : 'Matched outcomes spread out a lot, so treat the range as a broad map, not a sharp call.',
+          ? 'Matched next-round outcomes were mixed but still clustered enough to use as a guide.'
+          : 'Matched next-round outcomes spread out a lot, so treat the range as a broad map, not a sharp call.',
     },
     examples: usedMatches.slice(0, 4).map((item, index) => ({
       rank: index + 1,
