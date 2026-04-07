@@ -130,6 +130,13 @@ function formatMultiplierRange(minValue, maxValue) {
   return `${formatMultiplier(minNumeric)} - ${formatMultiplier(maxNumeric)}`;
 }
 
+function formatThresholdLabel(value) {
+  const numeric = safeNumber(value, null);
+  if (numeric == null) return '-';
+  if (Math.abs(numeric - Math.round(numeric)) < 0.001) return `${Math.round(numeric)}x+`;
+  return `${numeric.toFixed(2)}x+`;
+}
+
 function formatRoundRange(fromRoundId, toRoundId) {
   if (!fromRoundId && !toRoundId) return '-';
   if (!toRoundId || fromRoundId === toRoundId) return `#${fromRoundId}`;
@@ -444,6 +451,25 @@ function buildMatchedNextRoundRows(rounds, matches) {
   return rows;
 }
 
+function buildMatchedNextFirstRoundRows(rounds, matches) {
+  const items = Array.isArray(rounds) ? rounds : [];
+  const rows = [];
+
+  for (const match of Array.isArray(matches) ? matches : []) {
+    const index = Math.max(0, Number(match?.nextStartIndex) || 0);
+    if (index >= items.length) continue;
+    const round = items[index];
+    rows.push({
+      weight: Math.max(safeNumber(match?.weight, 0), 0.0001),
+      multiplier: safeNumber(round?.multiplier, 0),
+      roundId: round?.roundId || null,
+      offset: 1,
+    });
+  }
+
+  return rows;
+}
+
 function buildPatternWindowSummary(rounds) {
   const summary = summarizeRounds(rounds);
   const sequence = buildSequenceSample(rounds, 12);
@@ -735,77 +761,85 @@ function buildRangePatternReport(rounds, windowConfig, timeZone) {
     .sort((left, right) => left.distance - right.distance)
     .slice(0, clamp(Math.round(Math.sqrt(candidateRows.length)), 6, 12));
 
+  const nextFirstRoundRows = buildMatchedNextFirstRoundRows(rounds, usedMatches);
   const matchedNextRoundRows = buildMatchedNextRoundRows(rounds, usedMatches);
-  const p25 = weightedQuantile(matchedNextRoundRows, (item) => item.multiplier, (item) => item.weight, 0.25, 0);
-  const p50 = weightedQuantile(matchedNextRoundRows, (item) => item.multiplier, (item) => item.weight, 0.5, 0);
-  const p65 = weightedQuantile(matchedNextRoundRows, (item) => item.multiplier, (item) => item.weight, 0.65, 0);
-  const p75 = weightedQuantile(matchedNextRoundRows, (item) => item.multiplier, (item) => item.weight, 0.75, 0);
-  const p90 = weightedQuantile(matchedNextRoundRows, (item) => item.multiplier, (item) => item.weight, 0.9, 0);
-  const likelyZoneFrom = p25;
-  const likelyZoneTo = p65;
-  const stretchZoneFrom = p65;
-  const stretchZoneTo = p90;
-  const rareSpikeFrom = p90;
+  const nextRoundP25 = weightedQuantile(nextFirstRoundRows, (item) => item.multiplier, (item) => item.weight, 0.25, 0);
+  const nextRoundP50 = weightedQuantile(nextFirstRoundRows, (item) => item.multiplier, (item) => item.weight, 0.5, 0);
+  const nextRoundP75 = weightedQuantile(nextFirstRoundRows, (item) => item.multiplier, (item) => item.weight, 0.75, 0);
+  const peakP25 = weightedQuantile(usedMatches, (item) => item.nextPeakMultiplier, (item) => item.weight, 0.25, 0);
+  const peakP50 = weightedQuantile(usedMatches, (item) => item.nextPeakMultiplier, (item) => item.weight, 0.5, 0);
+  const peakP75 = weightedQuantile(usedMatches, (item) => item.nextPeakMultiplier, (item) => item.weight, 0.75, 0);
+  const peakP90 = weightedQuantile(usedMatches, (item) => item.nextPeakMultiplier, (item) => item.weight, 0.9, 0);
+  const likelyZoneFrom = nextRoundP25;
+  const likelyZoneTo = nextRoundP75;
+  const stretchZoneFrom = peakP50;
+  const stretchZoneTo = peakP75;
+  const rareSpikeFrom = peakP90;
   const matchedSetupRounds = usedMatches.reduce((sum, item) => sum + safeNumber(item.inputRoundCount, 0), 0);
   const matchedNextRounds = usedMatches.reduce((sum, item) => sum + safeNumber(item.nextRoundCount, 0), 0);
   const averageSimilarityPct = weightedAverage(usedMatches, (item) => item.similarityPct, (item) => item.weight, 0);
-  const likelyZoneCoveragePct = weightedAverage(
-    matchedNextRoundRows,
+  const nextRoundCoveragePct = weightedAverage(
+    nextFirstRoundRows,
     (item) => (item.multiplier >= likelyZoneFrom && item.multiplier <= likelyZoneTo ? 100 : 0),
     (item) => item.weight,
     0
   );
-  const stretchZoneCoveragePct = weightedAverage(
-    matchedNextRoundRows,
-    (item) => (item.multiplier > likelyZoneTo && item.multiplier <= stretchZoneTo ? 100 : 0),
-    (item) => item.weight,
-    0
-  );
-  const rareSpikeCoveragePct = weightedAverage(
-    matchedNextRoundRows,
-    (item) => (item.multiplier >= rareSpikeFrom ? 100 : 0),
-    (item) => item.weight,
-    0
-  );
+  const likelyZoneCoveragePct = nextRoundCoveragePct;
   const belowLikelyPct = weightedAverage(
-    matchedNextRoundRows,
+    nextFirstRoundRows,
     (item) => (item.multiplier < likelyZoneFrom ? 100 : 0),
     (item) => item.weight,
     0
   );
-  const likelyZoneMatches = matchedNextRoundRows.filter(
+  const likelyZoneMatches = nextFirstRoundRows.filter(
     (item) => item.multiplier >= likelyZoneFrom && item.multiplier <= likelyZoneTo
   );
-  const stretchZoneMatches = matchedNextRoundRows.filter(
-    (item) => item.multiplier > likelyZoneTo && item.multiplier <= stretchZoneTo
+  const stretchZoneMatches = usedMatches.filter(
+    (item) => item.nextPeakMultiplier >= stretchZoneFrom && item.nextPeakMultiplier <= stretchZoneTo
   );
-  const rareSpikeMatches = matchedNextRoundRows.filter(
-    (item) => item.multiplier >= rareSpikeFrom
+  const rareSpikeMatches = usedMatches.filter(
+    (item) => item.nextPeakMultiplier >= rareSpikeFrom
   );
+  const HIT_CHANCE_THRESHOLDS = [2, 5, 10, 25, 50];
+  const hitChances = HIT_CHANCE_THRESHOLDS.map((threshold) => {
+    const chancePct = weightedAverage(
+      usedMatches,
+      (item) => (item.nextPeakMultiplier >= threshold ? 100 : 0),
+      (item) => item.weight,
+      0
+    );
+    return {
+      threshold,
+      label: formatThresholdLabel(threshold),
+      chancePct: Number(chancePct.toFixed(1)),
+    };
+  });
+  const stretchZoneCoveragePct = hitChances.find((item) => item.threshold === 10)?.chancePct || 0;
+  const rareSpikeCoveragePct = hitChances.find((item) => item.threshold === 50)?.chancePct || 0;
   const likelyZonePrediction = buildZonePrediction(
     likelyZoneMatches,
     likelyZoneCoveragePct,
     latestRoundId,
-    `Built from ${likelyZoneMatches.length || 0} matched next-round outcomes inside the likely zone.`
+    `Built from ${likelyZoneMatches.length || 0} matched first-round outcomes inside the next-round band.`
   );
   const stretchZonePrediction = buildZonePrediction(
     stretchZoneMatches,
     stretchZoneCoveragePct,
     latestRoundId,
-    `Built from ${stretchZoneMatches.length || 0} matched next-round outcomes inside the upper range.`
+    `Built from ${stretchZoneMatches.length || 0} matched next-window peaks in the upper band.`
   );
   const rareSpikePrediction = buildZonePrediction(
     rareSpikeMatches,
     rareSpikeCoveragePct,
     latestRoundId,
-    `Built from ${rareSpikeMatches.length || 0} higher matched next-round outcomes.`
+    `Built from ${rareSpikeMatches.length || 0} matched next-window peaks in the high tail.`
   );
   const predictedPeakOffsetFrom = likelyZonePrediction.offsetFrom;
   const predictedPeakOffsetTo = likelyZonePrediction.offsetTo;
   const predictedPeakRoundIdFrom = latestRoundId ? latestRoundId + predictedPeakOffsetFrom : null;
   const predictedPeakRoundIdTo = latestRoundId ? latestRoundId + predictedPeakOffsetTo : null;
-  const spreadLabel = classifySpreadLabel(p25, p90, p50);
-  const spreadRatio = Math.max(0, p90 - p25) / Math.max(1, p50);
+  const spreadLabel = classifySpreadLabel(nextRoundP25, peakP90, peakP50);
+  const spreadRatio = Math.max(0, peakP90 - nextRoundP25) / Math.max(1, peakP50);
   const confidencePct = clamp(
     (averageSimilarityPct * 0.52)
     + ((Math.min(usedMatches.length, 12) / 12) * 22)
@@ -832,10 +866,10 @@ function buildRangePatternReport(rounds, windowConfig, timeZone) {
       totalComparedRounds: matchedSetupRounds + matchedNextRounds,
     },
     prediction: {
-      rangeFrom: p25,
-      rangeTo: p90,
-      medianPeak: p50,
-      rangeLabel: formatMultiplierRange(p25, p90),
+      rangeFrom: nextRoundP25,
+      rangeTo: nextRoundP75,
+      medianPeak: peakP50,
+      rangeLabel: formatMultiplierRange(nextRoundP25, nextRoundP75),
       likelyZoneFrom,
       likelyZoneTo,
       likelyZoneLabel: formatMultiplierRange(likelyZoneFrom, likelyZoneTo),
@@ -844,31 +878,58 @@ function buildRangePatternReport(rounds, windowConfig, timeZone) {
       stretchZoneLabel: formatMultiplierRange(stretchZoneFrom, stretchZoneTo),
       rareSpikeFrom,
       rareSpikeLabel: `${formatMultiplier(rareSpikeFrom)}+`,
-      p25,
-      p50,
-      p75,
-      p90,
-      p25Label: formatMultiplier(p25),
-      p50Label: formatMultiplier(p50),
-      p75Label: formatMultiplier(p75),
-      p90Label: formatMultiplier(p90),
+      p25: nextRoundP25,
+      p50: nextRoundP50,
+      p75: nextRoundP75,
+      p90: peakP90,
+      p25Label: formatMultiplier(nextRoundP25),
+      p50Label: formatMultiplier(nextRoundP50),
+      p75Label: formatMultiplier(nextRoundP75),
+      p90Label: formatMultiplier(peakP90),
       spreadLabel,
       spreadRatio: Number(spreadRatio.toFixed(2)),
       confidencePct: Number(confidencePct.toFixed(1)),
       confidenceLabel: classifyConfidenceLabel(confidencePct),
+      nextRound: {
+        from: nextRoundP25,
+        to: nextRoundP75,
+        median: nextRoundP50,
+        label: formatMultiplierRange(nextRoundP25, nextRoundP75),
+        medianLabel: formatMultiplier(nextRoundP50),
+        roundId: latestRoundId ? latestRoundId + 1 : null,
+        roundIdLabel: latestRoundId ? `#${latestRoundId + 1}` : '-',
+        confidencePct: Number(likelyZoneCoveragePct.toFixed(1)),
+        confidenceLabel: classifyConfidenceLabel(likelyZoneCoveragePct),
+      },
+      windowHitChances: hitChances,
+      expectedPeak: {
+        p50: peakP50,
+        p75: peakP75,
+        p90: peakP90,
+        p50Label: formatMultiplier(peakP50),
+        p75Label: formatMultiplier(peakP75),
+        p90Label: formatMultiplier(peakP90),
+        roundIdFrom: stretchZonePrediction.roundIdFrom,
+        roundIdTo: rareSpikePrediction.roundIdTo || stretchZonePrediction.roundIdTo,
+        roundIdLabel: formatRoundRange(
+          stretchZonePrediction.roundIdFrom,
+          rareSpikePrediction.roundIdTo || stretchZonePrediction.roundIdTo
+        ),
+        offsetLabel: stretchZonePrediction.offsetLabel || 'No stable peak range yet',
+      },
       likelyZonePrediction,
       stretchZonePrediction,
       rareSpikePrediction,
       predictedPeakRoundIdFrom,
       predictedPeakRoundIdTo,
       predictedPeakRoundIdLabel: formatRoundRange(predictedPeakRoundIdFrom, predictedPeakRoundIdTo),
-      predictedPeakRoundIdBasis: `Built from ${matchedNextRoundRows.length} matched next-round outcomes.`,
+      predictedPeakRoundIdBasis: `Built from ${nextFirstRoundRows.length} matched next-round outcomes.`,
       predictedPeakOffsetFrom,
       predictedPeakOffsetTo,
       predictedPeakOffsetLabel: predictedPeakOffsetFrom === predictedPeakOffsetTo
         ? `around round ${predictedPeakOffsetFrom} of the next window`
         : `around rounds ${predictedPeakOffsetFrom}-${predictedPeakOffsetTo} of the next window`,
-      summary: `Most matched next-round outcomes landed in ${formatMultiplierRange(likelyZoneFrom, likelyZoneTo)}. Higher but less common outcomes ran through ${formatMultiplierRange(stretchZoneFrom, stretchZoneTo)}, and the upper tail started around ${formatMultiplier(rareSpikeFrom)}+.`,
+      summary: `Next matched first rounds usually land in ${formatMultiplierRange(nextRoundP25, nextRoundP75)}. Across the whole next window, ${formatThresholdLabel(5)} hit ${formatPercent(hitChances.find((item) => item.threshold === 5)?.chancePct || 0)}, ${formatThresholdLabel(10)} hit ${formatPercent(hitChances.find((item) => item.threshold === 10)?.chancePct || 0)}, and the expected peak sat near ${formatMultiplier(peakP50)}.`,
     },
     note: `Matched the latest ${windowConfig.label.toLowerCase()} pattern against ${candidateRows.length} historical patterns and kept the closest ${usedMatches.length}.`,
     support: {
@@ -880,15 +941,15 @@ function buildRangePatternReport(rounds, windowConfig, timeZone) {
       rareSpikeCoveragePct: Number(rareSpikeCoveragePct.toFixed(1)),
       belowLikelyPct: Number(belowLikelyPct.toFixed(1)),
       spreadLabel,
-      summary: `Across the matched next-round outcomes, ${Number(likelyZoneCoveragePct.toFixed(1))}% landed inside the likely zone, ${Number(stretchZoneCoveragePct.toFixed(1))}% landed in the upper range, and ${Number(rareSpikeCoveragePct.toFixed(1))}% reached the high-end tail.`,
+      summary: `Across matched history, the next round usually stayed in ${formatMultiplierRange(nextRoundP25, nextRoundP75)}, while the whole next window peaked near ${formatMultiplier(peakP50)} and reached ${formatThresholdLabel(10)} ${formatPercent(hitChances.find((item) => item.threshold === 10)?.chancePct || 0)} of the time.`,
     },
     honesty: {
       label: spreadLabel === 'Tight' ? 'Tighter Read' : spreadLabel === 'Balanced' ? 'Usable Read' : 'Wide Read',
       note: spreadLabel === 'Tight'
-        ? 'Matched next-round outcomes stayed fairly compact, so the range is more trustworthy than usual.'
+        ? 'The matched first rounds stayed compact and the next-window peaks agreed fairly well.'
         : spreadLabel === 'Balanced'
-          ? 'Matched next-round outcomes were mixed but still clustered enough to use as a guide.'
-          : 'Matched next-round outcomes spread out a lot, so treat the range as a broad map, not a sharp call.',
+          ? 'The matched first rounds were usable, but the next-window peaks still had some spread.'
+          : 'The next round is readable, but the full next-window peak still spreads out across matched history.',
     },
     examples: usedMatches.slice(0, 4).map((item, index) => ({
       rank: index + 1,
@@ -968,6 +1029,36 @@ function buildEmptyReport(windowConfig, timeZone) {
       spreadRatio: 0,
       confidencePct: 0,
       confidenceLabel: 'Low',
+      nextRound: {
+        from: null,
+        to: null,
+        median: null,
+        label: '-',
+        medianLabel: '-',
+        roundId: null,
+        roundIdLabel: '-',
+        confidencePct: 0,
+        confidenceLabel: 'Low',
+      },
+      windowHitChances: [
+        { threshold: 2, label: '2x+', chancePct: 0 },
+        { threshold: 5, label: '5x+', chancePct: 0 },
+        { threshold: 10, label: '10x+', chancePct: 0 },
+        { threshold: 25, label: '25x+', chancePct: 0 },
+        { threshold: 50, label: '50x+', chancePct: 0 },
+      ],
+      expectedPeak: {
+        p50: null,
+        p75: null,
+        p90: null,
+        p50Label: '-',
+        p75Label: '-',
+        p90Label: '-',
+        roundIdFrom: null,
+        roundIdTo: null,
+        roundIdLabel: '-',
+        offsetLabel: 'No stable peak range yet',
+      },
       likelyZonePrediction: {
         confidencePct: 0,
         confidenceLabel: 'Low',
