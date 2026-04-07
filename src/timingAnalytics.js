@@ -375,6 +375,44 @@ function classifyConfidenceLabel(score) {
   return 'Low';
 }
 
+function buildZonePrediction(matches, coveragePct, latestRoundId, basisLabel) {
+  const zoneMatches = Array.isArray(matches) ? matches : [];
+  if (!zoneMatches.length) {
+    return {
+      confidencePct: Number(safeNumber(coveragePct, 0).toFixed(1)),
+      confidenceLabel: classifyConfidenceLabel(coveragePct),
+      roundIdFrom: null,
+      roundIdTo: null,
+      roundIdLabel: '-',
+      offsetFrom: null,
+      offsetTo: null,
+      offsetLabel: 'No stable round range yet',
+      basis: basisLabel,
+      sampleCount: 0,
+    };
+  }
+
+  const offsetFrom = Math.max(1, Math.round(weightedQuantile(zoneMatches, (item) => item.nextPeakOffset, (item) => item.weight, 0.2, 1)));
+  const offsetTo = Math.max(1, Math.round(weightedQuantile(zoneMatches, (item) => item.nextPeakOffset, (item) => item.weight, 0.8, 1)));
+  const roundIdFrom = latestRoundId ? latestRoundId + offsetFrom : null;
+  const roundIdTo = latestRoundId ? latestRoundId + offsetTo : null;
+
+  return {
+    confidencePct: Number(safeNumber(coveragePct, 0).toFixed(1)),
+    confidenceLabel: classifyConfidenceLabel(coveragePct),
+    roundIdFrom,
+    roundIdTo,
+    roundIdLabel: formatRoundRange(roundIdFrom, roundIdTo),
+    offsetFrom,
+    offsetTo,
+    offsetLabel: offsetFrom === offsetTo
+      ? `around round ${offsetFrom} of the next window`
+      : `around rounds ${offsetFrom}-${offsetTo} of the next window`,
+    basis: basisLabel,
+    sampleCount: zoneMatches.length,
+  };
+}
+
 function buildPatternWindowSummary(rounds) {
   const summary = summarizeRounds(rounds);
   const sequence = buildSequenceSample(rounds, 12);
@@ -707,6 +745,33 @@ function buildRangePatternReport(rounds, windowConfig, timeZone) {
     (item) => item.weight,
     0
   );
+  const likelyZoneMatches = usedMatches.filter(
+    (item) => item.nextPeakMultiplier >= likelyZoneFrom && item.nextPeakMultiplier <= likelyZoneTo
+  );
+  const stretchZoneMatches = usedMatches.filter(
+    (item) => item.nextPeakMultiplier > likelyZoneTo && item.nextPeakMultiplier <= stretchZoneTo
+  );
+  const rareSpikeMatches = usedMatches.filter(
+    (item) => item.nextPeakMultiplier >= rareSpikeFrom
+  );
+  const likelyZonePrediction = buildZonePrediction(
+    likelyZoneMatches,
+    likelyZoneCoveragePct,
+    latestRoundId,
+    `Built from ${likelyZoneMatches.length || 0} matched next-window peaks inside the likely zone.`
+  );
+  const stretchZonePrediction = buildZonePrediction(
+    stretchZoneMatches,
+    stretchZoneCoveragePct,
+    latestRoundId,
+    `Built from ${stretchZoneMatches.length || 0} matched next-window peaks inside the stretch zone.`
+  );
+  const rareSpikePrediction = buildZonePrediction(
+    rareSpikeMatches,
+    rareSpikeCoveragePct,
+    latestRoundId,
+    `Built from ${rareSpikeMatches.length || 0} matched next-window peaks inside the rare-spike zone.`
+  );
   const spreadLabel = classifySpreadLabel(p25, p90, p50);
   const spreadRatio = Math.max(0, p90 - p25) / Math.max(1, p50);
   const confidencePct = clamp(
@@ -759,6 +824,9 @@ function buildRangePatternReport(rounds, windowConfig, timeZone) {
       spreadRatio: Number(spreadRatio.toFixed(2)),
       confidencePct: Number(confidencePct.toFixed(1)),
       confidenceLabel: classifyConfidenceLabel(confidencePct),
+      likelyZonePrediction,
+      stretchZonePrediction,
+      rareSpikePrediction,
       predictedPeakRoundIdFrom,
       predictedPeakRoundIdTo,
       predictedPeakRoundIdLabel: formatRoundRange(predictedPeakRoundIdFrom, predictedPeakRoundIdTo),
@@ -868,6 +936,42 @@ function buildEmptyReport(windowConfig, timeZone) {
       spreadRatio: 0,
       confidencePct: 0,
       confidenceLabel: 'Low',
+      likelyZonePrediction: {
+        confidencePct: 0,
+        confidenceLabel: 'Low',
+        roundIdFrom: null,
+        roundIdTo: null,
+        roundIdLabel: '-',
+        offsetFrom: null,
+        offsetTo: null,
+        offsetLabel: 'No stable round range yet',
+        basis: '',
+        sampleCount: 0,
+      },
+      stretchZonePrediction: {
+        confidencePct: 0,
+        confidenceLabel: 'Low',
+        roundIdFrom: null,
+        roundIdTo: null,
+        roundIdLabel: '-',
+        offsetFrom: null,
+        offsetTo: null,
+        offsetLabel: 'No stable round range yet',
+        basis: '',
+        sampleCount: 0,
+      },
+      rareSpikePrediction: {
+        confidencePct: 0,
+        confidenceLabel: 'Low',
+        roundIdFrom: null,
+        roundIdTo: null,
+        roundIdLabel: '-',
+        offsetFrom: null,
+        offsetTo: null,
+        offsetLabel: 'No stable round range yet',
+        basis: '',
+        sampleCount: 0,
+      },
       predictedPeakRoundIdFrom: null,
       predictedPeakRoundIdTo: null,
       predictedPeakRoundIdLabel: '-',
