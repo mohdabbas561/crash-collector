@@ -298,6 +298,7 @@ const dashboardCache = {
   payload: null,
 };
 const timingAnalyticsCache = new Map();
+const timingAnalyticsInFlight = new Map();
 let predictComputeInFlight = null;
 let lockedComputeInFlight = null;
 let lockedBackgroundTimer = null;
@@ -758,20 +759,33 @@ app.get('/analytics/timing', requireDatabase, rateLimit(20), async (req, res) =>
       return res.json(cached.payload);
     }
 
-    const totalRounds = latestRound == null ? 0 : await getRoundCount();
-    const rounds = totalRounds > 0 ? await getRounds({ limit: totalRounds, order: 'ASC' }) : [];
-    markDbHealthy();
+    let computePromise = timingAnalyticsInFlight.get(cacheKey);
+    if (!computePromise) {
+      computePromise = (async () => {
+        const totalRounds = latestRound == null ? 0 : await getRoundCount();
+        const rounds = totalRounds > 0 ? await getRounds({ limit: totalRounds, order: 'ASC' }) : [];
+        markDbHealthy();
 
-    const payload = buildTimingAnalyticsReport(rounds, { windowKey, timeZone });
+        const payload = buildTimingAnalyticsReport(rounds, { windowKey, timeZone });
 
-    if (!timingAnalyticsCache.has(cacheKey) && timingAnalyticsCache.size >= 80) {
-      timingAnalyticsCache.delete(timingAnalyticsCache.keys().next().value);
+        if (!timingAnalyticsCache.has(cacheKey) && timingAnalyticsCache.size >= 80) {
+          timingAnalyticsCache.delete(timingAnalyticsCache.keys().next().value);
+        }
+        timingAnalyticsCache.set(cacheKey, {
+          createdAt: Date.now(),
+          payload,
+        });
+
+        return payload;
+      })()
+        .finally(() => {
+          timingAnalyticsInFlight.delete(cacheKey);
+        });
+
+      timingAnalyticsInFlight.set(cacheKey, computePromise);
     }
-    timingAnalyticsCache.set(cacheKey, {
-      createdAt: Date.now(),
-      payload,
-    });
 
+    const payload = await computePromise;
     res.json(payload);
   } catch (e) {
     if (isLikelyDbError(e)) setDatabaseAvailability(false, e.message);
