@@ -326,14 +326,72 @@ function fuzzyMultiplierDiff(a, b) {
   return (delta - tolerance) / Math.max(tolerance, Math.max(left, right) * 0.35, 1);
 }
 
+function multiplierClusterBucket(value) {
+  const numeric = Math.max(0, safeNumber(value, 0));
+  if (numeric < 1.25) return 0;
+  if (numeric < 1.6) return 1;
+  if (numeric < 2.1) return 2;
+  if (numeric < 3) return 3;
+  if (numeric < 5) return 4;
+  if (numeric < 8) return 5;
+  if (numeric < 12) return 6;
+  if (numeric < 20) return 7;
+  if (numeric < 35) return 8;
+  if (numeric < 60) return 9;
+  if (numeric < 100) return 10;
+  if (numeric < 250) return 11;
+  if (numeric < 500) return 12;
+  return 13;
+}
+
+function buildClusterSequence(sequence) {
+  return (Array.isArray(sequence) ? sequence : []).map(multiplierClusterBucket);
+}
+
+function averageSlice(values, startIndex, endIndexExclusive) {
+  const items = Array.isArray(values) ? values : [];
+  const safeStart = Math.max(0, Math.min(items.length, Number(startIndex) || 0));
+  const safeEnd = Math.max(safeStart, Math.min(items.length, Number(endIndexExclusive) || 0));
+  if (safeEnd <= safeStart) return 0;
+  let sum = 0;
+  for (let index = safeStart; index < safeEnd; index += 1) {
+    sum += safeNumber(items[index], 0);
+  }
+  return sum / (safeEnd - safeStart);
+}
+
+function classifySpreadLabel(p25, p90, p50) {
+  const median = Math.max(1, safeNumber(p50, 0));
+  const spreadRatio = Math.max(0, safeNumber(p90, 0) - safeNumber(p25, 0)) / median;
+  if (spreadRatio <= 0.75) return 'Tight';
+  if (spreadRatio <= 1.8) return 'Balanced';
+  return 'Wide';
+}
+
+function classifyConfidenceLabel(score) {
+  const numeric = safeNumber(score, 0);
+  if (numeric >= 82) return 'High';
+  if (numeric >= 62) return 'Medium';
+  return 'Low';
+}
+
 function buildPatternWindowSummary(rounds) {
   const summary = summarizeRounds(rounds);
+  const sequence = buildSequenceSample(rounds, 12);
   return {
     ...summary,
     roundFromId: rounds[0]?.roundId ?? null,
     roundToId: rounds[rounds.length - 1]?.roundId ?? null,
     peak: summarizePeakRound(rounds),
-    sequence: buildSequenceSample(rounds, 12),
+    sequence,
+    clusterSequence: buildClusterSequence(sequence),
+    startAvg: averageSlice(sequence, 0, Math.max(1, Math.ceil(sequence.length / 3))),
+    middleAvg: averageSlice(
+      sequence,
+      Math.max(0, Math.floor(sequence.length / 3)),
+      Math.max(Math.floor(sequence.length / 3), Math.ceil((sequence.length * 2) / 3))
+    ),
+    endAvg: averageSlice(sequence, Math.max(0, Math.floor((sequence.length * 2) / 3)), sequence.length),
   };
 }
 
@@ -360,10 +418,38 @@ function computePatternDistance(candidateSummary, referenceSummary) {
       )
     : 1;
 
+  const clusterLength = Math.min(
+    Array.isArray(candidateSummary.clusterSequence) ? candidateSummary.clusterSequence.length : 0,
+    Array.isArray(referenceSummary.clusterSequence) ? referenceSummary.clusterSequence.length : 0
+  );
+  const clusterDistance = clusterLength
+    ? average(
+        Array.from({ length: clusterLength }, (_, index) => (
+          Math.abs(
+            safeNumber(candidateSummary.clusterSequence[index], 0)
+            - safeNumber(referenceSummary.clusterSequence[index], 0)
+          ) / 3
+        ))
+      )
+    : 1;
+
+  const trendDistance = average([
+    fuzzyMultiplierDiff(candidateSummary.startAvg, referenceSummary.startAvg),
+    fuzzyMultiplierDiff(candidateSummary.middleAvg, referenceSummary.middleAvg),
+    fuzzyMultiplierDiff(candidateSummary.endAvg, referenceSummary.endAvg),
+  ]);
+
   const roundCountDistance = Math.abs(safeNumber(candidateSummary.roundCount, 0) - safeNumber(referenceSummary.roundCount, 0))
     / Math.max(6, safeNumber(referenceSummary.roundCount, 0), 1);
 
-  return (sequenceDistance * 0.55) + (scalarDistance * 0.25) + (distributionDistance * 0.15) + (roundCountDistance * 0.05);
+  return (
+    (sequenceDistance * 0.34)
+    + (clusterDistance * 0.24)
+    + (scalarDistance * 0.18)
+    + (trendDistance * 0.14)
+    + (distributionDistance * 0.07)
+    + (roundCountDistance * 0.03)
+  );
 }
 
 function similarityPctFromDistance(distance) {
@@ -453,12 +539,21 @@ function buildRollingInputWindow(rounds, windowMs, timeZone) {
   }
 
   const windowRounds = items.slice(startIndex, endIndex + 1);
+  const sequence = buildSequenceSampleRange(items, startIndex, endIndex + 1, 12);
   const summary = {
     ...summarizeRoundsRange(items, startIndex, endIndex + 1),
     roundFromId: items[startIndex]?.roundId ?? null,
     roundToId: items[endIndex]?.roundId ?? null,
     peak: summarizePeakRoundRange(items, startIndex, endIndex + 1),
-    sequence: buildSequenceSampleRange(items, startIndex, endIndex + 1, 12),
+    sequence,
+    clusterSequence: buildClusterSequence(sequence),
+    startAvg: averageSlice(sequence, 0, Math.max(1, Math.ceil(sequence.length / 3))),
+    middleAvg: averageSlice(
+      sequence,
+      Math.max(0, Math.floor(sequence.length / 3)),
+      Math.max(Math.floor(sequence.length / 3), Math.ceil((sequence.length * 2) / 3))
+    ),
+    endAvg: averageSlice(sequence, Math.max(0, Math.floor((sequence.length * 2) / 3)), sequence.length),
   };
 
   return {
@@ -506,12 +601,21 @@ function buildRangePatternReport(rounds, windowConfig, timeZone) {
     const nextCount = nextEnd - (anchorIndex + 1);
     if (inputCount < minimumInputRounds || nextCount <= 0) continue;
 
+    const inputSequence = buildSequenceSampleRange(rounds, inputStart, anchorIndex + 1, 12);
     const inputSummary = {
       ...summarizeRoundsRange(rounds, inputStart, anchorIndex + 1),
       roundFromId: rounds[inputStart]?.roundId ?? null,
       roundToId: rounds[anchorIndex]?.roundId ?? null,
       peak: summarizePeakRoundRange(rounds, inputStart, anchorIndex + 1),
-      sequence: buildSequenceSampleRange(rounds, inputStart, anchorIndex + 1, 12),
+      sequence: inputSequence,
+      clusterSequence: buildClusterSequence(inputSequence),
+      startAvg: averageSlice(inputSequence, 0, Math.max(1, Math.ceil(inputSequence.length / 3))),
+      middleAvg: averageSlice(
+        inputSequence,
+        Math.max(0, Math.floor(inputSequence.length / 3)),
+        Math.max(Math.floor(inputSequence.length / 3), Math.ceil((inputSequence.length * 2) / 3))
+      ),
+      endAvg: averageSlice(inputSequence, Math.max(0, Math.floor((inputSequence.length * 2) / 3)), inputSequence.length),
     };
     const nextSummary = {
       ...summarizeRoundsRange(rounds, anchorIndex + 1, nextEnd),
@@ -562,9 +666,16 @@ function buildRangePatternReport(rounds, windowConfig, timeZone) {
     .sort((left, right) => left.distance - right.distance)
     .slice(0, clamp(Math.round(Math.sqrt(candidateRows.length)), 6, 12));
 
-  const predictedPeakFrom = weightedQuantile(usedMatches, (item) => item.nextPeakMultiplier, (item) => item.weight, 0.2, 0);
-  const predictedPeakTo = weightedQuantile(usedMatches, (item) => item.nextPeakMultiplier, (item) => item.weight, 0.8, 0);
-  const predictedPeakMedian = weightedQuantile(usedMatches, (item) => item.nextPeakMultiplier, (item) => item.weight, 0.5, 0);
+  const p25 = weightedQuantile(usedMatches, (item) => item.nextPeakMultiplier, (item) => item.weight, 0.25, 0);
+  const p50 = weightedQuantile(usedMatches, (item) => item.nextPeakMultiplier, (item) => item.weight, 0.5, 0);
+  const p65 = weightedQuantile(usedMatches, (item) => item.nextPeakMultiplier, (item) => item.weight, 0.65, 0);
+  const p75 = weightedQuantile(usedMatches, (item) => item.nextPeakMultiplier, (item) => item.weight, 0.75, 0);
+  const p90 = weightedQuantile(usedMatches, (item) => item.nextPeakMultiplier, (item) => item.weight, 0.9, 0);
+  const likelyZoneFrom = p25;
+  const likelyZoneTo = p65;
+  const stretchZoneFrom = p65;
+  const stretchZoneTo = p90;
+  const rareSpikeFrom = p90;
   const predictedPeakOffsetFrom = Math.max(1, Math.round(weightedQuantile(usedMatches, (item) => item.nextPeakOffset, (item) => item.weight, 0.2, 1)));
   const predictedPeakOffsetTo = Math.max(1, Math.round(weightedQuantile(usedMatches, (item) => item.nextPeakOffset, (item) => item.weight, 0.8, 1)));
   const predictedPeakRoundIdFrom = latestRoundId ? latestRoundId + predictedPeakOffsetFrom : null;
@@ -572,8 +683,36 @@ function buildRangePatternReport(rounds, windowConfig, timeZone) {
   const matchedSetupRounds = usedMatches.reduce((sum, item) => sum + safeNumber(item.inputRoundCount, 0), 0);
   const matchedNextRounds = usedMatches.reduce((sum, item) => sum + safeNumber(item.nextRoundCount, 0), 0);
   const averageSimilarityPct = weightedAverage(usedMatches, (item) => item.similarityPct, (item) => item.weight, 0);
+  const likelyZoneCoveragePct = weightedAverage(
+    usedMatches,
+    (item) => (item.nextPeakMultiplier >= likelyZoneFrom && item.nextPeakMultiplier <= likelyZoneTo ? 100 : 0),
+    (item) => item.weight,
+    0
+  );
+  const stretchZoneCoveragePct = weightedAverage(
+    usedMatches,
+    (item) => (item.nextPeakMultiplier > likelyZoneTo && item.nextPeakMultiplier <= stretchZoneTo ? 100 : 0),
+    (item) => item.weight,
+    0
+  );
+  const rareSpikeCoveragePct = weightedAverage(
+    usedMatches,
+    (item) => (item.nextPeakMultiplier >= rareSpikeFrom ? 100 : 0),
+    (item) => item.weight,
+    0
+  );
+  const belowLikelyPct = weightedAverage(
+    usedMatches,
+    (item) => (item.nextPeakMultiplier < likelyZoneFrom ? 100 : 0),
+    (item) => item.weight,
+    0
+  );
+  const spreadLabel = classifySpreadLabel(p25, p90, p50);
+  const spreadRatio = Math.max(0, p90 - p25) / Math.max(1, p50);
   const confidencePct = clamp(
-    (averageSimilarityPct * 0.72) + ((Math.min(usedMatches.length, 12) / 12) * 28),
+    (averageSimilarityPct * 0.52)
+    + ((Math.min(usedMatches.length, 12) / 12) * 22)
+    + (Math.max(0, 1 - Math.min(spreadRatio, 3.5) / 3.5) * 26),
     8,
     96
   );
@@ -596,19 +735,56 @@ function buildRangePatternReport(rounds, windowConfig, timeZone) {
       totalComparedRounds: matchedSetupRounds + matchedNextRounds,
     },
     prediction: {
-      rangeFrom: predictedPeakFrom,
-      rangeTo: predictedPeakTo,
-      medianPeak: predictedPeakMedian,
-      rangeLabel: formatMultiplierRange(predictedPeakFrom, predictedPeakTo),
+      rangeFrom: p25,
+      rangeTo: p90,
+      medianPeak: p50,
+      rangeLabel: formatMultiplierRange(p25, p90),
+      likelyZoneFrom,
+      likelyZoneTo,
+      likelyZoneLabel: formatMultiplierRange(likelyZoneFrom, likelyZoneTo),
+      stretchZoneFrom,
+      stretchZoneTo,
+      stretchZoneLabel: formatMultiplierRange(stretchZoneFrom, stretchZoneTo),
+      rareSpikeFrom,
+      rareSpikeLabel: `${formatMultiplier(rareSpikeFrom)}+`,
+      p25,
+      p50,
+      p75,
+      p90,
+      p25Label: formatMultiplier(p25),
+      p50Label: formatMultiplier(p50),
+      p75Label: formatMultiplier(p75),
+      p90Label: formatMultiplier(p90),
+      spreadLabel,
+      spreadRatio: Number(spreadRatio.toFixed(2)),
       confidencePct: Number(confidencePct.toFixed(1)),
-      confidenceLabel: confidencePct >= 76 ? 'High' : confidencePct >= 55 ? 'Medium' : 'Low',
+      confidenceLabel: classifyConfidenceLabel(confidencePct),
       predictedPeakRoundIdFrom,
       predictedPeakRoundIdTo,
       predictedPeakRoundIdLabel: formatRoundRange(predictedPeakRoundIdFrom, predictedPeakRoundIdTo),
       predictedPeakRoundIdBasis: `Built from ${usedMatches.length} matched next-window peaks.`,
-      summary: `Based on ${usedMatches.length} matched past patterns, the next ${windowConfig.label.toLowerCase()} is expected to peak around ${formatMultiplierRange(predictedPeakFrom, predictedPeakTo)}.`,
+      summary: `Most matched next windows peaked in ${formatMultiplierRange(likelyZoneFrom, likelyZoneTo)}. Stretch cases reached ${formatMultiplierRange(stretchZoneFrom, stretchZoneTo)}, and rare spikes started around ${formatMultiplier(rareSpikeFrom)}+.`,
     },
     note: `Matched the latest ${windowConfig.label.toLowerCase()} pattern against ${candidateRows.length} historical patterns and kept the closest ${usedMatches.length}.`,
+    support: {
+      matchedPatterns: usedMatches.length,
+      candidatePatterns: candidateRows.length,
+      averageSimilarityPct,
+      likelyZoneCoveragePct: Number(likelyZoneCoveragePct.toFixed(1)),
+      stretchZoneCoveragePct: Number(stretchZoneCoveragePct.toFixed(1)),
+      rareSpikeCoveragePct: Number(rareSpikeCoveragePct.toFixed(1)),
+      belowLikelyPct: Number(belowLikelyPct.toFixed(1)),
+      spreadLabel,
+      summary: `In these matched histories, ${Number(likelyZoneCoveragePct.toFixed(1))}% landed inside the likely zone, ${Number(stretchZoneCoveragePct.toFixed(1))}% stretched above it, and ${Number(rareSpikeCoveragePct.toFixed(1))}% became rare spikes.`,
+    },
+    honesty: {
+      label: spreadLabel === 'Tight' ? 'Tighter Read' : spreadLabel === 'Balanced' ? 'Usable Read' : 'Wide Read',
+      note: spreadLabel === 'Tight'
+        ? 'Matched outcomes stayed fairly compact, so the range is more trustworthy than usual.'
+        : spreadLabel === 'Balanced'
+          ? 'Matched outcomes were mixed but still clustered enough to use as a guide.'
+          : 'Matched outcomes spread out a lot, so treat the range as a broad map, not a sharp call.',
+    },
     examples: usedMatches.slice(0, 4).map((item, index) => ({
       rank: index + 1,
       similarityPct: item.similarityPct,
@@ -667,6 +843,24 @@ function buildEmptyReport(windowConfig, timeZone) {
       rangeTo: null,
       medianPeak: null,
       rangeLabel: '-',
+      likelyZoneFrom: null,
+      likelyZoneTo: null,
+      likelyZoneLabel: '-',
+      stretchZoneFrom: null,
+      stretchZoneTo: null,
+      stretchZoneLabel: '-',
+      rareSpikeFrom: null,
+      rareSpikeLabel: '-',
+      p25: null,
+      p50: null,
+      p75: null,
+      p90: null,
+      p25Label: '-',
+      p50Label: '-',
+      p75Label: '-',
+      p90Label: '-',
+      spreadLabel: 'Wide',
+      spreadRatio: 0,
       confidencePct: 0,
       confidenceLabel: 'Low',
       predictedPeakRoundIdFrom: null,
@@ -691,6 +885,21 @@ function buildEmptyReport(windowConfig, timeZone) {
         totalComparedRounds: 0,
       },
       examples: [],
+    },
+    support: {
+      matchedPatterns: 0,
+      candidatePatterns: 0,
+      averageSimilarityPct: 0,
+      likelyZoneCoveragePct: 0,
+      stretchZoneCoveragePct: 0,
+      rareSpikeCoveragePct: 0,
+      belowLikelyPct: 0,
+      spreadLabel: 'Wide',
+      summary: 'No support data yet.',
+    },
+    honesty: {
+      label: 'Wide Read',
+      note: 'No support data yet.',
     },
   };
 }
@@ -729,6 +938,12 @@ function buildTimingAnalyticsReport(rounds, options = {}) {
       prediction: {
         ...empty.prediction,
         summary: rangeReport.reason || empty.prediction.summary,
+      },
+      support: {
+        ...empty.support,
+      },
+      honesty: {
+        ...empty.honesty,
       },
     };
   }
@@ -783,6 +998,8 @@ function buildTimingAnalyticsReport(rounds, options = {}) {
       roundsComputed: rangeReport.roundsComputed,
       examples: rangeReport.examples,
     },
+    support: rangeReport.support,
+    honesty: rangeReport.honesty,
   };
 }
 
