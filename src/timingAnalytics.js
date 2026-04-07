@@ -763,6 +763,11 @@ function buildRangePatternReport(rounds, windowConfig, timeZone) {
       predictedPeakRoundIdTo,
       predictedPeakRoundIdLabel: formatRoundRange(predictedPeakRoundIdFrom, predictedPeakRoundIdTo),
       predictedPeakRoundIdBasis: `Built from ${usedMatches.length} matched next-window peaks.`,
+      predictedPeakOffsetFrom,
+      predictedPeakOffsetTo,
+      predictedPeakOffsetLabel: predictedPeakOffsetFrom === predictedPeakOffsetTo
+        ? `around round ${predictedPeakOffsetFrom} of the next window`
+        : `around rounds ${predictedPeakOffsetFrom}-${predictedPeakOffsetTo} of the next window`,
       summary: `Most matched next windows peaked in ${formatMultiplierRange(likelyZoneFrom, likelyZoneTo)}. Stretch cases reached ${formatMultiplierRange(stretchZoneFrom, stretchZoneTo)}, and rare spikes started around ${formatMultiplier(rareSpikeFrom)}+.`,
     },
     note: `Matched the latest ${windowConfig.label.toLowerCase()} pattern against ${candidateRows.length} historical patterns and kept the closest ${usedMatches.length}.`,
@@ -867,6 +872,9 @@ function buildEmptyReport(windowConfig, timeZone) {
       predictedPeakRoundIdTo: null,
       predictedPeakRoundIdLabel: '-',
       predictedPeakRoundIdBasis: '',
+      predictedPeakOffsetFrom: null,
+      predictedPeakOffsetTo: null,
+      predictedPeakOffsetLabel: '-',
       summary: 'No rounds are stored yet, so there is no pattern prediction yet.',
     },
     patternMatches: {
