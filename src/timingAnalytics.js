@@ -2083,16 +2083,288 @@ function buildBestWindowsToday(slotAnalytics, focusTarget) {
   };
 }
 
-function buildEmptyReport(windowConfig, focusTarget, timeZone) {
+function formatWindowTimeRange(startTimestamp, endTimestamp, timeZone, includeDate = false) {
+  const safeStart = safeNumber(startTimestamp, 0);
+  const safeEnd = safeNumber(endTimestamp, 0);
+  if (!safeStart || !safeEnd) return '-';
+
+  const timeFormatter = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+  const dayFormatter = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    month: 'short',
+    day: 'numeric',
+  });
+
+  const timeLabel = `${timeFormatter.format(new Date(safeStart))} - ${timeFormatter.format(new Date(safeEnd))}`;
+  if (!includeDate) return timeLabel;
+  return `${dayFormatter.format(new Date(safeStart))} | ${timeLabel}`;
+}
+
+function serializePatternRounds(rounds) {
+  return (Array.isArray(rounds) ? rounds : []).map((round) => ({
+    roundId: round.roundId || null,
+    multiplier: safeNumber(round.multiplier, 0),
+    label: formatMultiplier(round.multiplier),
+  }));
+}
+
+function buildSequenceSample(rounds, maxSamples = 12) {
+  const items = Array.isArray(rounds) ? rounds : [];
+  if (!items.length) return [];
+  if (items.length <= maxSamples) return items.map((round) => safeNumber(round.multiplier, 0));
+
+  const sample = [];
+  const divisor = Math.max(1, maxSamples - 1);
+  for (let index = 0; index < maxSamples; index += 1) {
+    const pickIndex = Math.round((index / divisor) * (items.length - 1));
+    sample.push(safeNumber(items[pickIndex]?.multiplier, 0));
+  }
+  return sample;
+}
+
+function fuzzyMultiplierTolerance(value) {
+  const numeric = Math.max(0, safeNumber(value, 0));
+  if (numeric < 2) return 0.2;
+  if (numeric < 5) return 0.5;
+  if (numeric < 20) return 1.5;
+  if (numeric < 50) return 3;
+  if (numeric < 100) return 8;
+  if (numeric < 500) return 25;
+  return 100;
+}
+
+function fuzzyMultiplierDiff(a, b) {
+  const left = Math.max(0, safeNumber(a, 0));
+  const right = Math.max(0, safeNumber(b, 0));
+  const tolerance = Math.max(fuzzyMultiplierTolerance(left), fuzzyMultiplierTolerance(right));
+  const delta = Math.abs(left - right);
+  if (delta <= tolerance) return 0;
+  return (delta - tolerance) / Math.max(tolerance, Math.max(left, right) * 0.35, 1);
+}
+
+function buildPatternWindowSummary(rounds) {
+  const summary = summarizeRounds(rounds, DEFAULT_TARGET);
+  return {
+    ...summary,
+    roundFromId: rounds[0]?.roundId ?? null,
+    roundToId: rounds[rounds.length - 1]?.roundId ?? null,
+    peak: summarizePeakRound(rounds),
+    sequence: buildSequenceSample(rounds, 12),
+  };
+}
+
+function computeRangePatternDistance(candidateSummary, referenceSummary) {
+  if (!candidateSummary || !referenceSummary) return Number.POSITIVE_INFINITY;
+
+  const bandDiff = average(
+    DISTRIBUTION_BANDS.map((band) => Math.abs(distributionPct(candidateSummary, band.key) - distributionPct(referenceSummary, band.key)))
+  ) * 2.4;
+
+  const scalarDiff = average([
+    fuzzyMultiplierDiff(candidateSummary.avgMultiplier, referenceSummary.avgMultiplier),
+    fuzzyMultiplierDiff(candidateSummary.medianMultiplier, referenceSummary.medianMultiplier),
+    fuzzyMultiplierDiff(candidateSummary.p90Multiplier, referenceSummary.p90Multiplier),
+    fuzzyMultiplierDiff(candidateSummary.maxMultiplier, referenceSummary.maxMultiplier),
+  ]);
+
+  const sequenceLength = Math.min(candidateSummary.sequence.length, referenceSummary.sequence.length);
+  const sequenceDiff = sequenceLength
+    ? average(
+        Array.from({ length: sequenceLength }, (_, index) => (
+          fuzzyMultiplierDiff(candidateSummary.sequence[index], referenceSummary.sequence[index])
+        ))
+      )
+    : 1;
+
+  const roundCountDiff = Math.abs(safeNumber(candidateSummary.roundCount, 0) - safeNumber(referenceSummary.roundCount, 0))
+    / Math.max(6, safeNumber(referenceSummary.roundCount, 0), 1);
+
+  return (sequenceDiff * 0.55) + (scalarDiff * 0.25) + (bandDiff * 0.15) + (roundCountDiff * 0.05);
+}
+
+function similarityPctFromDistance(distance) {
+  return Number(clamp(Math.exp(-Math.max(0, safeNumber(distance, 0)) * 1.35) * 100, 0, 100).toFixed(1));
+}
+
+function buildRollingInputWindow(rounds, windowMs, timeZone) {
+  const items = Array.isArray(rounds) ? rounds : [];
+  if (!items.length) return null;
+
+  const endIndex = items.length - 1;
+  const endTimestamp = items[endIndex].timestamp;
+  const startTimestamp = endTimestamp - windowMs;
+  let startIndex = endIndex;
+  while (startIndex > 0 && items[startIndex - 1].timestamp >= startTimestamp) {
+    startIndex -= 1;
+  }
+
+  const windowRounds = items.slice(startIndex, endIndex + 1);
+  const summary = buildPatternWindowSummary(windowRounds);
+
+  return {
+    startIndex,
+    endIndex,
+    startTimestamp,
+    endTimestamp,
+    label: formatWindowTimeRange(startTimestamp, endTimestamp, timeZone),
+    datedLabel: formatWindowTimeRange(startTimestamp, endTimestamp, timeZone, true),
+    rounds: windowRounds,
+    summary,
+  };
+}
+
+function buildRangePatternReport(rounds, windowConfig, timeZone) {
+  const currentInput = buildRollingInputWindow(rounds, windowConfig.ms, timeZone);
+  if (!currentInput || currentInput.summary.roundCount < 2) {
+    return {
+      available: false,
+      reason: 'Not enough recent rounds yet to build a pattern window.',
+    };
+  }
+
+  const latestRound = rounds[rounds.length - 1];
+  const latestRoundId = latestRound?.roundId || null;
+  const candidateRows = [];
+  const minimumInputRounds = Math.max(3, Math.min(12, Math.round(currentInput.summary.roundCount * 0.4)));
+
+  let inputStart = 0;
+  let nextEnd = 1;
+  for (let anchorIndex = 0; anchorIndex < rounds.length - 1; anchorIndex += 1) {
+    const anchorRound = rounds[anchorIndex];
+    const anchorTimestamp = anchorRound.timestamp;
+    if (anchorTimestamp >= currentInput.startTimestamp) break;
+
+    while (inputStart <= anchorIndex && rounds[inputStart].timestamp < (anchorTimestamp - windowConfig.ms)) {
+      inputStart += 1;
+    }
+    if (nextEnd < anchorIndex + 1) nextEnd = anchorIndex + 1;
+    while (nextEnd < rounds.length && rounds[nextEnd].timestamp <= (anchorTimestamp + windowConfig.ms)) {
+      nextEnd += 1;
+    }
+
+    const inputRounds = rounds.slice(inputStart, anchorIndex + 1);
+    const nextRounds = rounds.slice(anchorIndex + 1, nextEnd);
+    if (inputRounds.length < minimumInputRounds || !nextRounds.length) continue;
+
+    const inputSummary = buildPatternWindowSummary(inputRounds);
+    const nextSummary = buildPatternWindowSummary(nextRounds);
+    const distance = computeRangePatternDistance(inputSummary, currentInput.summary);
+    const similarityPct = similarityPctFromDistance(distance);
+    const daysAgo = ratio(currentInput.endTimestamp - anchorTimestamp, DAY_MS);
+    const weight = (1 / (1 + (distance * 3.6))) * (1 / (1 + (daysAgo / 20)));
+
+    candidateRows.push({
+      anchorIndex,
+      anchorRoundId: anchorRound.roundId || null,
+      anchorTimestamp,
+      distance,
+      similarityPct,
+      weight,
+      inputStartTimestamp: anchorTimestamp - windowConfig.ms,
+      inputEndTimestamp: anchorTimestamp,
+      inputRounds,
+      inputSummary,
+      nextStartTimestamp: anchorTimestamp,
+      nextEndTimestamp: anchorTimestamp + windowConfig.ms,
+      nextRounds,
+      nextSummary,
+      nextPeak: nextSummary.peak,
+    });
+  }
+
+  if (candidateRows.length < 4) {
+    return {
+      available: false,
+      reason: 'Not enough historical pattern matches yet for this window size.',
+      currentInput,
+    };
+  }
+
+  const usedMatches = [...candidateRows]
+    .sort((left, right) => left.distance - right.distance)
+    .slice(0, clamp(Math.round(Math.sqrt(candidateRows.length)), 6, 12));
+
+  const predictedPeakFrom = weightedQuantile(usedMatches, (item) => item.nextPeak.peakMultiplier, (item) => item.weight, 0.2, 0);
+  const predictedPeakTo = weightedQuantile(usedMatches, (item) => item.nextPeak.peakMultiplier, (item) => item.weight, 0.8, 0);
+  const predictedPeakMedian = weightedQuantile(usedMatches, (item) => item.nextPeak.peakMultiplier, (item) => item.weight, 0.5, 0);
+  const predictedPeakOffsetFrom = Math.max(1, Math.round(weightedQuantile(usedMatches, (item) => item.nextPeak.peakOffset, (item) => item.weight, 0.2, 1)));
+  const predictedPeakOffsetTo = Math.max(1, Math.round(weightedQuantile(usedMatches, (item) => item.nextPeak.peakOffset, (item) => item.weight, 0.8, 1)));
+  const predictedPeakRoundIdFrom = latestRoundId ? latestRoundId + predictedPeakOffsetFrom : null;
+  const predictedPeakRoundIdTo = latestRoundId ? latestRoundId + predictedPeakOffsetTo : null;
+  const matchedSetupRounds = usedMatches.reduce((sum, item) => sum + safeNumber(item.inputSummary.roundCount, 0), 0);
+  const matchedNextRounds = usedMatches.reduce((sum, item) => sum + safeNumber(item.nextSummary.roundCount, 0), 0);
+  const averageSimilarityPct = weightedAverage(usedMatches, (item) => item.similarityPct, (item) => item.weight, 0);
+  const confidencePct = clamp(
+    (averageSimilarityPct * 0.72) + ((Math.min(usedMatches.length, 12) / 12) * 28),
+    8,
+    96
+  );
+
+  return {
+    available: true,
+    currentInput,
+    nextWindowLabel: formatWindowTimeRange(currentInput.endTimestamp, currentInput.endTimestamp + windowConfig.ms, timeZone),
+    nextWindowDatedLabel: formatWindowTimeRange(currentInput.endTimestamp, currentInput.endTimestamp + windowConfig.ms, timeZone, true),
+    candidateCount: candidateRows.length,
+    usedMatches: usedMatches.length,
+    lookbackDaysUsed: ratio(currentInput.endTimestamp - rounds[0].timestamp, DAY_MS),
+    averageSimilarityPct,
+    roundsComputed: {
+      currentInputRounds: currentInput.summary.roundCount,
+      matchedSetupRounds,
+      matchedNextRounds,
+      avgSetupRoundsPerMatch: ratio(matchedSetupRounds, usedMatches.length),
+      avgNextRoundsPerMatch: ratio(matchedNextRounds, usedMatches.length),
+      totalComparedRounds: matchedSetupRounds + matchedNextRounds,
+    },
+    prediction: {
+      rangeFrom: predictedPeakFrom,
+      rangeTo: predictedPeakTo,
+      medianPeak: predictedPeakMedian,
+      rangeLabel: formatMultiplierRange(predictedPeakFrom, predictedPeakTo),
+      confidencePct: Number(confidencePct.toFixed(1)),
+      confidenceLabel: confidencePct >= 76 ? 'High' : confidencePct >= 55 ? 'Medium' : 'Low',
+      predictedPeakRoundIdFrom,
+      predictedPeakRoundIdTo,
+      predictedPeakRoundIdLabel: predictedPeakRoundIdFrom && predictedPeakRoundIdTo
+        ? `#${predictedPeakRoundIdFrom} - #${predictedPeakRoundIdTo}`
+        : '-',
+      predictedPeakRoundIdBasis: `Built from ${usedMatches.length} matched next-window peaks.`,
+      summary: `Based on ${usedMatches.length} matched past patterns, the next ${windowConfig.label.toLowerCase()} is expected to peak around ${formatMultiplierRange(predictedPeakFrom, predictedPeakTo)}.`,
+    },
+    note: `Matched the latest ${windowConfig.label.toLowerCase()} pattern against ${candidateRows.length} historical patterns and kept the closest ${usedMatches.length}.`,
+    examples: usedMatches.slice(0, 4).map((item, index) => ({
+      rank: index + 1,
+      similarityPct: item.similarityPct,
+      inputLabel: formatWindowTimeRange(item.inputStartTimestamp, item.inputEndTimestamp, timeZone, true),
+      inputRoundFrom: item.inputSummary.roundFromId,
+      inputRoundTo: item.inputSummary.roundToId,
+      inputRoundCount: item.inputSummary.roundCount,
+      inputRounds: serializePatternRounds(item.inputRounds),
+      nextLabel: formatWindowTimeRange(item.nextStartTimestamp, item.nextEndTimestamp, timeZone, true),
+      nextRoundFrom: item.nextSummary.roundFromId,
+      nextRoundTo: item.nextSummary.roundToId,
+      nextRoundCount: item.nextSummary.roundCount,
+      nextRounds: serializePatternRounds(item.nextRounds),
+      nextPeakMultiplier: item.nextPeak.peakMultiplier,
+      nextPeakLabel: formatMultiplier(item.nextPeak.peakMultiplier),
+      nextPeakRoundId: item.nextPeak.peakRoundId,
+      nextPeakOffset: item.nextPeak.peakOffset,
+    })),
+  };
+}
+
+function buildEmptyReport(windowConfig, timeZone) {
   return {
     ok: true,
     generatedAt: Date.now(),
     latestRoundId: null,
     totalRounds: 0,
-    focusTarget,
-    focusTargetLabel: labelForTarget(focusTarget),
     availableWindows: WINDOW_OPTIONS.map(({ key, label }) => ({ key, label })),
-    availableTargets: TARGETS.map((value) => ({ value, label: labelForTarget(value) })),
     timeZone,
     dataset: {
       totalRounds: 0,
@@ -2104,170 +2376,99 @@ function buildEmptyReport(windowConfig, focusTarget, timeZone) {
       key: windowConfig.key,
       label: windowConfig.label,
       ms: windowConfig.ms,
-      startTimestamp: null,
-      endTimestamp: null,
+      inputLabel: '-',
+      predictionLabel: '-',
     },
-    baseline: summarizeWindowCollection([], focusTarget),
-    previousWindow: summarizeRounds([], focusTarget),
-    currentWindow: summarizeRounds([], focusTarget),
-    patternPrediction: {
-      action: 'SKIP',
-      tone: 'bad',
-      confidence: 0,
+    currentPattern: {
+      label: '-',
+      roundCount: 0,
+      roundFromId: null,
+      roundToId: null,
+      avgMultiplier: 0,
+      medianMultiplier: 0,
+      p90Multiplier: 0,
+      maxMultiplier: 0,
+      rounds: [],
+    },
+    prediction: {
+      rangeFrom: null,
+      rangeTo: null,
+      medianPeak: null,
+      rangeLabel: '-',
+      confidencePct: 0,
       confidenceLabel: 'Low',
-      predictsLabel: `Current ${windowConfig.label}`,
-      inputLabel: `Closed Previous ${windowConfig.label}`,
-      inputSlotLabel: '-',
-      currentSlotLabel: '-',
-      currentHitRate: 0,
-      baselineHitRate: 0,
-      baselineCurrentWindowHitRate: 0,
-      currentLift: 1,
-      effectiveCurrentLift: 1,
-      currentEvidenceWeight: 0,
-      currentSlotChance: 0,
-      currentWindowHitRate: 0,
-      currentWindowLift: 1,
-      remainingHitRate: 0,
-      remainingLift: 1,
-      baselineRemainingHitRate: 0,
-      matchedWindows: 0,
-      sameWeekdayMatches: 0,
+      predictedPeakRoundIdFrom: null,
+      predictedPeakRoundIdTo: null,
+      predictedPeakRoundIdLabel: '-',
+      predictedPeakRoundIdBasis: '',
+      summary: 'No rounds are stored yet, so there is no pattern prediction yet.',
+    },
+    patternMatches: {
+      available: false,
+      note: 'No rounds are stored yet.',
+      candidateCount: 0,
+      usedMatches: 0,
       lookbackDaysUsed: 0,
-      alreadyHitInCurrentWindow: false,
-      hitsSoFar: 0,
-      expectedRoundIdFrom: null,
-      expectedRoundIdTo: null,
-      expectedRoundIdLabel: '-',
-      expectedRoundIdBasis: '',
-      fallbackPeakFrom: null,
-      fallbackPeakTo: null,
-      fallbackPeakMedian: null,
-      fallbackPeakLabel: '-',
-      fallbackRoundIdFrom: null,
-      fallbackRoundIdTo: null,
-      fallbackRoundIdLabel: '-',
-      fallbackRoundIdBasis: '',
-      summary: 'No rounds are stored yet, so there is no timing prediction.',
-      reasons: [],
+      averageSimilarityPct: 0,
+      roundsComputed: {
+        currentInputRounds: 0,
+        matchedSetupRounds: 0,
+        matchedNextRounds: 0,
+        avgSetupRoundsPerMatch: 0,
+        avgNextRoundsPerMatch: 0,
+        totalComparedRounds: 0,
+      },
+      examples: [],
     },
-    comparison: {
-      band: 'skip',
-      label: 'SKIP',
-      message: 'No rounds are stored yet, so timing analytics cannot be computed.',
-    },
-    targetCards: [],
-    decision: null,
-    targetReadiness: [],
-    recommendationStability: null,
-    bestWindowsToday: { items: [], slotMode: 'window', slotMinutes: chooseSlotMinutes(windowConfig.ms), note: '' },
-    patternMatch: { available: false, examples: [], reason: 'No rounds are stored yet.', inputSlotLabel: '-', currentSlotLabel: '-' },
-    cooldowns: [],
-    backtest: null,
-    hourlyHistory: { timeZone, rows: [], bestHours: [] },
-    dayHourHeatmap: {
-      focusTarget,
-      focusTargetLabel: labelForTarget(focusTarget),
-      days: WEEKDAYS,
-      hours: Array.from({ length: 24 }, (_, hour) => ({ value: hour, label: formatHourLabel(hour) })),
-      cells: [],
-      strongest: [],
-      weakest: [],
-    },
-    outlook: null,
   };
 }
 
 function buildTimingAnalyticsReport(rounds, options = {}) {
   const windowKey = normalizeTimingWindowKey(options.windowKey);
-  const focusTarget = normalizeTimingTarget(options.focusTarget);
   const timeZone = normalizeTimingTimeZone(options.timeZone);
-  const includeOutlook = Boolean(options.includeOutlook);
   const windowConfig = WINDOW_MAP.get(windowKey);
   const normalizedRounds = normalizeRounds(rounds);
 
   if (!normalizedRounds.length) {
-    return buildEmptyReport(windowConfig, focusTarget, timeZone);
+    return buildEmptyReport(windowConfig, timeZone);
   }
 
   const latestRound = normalizedRounds[normalizedRounds.length - 1];
   const earliestRound = normalizedRounds[0];
-  const slotMinutes = chooseSlotMinutes(windowConfig.ms);
-  const slotWindows = buildSlotWindows(normalizedRounds, slotMinutes, timeZone, focusTarget);
-  const slotAnalytics = buildSlotAnalytics(slotWindows, slotMinutes, windowConfig.ms, focusTarget, latestRound.timestamp, timeZone);
-  const currentParts = buildZonedPartsGetter(timeZone)(latestRound.timestamp);
-  const currentKey = `${currentParts.dateKey}|${slotAnalytics.currentSlotIndex}`;
-  const orderedSlotWindows = [...slotWindows].sort((a, b) => {
-    if (a.dateKey !== b.dateKey) return a.dateKey.localeCompare(b.dateKey);
-    return a.slotIndex - b.slotIndex;
-  });
-  const slotIndexByKey = new Map(orderedSlotWindows.map((window, index) => [window.key, index]));
-  const currentSlotPosition = slotIndexByKey.get(currentKey);
-  const currentSlotWindow = Number.isInteger(currentSlotPosition)
-    ? orderedSlotWindows[currentSlotPosition]
-    : (orderedSlotWindows[orderedSlotWindows.length - 1] || null);
-  const previousSlotWindow = Number.isInteger(currentSlotPosition) && currentSlotPosition > 0
-    ? orderedSlotWindows[currentSlotPosition - 1]
-    : null;
-  const currentSummary = currentSlotWindow ? currentSlotWindow.summary : summarizeRounds([], focusTarget);
-  const previousSummary = previousSlotWindow ? previousSlotWindow.summary : summarizeRounds([], focusTarget);
+  const rangeReport = buildRangePatternReport(normalizedRounds, windowConfig, timeZone);
 
-  const fixedWindows = segmentRoundsByWindow(normalizedRounds, windowConfig.ms, focusTarget);
-  const completedWindows = fixedWindows.slice(0, -1);
-  const completedSlotWindows = slotWindows.filter((window) => window.key !== currentKey);
-  const baselineStats = completedSlotWindows.length
-    ? summarizeWindowCollection(completedSlotWindows, focusTarget)
-    : summarizeWindowCollection(slotWindows, focusTarget);
+  if (!rangeReport.available) {
+    const empty = buildEmptyReport(windowConfig, timeZone);
+    return {
+      ...empty,
+      generatedAt: Date.now(),
+      latestRoundId: latestRound.roundId || null,
+      totalRounds: normalizedRounds.length,
+      dataset: {
+        totalRounds: normalizedRounds.length,
+        startTimestamp: earliestRound.timestamp,
+        endTimestamp: latestRound.timestamp,
+        spanDays: ratio(latestRound.timestamp - earliestRound.timestamp, DAY_MS),
+      },
+      patternMatches: {
+        ...empty.patternMatches,
+        note: rangeReport.reason || empty.patternMatches.note,
+      },
+      prediction: {
+        ...empty.prediction,
+        summary: rangeReport.reason || empty.prediction.summary,
+      },
+    };
+  }
 
-  const bestWindowsToday = buildBestWindowsToday(slotAnalytics, focusTarget);
-  const lastHits = buildLastHitMap(normalizedRounds);
-  const cooldowns = buildCooldownReport(normalizedRounds, baselineStats.perRoundHitRates, latestRound.timestamp, lastHits);
-  const targetReadiness = buildTargetReadiness(currentSummary, baselineStats, slotAnalytics, cooldowns, latestRound.timestamp);
-  const decision = buildDecision({
-    focusTarget,
-    windowLabel: windowConfig.label,
-    currentSummary,
-    baselineStats,
-    slotAnalytics,
-    cooldowns,
-    readiness: targetReadiness,
-  });
-  const recommendationStability = buildStability(completedWindows, baselineStats, slotAnalytics, timeZone, focusTarget);
-  const hourlyHistory = buildHourlyHistory(normalizedRounds, timeZone, baselineStats.perRoundHitRates);
-  const dayHourHeatmap = buildHeatmap(normalizedRounds, timeZone, focusTarget, baselineStats.perRoundHitRates);
-  const backtest = buildBacktest(slotWindows, slotAnalytics, focusTarget);
-  const comparison = buildComparison(decision, focusTarget, currentSummary, baselineStats, bestWindowsToday);
-  const targetCards = buildTargetCards(currentSummary, baselineStats);
-  const patternMatch = buildPatternMatchReport(
-    slotWindows,
-    previousSummary,
-    currentSummary,
-    baselineStats,
-    focusTarget,
-    latestRound.timestamp,
-    timeZone,
-    slotAnalytics
-  );
-  const patternPrediction = buildPatternPrediction({
-    focusTarget,
-    windowLabel: windowConfig.label,
-    latestRoundId: latestRound.roundId || null,
-    currentSummary,
-    baselineStats,
-    slotAnalytics,
-    patternMatch,
-  });
-  const outlook = includeOutlook ? buildOutlook(completedWindows, currentSummary, baselineStats, focusTarget) : null;
+  const currentInput = rangeReport.currentInput;
 
   return {
     ok: true,
     generatedAt: Date.now(),
     latestRoundId: latestRound.roundId || null,
     totalRounds: normalizedRounds.length,
-    focusTarget,
-    focusTargetLabel: labelForTarget(focusTarget),
     availableWindows: WINDOW_OPTIONS.map(({ key, label }) => ({ key, label })),
-    availableTargets: TARGETS.map((value) => ({ value, label: labelForTarget(value) })),
     timeZone,
     dataset: {
       totalRounds: normalizedRounds.length,
@@ -2279,25 +2480,37 @@ function buildTimingAnalyticsReport(rounds, options = {}) {
       key: windowConfig.key,
       label: windowConfig.label,
       ms: windowConfig.ms,
-      startTimestamp: currentSlotWindow?.firstTimestamp || (latestRound.timestamp - windowConfig.ms),
-      endTimestamp: latestRound.timestamp,
+      inputLabel: currentInput.label,
+      inputDatedLabel: currentInput.datedLabel,
+      predictionLabel: rangeReport.nextWindowLabel,
+      predictionDatedLabel: rangeReport.nextWindowDatedLabel,
+      inputStartTimestamp: currentInput.startTimestamp,
+      inputEndTimestamp: currentInput.endTimestamp,
+      predictionStartTimestamp: currentInput.endTimestamp,
+      predictionEndTimestamp: currentInput.endTimestamp + windowConfig.ms,
     },
-    baseline: baselineStats,
-    previousWindow: previousSummary,
-    currentWindow: currentSummary,
-    patternPrediction,
-    comparison,
-    targetCards,
-    decision,
-    targetReadiness,
-    recommendationStability,
-    bestWindowsToday,
-    patternMatch,
-    cooldowns,
-    backtest,
-    hourlyHistory,
-    dayHourHeatmap,
-    outlook,
+    currentPattern: {
+      label: currentInput.label,
+      roundCount: currentInput.summary.roundCount,
+      roundFromId: currentInput.summary.roundFromId,
+      roundToId: currentInput.summary.roundToId,
+      avgMultiplier: currentInput.summary.avgMultiplier,
+      medianMultiplier: currentInput.summary.medianMultiplier,
+      p90Multiplier: currentInput.summary.p90Multiplier,
+      maxMultiplier: currentInput.summary.maxMultiplier,
+      rounds: serializePatternRounds(currentInput.rounds),
+    },
+    prediction: rangeReport.prediction,
+    patternMatches: {
+      available: true,
+      note: rangeReport.note,
+      candidateCount: rangeReport.candidateCount,
+      usedMatches: rangeReport.usedMatches,
+      lookbackDaysUsed: rangeReport.lookbackDaysUsed,
+      averageSimilarityPct: rangeReport.averageSimilarityPct,
+      roundsComputed: rangeReport.roundsComputed,
+      examples: rangeReport.examples,
+    },
   };
 }
 
