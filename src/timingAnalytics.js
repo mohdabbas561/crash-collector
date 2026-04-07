@@ -137,6 +137,12 @@ function formatThresholdLabel(value) {
   return `${numeric.toFixed(2)}x+`;
 }
 
+function formatPercent(value, digits = 1) {
+  const numeric = safeNumber(value, null);
+  if (numeric == null) return '-';
+  return `${numeric.toFixed(digits)}%`;
+}
+
 function formatRoundRange(fromRoundId, toRoundId) {
   if (!fromRoundId && !toRoundId) return '-';
   if (!toRoundId || fromRoundId === toRoundId) return `#${fromRoundId}`;
