@@ -734,9 +734,14 @@ async function computeOraclePredictionPayload() {
       );
 
       if (hit) {
+        const outcome =
+          hit.id < existing.windowLo ? 'early' :
+          hit.id <= existing.windowHi ? 'win' :
+          'loss';
         resolvedRowsToPersist.push({
           target: target.label,
           minMult: target.minVal,
+          outcome,
           lo: existing.windowLo,
           hi: existing.windowHi,
           hitRound: hit.id,
@@ -749,6 +754,7 @@ async function computeOraclePredictionPayload() {
         resolvedRowsToPersist.push({
           target: target.label,
           minMult: target.minVal,
+          outcome: 'loss',
           lo: existing.windowLo,
           hi: existing.windowHi,
           hitRound: null,
