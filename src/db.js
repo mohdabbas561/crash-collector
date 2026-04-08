@@ -166,6 +166,34 @@ async function initDB() {
        OR
        (hit_round IS NOT NULL AND hit_round > window_hi AND outcome <> 'loss')
   `).catch(() => {});
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS oracle_active_locks (
+      target          VARCHAR(10) PRIMARY KEY,
+      min_mult        NUMERIC(12,4) NOT NULL,
+      color           VARCHAR(20) NOT NULL,
+      predicted_round BIGINT NOT NULL,
+      window_lo       BIGINT NOT NULL,
+      window_hi       BIGINT NOT NULL,
+      window_size     INT NOT NULL,
+      snap_at         BIGINT NOT NULL,
+      last_hit_id     BIGINT NOT NULL,
+      confidence      NUMERIC(8,4),
+      pred_basis      TEXT,
+      pred_method     VARCHAR(30),
+      med             INT,
+      iqr             INT,
+      cluster_center  INT,
+      drought_at_snap INT,
+      created_at      TIMESTAMPTZ DEFAULT NOW(),
+      updated_at      TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_oracle_active_locks_window_hi
+      ON oracle_active_locks(window_hi DESC)
+  `).catch(() => {});
 }
 
 async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation, source = 'engine', probW = null }) {
@@ -252,6 +280,84 @@ async function getPredictions({ limit = 500, target = null, source = null } = {}
       ts:         new Date(r.created_at).getTime(),
     };
   });
+}
+
+async function getOracleLocks() {
+  const res = await pool.query(`
+    SELECT
+      target, min_mult, color, predicted_round, window_lo, window_hi, window_size,
+      snap_at, last_hit_id, confidence, pred_basis, pred_method, med, iqr,
+      cluster_center, drought_at_snap, created_at, updated_at
+    FROM oracle_active_locks
+    ORDER BY min_mult ASC, target ASC
+  `);
+  return res.rows.map((row) => ({
+    label: row.target,
+    minVal: parseFloat(row.min_mult),
+    color: row.color,
+    predictedRound: Number(row.predicted_round),
+    windowLo: Number(row.window_lo),
+    windowHi: Number(row.window_hi),
+    windowSize: Number(row.window_size),
+    snapAt: Number(row.snap_at),
+    lastHitId: Number(row.last_hit_id),
+    confidence: row.confidence != null ? Number(row.confidence) : null,
+    predBasis: row.pred_basis || '',
+    predMethod: row.pred_method || '',
+    med: row.med != null ? Number(row.med) : null,
+    iqr: row.iqr != null ? Number(row.iqr) : null,
+    clusterCenter: row.cluster_center != null ? Number(row.cluster_center) : null,
+    droughtAtSnap: row.drought_at_snap != null ? Number(row.drought_at_snap) : null,
+    createdAt: row.created_at ? new Date(row.created_at).toISOString() : null,
+    updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : null,
+    pending: true,
+  }));
+}
+
+async function replaceOracleLocks(locks = []) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('TRUNCATE TABLE oracle_active_locks');
+    for (const lock of locks) {
+      await client.query(
+        `INSERT INTO oracle_active_locks (
+          target, min_mult, color, predicted_round, window_lo, window_hi,
+          window_size, snap_at, last_hit_id, confidence, pred_basis, pred_method,
+          med, iqr, cluster_center, drought_at_snap, updated_at
+        ) VALUES (
+          $1,$2,$3,$4,$5,$6,
+          $7,$8,$9,$10,$11,$12,
+          $13,$14,$15,$16,NOW()
+        )`,
+        [
+          lock.label,
+          lock.minVal,
+          lock.color,
+          lock.predictedRound,
+          lock.windowLo,
+          lock.windowHi,
+          lock.windowSize,
+          lock.snapAt,
+          lock.lastHitId,
+          lock.confidence ?? null,
+          lock.predBasis || '',
+          lock.predMethod || '',
+          lock.med ?? null,
+          lock.iqr ?? null,
+          lock.clusterCenter ?? null,
+          lock.droughtAtSnap ?? null,
+        ]
+      );
+    }
+    await client.query('COMMIT');
+    return { activeLocksSaved: locks.length };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 const ROUND_BATCH_CHUNK = 1000; // 3 params per row → 3000 params max per chunk
@@ -454,15 +560,17 @@ async function clearAllLocks() {
       SELECT
         (SELECT COUNT(*)::BIGINT FROM locked_preds_consensus) AS consensus_total,
         (SELECT COUNT(*)::BIGINT FROM locked_preds_adv) AS adv_total,
-        (SELECT COUNT(*)::BIGINT FROM locked_preds) AS engine_total
+        (SELECT COUNT(*)::BIGINT FROM locked_preds) AS engine_total,
+        (SELECT COUNT(*)::BIGINT FROM oracle_active_locks) AS oracle_total
     `);
-    await client.query(`TRUNCATE TABLE locked_preds_consensus, locked_preds_adv, locked_preds`);
+    await client.query(`TRUNCATE TABLE locked_preds_consensus, locked_preds_adv, locked_preds, oracle_active_locks`);
     await client.query('COMMIT');
     const row = countRes.rows?.[0] || {};
     return {
       consensusLocksCleared: Number(row.consensus_total || 0),
       advLocksCleared: Number(row.adv_total || 0),
       engineLocksCleared: Number(row.engine_total || 0),
+      oracleLocksCleared: Number(row.oracle_total || 0),
     };
   } catch (e) {
     await client.query('ROLLBACK');
@@ -747,6 +855,7 @@ module.exports = {
   saveLockedPreds, getLockedPreds,
   saveLockedAdvPreds, getLockedAdvPreds,
   saveLockedConsensusPreds, getLockedConsensusPreds,
+  getOracleLocks, replaceOracleLocks,
   initWalletStorage, saveWallet, getWallets, getWalletByPubkey, deleteWallet,
   savePrediction, getPredictions, clearPredictions, clearAllLocks,
   initAccessCodes, createAccessCode, getAccessCode,

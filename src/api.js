@@ -3,6 +3,7 @@ const express    = require('express');
 const cors       = require('cors');
 const { buildPredictionReport } = require('./predictionEngine');
 const { computeLockedRangePredictions } = require('./lockedRangeEngine');
+const { ORACLE_TARGETS, normalizeRounds, computeOracleForecast, makeOracleLock } = require('./oracleEngine');
 const {
   buildTimingAnalyticsReport,
   normalizeTimingWindowKey,
@@ -13,6 +14,7 @@ const {
   getLatestRoundId, getRoundCount,
   getRounds, getStats, getStorageStats,
   getPredictions, savePrediction, clearPredictions, clearAllLocks,
+  getOracleLocks, replaceOracleLocks,
   getLockedConsensusPreds, saveLockedConsensusPreds,
   initAccessCodes, createAccessCode, getAccessCode,
   updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,
@@ -291,6 +293,11 @@ const lockedCache = {
   createdAt: 0,
   basePayload: null,
 };
+const oraclePredictCache = {
+  asOfRound: null,
+  createdAt: 0,
+  payload: null,
+};
 const dashboardCache = {
   asOfRound: null,
   recentLimit: null,
@@ -368,6 +375,9 @@ function invalidatePredictionCaches() {
   lockedCache.createdAt = 0;
   lockedCache.basePayload = null;
   lockedComputeInFlight = null;
+  oraclePredictCache.asOfRound = null;
+  oraclePredictCache.createdAt = 0;
+  oraclePredictCache.payload = null;
   dashboardCache.asOfRound = null;
   dashboardCache.recentLimit = null;
   dashboardCache.createdAt = 0;
@@ -668,6 +678,143 @@ async function refreshLockedPredictionInBackground() {
   }
 }
 
+function summarizeOracleHistoryByTarget(historyRows) {
+  const summary = {};
+  for (const target of ORACLE_TARGETS) {
+    summary[target.label] = {
+      wins: 0,
+      early: 0,
+      failed: 0,
+      total: 0,
+      winRate: null,
+    };
+  }
+  for (const row of historyRows || []) {
+    if (!summary[row.target]) continue;
+    summary[row.target].total += 1;
+    if (row.outcome === 'win') summary[row.target].wins += 1;
+    else if (row.outcome === 'early') summary[row.target].early += 1;
+    else summary[row.target].failed += 1;
+  }
+  for (const key of Object.keys(summary)) {
+    const item = summary[key];
+    item.winRate = item.total > 0 ? Math.round((item.wins / item.total) * 100) : null;
+  }
+  return summary;
+}
+
+async function computeOraclePredictionPayload() {
+  const latestRound = await getLatestRoundId();
+  const totalRounds = latestRound == null ? 0 : await getRoundCount();
+  const rawRounds = totalRounds > 0 ? await getRounds({ limit: totalRounds, order: 'ASC' }) : [];
+  const rounds = normalizeRounds(rawRounds);
+  const nowId = rounds.length ? rounds[rounds.length - 1].id : 0;
+
+  const [existingLocks, historyRows] = await Promise.all([
+    getOracleLocks(),
+    getPredictions({ limit: 500, source: 'oracle_v22' }),
+  ]);
+
+  const existingLockMap = new Map(existingLocks.map((lock) => [lock.label, lock]));
+  const resolvedRowsToPersist = [];
+  const nextLocks = [];
+  const forecasts = [];
+
+  for (const target of ORACLE_TARGETS) {
+    const forecast = computeOracleForecast(rounds, target);
+    if (!forecast) continue;
+    forecasts.push(forecast);
+
+    const existing = existingLockMap.get(target.label);
+    let resolvedExisting = false;
+
+    if (existing?.lastHitId != null) {
+      const hit = rounds.find(
+        (round) => round.id > existing.lastHitId && round.val >= target.minVal
+      );
+
+      if (hit) {
+        resolvedRowsToPersist.push({
+          target: target.label,
+          minMult: target.minVal,
+          lo: existing.windowLo,
+          hi: existing.windowHi,
+          hitRound: hit.id,
+          generation: 1,
+          source: 'oracle_v22',
+          probW: existing.confidence != null ? Number(existing.confidence) / 100 : null,
+        });
+        resolvedExisting = true;
+      } else if (nowId > existing.windowHi) {
+        resolvedRowsToPersist.push({
+          target: target.label,
+          minMult: target.minVal,
+          lo: existing.windowLo,
+          hi: existing.windowHi,
+          hitRound: null,
+          generation: 1,
+          source: 'oracle_v22',
+          probW: existing.confidence != null ? Number(existing.confidence) / 100 : null,
+        });
+        resolvedExisting = true;
+      }
+    }
+
+    if (!forecast.noData) {
+      if (!existing || resolvedExisting || forecast.lastHit.id > (existing.lastHitId || -1)) {
+        nextLocks.push(makeOracleLock(forecast, nowId));
+      } else if (existing) {
+        nextLocks.push(existing);
+      }
+    }
+  }
+
+  if (resolvedRowsToPersist.length) {
+    await Promise.all(resolvedRowsToPersist.map((row) => savePrediction(row)));
+  }
+
+  await replaceOracleLocks(nextLocks);
+
+  const persistedHistory = await getPredictions({ limit: 500, source: 'oracle_v22' });
+  const history = persistedHistory.map((row) => ({
+    ...row,
+    result: row.outcome === 'win' ? 'WIN' : row.outcome === 'early' ? 'EARLY' : 'FAILED',
+  }));
+
+  const activeLockMap = new Map(nextLocks.map((lock) => [lock.label, lock]));
+  const targets = forecasts.map((forecast) => {
+    const activeLock = activeLockMap.get(forecast.label);
+    const windowLo = activeLock?.windowLo ?? forecast.windowLo;
+    const windowHi = activeLock?.windowHi ?? forecast.windowHi;
+    const predictedRound = activeLock?.predictedRound ?? forecast.predictedRound;
+    const roundsUntilWindowLo = Math.max(0, windowLo - nowId);
+    const roundsUntilWindowHi = Math.max(0, windowHi - nowId);
+    const inWindow = nowId >= windowLo && nowId <= windowHi;
+    return {
+      ...forecast,
+      activeLock: activeLock || null,
+      windowLo,
+      windowHi,
+      predictedRound,
+      roundsUntilWindowLo,
+      roundsUntilWindowHi,
+      inWindow,
+    };
+  });
+
+  return {
+    ok: true,
+    generatedAt: new Date().toISOString(),
+    asOfRound: nowId || null,
+    roundsLoaded: rounds.length,
+    activeLockCount: nextLocks.length,
+    inWindowCount: targets.filter((target) => target.inWindow).length,
+    targets,
+    history,
+    historyByTarget: summarizeOracleHistoryByTarget(persistedHistory),
+  };
+}
+
 app.get('/rounds', requireDatabase, rateLimit(60), async (req, res) => {
   try {
     const limit      = await parseRoundsLimit(req.query.limit);
@@ -681,6 +828,34 @@ app.get('/rounds', requireDatabase, rateLimit(60), async (req, res) => {
     if (isLikelyDbError(e)) setDatabaseAvailability(false, e.message);
     console.error('[rounds] error:', e.message);
     res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+app.get('/predict/oracle', requireDatabase, rateLimit(20), async (req, res) => {
+  try {
+    const latestRound = await getLatestRoundId();
+    markDbHealthy();
+
+    const sameRoundFresh = (
+      oraclePredictCache.payload &&
+      oraclePredictCache.asOfRound != null &&
+      latestRound != null &&
+      oraclePredictCache.asOfRound === latestRound
+    );
+
+    if (sameRoundFresh) {
+      return res.json(oraclePredictCache.payload);
+    }
+
+    const payload = await computeOraclePredictionPayload();
+    oraclePredictCache.asOfRound = payload.asOfRound ?? latestRound ?? null;
+    oraclePredictCache.createdAt = Date.now();
+    oraclePredictCache.payload = payload;
+    res.json(payload);
+  } catch (e) {
+    if (isLikelyDbError(e)) setDatabaseAvailability(false, e.message);
+    console.error('[predict/oracle] error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
