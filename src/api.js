@@ -710,11 +710,7 @@ async function computeOraclePredictionPayload() {
   const rounds = normalizeRounds(rawRounds);
   const nowId = rounds.length ? rounds[rounds.length - 1].id : 0;
 
-  const [existingLocks, historyRows] = await Promise.all([
-    getOracleLocks(),
-    getPredictions({ limit: 500, source: 'oracle_v22' }),
-  ]);
-
+  const existingLocks = await getOracleLocks();
   const existingLockMap = new Map(existingLocks.map((lock) => [lock.label, lock]));
   const resolvedRowsToPersist = [];
   const nextLocks = [];
@@ -776,7 +772,20 @@ async function computeOraclePredictionPayload() {
   }
 
   if (resolvedRowsToPersist.length) {
-    await Promise.all(resolvedRowsToPersist.map((row) => savePrediction(row)));
+    const results = await Promise.allSettled(resolvedRowsToPersist.map((row) => savePrediction(row)));
+    const failures = results
+      .map((result, index) => ({ result, row: resolvedRowsToPersist[index] }))
+      .filter(({ result }) => result.status === 'rejected');
+    if (failures.length) {
+      for (const failure of failures.slice(0, 5)) {
+        console.error(
+          '[predict/oracle] savePrediction failed:',
+          `target=${failure.row?.target} lo=${failure.row?.lo} hi=${failure.row?.hi}`,
+          String(failure.result.reason?.message || failure.result.reason || 'unknown')
+        );
+      }
+      console.error(`[predict/oracle] savePrediction failures: ${failures.length}/${results.length}`);
+    }
   }
 
   await replaceOracleLocks(nextLocks);

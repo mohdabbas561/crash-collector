@@ -87,17 +87,21 @@ function kmProb(kmTable, roundsSince, roundsAhead) {
 }
 
 function normalizeRounds(rounds) {
-  return (rounds || [])
-    .map((round) => ({
-      id: Number(round.roundId ?? round.id),
-      val: Number.parseFloat(round.multiplier ?? round.val),
-    }))
-    .filter((round) => Number.isFinite(round.id) && Number.isFinite(round.val) && round.val > 0)
-    .sort((a, b) => a.id - b.id);
+  const mapped = new Map();
+  for (const round of rounds || []) {
+    const id = Number(round?.roundId ?? round?.id);
+    const val = Number.parseFloat(round?.multiplier ?? round?.val);
+    if (!Number.isFinite(id) || !Number.isFinite(val) || val <= 0) continue;
+    mapped.set(id, { id, val });
+  }
+  return [...mapped.values()].sort((a, b) => a.id - b.id);
 }
 
 function computeOracleForecast(rounds, target) {
-  const normalizedRounds = normalizeRounds(rounds);
+  const normalizedRounds = Array.isArray(rounds)
+    && rounds.every((round) => Number.isFinite(round?.id) && Number.isFinite(round?.val))
+      ? rounds
+      : normalizeRounds(rounds);
   const { minVal, scanN, window: winSize, minHits } = target;
   if (!normalizedRounds.length) return null;
 
@@ -212,26 +216,37 @@ function computeOracleForecast(rounds, target) {
   const winGapHi = winGapLo + winSize - 1;
   const hitsInWindow = allGapsSorted.filter((gap) => gap >= winGapLo && gap <= winGapHi).length;
   const baseConf = n > 0 ? Math.round((hitsInWindow / n) * 100) : 0;
+  const recentHitsInWindow = recentSorted.filter((gap) => gap >= winGapLo && gap <= winGapHi).length;
+  const recentWindowHitRate = recentSorted.length > 0
+    ? Math.round((recentHitsInWindow / recentSorted.length) * 100)
+    : baseConf;
+  const blendedBaseConf = Math.round((baseConf * 0.65) + (recentWindowHitRate * 0.35));
   const inWindow = nowId >= windowLo && nowId <= windowHi;
   const proximityBonus = inWindow ? 15 : roundsUntilWindowLo <= 5 ? 10 : roundsUntilWindowLo <= 15 ? 5 : 0;
   const confPenalty = (isExtreme ? 35 : 0)
     + (isHardGap ? 18 : 0)
     + (isOverdue && !isHardGap ? 6 : 0)
     + (regimeDrift > 0.4 ? 8 : 0);
-  const confidence = Math.max(4, Math.min(92, baseConf - confPenalty + proximityBonus));
+  const confidence = Math.max(4, Math.min(92, blendedBaseConf - confPenalty + proximityBonus));
 
+  const nearWindowRounds = Math.max(1, Math.min(20, Math.max(winSize, Math.round(med * 0.35))));
+  const verySoonThreshold = Math.max(2, Math.ceil(winSize * 0.5));
+  const soonThreshold = Math.max(5, Math.ceil(winSize * 1.5));
+  const warmThreshold = Math.max(10, Math.ceil(winSize * 3));
+  const farThreshold = Math.max(20, Math.ceil(winSize * 6));
   const windowProximityBonus = inWindow
     ? 55
-    : roundsUntilWindowLo <= 5
+    : roundsUntilWindowLo <= verySoonThreshold
       ? 40
-      : roundsUntilWindowLo <= 15
+      : roundsUntilWindowLo <= soonThreshold
         ? 28
-        : roundsUntilWindowLo <= 30
+        : roundsUntilWindowLo <= warmThreshold
           ? 16
-          : roundsUntilWindowLo <= 60
+          : roundsUntilWindowLo <= farThreshold
             ? 8
             : 0;
-  const kmBase = Math.max(pHit10, pHitWindow > 0 ? pHitWindow : 0);
+  const pHitNearWindow = kmProb(kmTable, roundsSince, nearWindowRounds);
+  const kmBase = Math.max(pHitNearWindow, pHitWindow > 0 ? pHitWindow : 0);
   const chaseRaw = Math.min(100, Math.max(0, Math.round(
     (kmBase * 1)
     + windowProximityBonus
@@ -302,6 +317,10 @@ function computeOracleForecast(rounds, target) {
     pHit10,
     pHit20,
     pHitWindow,
+    pHitNearWindow,
+    nearWindowRounds,
+    baseWindowHitRate: baseConf,
+    recentWindowHitRate,
     roundsUntilWindowLo,
     roundsUntilWindowHi,
     inWindow,
