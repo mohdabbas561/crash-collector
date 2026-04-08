@@ -5,11 +5,6 @@ const { buildPredictionReport } = require('./predictionEngine');
 const { computeLockedRangePredictions } = require('./lockedRangeEngine');
 const { ORACLE_TARGETS, normalizeRounds, computeOracleForecast, makeOracleLock } = require('./oracleEngine');
 const {
-  buildTimingAnalyticsReport,
-  normalizeTimingWindowKey,
-  normalizeTimingTimeZone,
-} = require('./timingAnalytics');
-const {
   pool,
   getLatestRoundId, getRoundCount,
   getRounds, getStats, getStorageStats,
@@ -304,10 +299,9 @@ const dashboardCache = {
   createdAt: 0,
   payload: null,
 };
-const timingAnalyticsCache = new Map();
-const timingAnalyticsInFlight = new Map();
 let predictComputeInFlight = null;
 let lockedComputeInFlight = null;
+let oraclePredictInFlight = null;
 let lockedBackgroundTimer = null;
 let dbState = {
   available: true,
@@ -703,6 +697,15 @@ function summarizeOracleHistoryByTarget(historyRows) {
   return summary;
 }
 
+function getNextOracleGeneration(existingLock, forecast) {
+  if (!existingLock) return 1;
+  const existingGeneration = Number(existingLock.generation || 1);
+  const existingLastHitId = Number(existingLock.lastHitId || 0);
+  const forecastLastHitId = Number(forecast?.lastHit?.id || 0);
+  if (forecastLastHitId > existingLastHitId) return 1;
+  return existingGeneration + 1;
+}
+
 async function computeOraclePredictionPayload() {
   const latestRound = await getLatestRoundId();
   const totalRounds = latestRound == null ? 0 : await getRoundCount();
@@ -741,7 +744,7 @@ async function computeOraclePredictionPayload() {
           lo: existing.windowLo,
           hi: existing.windowHi,
           hitRound: hit.id,
-          generation: 1,
+          generation: existing.generation || 1,
           source: 'oracle_v22',
           probW: existing.confidence != null ? Number(existing.confidence) / 100 : null,
         });
@@ -754,7 +757,7 @@ async function computeOraclePredictionPayload() {
           lo: existing.windowLo,
           hi: existing.windowHi,
           hitRound: null,
-          generation: 1,
+          generation: existing.generation || 1,
           source: 'oracle_v22',
           probW: existing.confidence != null ? Number(existing.confidence) / 100 : null,
         });
@@ -764,7 +767,10 @@ async function computeOraclePredictionPayload() {
 
     if (!forecast.noData) {
       if (!existing || resolvedExisting || forecast.lastHit.id > (existing.lastHitId || -1)) {
-        nextLocks.push(makeOracleLock(forecast, nowId));
+        nextLocks.push({
+          ...makeOracleLock(forecast, nowId),
+          generation: getNextOracleGeneration(existing, forecast),
+        });
       } else if (existing) {
         nextLocks.push(existing);
       }
@@ -862,12 +868,32 @@ app.get('/predict/oracle', requireDatabase, rateLimit(20), async (req, res) => {
       return res.json(oraclePredictCache.payload);
     }
 
-    const payload = await computeOraclePredictionPayload();
+    const sameInFlight = (
+      oraclePredictInFlight &&
+      oraclePredictInFlight.latestRound != null &&
+      latestRound != null &&
+      oraclePredictInFlight.latestRound === latestRound
+    );
+    if (sameInFlight) {
+      const payload = await oraclePredictInFlight.promise;
+      return res.json(payload);
+    }
+
+    const promise = computeOraclePredictionPayload();
+    oraclePredictInFlight = {
+      latestRound: latestRound ?? null,
+      promise,
+    };
+    const payload = await promise;
     oraclePredictCache.asOfRound = payload.asOfRound ?? latestRound ?? null;
     oraclePredictCache.createdAt = Date.now();
     oraclePredictCache.payload = payload;
     res.json(payload);
+    if (oraclePredictInFlight?.promise === promise) {
+      oraclePredictInFlight = null;
+    }
   } catch (e) {
+    oraclePredictInFlight = null;
     if (isLikelyDbError(e)) setDatabaseAvailability(false, e.message);
     console.error('[predict/oracle] error:', e.message);
     res.status(500).json({ ok: false, error: e.message });
@@ -931,55 +957,6 @@ app.get('/dashboard', requireDatabase, rateLimit(60), async (req, res) => {
   } catch (e) {
     if (isLikelyDbError(e)) setDatabaseAvailability(false, e.message);
     console.error('[dashboard] error:', e.message);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-app.get('/analytics/timing', requireDatabase, rateLimit(20), async (req, res) => {
-  try {
-    const windowKey = normalizeTimingWindowKey(req.query.window);
-    const timeZone = normalizeTimingTimeZone(req.query.tz || req.query.timeZone);
-    const latestRound = await getLatestRoundId();
-    markDbHealthy();
-
-    const cacheRoundKey = latestRound == null ? 'empty' : String(latestRound);
-    const cacheKey = `${cacheRoundKey}|timing|${windowKey}|${timeZone}`;
-    const cached = timingAnalyticsCache.get(cacheKey);
-    if (cached && (!RESPONSE_CACHE_ENABLED || (Date.now() - cached.createdAt) < DASHBOARD_CACHE_TTL_MS)) {
-      return res.json(cached.payload);
-    }
-
-    let computePromise = timingAnalyticsInFlight.get(cacheKey);
-    if (!computePromise) {
-      computePromise = (async () => {
-        const totalRounds = latestRound == null ? 0 : await getRoundCount();
-        const rounds = totalRounds > 0 ? await getRounds({ limit: totalRounds, order: 'ASC' }) : [];
-        markDbHealthy();
-
-        const payload = buildTimingAnalyticsReport(rounds, { windowKey, timeZone });
-
-        if (!timingAnalyticsCache.has(cacheKey) && timingAnalyticsCache.size >= 80) {
-          timingAnalyticsCache.delete(timingAnalyticsCache.keys().next().value);
-        }
-        timingAnalyticsCache.set(cacheKey, {
-          createdAt: Date.now(),
-          payload,
-        });
-
-        return payload;
-      })()
-        .finally(() => {
-          timingAnalyticsInFlight.delete(cacheKey);
-        });
-
-      timingAnalyticsInFlight.set(cacheKey, computePromise);
-    }
-
-    const payload = await computePromise;
-    res.json(payload);
-  } catch (e) {
-    if (isLikelyDbError(e)) setDatabaseAvailability(false, e.message);
-    console.error('[analytics/timing] error:', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
 });

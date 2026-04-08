@@ -178,6 +178,7 @@ async function initDB() {
       window_size     INT NOT NULL,
       snap_at         BIGINT NOT NULL,
       last_hit_id     BIGINT NOT NULL,
+      generation      INT NOT NULL DEFAULT 1,
       confidence      NUMERIC(8,4),
       pred_basis      TEXT,
       pred_method     VARCHAR(30),
@@ -193,6 +194,11 @@ async function initDB() {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_oracle_active_locks_window_hi
       ON oracle_active_locks(window_hi DESC)
+  `).catch(() => {});
+
+  await pool.query(`
+    ALTER TABLE oracle_active_locks
+      ADD COLUMN IF NOT EXISTS generation INT NOT NULL DEFAULT 1
   `).catch(() => {});
 }
 
@@ -286,7 +292,7 @@ async function getOracleLocks() {
   const res = await pool.query(`
     SELECT
       target, min_mult, color, predicted_round, window_lo, window_hi, window_size,
-      snap_at, last_hit_id, confidence, pred_basis, pred_method, med, iqr,
+      snap_at, last_hit_id, generation, confidence, pred_basis, pred_method, med, iqr,
       cluster_center, drought_at_snap, created_at, updated_at
     FROM oracle_active_locks
     ORDER BY min_mult ASC, target ASC
@@ -301,6 +307,7 @@ async function getOracleLocks() {
     windowSize: Number(row.window_size),
     snapAt: Number(row.snap_at),
     lastHitId: Number(row.last_hit_id),
+    generation: Number(row.generation || 1),
     confidence: row.confidence != null ? Number(row.confidence) : null,
     predBasis: row.pred_basis || '',
     predMethod: row.pred_method || '',
@@ -323,12 +330,12 @@ async function replaceOracleLocks(locks = []) {
       await client.query(
         `INSERT INTO oracle_active_locks (
           target, min_mult, color, predicted_round, window_lo, window_hi,
-          window_size, snap_at, last_hit_id, confidence, pred_basis, pred_method,
+          window_size, snap_at, last_hit_id, generation, confidence, pred_basis, pred_method,
           med, iqr, cluster_center, drought_at_snap, updated_at
         ) VALUES (
           $1,$2,$3,$4,$5,$6,
           $7,$8,$9,$10,$11,$12,
-          $13,$14,$15,$16,NOW()
+          $13,$14,$15,$16,$17,NOW()
         )`,
         [
           lock.label,
@@ -340,6 +347,7 @@ async function replaceOracleLocks(locks = []) {
           lock.windowSize,
           lock.snapAt,
           lock.lastHitId,
+          lock.generation ?? 1,
           lock.confidence ?? null,
           lock.predBasis || '',
           lock.predMethod || '',

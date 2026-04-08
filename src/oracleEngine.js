@@ -86,6 +86,17 @@ function kmProb(kmTable, roundsSince, roundsAhead) {
   return Math.round((1 - (kmTable[to] / sFrom)) * 1000) / 10;
 }
 
+function kmIntervalProb(kmTable, roundsSince, startAhead, endAhead) {
+  const from = Math.min(roundsSince, kmTable.length - 1);
+  const start = Math.min(roundsSince + Math.max(0, startAhead), kmTable.length - 1);
+  const end = Math.min(roundsSince + Math.max(0, endAhead), kmTable.length - 1);
+  const sFrom = kmTable[from];
+  if (sFrom <= 0 || end <= start) return 0;
+  const startSurvival = kmTable[start];
+  const endSurvival = kmTable[end];
+  return Math.max(0, Math.round((1 - (endSurvival / sFrom) - (1 - (startSurvival / sFrom))) * 1000) / 10);
+}
+
 function normalizeRounds(rounds) {
   const mapped = new Map();
   for (const round of rounds || []) {
@@ -210,7 +221,7 @@ function computeOracleForecast(rounds, target) {
   const roundsUntilWindowHi = Math.max(0, windowHi - nowId);
   const pHitWindow = roundsUntilWindowHi <= 0
     ? 0
-    : kmProb(kmTable, roundsSince, roundsUntilWindowHi) - kmProb(kmTable, roundsSince, roundsUntilWindowLo);
+    : kmIntervalProb(kmTable, roundsSince, roundsUntilWindowLo, roundsUntilWindowHi);
 
   const winGapLo = predictedGap - halfWin;
   const winGapHi = winGapLo + winSize - 1;
