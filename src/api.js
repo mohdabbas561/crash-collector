@@ -680,6 +680,7 @@ function summarizeOracleHistoryByTarget(historyRows) {
       early: 0,
       failed: 0,
       total: 0,
+      counted: 0,
       winRate: null,
     };
   }
@@ -692,7 +693,8 @@ function summarizeOracleHistoryByTarget(historyRows) {
   }
   for (const key of Object.keys(summary)) {
     const item = summary[key];
-    item.winRate = item.total > 0 ? Math.round((item.wins / item.total) * 100) : null;
+    item.counted = item.wins + item.failed;
+    item.winRate = item.counted > 0 ? Math.round((item.wins / item.counted) * 100) : null;
   }
   return summary;
 }
