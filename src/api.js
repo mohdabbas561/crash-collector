@@ -304,7 +304,7 @@ const dashboardCache = {
 let predictComputeInFlight = null;
 let lockedComputeInFlight = null;
 let oraclePredictInFlight = null;
-const ORACLE_PREDICTION_SOURCE = 'oracle_v23';
+const ORACLE_PREDICTION_SOURCE = 'oracle_v24';
 let lockedBackgroundTimer = null;
 let oracleBackgroundTimer = null;
 let dbState = {
@@ -834,16 +834,18 @@ function replayOracleTargetState({ rounds, nowId, target, existingLock, forecast
       nextForecast = advanceOracleForecastPastExistingWindow(activeLock, nextForecast);
     }
 
-    const nextLock = {
-      ...makeOracleLock(nextForecast, replayCutoffId),
-      generation: getNextOracleGeneration(activeLock, nextForecast),
-    };
+    const nextLock = nextForecast.issuePrediction
+      ? {
+          ...makeOracleLock(nextForecast, replayCutoffId),
+          generation: getNextOracleGeneration(activeLock, nextForecast),
+        }
+      : null;
 
     forecast = computeOracleForecast(rounds, target, forecastOptions) || nextForecast;
     activeLock = nextLock;
   }
 
-  if (!activeLock && forecast && !forecast.noData) {
+  if (!activeLock && forecast && !forecast.noData && forecast.issuePrediction) {
     activeLock = {
       ...makeOracleLock(forecast, nowId),
       generation: 1,
@@ -851,10 +853,12 @@ function replayOracleTargetState({ rounds, nowId, target, existingLock, forecast
   } else if (activeLock && forecast && !forecast.noData) {
     const sameHitChain = Number(activeLock.lastHitId || 0) === Number(forecast?.lastHit?.id || 0);
     if (!sameHitChain && Number(forecast?.lastHit?.id || 0) > 0) {
-      activeLock = {
-        ...makeOracleLock(forecast, nowId),
-        generation: 1,
-      };
+      activeLock = forecast.issuePrediction
+        ? {
+            ...makeOracleLock(forecast, nowId),
+            generation: 1,
+          }
+        : null;
     }
   }
 
@@ -884,6 +888,9 @@ function buildOracleTargetPayload(forecast, activeLock, nowId) {
     med: activeLock?.med ?? forecast.med,
     iqr: activeLock?.iqr ?? forecast.iqr,
     clusterCenter: activeLock?.clusterCenter ?? forecast.clusterCenter,
+    activePrediction: Boolean(activeLock),
+    issuePrediction: Boolean(activeLock || forecast.issuePrediction),
+    avoidReason: activeLock ? null : (forecast.avoidReason || null),
   };
 }
 
@@ -901,7 +908,7 @@ async function computeOraclePredictionPayload() {
     calibrationByTarget.get(key).push(row);
   }
 
-  const existingLocks = await getOracleLocks();
+  const existingLocks = await getOracleLocks(ORACLE_PREDICTION_SOURCE);
   const existingLockMap = new Map(existingLocks.map((lock) => [lock.label, lock]));
   const resolvedRowsToPersist = [];
   const nextLocks = [];
@@ -943,7 +950,7 @@ async function computeOraclePredictionPayload() {
     }
   }
 
-  await replaceOracleLocks(nextLocks);
+  await replaceOracleLocks(nextLocks, ORACLE_PREDICTION_SOURCE);
 
   const persistedHistory = await getPredictions({ limit: 500, source: ORACLE_PREDICTION_SOURCE });
   const history = persistedHistory.map((row) => ({

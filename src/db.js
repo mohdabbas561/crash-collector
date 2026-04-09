@@ -170,6 +170,7 @@ async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS oracle_active_locks (
       target          VARCHAR(10) PRIMARY KEY,
+      source          VARCHAR(20) NOT NULL DEFAULT 'oracle_v24',
       min_mult        NUMERIC(12,4) NOT NULL,
       color           VARCHAR(20) NOT NULL,
       predicted_round BIGINT NOT NULL,
@@ -199,6 +200,11 @@ async function initDB() {
   await pool.query(`
     ALTER TABLE oracle_active_locks
       ADD COLUMN IF NOT EXISTS generation INT NOT NULL DEFAULT 1
+  `).catch(() => {});
+
+  await pool.query(`
+    ALTER TABLE oracle_active_locks
+      ADD COLUMN IF NOT EXISTS source VARCHAR(20) NOT NULL DEFAULT 'oracle_v24'
   `).catch(() => {});
 }
 
@@ -288,17 +294,25 @@ async function getPredictions({ limit = 500, target = null, source = null } = {}
   });
 }
 
-async function getOracleLocks() {
+async function getOracleLocks(source = null) {
+  const params = [];
+  let where = '';
+  if (source) {
+    params.push(source);
+    where = 'WHERE source = $1';
+  }
   const res = await pool.query(`
     SELECT
-      target, min_mult, color, predicted_round, window_lo, window_hi, window_size,
+      target, source, min_mult, color, predicted_round, window_lo, window_hi, window_size,
       snap_at, last_hit_id, generation, confidence, pred_basis, pred_method, med, iqr,
       cluster_center, drought_at_snap, created_at, updated_at
     FROM oracle_active_locks
+    ${where}
     ORDER BY min_mult ASC, target ASC
-  `);
+  `, params);
   return res.rows.map((row) => ({
     label: row.target,
+    source: row.source || 'oracle_v24',
     minVal: parseFloat(row.min_mult),
     color: row.color,
     predictedRound: Number(row.predicted_round),
@@ -321,24 +335,25 @@ async function getOracleLocks() {
   }));
 }
 
-async function replaceOracleLocks(locks = []) {
+async function replaceOracleLocks(locks = [], source = 'oracle_v24') {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query('TRUNCATE TABLE oracle_active_locks');
+    await client.query('DELETE FROM oracle_active_locks');
     for (const lock of locks) {
       await client.query(
         `INSERT INTO oracle_active_locks (
-          target, min_mult, color, predicted_round, window_lo, window_hi,
+          target, source, min_mult, color, predicted_round, window_lo, window_hi,
           window_size, snap_at, last_hit_id, generation, confidence, pred_basis, pred_method,
           med, iqr, cluster_center, drought_at_snap, updated_at
         ) VALUES (
-          $1,$2,$3,$4,$5,$6,
-          $7,$8,$9,$10,$11,$12,
-          $13,$14,$15,$16,$17,NOW()
+          $1,$2,$3,$4,$5,$6,$7,
+          $8,$9,$10,$11,$12,$13,
+          $14,$15,$16,$17,$18,NOW()
         )`,
         [
           lock.label,
+          source,
           lock.minVal,
           lock.color,
           lock.predictedRound,
