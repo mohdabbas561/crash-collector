@@ -117,6 +117,11 @@ async function initDB() {
   `);
 
   await pool.query(`
+    ALTER TABLE predictions
+      ADD COLUMN IF NOT EXISTS issue_mode VARCHAR(30);
+  `);
+
+  await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_predictions_source ON predictions(source);
   `);
 
@@ -183,6 +188,7 @@ async function initDB() {
       confidence      NUMERIC(8,4),
       pred_basis      TEXT,
       pred_method     VARCHAR(30),
+      issue_mode      VARCHAR(30),
       med             INT,
       iqr             INT,
       cluster_center  INT,
@@ -206,9 +212,14 @@ async function initDB() {
     ALTER TABLE oracle_active_locks
       ADD COLUMN IF NOT EXISTS source VARCHAR(20) NOT NULL DEFAULT 'oracle_v24'
   `).catch(() => {});
+
+  await pool.query(`
+    ALTER TABLE oracle_active_locks
+      ADD COLUMN IF NOT EXISTS issue_mode VARCHAR(30)
+  `).catch(() => {});
 }
 
-async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation, source = 'engine', probW = null }) {
+async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, generation, source = 'engine', probW = null, issueMode = null }) {
   // FIX: validate inputs before hitting the DB — reject nonsense windows early
   if (!target || !outcome || lo == null || hi == null) throw new Error('savePrediction: missing required fields');
   if (!Number.isFinite(Number(lo)) || !Number.isFinite(Number(hi)) || Number(hi) < Number(lo))
@@ -216,8 +227,8 @@ async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, gene
   const normalized = canonicalizePredictionOutcome({ lo, hi, hitRound });
 
   await pool.query(
-    `INSERT INTO predictions (target, min_mult, outcome, window_lo, window_hi, hit_round, generation, source, prob_w)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    `INSERT INTO predictions (target, min_mult, outcome, window_lo, window_hi, hit_round, generation, source, prob_w, issue_mode)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      ON CONFLICT (source, target, window_lo, window_hi, generation) DO UPDATE
        SET hit_round  = CASE
                           WHEN predictions.hit_round IS NULL THEN EXCLUDED.hit_round
@@ -226,6 +237,7 @@ async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, gene
                         END,
            generation = GREATEST(EXCLUDED.generation, predictions.generation),
            prob_w     = COALESCE(EXCLUDED.prob_w, predictions.prob_w),
+           issue_mode = COALESCE(EXCLUDED.issue_mode, predictions.issue_mode),
            outcome    = CASE
                           WHEN (
                             CASE
@@ -250,7 +262,7 @@ async function savePrediction({ target, minMult, outcome, lo, hi, hitRound, gene
                           ) <= predictions.window_hi THEN 'win'
                           ELSE 'loss'
                         END`,
-    [target, minMult, normalized.outcome, lo, hi, normalized.hitRound, generation ?? 1, source, probW ?? null]
+    [target, minMult, normalized.outcome, lo, hi, normalized.hitRound, generation ?? 1, source, probW ?? null, issueMode || null]
   );
 }
 
@@ -263,7 +275,7 @@ async function getPredictions({ limit = 500, target = null, source = null } = {}
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   params.push(limit);
   const res = await pool.query(
-    `SELECT id, target, min_mult, outcome, window_lo, window_hi, hit_round, generation, source, prob_w, created_at
+    `SELECT id, target, min_mult, outcome, window_lo, window_hi, hit_round, generation, source, prob_w, issue_mode, created_at
      FROM predictions ${where}
      ORDER BY
        COALESCE(hit_round, window_hi) DESC,
@@ -289,6 +301,7 @@ async function getPredictions({ limit = 500, target = null, source = null } = {}
       generation: r.generation,
       source:     r.source || 'engine',
       probW:      r.prob_w != null ? parseFloat(r.prob_w) : null,
+      issueMode:  r.issue_mode || null,
       ts:         new Date(r.created_at).getTime(),
     };
   });
@@ -304,7 +317,7 @@ async function getOracleLocks(source = null) {
   const res = await pool.query(`
     SELECT
       target, source, min_mult, color, predicted_round, window_lo, window_hi, window_size,
-      snap_at, last_hit_id, generation, confidence, pred_basis, pred_method, med, iqr,
+      snap_at, last_hit_id, generation, confidence, pred_basis, pred_method, issue_mode, med, iqr,
       cluster_center, drought_at_snap, created_at, updated_at
     FROM oracle_active_locks
     ${where}
@@ -325,6 +338,7 @@ async function getOracleLocks(source = null) {
     confidence: row.confidence != null ? Number(row.confidence) : null,
     predBasis: row.pred_basis || '',
     predMethod: row.pred_method || '',
+    issueMode: row.issue_mode || null,
     med: row.med != null ? Number(row.med) : null,
     iqr: row.iqr != null ? Number(row.iqr) : null,
     clusterCenter: row.cluster_center != null ? Number(row.cluster_center) : null,
@@ -345,11 +359,11 @@ async function replaceOracleLocks(locks = [], source = 'oracle_v24') {
         `INSERT INTO oracle_active_locks (
           target, source, min_mult, color, predicted_round, window_lo, window_hi,
           window_size, snap_at, last_hit_id, generation, confidence, pred_basis, pred_method,
-          med, iqr, cluster_center, drought_at_snap, updated_at
+          issue_mode, med, iqr, cluster_center, drought_at_snap, updated_at
         ) VALUES (
           $1,$2,$3,$4,$5,$6,$7,
           $8,$9,$10,$11,$12,$13,
-          $14,$15,$16,$17,$18,NOW()
+          $14,$15,$16,$17,$18,$19,NOW()
         )`,
         [
           lock.label,
@@ -366,6 +380,7 @@ async function replaceOracleLocks(locks = [], source = 'oracle_v24') {
           lock.confidence ?? null,
           lock.predBasis || '',
           lock.predMethod || '',
+          lock.issueMode || null,
           lock.med ?? null,
           lock.iqr ?? null,
           lock.clusterCenter ?? null,

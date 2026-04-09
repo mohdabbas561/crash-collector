@@ -19,7 +19,7 @@ const MIN_HIGH_QUANTILE_GAPS = 30;
 const MIN_EXTREME_QUANTILE_GAPS = 60;
 const MIN_BUCKET_CALIBRATION = 8;
 const MIN_GLOBAL_CALIBRATION = 20;
-const CALIBRATION_RECENT_LIMIT = 180;
+const CALIBRATION_RECENT_LIMIT = 240;
 const WHITE_CLUSTER_HARD_MAX = 1.25;
 const WHITE_CLUSTER_SOFT_MAX = 1.6;
 
@@ -544,10 +544,7 @@ function kmIntervalProb(kmTable, roundsSince, startAhead, endAhead) {
   );
 }
 
-function buildCalibrationModel(rows) {
-  const usable = (rows || [])
-    .filter((row) => row && row.probW != null && row.outcome !== 'early')
-    .slice(0, CALIBRATION_RECENT_LIMIT);
+function summarizeCalibrationRows(rows) {
   const buckets = Array.from({ length: 10 }, (_, index) => ({
     lo: index * 10,
     hi: (index * 10) + 9,
@@ -555,52 +552,90 @@ function buildCalibrationModel(rows) {
     total: 0,
   }));
 
-  for (const row of usable) {
+  let globalWins = 0;
+  let globalLosses = 0;
+
+  for (const row of rows) {
     const probPercent = clampNumber(Math.round(Number(row.probW || 0) * 100), 0, 99);
     const bucketIndex = clampNumber(Math.floor(probPercent / 10), 0, 9);
     buckets[bucketIndex].total += 1;
-    if (row.outcome === 'win') buckets[bucketIndex].wins += 1;
+    if (row.outcome === 'win') {
+      buckets[bucketIndex].wins += 1;
+      globalWins += 1;
+    } else if (row.outcome === 'loss') {
+      globalLosses += 1;
+    }
   }
 
-  const globalWins = usable.filter((row) => row.outcome === 'win').length;
-  const globalLosses = usable.filter((row) => row.outcome === 'loss').length;
   const globalTotal = globalWins + globalLosses;
-
   return {
     buckets,
-    globalRate: globalTotal >= MIN_GLOBAL_CALIBRATION ? (globalWins / globalTotal) * 100 : null,
     globalTotal,
+    globalRate: globalTotal >= MIN_GLOBAL_CALIBRATION ? (globalWins / globalTotal) * 100 : null,
   };
 }
 
-function calibrateProbability(rawPercent, calibrationRows) {
-  const raw = clampNumber(Number(rawPercent || 0), 0, 100);
-  const model = buildCalibrationModel(calibrationRows);
-  const bucketIndex = clampNumber(Math.floor(Math.min(raw, 99) / 10), 0, 9);
-  const bucket = model.buckets[bucketIndex];
+function buildCalibrationModel(rows, issueMode) {
+  const usable = (rows || [])
+    .filter((row) => row && row.probW != null && row.outcome !== 'early')
+    .slice(0, CALIBRATION_RECENT_LIMIT);
+  const sameModeRows = issueMode
+    ? usable.filter((row) => String(row.issueMode || '') === String(issueMode))
+    : [];
 
-  if (bucket.total >= MIN_BUCKET_CALIBRATION) {
+  return {
+    sameMode: summarizeCalibrationRows(sameModeRows),
+    allModes: summarizeCalibrationRows(usable),
+  };
+}
+
+function calibrateProbability(rawPercent, calibrationRows, issueMode) {
+  const raw = clampNumber(Number(rawPercent || 0), 0, 100);
+  const bucketIndex = clampNumber(Math.floor(Math.min(raw, 99) / 10), 0, 9);
+  const model = buildCalibrationModel(calibrationRows, issueMode);
+  const sameModeBucket = model.sameMode.buckets[bucketIndex];
+  const allModesBucket = model.allModes.buckets[bucketIndex];
+
+  if (issueMode && sameModeBucket.total >= MIN_BUCKET_CALIBRATION) {
     return {
-      calibrated: clampNumber((bucket.wins / bucket.total) * 100, 0, 100),
-      bucketLabel: `${bucket.lo}-${bucket.hi}%`,
-      support: bucket.total,
-      mode: 'bucket',
+      calibrated: clampNumber((sameModeBucket.wins / sameModeBucket.total) * 100, 0, 100),
+      bucketLabel: `${sameModeBucket.lo}-${sameModeBucket.hi}%`,
+      support: sameModeBucket.total,
+      mode: `${issueMode}_bucket`,
     };
   }
 
-  if (model.globalRate != null) {
+  if (issueMode && model.sameMode.globalRate != null) {
     return {
-      calibrated: model.globalRate,
+      calibrated: model.sameMode.globalRate,
       bucketLabel: 'global',
-      support: model.globalTotal,
-      mode: 'global',
+      support: model.sameMode.globalTotal,
+      mode: `${issueMode}_global`,
+    };
+  }
+
+  if (allModesBucket.total >= MIN_BUCKET_CALIBRATION) {
+    return {
+      calibrated: clampNumber((allModesBucket.wins / allModesBucket.total) * 100, 0, 100),
+      bucketLabel: `${allModesBucket.lo}-${allModesBucket.hi}%`,
+      support: allModesBucket.total,
+      mode: 'target_bucket',
+    };
+  }
+
+  if (model.allModes.globalRate != null) {
+    return {
+      calibrated: model.allModes.globalRate,
+      bucketLabel: 'global',
+      support: model.allModes.globalTotal,
+      mode: 'target_global',
     };
   }
 
   return {
     calibrated: raw,
-    bucketLabel: `${bucket.lo}-${bucket.hi}%`,
-    support: bucket.total,
+    bucketLabel: `${allModesBucket.lo}-${allModesBucket.hi}%`,
+    support: allModesBucket.total,
     mode: 'raw',
   };
 }
@@ -750,16 +785,6 @@ function computeOracleForecast(rounds, target, options = {}) {
   const rawConfidence = kmReliable && pHitWindow != null
     ? pHitWindow
     : empiricalWindowHitRate;
-  const calibration = calibrateProbability(rawConfidence, options.calibrationRows || []);
-  let confidence = calibration.calibrated;
-  if (lowData) confidence = Math.min(confidence, 25);
-  if (!kmReliable) confidence = Math.min(confidence, 45);
-  if (randomLike) confidence = Math.min(confidence, Math.max(8, confidence - 12));
-  if (openWindow) confidence = Math.min(confidence, 18);
-  if (recentPattern.whiteCluster) confidence = Math.min(confidence, 42);
-  if (recentPattern.downtrend) confidence = Math.min(confidence, 46);
-  if (recentPattern.b2bBlocked) confidence = Math.min(confidence, 40);
-  confidence = Math.round(clampNumber(confidence, 4, 95));
 
   const reliabilityFlags = [];
   if (regimeMode === 'recent') reliabilityFlags.push('recent_regime');
@@ -775,7 +800,7 @@ function computeOracleForecast(rounds, target, options = {}) {
   const clusterSupportPct = primaryCluster ? primaryCluster.supportPct * 100 : 0;
   const windowReadyThreshold = Math.max(1, Math.ceil(winSize * thresholds.readinessFactor));
   const windowReady = inWindow || roundsUntilWindowLo <= windowReadyThreshold;
-  const signalProb = kmReliable && pHitWindow != null ? pHitWindow : confidence;
+  const signalProb = rawConfidence;
   const strongProbability = signalProb >= thresholds.minProbability;
   const strongEdge = predictiveLift >= thresholds.minLift;
   const strongCluster = clusterSupportPct >= thresholds.minClusterSupport;
@@ -828,6 +853,20 @@ function computeOracleForecast(rounds, target, options = {}) {
       supportiveB2BIssue
     )
   );
+  const issueMode = issuePrediction
+    ? (supportiveB2BIssue ? 'b2b_support' : patternDrivenIssue ? 'pattern_support' : highProbabilitySupport ? 'high_probability' : 'strict')
+    : 'observe';
+
+  const calibration = calibrateProbability(rawConfidence, options.calibrationRows || [], issueMode);
+  let confidence = calibration.calibrated;
+  if (lowData) confidence = Math.min(confidence, 25);
+  if (!kmReliable) confidence = Math.min(confidence, 45);
+  if (randomLike) confidence = Math.min(confidence, Math.max(8, confidence - 12));
+  if (openWindow) confidence = Math.min(confidence, 18);
+  if (recentPattern.whiteCluster) confidence = Math.min(confidence, 42);
+  if (recentPattern.downtrend) confidence = Math.min(confidence, 46);
+  if (recentPattern.b2bBlocked) confidence = Math.min(confidence, 40);
+  confidence = Math.round(clampNumber(confidence, 4, 95));
 
   let avoidReason = null;
   if (!issuePrediction) {
@@ -944,9 +983,7 @@ function computeOracleForecast(rounds, target, options = {}) {
     chaseSignal,
     chaseColor,
     issuePrediction,
-    issueMode: issuePrediction
-      ? (supportiveB2BIssue ? 'b2b_support' : patternDrivenIssue ? 'pattern_support' : highProbabilitySupport ? 'high_probability' : 'strict')
-      : 'observe',
+    issueMode,
     avoidReason,
     windowReady,
     windowReadyThreshold,
@@ -988,6 +1025,7 @@ function makeOracleLock(forecast, nowId) {
     clusterCenter: forecast.clusterCenter,
     droughtAtSnap: forecast.droughtPct,
     signal: forecast.chaseSignal,
+    issueMode: forecast.issueMode || null,
     issuePrediction: Boolean(forecast.issuePrediction),
     avoidReason: forecast.avoidReason || null,
   };

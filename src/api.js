@@ -304,7 +304,7 @@ const dashboardCache = {
 let predictComputeInFlight = null;
 let lockedComputeInFlight = null;
 let oraclePredictInFlight = null;
-const ORACLE_PREDICTION_SOURCE = 'oracle_v24';
+const ORACLE_PREDICTION_SOURCE = 'oracle_v25';
 let lockedBackgroundTimer = null;
 let oracleBackgroundTimer = null;
 let dbState = {
@@ -821,6 +821,7 @@ function replayOracleTargetState({ rounds, nowId, target, existingLock, forecast
       generation: activeLock.generation || 1,
       source: ORACLE_PREDICTION_SOURCE,
       probW: activeLock.confidence != null ? Number(activeLock.confidence) / 100 : null,
+      issueMode: activeLock.issueMode || forecast.issueMode || null,
     });
 
     const replayRounds = sliceRoundsUpTo(rounds, replayCutoffId);
@@ -888,6 +889,7 @@ function buildOracleTargetPayload(forecast, activeLock, nowId) {
     med: activeLock?.med ?? forecast.med,
     iqr: activeLock?.iqr ?? forecast.iqr,
     clusterCenter: activeLock?.clusterCenter ?? forecast.clusterCenter,
+    issueMode: activeLock?.issueMode ?? forecast.issueMode ?? 'observe',
     activePrediction: Boolean(activeLock),
     issuePrediction: Boolean(activeLock || forecast.issuePrediction),
     avoidReason: activeLock ? null : (forecast.avoidReason || null),
