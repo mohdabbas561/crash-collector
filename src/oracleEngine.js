@@ -323,11 +323,20 @@ function getPatternThresholds(target) {
   };
 }
 
+function getNearHitFactor(target) {
+  if (target.minVal <= 10) return 0.7;
+  if (target.minVal <= 30) return 0.58;
+  if (target.minVal <= 100) return 0.46;
+  if (target.minVal <= 500) return 0.34;
+  return 0.28;
+}
+
 function computeRecentPatternDiagnostics(rounds, target, roundsSince, allGapsRaw, selectedStats) {
   const thresholds = getPatternThresholds(target);
   const lookback = clampNumber(Math.max(target.window * 8, 12), 12, 96);
   const recentRounds = rounds.slice(-lookback);
   const values = recentRounds.map((round) => round.val);
+  const nearHitMin = Math.max(1.2, target.minVal * getNearHitFactor(target));
   if (!values.length) {
     return {
       lookback,
@@ -336,6 +345,12 @@ function computeRecentPatternDiagnostics(rounds, target, roundsSince, allGapsRaw
       maxHardWhiteStreak: 0,
       maxSoftWhiteStreak: 0,
       recentTargetHits: 0,
+      recentNearHits: 0,
+      tailTargetHits: 0,
+      tailNearHits: 0,
+      whiteRelease: false,
+      reboundSupport: false,
+      patternScore: 0,
       downtrend: false,
       downtrendPct: 0,
       shortRepeatRate: 0,
@@ -374,12 +389,24 @@ function computeRecentPatternDiagnostics(rounds, target, roundsSince, allGapsRaw
   const split = Math.max(1, Math.floor(values.length / 2));
   const firstHalf = values.slice(0, split);
   const secondHalf = values.slice(split);
+  const tailWindowSize = Math.max(4, Math.min(values.length, Math.max(target.window * 2, 6)));
+  const tailValues = values.slice(-tailWindowSize);
+  const headValues = values.slice(0, Math.max(1, values.length - tailWindowSize));
   const headLogMean = meanLog(firstHalf);
   const tailLogMean = meanLog(secondHalf);
   const trendDelta = headLogMean > 0 ? ((tailLogMean - headLogMean) / headLogMean) : 0;
   const headPeak = firstHalf.length ? Math.max(...firstHalf) : 0;
   const tailPeak = secondHalf.length ? Math.max(...secondHalf) : 0;
   const recentTargetHits = values.filter((value) => value >= target.minVal).length;
+  const recentNearHits = values.filter((value) => value >= nearHitMin).length;
+  const tailTargetHits = tailValues.filter((value) => value >= target.minVal).length;
+  const tailNearHits = tailValues.filter((value) => value >= nearHitMin).length;
+  const headSoftWhitePct = headValues.length
+    ? (headValues.filter((value) => value <= WHITE_CLUSTER_SOFT_MAX).length / headValues.length) * 100
+    : 0;
+  const tailSoftWhitePct = tailValues.length
+    ? (tailValues.filter((value) => value <= WHITE_CLUSTER_SOFT_MAX).length / tailValues.length) * 100
+    : 0;
 
   const hardWhitePct = (hardWhiteCount / values.length) * 100;
   const softWhitePct = (softWhiteCount / values.length) * 100;
@@ -419,6 +446,29 @@ function computeRecentPatternDiagnostics(rounds, target, roundsSince, allGapsRaw
     maxHardWhiteStreak >= thresholds.hardStreakThreshold ||
     maxSoftWhiteStreak >= thresholds.softStreakThreshold
   );
+  const whiteRelease = (
+    headSoftWhitePct >= Math.max(55, thresholds.softWhitePctThreshold - 12) &&
+    tailSoftWhitePct <= Math.max(45, thresholds.softWhitePctThreshold - 25) &&
+    (tailNearHits > 0 || tailTargetHits > 0)
+  );
+  const reboundSupport = (
+    whiteRelease ||
+    (tailNearHits >= Math.max(1, Math.ceil(tailWindowSize * 0.18))) ||
+    (tailPeak >= Math.max(target.minVal * 0.85, headPeak * 0.9) && trendDelta >= -0.04)
+  );
+  let patternScore = 0;
+  if (b2bFriendly) patternScore += 22;
+  if (recentTargetHits > 0) patternScore += Math.min(20, recentTargetHits * 6);
+  if (recentNearHits > recentTargetHits) patternScore += Math.min(14, (recentNearHits - recentTargetHits) * 3);
+  if (tailTargetHits > 0) patternScore += Math.min(18, tailTargetHits * 8);
+  if (tailNearHits > tailTargetHits) patternScore += Math.min(10, (tailNearHits - tailTargetHits) * 2.5);
+  if (whiteRelease) patternScore += 18;
+  if (reboundSupport) patternScore += 10;
+  if (trendDelta > 0.04) patternScore += 8;
+  if (whiteCluster) patternScore -= 14;
+  if (downtrend) patternScore -= 14;
+  if (b2bBlocked) patternScore -= 16;
+  patternScore = Math.round(clampNumber(patternScore, -40, 100));
 
   return {
     lookback,
@@ -427,7 +477,13 @@ function computeRecentPatternDiagnostics(rounds, target, roundsSince, allGapsRaw
     maxHardWhiteStreak,
     maxSoftWhiteStreak,
     recentTargetHits,
+    recentNearHits,
+    tailTargetHits,
+    tailNearHits,
     whiteCluster,
+    whiteRelease,
+    reboundSupport,
+    patternScore,
     downtrend,
     downtrendPct: Number((trendDelta * 100).toFixed(1)),
     shortRepeatRate: Number((shortRepeatRate * 100).toFixed(1)),
@@ -732,6 +788,15 @@ function computeOracleForecast(rounds, target, options = {}) {
   );
   const positiveB2B = recentPattern.b2bFriendly && !severeWhiteCluster && !severeDowntrend;
   const patternBlocked = severeWhiteCluster || severeDowntrend || (recentPattern.b2bBlocked && !positiveB2B);
+  const patternDrivenIssue = (
+    windowReady &&
+    recentPattern.patternScore >= (target.minVal <= 15 ? 36 : target.minVal <= 100 ? 30 : 24) &&
+    signalProb >= Math.max(14, thresholds.minProbability * 0.55) &&
+    clusterSupportPct >= Math.max(14, thresholds.minClusterSupport - 4) &&
+    recentPattern.reboundSupport &&
+    !severeWhiteCluster &&
+    !severeDowntrend
+  );
   const highProbabilitySupport = (
     windowReady &&
     signalProb >= Math.max(55, thresholds.minProbability + 10) &&
@@ -758,6 +823,7 @@ function computeOracleForecast(rounds, target, options = {}) {
     !patternBlocked &&
     (
       (strongProbability && strongEdge && strongCluster) ||
+      patternDrivenIssue ||
       highProbabilitySupport ||
       supportiveB2BIssue
     )
@@ -782,7 +848,8 @@ function computeOracleForecast(rounds, target, options = {}) {
   let chaseRaw = Math.round(
     (signalProb * 0.68) +
     (clusterSupportPct * 0.18) +
-    clampNumber(Math.max(0, predictiveLift) * 4, 0, 20)
+    clampNumber(Math.max(0, predictiveLift) * 4, 0, 20) +
+    clampNumber(recentPattern.patternScore * 0.16, -12, 16)
   );
   if (inWindow) chaseRaw += 10;
   else if (windowReady) chaseRaw += 4;
@@ -878,7 +945,7 @@ function computeOracleForecast(rounds, target, options = {}) {
     chaseColor,
     issuePrediction,
     issueMode: issuePrediction
-      ? (supportiveB2BIssue ? 'b2b_support' : highProbabilitySupport ? 'high_probability' : 'strict')
+      ? (supportiveB2BIssue ? 'b2b_support' : patternDrivenIssue ? 'pattern_support' : highProbabilitySupport ? 'high_probability' : 'strict')
       : 'observe',
     avoidReason,
     windowReady,
