@@ -236,6 +236,8 @@ const STRICT_FRESH_MODE = String(process.env.STRICT_FRESH_MODE || 'false').trim(
 const LOCKED_USE_FULL_DATA = String(process.env.LOCKED_USE_FULL_DATA || 'true').trim().toLowerCase() !== 'false';
 const LOCKED_BACKGROUND_ENABLED = String(process.env.LOCKED_BACKGROUND_ENABLED || 'true').trim().toLowerCase() !== 'false';
 const LOCKED_BACKGROUND_INTERVAL_MS = toPositiveInt(process.env.LOCKED_BACKGROUND_INTERVAL_MS, 8000);
+const ORACLE_BACKGROUND_ENABLED = String(process.env.ORACLE_BACKGROUND_ENABLED || 'true').trim().toLowerCase() !== 'false';
+const ORACLE_BACKGROUND_INTERVAL_MS = toPositiveInt(process.env.ORACLE_BACKGROUND_INTERVAL_MS, 8000);
 function firstNonEmptyEnv(...values) {
   for (const raw of values) {
     const value = String(raw || '').trim();
@@ -303,6 +305,7 @@ let predictComputeInFlight = null;
 let lockedComputeInFlight = null;
 let oraclePredictInFlight = null;
 let lockedBackgroundTimer = null;
+let oracleBackgroundTimer = null;
 let dbState = {
   available: true,
   lastError: '',
@@ -708,6 +711,181 @@ function getNextOracleGeneration(existingLock, forecast) {
   return existingGeneration + 1;
 }
 
+function advanceOracleForecastPastExistingWindow(existingLock, forecast) {
+  if (!existingLock || !forecast || forecast.noData) return forecast;
+  const sameHitChain = Number(existingLock.lastHitId || 0) === Number(forecast?.lastHit?.id || 0);
+  if (!sameHitChain) return forecast;
+  if (Number(forecast.windowHi || 0) > Number(existingLock.windowHi || 0)) return forecast;
+
+  const safeStep = Math.max(
+    1,
+    Number(forecast.windowSize || 0),
+    Number(forecast.med || 0)
+  );
+  let predictedRound = Number(forecast.predictedRound || 0);
+  let windowLo = Number(forecast.windowLo || 0);
+  let windowHi = Number(forecast.windowHi || 0);
+  const maxIterations = 12;
+  let iteration = 0;
+
+  while (windowHi <= Number(existingLock.windowHi || 0) && iteration < maxIterations) {
+    predictedRound += safeStep;
+    windowLo += safeStep;
+    windowHi += safeStep;
+    iteration += 1;
+  }
+
+  return {
+    ...forecast,
+    predictedGap: Number(forecast.lastHit?.id || 0) > 0
+      ? predictedRound - Number(forecast.lastHit.id || 0)
+      : forecast.predictedGap,
+    predictedRound,
+    windowLo,
+    windowHi,
+  };
+}
+
+function upperBoundRoundIndex(rounds, maxId) {
+  let lo = 0;
+  let hi = rounds.length;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (Number(rounds[mid]?.id || 0) <= maxId) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+function sliceRoundsUpTo(rounds, maxId) {
+  if (!Array.isArray(rounds) || !rounds.length) return [];
+  const end = upperBoundRoundIndex(rounds, maxId);
+  return end > 0 ? rounds.slice(0, end) : [];
+}
+
+function findFirstOracleHitAfter(targetHits, afterId) {
+  if (!Array.isArray(targetHits) || !targetHits.length) return null;
+  let lo = 0;
+  let hi = targetHits.length;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (Number(targetHits[mid]?.id || 0) <= afterId) lo = mid + 1;
+    else hi = mid;
+  }
+  return targetHits[lo] || null;
+}
+
+function replayOracleTargetState({ rounds, nowId, target, existingLock }) {
+  let forecast = computeOracleForecast(rounds, target);
+  const resolvedRows = [];
+  if (!forecast) return { forecast: null, activeLock: null, resolvedRows };
+
+  const targetHits = rounds.filter((round) => round.val >= target.minVal);
+  let activeLock = existingLock || null;
+  let replayGuard = 0;
+
+  while (activeLock && replayGuard < 64) {
+    replayGuard += 1;
+    const hit = findFirstOracleHitAfter(targetHits, Number(activeLock.lastHitId || 0));
+    const hasFutureHit = Boolean(hit);
+    const hitInsideOrBeforeWindow = hasFutureHit && Number(hit.id || 0) <= Number(activeLock.windowHi || 0);
+    const expiredWithoutKnownHit = !hasFutureHit && nowId > Number(activeLock.windowHi || 0);
+    const missedBeforeLaterHit = hasFutureHit && Number(hit.id || 0) > Number(activeLock.windowHi || 0);
+
+    if (!hitInsideOrBeforeWindow && !expiredWithoutKnownHit && !missedBeforeLaterHit) {
+      break;
+    }
+
+    let outcome = 'loss';
+    let historyHitRound = null;
+    let replayCutoffId = Number(activeLock.windowHi || nowId);
+
+    if (hitInsideOrBeforeWindow) {
+      historyHitRound = Number(hit.id || 0);
+      replayCutoffId = historyHitRound;
+      outcome = historyHitRound < Number(activeLock.windowLo || 0) ? 'early' : 'win';
+    } else if (missedBeforeLaterHit) {
+      historyHitRound = Number(hit.id || 0);
+      replayCutoffId = Number(activeLock.windowHi || nowId);
+      outcome = 'loss';
+    }
+
+    resolvedRows.push({
+      target: target.label,
+      minMult: target.minVal,
+      outcome,
+      lo: activeLock.windowLo,
+      hi: activeLock.windowHi,
+      hitRound: historyHitRound,
+      generation: activeLock.generation || 1,
+      source: 'oracle_v22',
+      probW: activeLock.confidence != null ? Number(activeLock.confidence) / 100 : null,
+    });
+
+    const replayRounds = sliceRoundsUpTo(rounds, replayCutoffId);
+    let nextForecast = computeOracleForecast(replayRounds, target);
+    if (!nextForecast || nextForecast.noData) {
+      activeLock = null;
+      forecast = nextForecast || forecast;
+      break;
+    }
+    if (outcome === 'loss') {
+      nextForecast = advanceOracleForecastPastExistingWindow(activeLock, nextForecast);
+    }
+
+    const nextLock = {
+      ...makeOracleLock(nextForecast, replayCutoffId),
+      generation: getNextOracleGeneration(activeLock, nextForecast),
+    };
+
+    forecast = computeOracleForecast(rounds, target) || nextForecast;
+    activeLock = nextLock;
+  }
+
+  if (!activeLock && forecast && !forecast.noData) {
+    activeLock = {
+      ...makeOracleLock(forecast, nowId),
+      generation: 1,
+    };
+  } else if (activeLock && forecast && !forecast.noData) {
+    const sameHitChain = Number(activeLock.lastHitId || 0) === Number(forecast?.lastHit?.id || 0);
+    if (!sameHitChain && Number(forecast?.lastHit?.id || 0) > 0) {
+      activeLock = {
+        ...makeOracleLock(forecast, nowId),
+        generation: 1,
+      };
+    }
+  }
+
+  return { forecast, activeLock, resolvedRows };
+}
+
+function buildOracleTargetPayload(forecast, activeLock, nowId) {
+  const windowLo = activeLock?.windowLo ?? forecast.windowLo;
+  const windowHi = activeLock?.windowHi ?? forecast.windowHi;
+  const predictedRound = activeLock?.predictedRound ?? forecast.predictedRound;
+  const roundsUntilWindowLo = Math.max(0, windowLo - nowId);
+  const roundsUntilWindowHi = Math.max(0, windowHi - nowId);
+  const inWindow = nowId >= windowLo && nowId <= windowHi;
+
+  return {
+    ...forecast,
+    activeLock: activeLock || null,
+    predictedRound,
+    windowLo,
+    windowHi,
+    roundsUntilWindowLo,
+    roundsUntilWindowHi,
+    inWindow,
+    confidence: activeLock?.confidence ?? forecast.confidence,
+    predBasis: activeLock?.predBasis ?? forecast.predBasis,
+    predMethod: activeLock?.predMethod ?? forecast.predMethod,
+    med: activeLock?.med ?? forecast.med,
+    iqr: activeLock?.iqr ?? forecast.iqr,
+    clusterCenter: activeLock?.clusterCenter ?? forecast.clusterCenter,
+  };
+}
+
 async function computeOraclePredictionPayload() {
   const latestRound = await getLatestRoundId();
   const totalRounds = latestRound == null ? 0 : await getRoundCount();
@@ -722,60 +900,13 @@ async function computeOraclePredictionPayload() {
   const forecasts = [];
 
   for (const target of ORACLE_TARGETS) {
-    const forecast = computeOracleForecast(rounds, target);
-    if (!forecast) continue;
-    forecasts.push(forecast);
-
-    const existing = existingLockMap.get(target.label);
-    let resolvedExisting = false;
-
-    if (existing?.lastHitId != null) {
-      const hit = rounds.find(
-        (round) => round.id > existing.lastHitId && round.val >= target.minVal
-      );
-
-      if (hit) {
-        const outcome =
-          hit.id < existing.windowLo ? 'early' :
-          hit.id <= existing.windowHi ? 'win' :
-          'loss';
-        resolvedRowsToPersist.push({
-          target: target.label,
-          minMult: target.minVal,
-          outcome,
-          lo: existing.windowLo,
-          hi: existing.windowHi,
-          hitRound: hit.id,
-          generation: existing.generation || 1,
-          source: 'oracle_v22',
-          probW: existing.confidence != null ? Number(existing.confidence) / 100 : null,
-        });
-        resolvedExisting = true;
-      } else if (nowId > existing.windowHi) {
-        resolvedRowsToPersist.push({
-          target: target.label,
-          minMult: target.minVal,
-          outcome: 'loss',
-          lo: existing.windowLo,
-          hi: existing.windowHi,
-          hitRound: null,
-          generation: existing.generation || 1,
-          source: 'oracle_v22',
-          probW: existing.confidence != null ? Number(existing.confidence) / 100 : null,
-        });
-        resolvedExisting = true;
-      }
-    }
-
-    if (!forecast.noData) {
-      if (!existing || resolvedExisting || forecast.lastHit.id > (existing.lastHitId || -1)) {
-        nextLocks.push({
-          ...makeOracleLock(forecast, nowId),
-          generation: getNextOracleGeneration(existing, forecast),
-        });
-      } else if (existing) {
-        nextLocks.push(existing);
-      }
+    const existing = existingLockMap.get(target.label) || null;
+    const replay = replayOracleTargetState({ rounds, nowId, target, existingLock: existing });
+    if (!replay.forecast) continue;
+    forecasts.push(replay.forecast);
+    resolvedRowsToPersist.push(...replay.resolvedRows);
+    if (replay.activeLock && !replay.forecast.noData) {
+      nextLocks.push(replay.activeLock);
     }
   }
 
@@ -805,25 +936,11 @@ async function computeOraclePredictionPayload() {
   }));
 
   const activeLockMap = new Map(nextLocks.map((lock) => [lock.label, lock]));
-  const targets = forecasts.map((forecast) => {
-    const activeLock = activeLockMap.get(forecast.label);
-    const windowLo = activeLock?.windowLo ?? forecast.windowLo;
-    const windowHi = activeLock?.windowHi ?? forecast.windowHi;
-    const predictedRound = activeLock?.predictedRound ?? forecast.predictedRound;
-    const roundsUntilWindowLo = Math.max(0, windowLo - nowId);
-    const roundsUntilWindowHi = Math.max(0, windowHi - nowId);
-    const inWindow = nowId >= windowLo && nowId <= windowHi;
-    return {
-      ...forecast,
-      activeLock: activeLock || null,
-      windowLo,
-      windowHi,
-      predictedRound,
-      roundsUntilWindowLo,
-      roundsUntilWindowHi,
-      inWindow,
-    };
-  });
+  const targets = forecasts.map((forecast) => buildOracleTargetPayload(
+    forecast,
+    activeLockMap.get(forecast.label),
+    nowId
+  ));
 
   return {
     ok: true,
@@ -836,6 +953,46 @@ async function computeOraclePredictionPayload() {
     history,
     historyByTarget: summarizeOracleHistoryByTarget(persistedHistory),
   };
+}
+
+async function ensureOraclePredictionComputed({ latestRound }) {
+  const sameInFlight = (
+    oraclePredictInFlight &&
+    oraclePredictInFlight.latestRound != null &&
+    latestRound != null &&
+    oraclePredictInFlight.latestRound === latestRound
+  );
+  if (sameInFlight) return oraclePredictInFlight.promise;
+
+  const promise = computeOraclePredictionPayload();
+  oraclePredictInFlight = { latestRound: latestRound ?? null, promise };
+  try {
+    const payload = await promise;
+    oraclePredictCache.asOfRound = payload.asOfRound ?? latestRound ?? null;
+    oraclePredictCache.createdAt = Date.now();
+    oraclePredictCache.payload = payload;
+    return payload;
+  } finally {
+    if (oraclePredictInFlight?.promise === promise) {
+      oraclePredictInFlight = null;
+    }
+  }
+}
+
+async function refreshOraclePredictionInBackground() {
+  try {
+    const latestRound = await getLatestRoundId();
+    if (latestRound == null) return;
+    const cacheFresh = (
+      oraclePredictCache.payload &&
+      oraclePredictCache.asOfRound != null &&
+      oraclePredictCache.asOfRound === latestRound
+    );
+    if (cacheFresh) return;
+    await ensureOraclePredictionComputed({ latestRound });
+  } catch (e) {
+    console.error('[oracle-bg] refresh error:', e.message);
+  }
 }
 
 app.get('/rounds', requireDatabase, rateLimit(60), async (req, res) => {
@@ -870,30 +1027,8 @@ app.get('/predict/oracle', requireDatabase, rateLimit(20), async (req, res) => {
       return res.json(oraclePredictCache.payload);
     }
 
-    const sameInFlight = (
-      oraclePredictInFlight &&
-      oraclePredictInFlight.latestRound != null &&
-      latestRound != null &&
-      oraclePredictInFlight.latestRound === latestRound
-    );
-    if (sameInFlight) {
-      const payload = await oraclePredictInFlight.promise;
-      return res.json(payload);
-    }
-
-    const promise = computeOraclePredictionPayload();
-    oraclePredictInFlight = {
-      latestRound: latestRound ?? null,
-      promise,
-    };
-    const payload = await promise;
-    oraclePredictCache.asOfRound = payload.asOfRound ?? latestRound ?? null;
-    oraclePredictCache.createdAt = Date.now();
-    oraclePredictCache.payload = payload;
+    const payload = await ensureOraclePredictionComputed({ latestRound });
     res.json(payload);
-    if (oraclePredictInFlight?.promise === promise) {
-      oraclePredictInFlight = null;
-    }
   } catch (e) {
     oraclePredictInFlight = null;
     if (isLikelyDbError(e)) setDatabaseAvailability(false, e.message);
@@ -1422,6 +1557,13 @@ function startAPI() {
       refreshLockedPredictionInBackground().catch(e => console.error('[locked-bg] tick error:', e.message));
     }, LOCKED_BACKGROUND_INTERVAL_MS);
     console.log(`[locked-bg] running every ${LOCKED_BACKGROUND_INTERVAL_MS}ms (${LOCKED_USE_FULL_DATA ? 'full-data mode' : 'limited mode'}, strict=${STRICT_FRESH_MODE ? 'on' : 'off'}, cache=${RESPONSE_CACHE_ENABLED ? 'on' : 'off'})`);
+  }
+  if (ORACLE_BACKGROUND_ENABLED && !oracleBackgroundTimer) {
+    refreshOraclePredictionInBackground().catch(e => console.error('[oracle-bg] warmup error:', e.message));
+    oracleBackgroundTimer = setInterval(() => {
+      refreshOraclePredictionInBackground().catch(e => console.error('[oracle-bg] tick error:', e.message));
+    }, ORACLE_BACKGROUND_INTERVAL_MS);
+    console.log(`[oracle-bg] running every ${ORACLE_BACKGROUND_INTERVAL_MS}ms`);
   }
   if (STRICT_FRESH_MODE) {
     console.log('[strict-fresh] enabled (stale response cache disabled)');
