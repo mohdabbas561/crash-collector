@@ -21,6 +21,10 @@ function quantile(sorted, p) {
   return sorted[lo] + ((sorted[hi] - sorted[lo]) * (idx - lo));
 }
 
+function clampNumber(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
 function kdeModeEfficient(sortedGaps) {
   if (!sortedGaps.length) return null;
   const n = sortedGaps.length;
@@ -88,13 +92,20 @@ function kmProb(kmTable, roundsSince, roundsAhead) {
 
 function kmIntervalProb(kmTable, roundsSince, startAhead, endAhead) {
   const from = Math.min(roundsSince, kmTable.length - 1);
-  const start = Math.min(roundsSince + Math.max(0, startAhead), kmTable.length - 1);
+  const startExclusive = Math.min(
+    roundsSince + Math.max(0, startAhead) - 1,
+    kmTable.length - 1
+  );
   const end = Math.min(roundsSince + Math.max(0, endAhead), kmTable.length - 1);
   const sFrom = kmTable[from];
-  if (sFrom <= 0 || end <= start) return 0;
-  const startSurvival = kmTable[start];
+  if (sFrom <= 0 || end <= startExclusive) return 0;
+  const startSurvival = kmTable[Math.max(from, startExclusive)];
   const endSurvival = kmTable[end];
-  return Math.max(0, Math.round((1 - (endSurvival / sFrom) - (1 - (startSurvival / sFrom))) * 1000) / 10);
+  return clampNumber(
+    Math.round((((startSurvival - endSurvival) / sFrom) * 1000)) / 10,
+    0,
+    100
+  );
 }
 
 function normalizeRounds(rounds) {
@@ -240,41 +251,56 @@ function computeOracleForecast(rounds, target) {
     + (regimeDrift > 0.4 ? 8 : 0);
   const confidence = Math.max(4, Math.min(92, blendedBaseConf - confPenalty + proximityBonus));
 
-  const nearWindowRounds = Math.max(1, Math.min(20, Math.max(winSize, Math.round(med * 0.35))));
+  const nearWindowRounds = Math.max(1, Math.min(75, Math.max(winSize, Math.round(med * 0.35))));
   const verySoonThreshold = Math.max(2, Math.ceil(winSize * 0.5));
   const soonThreshold = Math.max(5, Math.ceil(winSize * 1.5));
   const warmThreshold = Math.max(10, Math.ceil(winSize * 3));
   const farThreshold = Math.max(20, Math.ceil(winSize * 6));
-  const windowProximityBonus = inWindow
-    ? 55
-    : roundsUntilWindowLo <= verySoonThreshold
-      ? 40
-      : roundsUntilWindowLo <= soonThreshold
-        ? 28
-        : roundsUntilWindowLo <= warmThreshold
-          ? 16
-          : roundsUntilWindowLo <= farThreshold
-            ? 8
-            : 0;
   const pHitNearWindow = kmProb(kmTable, roundsSince, nearWindowRounds);
-  const kmBase = Math.max(pHitNearWindow, pHitWindow > 0 ? pHitWindow : 0);
-  const chaseRaw = Math.min(100, Math.max(0, Math.round(
-    (kmBase * 1)
-    + windowProximityBonus
-    + (droughtPct >= 40 && droughtPct < 88 ? (droughtPct - 40) * 0.3 : 0)
-    + (isOverdue && !isHardGap ? 8 : 0)
-    + (regimeDrift <= 0.2 ? 4 : regimeDrift > 0.4 ? -4 : 0)
-    + (isTooEarly ? -5 : 0)
-    + (isHardGap ? -10 : 0)
-    + (isExtreme ? -20 : 0)
-    + (openWindow ? -35 : 0)
-  )));
+  const proximityScore = inWindow
+    ? 12
+    : roundsUntilWindowLo <= verySoonThreshold
+      ? 8
+      : roundsUntilWindowLo <= soonThreshold
+        ? 4
+        : roundsUntilWindowLo <= warmThreshold
+          ? 2
+          : roundsUntilWindowLo <= farThreshold
+            ? 1
+            : 0;
+  const droughtScore = isTooEarly
+    ? -8
+    : openWindow
+      ? -15
+      : isExtreme
+        ? -10
+        : isHardGap
+          ? -6
+          : isOverdue
+            ? 4
+            : clampNumber((droughtPct - 50) * 0.18, -4, 8);
+  const regimeScore = regimeDrift <= 0.2 ? 3 : regimeDrift > 0.4 ? -6 : 0;
+  const clusterScore = med > 0 && clusterCenter != null
+    ? clampNumber((((med - Math.abs(clusterCenter - med)) / med) * 6) - 3, -4, 6)
+    : 0;
+  const supportScore = (
+    (confidence * 0.45) +
+    (pHitWindow * 0.35) +
+    (pHitNearWindow * 0.2)
+  );
+  const chaseRaw = clampNumber(Math.round(
+    supportScore +
+    proximityScore +
+    droughtScore +
+    regimeScore +
+    clusterScore
+  ), 0, 100);
 
-  const chaseSignal = chaseRaw >= 68
+  const chaseSignal = chaseRaw >= 70
     ? 'CHASE'
-    : chaseRaw >= 44
+    : chaseRaw >= 50
       ? 'WATCH'
-      : chaseRaw >= 24
+      : chaseRaw >= 30
         ? 'WAIT'
         : 'SKIP';
   const chaseColor = chaseRaw >= 68
