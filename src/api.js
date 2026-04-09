@@ -304,6 +304,7 @@ const dashboardCache = {
 let predictComputeInFlight = null;
 let lockedComputeInFlight = null;
 let oraclePredictInFlight = null;
+const ORACLE_PREDICTION_SOURCE = 'oracle_v23';
 let lockedBackgroundTimer = null;
 let oracleBackgroundTimer = null;
 let dbState = {
@@ -775,8 +776,8 @@ function findFirstOracleHitAfter(targetHits, afterId) {
   return targetHits[lo] || null;
 }
 
-function replayOracleTargetState({ rounds, nowId, target, existingLock }) {
-  let forecast = computeOracleForecast(rounds, target);
+function replayOracleTargetState({ rounds, nowId, target, existingLock, forecastOptions = {} }) {
+  let forecast = computeOracleForecast(rounds, target, forecastOptions);
   const resolvedRows = [];
   if (!forecast) return { forecast: null, activeLock: null, resolvedRows };
 
@@ -818,12 +819,12 @@ function replayOracleTargetState({ rounds, nowId, target, existingLock }) {
       hi: activeLock.windowHi,
       hitRound: historyHitRound,
       generation: activeLock.generation || 1,
-      source: 'oracle_v22',
+      source: ORACLE_PREDICTION_SOURCE,
       probW: activeLock.confidence != null ? Number(activeLock.confidence) / 100 : null,
     });
 
     const replayRounds = sliceRoundsUpTo(rounds, replayCutoffId);
-    let nextForecast = computeOracleForecast(replayRounds, target);
+    let nextForecast = computeOracleForecast(replayRounds, target, forecastOptions);
     if (!nextForecast || nextForecast.noData) {
       activeLock = null;
       forecast = nextForecast || forecast;
@@ -838,7 +839,7 @@ function replayOracleTargetState({ rounds, nowId, target, existingLock }) {
       generation: getNextOracleGeneration(activeLock, nextForecast),
     };
 
-    forecast = computeOracleForecast(rounds, target) || nextForecast;
+    forecast = computeOracleForecast(rounds, target, forecastOptions) || nextForecast;
     activeLock = nextLock;
   }
 
@@ -892,6 +893,13 @@ async function computeOraclePredictionPayload() {
   const rawRounds = totalRounds > 0 ? await getRounds({ limit: totalRounds, order: 'ASC' }) : [];
   const rounds = normalizeRounds(rawRounds);
   const nowId = rounds.length ? rounds[rounds.length - 1].id : 0;
+  const calibrationHistory = await getPredictions({ limit: 2000, source: ORACLE_PREDICTION_SOURCE });
+  const calibrationByTarget = new Map();
+  for (const row of calibrationHistory) {
+    const key = String(row.target || '');
+    if (!calibrationByTarget.has(key)) calibrationByTarget.set(key, []);
+    calibrationByTarget.get(key).push(row);
+  }
 
   const existingLocks = await getOracleLocks();
   const existingLockMap = new Map(existingLocks.map((lock) => [lock.label, lock]));
@@ -901,7 +909,15 @@ async function computeOraclePredictionPayload() {
 
   for (const target of ORACLE_TARGETS) {
     const existing = existingLockMap.get(target.label) || null;
-    const replay = replayOracleTargetState({ rounds, nowId, target, existingLock: existing });
+    const replay = replayOracleTargetState({
+      rounds,
+      nowId,
+      target,
+      existingLock: existing,
+      forecastOptions: {
+        calibrationRows: calibrationByTarget.get(target.label) || [],
+      },
+    });
     if (!replay.forecast) continue;
     forecasts.push(replay.forecast);
     resolvedRowsToPersist.push(...replay.resolvedRows);
@@ -929,7 +945,7 @@ async function computeOraclePredictionPayload() {
 
   await replaceOracleLocks(nextLocks);
 
-  const persistedHistory = await getPredictions({ limit: 500, source: 'oracle_v22' });
+  const persistedHistory = await getPredictions({ limit: 500, source: ORACLE_PREDICTION_SOURCE });
   const history = persistedHistory.map((row) => ({
     ...row,
     result: row.outcome === 'win' ? 'WIN' : row.outcome === 'early' ? 'EARLY' : 'FAILED',

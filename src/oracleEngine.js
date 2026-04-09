@@ -12,6 +12,21 @@ const ORACLE_TARGETS = Object.freeze([
   { label: '1000x', minVal: 1000, color: '#7aa2ff', window: 75, scanN: 20, minHits: 1 },
 ]);
 
+const REGIME_DRIFT_THRESHOLD = 0.35;
+const MIN_FORECAST_GAPS = 8;
+const MIN_KM_GAPS = 20;
+const MIN_HIGH_QUANTILE_GAPS = 30;
+const MIN_EXTREME_QUANTILE_GAPS = 60;
+const MIN_BUCKET_CALIBRATION = 8;
+const MIN_GLOBAL_CALIBRATION = 20;
+const CALIBRATION_RECENT_LIMIT = 180;
+
+function clampNumber(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+// Robust linear-interpolation quantile. We reuse this everywhere so the engine
+// stays interpretable and deterministic.
 function quantile(sorted, p) {
   if (!sorted.length) return 0;
   if (sorted.length === 1) return sorted[0];
@@ -21,40 +36,194 @@ function quantile(sorted, p) {
   return sorted[lo] + ((sorted[hi] - sorted[lo]) * (idx - lo));
 }
 
-function clampNumber(value, min, max) {
-  return Math.min(Math.max(value, min), max);
+function mean(values) {
+  if (!values.length) return 0;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
-function kdeModeEfficient(sortedGaps) {
-  if (!sortedGaps.length) return null;
-  const n = sortedGaps.length;
-  if (n === 1) return sortedGaps[0];
-  const mean = sortedGaps.reduce((sum, gap) => sum + gap, 0) / n;
-  const std = Math.sqrt(
-    sortedGaps.reduce((sum, gap) => sum + ((gap - mean) ** 2), 0) / n
-  ) || 1;
-  const bandwidth = Math.max(0.5, 1.06 * std * (n ** -0.2));
-  const lo = sortedGaps[0];
-  const hi = sortedGaps[n - 1];
-  const steps = Math.min(200, hi - lo + 1);
-  const step = steps > 1 ? (hi - lo) / (steps - 1) : 0;
-  let bestScore = -1;
-  let bestX = mean;
+function normalizeRounds(rounds) {
+  const mapped = new Map();
+  for (const round of rounds || []) {
+    const id = Number(round?.roundId ?? round?.id);
+    const val = Number.parseFloat(round?.multiplier ?? round?.val);
+    if (!Number.isFinite(id) || !Number.isFinite(val) || val <= 0) continue;
+    mapped.set(id, { id, val });
+  }
+  return [...mapped.values()].sort((a, b) => a.id - b.id);
+}
 
-  for (let i = 0; i < steps; i += 1) {
-    const x = lo + (i * step);
-    let score = 0;
-    for (const gap of sortedGaps) {
-      const z = (x - gap) / bandwidth;
-      score += Math.exp(-0.5 * z * z);
-    }
-    if (score > bestScore) {
-      bestScore = score;
-      bestX = x;
+function trimSorted(sorted, trimRatio) {
+  if (!sorted.length) return [];
+  const trimCount = Math.floor(sorted.length * trimRatio);
+  if (trimCount <= 0 || (trimCount * 2) >= sorted.length) return sorted.slice();
+  return sorted.slice(trimCount, sorted.length - trimCount);
+}
+
+function tukeyFilterSorted(sorted) {
+  if (sorted.length < 8) return sorted.slice();
+  const q1 = quantile(sorted, 25);
+  const q3 = quantile(sorted, 75);
+  const iqr = Math.max(1, q3 - q1);
+  const lo = q1 - (1.5 * iqr);
+  const hi = q3 + (1.5 * iqr);
+  const filtered = sorted.filter((gap) => gap >= lo && gap <= hi);
+  return filtered.length >= Math.max(5, Math.floor(sorted.length * 0.6))
+    ? filtered
+    : sorted.slice();
+}
+
+// Robust stats are taken from the selected regime only. We never blend recent
+// and full data once regime selection is made.
+function buildRobustStats(sourceSorted) {
+  const filtered = tukeyFilterSorted(sourceSorted);
+  const trimmed = trimSorted(filtered, filtered.length >= 10 ? 0.1 : 0);
+  const working = trimmed.length ? trimmed : filtered;
+  const q25 = quantile(working, 25);
+  const q50 = quantile(working, 50);
+  const q75 = quantile(working, 75);
+  const iqr = Math.max(1, q75 - q25);
+  const p10 = working.length >= 10 ? quantile(working, 10) : working[0];
+  const p90 = working.length >= MIN_HIGH_QUANTILE_GAPS ? quantile(working, 90) : q75;
+  const p99 = working.length >= MIN_EXTREME_QUANTILE_GAPS ? quantile(working, 99) : p90;
+  return {
+    filtered,
+    trimmed: working,
+    min: working[0],
+    max: working[working.length - 1],
+    p10: Math.round(p10),
+    p25: Math.round(q25),
+    med: Math.round(q50),
+    p75: Math.round(q75),
+    p90: Math.round(p90),
+    p99: Math.round(p99),
+    iqr: Math.max(1, Math.round(iqr)),
+    avg: Math.round(mean(working)),
+  };
+}
+
+function deriveBinWidth(sorted) {
+  if (sorted.length < 3) return 1;
+  const q25 = quantile(sorted, 25);
+  const q75 = quantile(sorted, 75);
+  const iqr = Math.max(1, q75 - q25);
+  const fdWidth = Math.max(1, Math.round((2 * iqr) / Math.cbrt(sorted.length)));
+  const spread = Math.max(1, sorted[sorted.length - 1] - sorted[0]);
+  const sqrtWidth = Math.max(1, Math.round(spread / Math.max(2, Math.sqrt(sorted.length))));
+  return Math.max(1, Math.min(fdWidth, sqrtWidth));
+}
+
+// Histogram clustering is more stable than KDE here. It is discrete, supports
+// multiple peaks, and lets us measure support directly.
+function buildHistogramClusters(sorted) {
+  if (!sorted.length) {
+    return {
+      binWidth: 1,
+      primary: null,
+      secondary: null,
+      bins: [],
+    };
+  }
+
+  const min = sorted[0];
+  const max = sorted[sorted.length - 1];
+  const binWidth = deriveBinWidth(sorted);
+  const binCount = Math.max(1, Math.floor((max - min) / binWidth) + 1);
+  const bins = Array.from({ length: binCount }, (_, index) => ({
+    index,
+    lo: min + (index * binWidth),
+    hi: min + ((index + 1) * binWidth) - 1,
+    count: 0,
+    sum: 0,
+  }));
+
+  for (const gap of sorted) {
+    const idx = clampNumber(Math.floor((gap - min) / binWidth), 0, binCount - 1);
+    bins[idx].count += 1;
+    bins[idx].sum += gap;
+  }
+
+  const smoothed = bins.map((bin, index) => {
+    const prev = bins[index - 1]?.count || 0;
+    const next = bins[index + 1]?.count || 0;
+    return bin.count + ((prev + next) * 0.55);
+  });
+
+  const peaks = [];
+  for (let i = 0; i < bins.length; i += 1) {
+    const left = smoothed[i - 1] ?? -Infinity;
+    const right = smoothed[i + 1] ?? -Infinity;
+    if (smoothed[i] >= left && smoothed[i] >= right && bins[i].count > 0) {
+      peaks.push({ index: i, strength: smoothed[i] });
     }
   }
 
-  return Math.round(bestX);
+  peaks.sort((a, b) => b.strength - a.strength);
+
+  function expandCluster(peakIndex) {
+    const peakStrength = smoothed[peakIndex];
+    const threshold = peakStrength * 0.42;
+    let lo = peakIndex;
+    let hi = peakIndex;
+    while (lo > 0 && smoothed[lo - 1] >= threshold) lo -= 1;
+    while (hi < bins.length - 1 && smoothed[hi + 1] >= threshold) hi += 1;
+    const clusterBins = bins.slice(lo, hi + 1);
+    const supportCount = clusterBins.reduce((sum, bin) => sum + bin.count, 0);
+    const weightedSum = clusterBins.reduce((sum, bin) => sum + bin.sum, 0);
+    return {
+      lo: clusterBins[0].lo,
+      hi: clusterBins[clusterBins.length - 1].hi,
+      center: supportCount > 0 ? Math.round(weightedSum / supportCount) : Math.round((clusterBins[0].lo + clusterBins[clusterBins.length - 1].hi) / 2),
+      supportCount,
+      supportPct: supportCount / sorted.length,
+      peakStrength,
+    };
+  }
+
+  const primary = peaks.length ? expandCluster(peaks[0].index) : null;
+  let secondary = null;
+  for (const peak of peaks.slice(1)) {
+    const candidate = expandCluster(peak.index);
+    if (
+      primary &&
+      Math.abs(candidate.center - primary.center) >= binWidth &&
+      candidate.supportPct >= Math.max(0.12, primary.supportPct * 0.45)
+    ) {
+      secondary = candidate;
+      break;
+    }
+  }
+
+  return { binWidth, bins, primary, secondary };
+}
+
+// In an orderless gap model, a shuffled-gap null is identical. The honest null
+// comparison is: "how often would a random window of the same size hit?".
+function computeChanceWindowRate(sorted, width) {
+  if (!sorted.length) return 0;
+  const min = sorted[0];
+  const max = sorted[sorted.length - 1];
+  if (max <= min) return 100;
+
+  const sampleCount = 15;
+  const startMax = Math.max(min, max - width + 1);
+  const step = sampleCount > 1 ? (startMax - min) / (sampleCount - 1) : 0;
+  const rates = [];
+  for (let i = 0; i < sampleCount; i += 1) {
+    const lo = Math.round(min + (step * i));
+    const hi = lo + width - 1;
+    const hits = sorted.filter((gap) => gap >= lo && gap <= hi).length;
+    rates.push((hits / sorted.length) * 100);
+  }
+  return mean(rates);
+}
+
+function computeConditionalExpectedGap(survivors, roundsSince) {
+  if (!survivors.length) return null;
+  const filtered = tukeyFilterSorted(survivors);
+  const trimmed = trimSorted(filtered, filtered.length >= 10 ? 0.1 : 0);
+  const base = trimmed.length ? trimmed : filtered;
+  const expectedGap = Math.round(mean(base));
+  return Math.max(expectedGap, roundsSince + 1);
 }
 
 function buildKMTable(allGapsSorted) {
@@ -87,7 +256,7 @@ function kmProb(kmTable, roundsSince, roundsAhead) {
   const to = Math.min(roundsSince + roundsAhead, kmTable.length - 1);
   const sFrom = kmTable[from];
   if (sFrom <= 0) return 100;
-  return Math.round((1 - (kmTable[to] / sFrom)) * 1000) / 10;
+  return clampNumber(Math.round((1 - (kmTable[to] / sFrom)) * 1000) / 10, 0, 100);
 }
 
 function kmIntervalProb(kmTable, roundsSince, startAhead, endAhead) {
@@ -108,18 +277,68 @@ function kmIntervalProb(kmTable, roundsSince, startAhead, endAhead) {
   );
 }
 
-function normalizeRounds(rounds) {
-  const mapped = new Map();
-  for (const round of rounds || []) {
-    const id = Number(round?.roundId ?? round?.id);
-    const val = Number.parseFloat(round?.multiplier ?? round?.val);
-    if (!Number.isFinite(id) || !Number.isFinite(val) || val <= 0) continue;
-    mapped.set(id, { id, val });
+function buildCalibrationModel(rows) {
+  const usable = (rows || [])
+    .filter((row) => row && row.probW != null && row.outcome !== 'early')
+    .slice(0, CALIBRATION_RECENT_LIMIT);
+  const buckets = Array.from({ length: 10 }, (_, index) => ({
+    lo: index * 10,
+    hi: (index * 10) + 9,
+    wins: 0,
+    total: 0,
+  }));
+
+  for (const row of usable) {
+    const probPercent = clampNumber(Math.round(Number(row.probW || 0) * 100), 0, 99);
+    const bucketIndex = clampNumber(Math.floor(probPercent / 10), 0, 9);
+    buckets[bucketIndex].total += 1;
+    if (row.outcome === 'win') buckets[bucketIndex].wins += 1;
   }
-  return [...mapped.values()].sort((a, b) => a.id - b.id);
+
+  const globalWins = usable.filter((row) => row.outcome === 'win').length;
+  const globalLosses = usable.filter((row) => row.outcome === 'loss').length;
+  const globalTotal = globalWins + globalLosses;
+
+  return {
+    buckets,
+    globalRate: globalTotal >= MIN_GLOBAL_CALIBRATION ? (globalWins / globalTotal) * 100 : null,
+    globalTotal,
+  };
 }
 
-function computeOracleForecast(rounds, target) {
+function calibrateProbability(rawPercent, calibrationRows) {
+  const raw = clampNumber(Number(rawPercent || 0), 0, 100);
+  const model = buildCalibrationModel(calibrationRows);
+  const bucketIndex = clampNumber(Math.floor(Math.min(raw, 99) / 10), 0, 9);
+  const bucket = model.buckets[bucketIndex];
+
+  if (bucket.total >= MIN_BUCKET_CALIBRATION) {
+    return {
+      calibrated: clampNumber((bucket.wins / bucket.total) * 100, 0, 100),
+      bucketLabel: `${bucket.lo}-${bucket.hi}%`,
+      support: bucket.total,
+      mode: 'bucket',
+    };
+  }
+
+  if (model.globalRate != null) {
+    return {
+      calibrated: model.globalRate,
+      bucketLabel: 'global',
+      support: model.globalTotal,
+      mode: 'global',
+    };
+  }
+
+  return {
+    calibrated: raw,
+    bucketLabel: `${bucket.lo}-${bucket.hi}%`,
+    support: bucket.total,
+    mode: 'raw',
+  };
+}
+
+function computeOracleForecast(rounds, target, options = {}) {
   const normalizedRounds = Array.isArray(rounds)
     && rounds.every((round) => Number.isFinite(round?.id) && Number.isFinite(round?.val))
       ? rounds
@@ -153,148 +372,133 @@ function computeOracleForecast(rounds, target) {
   }
 
   const allGapsSorted = [...allGapsRaw].sort((a, b) => a - b);
-  const n = allGapsRaw.length;
-  const recentN = Math.min(scanN, n);
-  const recentGaps = allGapsRaw.slice(-recentN);
-  const recentSorted = [...recentGaps].sort((a, b) => a - b);
-  const last10 = allGapsRaw.slice(-Math.min(10, n));
-  const weighted = [...recentGaps, ...last10].sort((a, b) => a - b);
-  const last20 = allGapsRaw.slice(-Math.min(20, n));
-  const last20Sorted = [...last20].sort((a, b) => a - b);
-  const medAll = quantile(allGapsSorted, 50);
-  const medLast20 = quantile(last20Sorted, 50);
-  const regimeDrift = medAll > 0 ? Math.abs(medLast20 - medAll) / medAll : 0;
-  const useRecentForCluster = regimeDrift > 0.4 && last20.length >= 10;
+  const fullStats = buildRobustStats(allGapsSorted);
+  const recentCount = Math.min(scanN, allGapsRaw.length);
+  const recentSorted = [...allGapsRaw.slice(-recentCount)].sort((a, b) => a - b);
+  const recentStats = buildRobustStats(recentSorted);
+  const regimeDrift = fullStats.med > 0 ? Math.abs(recentStats.med - fullStats.med) / fullStats.med : 0;
+  const regimeMode = regimeDrift > REGIME_DRIFT_THRESHOLD ? 'recent' : 'full';
+  const selectedSorted = regimeMode === 'recent' ? recentSorted : allGapsSorted;
+  const selectedStats = regimeMode === 'recent' ? recentStats : fullStats;
+  const selectedCount = selectedSorted.length;
+
   const lastHit = hits[hits.length - 1];
   const roundsSince = nowId - lastHit.id;
-  const med = Math.round(quantile(weighted, 50));
-  const p10 = Math.round(quantile(recentSorted, 10));
-  const p25 = Math.round(quantile(recentSorted, 25));
-  const p75 = Math.round(quantile(recentSorted, 75));
-  const p90 = Math.round(quantile(recentSorted, 90));
-  const p90all = Math.round(quantile(allGapsSorted, 90));
-  const p99all = Math.round(quantile(allGapsSorted, 99));
-  const maxGap = allGapsSorted[n - 1];
-  const minGap = allGapsSorted[0];
-  const avgGap = Math.round(allGapsRaw.reduce((sum, gap) => sum + gap, 0) / n);
-  const iqr = Math.max(1, p75 - p25);
-  const halfWin = Math.floor(winSize / 2);
-  const clusterSource = useRecentForCluster ? recentSorted : allGapsSorted;
-  const clusterCenter = kdeModeEfficient(clusterSource);
-  const isTooEarly = roundsSince < p10;
-  const isOverdue = roundsSince > med;
-  const isHardGap = roundsSince > p90all;
-  const isExtreme = roundsSince > p99all;
-  const survivingGaps = allGapsSorted.filter((gap) => gap > roundsSince);
+  const isTooEarly = roundsSince < selectedStats.p10;
+  const isOverdue = roundsSince > selectedStats.med;
+  const isHardGap = roundsSince > selectedStats.p90;
+  const isExtreme = roundsSince > selectedStats.p99;
+  const survivingGaps = selectedSorted.filter((gap) => gap > roundsSince);
+  const histogram = buildHistogramClusters(selectedStats.trimmed);
+  const candidateClusters = [histogram.primary, histogram.secondary].filter(Boolean);
+  const futureCluster = candidateClusters
+    .filter((cluster) => cluster.center > roundsSince)
+    .sort((a, b) => a.center - b.center)[0];
+  const primaryCluster = futureCluster || histogram.primary;
   const openWindow = isExtreme && survivingGaps.length === 0;
+  const lowData = selectedCount < MIN_FORECAST_GAPS;
+  const kmReliable = selectedCount >= MIN_KM_GAPS;
 
   let predictedGap;
   let predBasis;
   let predMethod;
 
   if (openWindow) {
-    predictedGap = roundsSince + halfWin + 1;
-    predBasis = `extreme drought - beyond all ${n} gaps`;
-    predMethod = 'extreme';
-  } else if (!isOverdue) {
-    predictedGap = clusterCenter ?? med;
-    predBasis = `cluster (${useRecentForCluster ? 'recent' : 'full'}, ${n} gaps)`;
+    const tailStep = Math.max(
+      1,
+      selectedStats.iqr,
+      selectedStats.max - selectedStats.p75,
+      Math.round(selectedStats.med * 0.25)
+    );
+    predictedGap = selectedStats.max + tailStep;
+    predBasis = `tail extrapolation (${regimeMode}, no survivor gaps)`;
+    predMethod = 'tail';
+  } else if (!isOverdue && primaryCluster) {
+    predictedGap = Math.max(primaryCluster.center, roundsSince + 1);
+    predBasis = `histogram cluster (${regimeMode}, ${selectedCount} gaps)`;
     predMethod = 'cluster';
   } else if (survivingGaps.length > 0) {
-    const survivors = [...survivingGaps];
-    predictedGap = survivors.length >= 4 ? Math.round(quantile(survivors, 25)) : survivors[0];
-    predBasis = `survival (${survivors.length} gaps > ${roundsSince}r)`;
+    predictedGap = computeConditionalExpectedGap(survivingGaps, roundsSince);
+    predBasis = `conditional expectation (${survivingGaps.length} survivors)`;
     predMethod = 'survival';
   } else {
-    predictedGap = roundsSince + halfWin + 1;
-    predBasis = 'no survivors - extending';
-    predMethod = 'extend';
+    predictedGap = Math.max(selectedStats.med, roundsSince + 1);
+    predBasis = `fallback median (${regimeMode})`;
+    predMethod = 'fallback';
   }
 
   let predictedRound = lastHit.id + predictedGap;
   if (predictedRound <= nowId) {
-    const stepsNeeded = Math.ceil((nowId + 1 - predictedRound) / Math.max(1, med));
-    predictedGap += stepsNeeded * Math.max(1, med);
+    predictedGap = roundsSince + Math.max(1, Math.round(selectedStats.iqr / 2), 1);
     predictedRound = lastHit.id + predictedGap;
   }
 
+  const halfWin = Math.floor(winSize / 2);
   const windowLo = predictedRound - halfWin;
   const windowHi = windowLo + winSize - 1;
-  const droughtPct = n > 0
-    ? Math.round((allGapsSorted.filter((gap) => gap <= roundsSince).length / n) * 100)
+  const droughtPct = selectedCount > 0
+    ? Math.round((selectedSorted.filter((gap) => gap <= roundsSince).length / selectedCount) * 100)
     : 0;
-  const kmTable = buildKMTable(allGapsSorted);
-  const pHit1 = kmProb(kmTable, roundsSince, 1);
-  const pHit5 = kmProb(kmTable, roundsSince, 5);
-  const pHit10 = kmProb(kmTable, roundsSince, 10);
-  const pHit20 = kmProb(kmTable, roundsSince, 20);
   const roundsUntilWindowLo = Math.max(0, windowLo - nowId);
   const roundsUntilWindowHi = Math.max(0, windowHi - nowId);
-  const pHitWindow = roundsUntilWindowHi <= 0
-    ? 0
-    : kmIntervalProb(kmTable, roundsSince, roundsUntilWindowLo, roundsUntilWindowHi);
+  const inWindow = nowId >= windowLo && nowId <= windowHi;
+
+  let pHit1 = null;
+  let pHit5 = null;
+  let pHit10 = null;
+  let pHit20 = null;
+  let pHitWindow = null;
+  let pHitNearWindow = null;
+  let nearWindowRounds = Math.max(1, Math.min(75, Math.max(winSize, Math.round(selectedStats.med * 0.35))));
+
+  if (kmReliable) {
+    const kmTable = buildKMTable(selectedSorted);
+    pHit1 = kmProb(kmTable, roundsSince, 1);
+    pHit5 = kmProb(kmTable, roundsSince, 5);
+    pHit10 = kmProb(kmTable, roundsSince, 10);
+    pHit20 = kmProb(kmTable, roundsSince, 20);
+    pHitWindow = roundsUntilWindowHi <= 0
+      ? 0
+      : kmIntervalProb(kmTable, roundsSince, roundsUntilWindowLo, roundsUntilWindowHi);
+    pHitNearWindow = kmProb(kmTable, roundsSince, nearWindowRounds);
+  }
 
   const winGapLo = predictedGap - halfWin;
   const winGapHi = winGapLo + winSize - 1;
-  const hitsInWindow = allGapsSorted.filter((gap) => gap >= winGapLo && gap <= winGapHi).length;
-  const baseConf = n > 0 ? Math.round((hitsInWindow / n) * 100) : 0;
-  const recentHitsInWindow = recentSorted.filter((gap) => gap >= winGapLo && gap <= winGapHi).length;
-  const recentWindowHitRate = recentSorted.length > 0
-    ? Math.round((recentHitsInWindow / recentSorted.length) * 100)
-    : baseConf;
-  const blendedBaseConf = Math.round((baseConf * 0.65) + (recentWindowHitRate * 0.35));
-  const inWindow = nowId >= windowLo && nowId <= windowHi;
-  const proximityBonus = inWindow ? 15 : roundsUntilWindowLo <= 5 ? 10 : roundsUntilWindowLo <= 15 ? 5 : 0;
-  const confPenalty = (isExtreme ? 35 : 0)
-    + (isHardGap ? 18 : 0)
-    + (isOverdue && !isHardGap ? 6 : 0)
-    + (regimeDrift > 0.4 ? 8 : 0);
-  const confidence = Math.max(4, Math.min(92, blendedBaseConf - confPenalty + proximityBonus));
+  const hitsInWindow = selectedSorted.filter((gap) => gap >= winGapLo && gap <= winGapHi).length;
+  const empiricalWindowHitRate = selectedCount > 0 ? (hitsInWindow / selectedCount) * 100 : 0;
+  const chanceWindowRate = computeChanceWindowRate(selectedSorted, winSize);
+  const predictiveLift = empiricalWindowHitRate - chanceWindowRate;
+  const randomLike = predictiveLift <= 2;
 
-  const nearWindowRounds = Math.max(1, Math.min(75, Math.max(winSize, Math.round(med * 0.35))));
-  const verySoonThreshold = Math.max(2, Math.ceil(winSize * 0.5));
-  const soonThreshold = Math.max(5, Math.ceil(winSize * 1.5));
-  const warmThreshold = Math.max(10, Math.ceil(winSize * 3));
-  const farThreshold = Math.max(20, Math.ceil(winSize * 6));
-  const pHitNearWindow = kmProb(kmTable, roundsSince, nearWindowRounds);
-  const proximityScore = inWindow
-    ? 12
-    : roundsUntilWindowLo <= verySoonThreshold
-      ? 8
-      : roundsUntilWindowLo <= soonThreshold
-        ? 4
-        : roundsUntilWindowLo <= warmThreshold
-          ? 2
-          : roundsUntilWindowLo <= farThreshold
-            ? 1
-            : 0;
-  const droughtScore = isTooEarly
-    ? -8
-    : openWindow
-      ? -15
-      : isExtreme
-        ? -10
-        : isHardGap
-          ? -6
-          : isOverdue
-            ? 4
-            : clampNumber((droughtPct - 50) * 0.18, -4, 8);
-  const regimeScore = regimeDrift <= 0.2 ? 3 : regimeDrift > 0.4 ? -6 : 0;
-  const clusterScore = med > 0 && clusterCenter != null
-    ? clampNumber((((med - Math.abs(clusterCenter - med)) / med) * 6) - 3, -4, 6)
-    : 0;
-  const supportScore = (
-    (confidence * 0.45) +
-    (pHitWindow * 0.35) +
-    (pHitNearWindow * 0.2)
-  );
-  const chaseRaw = clampNumber(Math.round(
-    supportScore +
-    proximityScore +
-    droughtScore +
-    regimeScore +
-    clusterScore
-  ), 0, 100);
+  const rawConfidence = kmReliable && pHitWindow != null
+    ? pHitWindow
+    : empiricalWindowHitRate;
+  const calibration = calibrateProbability(rawConfidence, options.calibrationRows || []);
+  let confidence = calibration.calibrated;
+  if (lowData) confidence = Math.min(confidence, 25);
+  if (!kmReliable) confidence = Math.min(confidence, 45);
+  if (randomLike) confidence = Math.min(confidence, Math.max(8, confidence - 12));
+  if (openWindow) confidence = Math.min(confidence, 18);
+  confidence = Math.round(clampNumber(confidence, 4, 95));
+
+  const reliabilityFlags = [];
+  if (regimeMode === 'recent') reliabilityFlags.push('recent_regime');
+  if (lowData) reliabilityFlags.push('low_data');
+  if (!kmReliable) reliabilityFlags.push('km_low_sample');
+  if (openWindow) reliabilityFlags.push('extreme_tail');
+  if (randomLike) reliabilityFlags.push('random_like');
+  if (!primaryCluster || primaryCluster.supportPct < 0.18) reliabilityFlags.push('weak_cluster');
+
+  const distanceScore = inWindow
+    ? 100
+    : Math.round(100 * Math.exp(-(roundsUntilWindowLo / Math.max(1, winSize * 2))));
+  const signalProb = kmReliable && pHitWindow != null ? pHitWindow : confidence;
+  let chaseRaw = Math.round((signalProb * 0.72) + (distanceScore * 0.28));
+  if (reliabilityFlags.includes('random_like')) chaseRaw = Math.min(chaseRaw, 48);
+  if (reliabilityFlags.includes('low_data')) chaseRaw = Math.min(chaseRaw, 42);
+  if (reliabilityFlags.includes('extreme_tail')) chaseRaw = Math.min(chaseRaw, 28);
+  chaseRaw = clampNumber(chaseRaw, 0, 100);
 
   const chaseSignal = chaseRaw >= 70
     ? 'CHASE'
@@ -303,11 +507,11 @@ function computeOracleForecast(rounds, target) {
       : chaseRaw >= 30
         ? 'WAIT'
         : 'SKIP';
-  const chaseColor = chaseRaw >= 68
+  const chaseColor = chaseRaw >= 70
     ? '#39ff8a'
-    : chaseRaw >= 44
+    : chaseRaw >= 50
       ? '#ffd250'
-      : chaseRaw >= 24
+      : chaseRaw >= 30
         ? '#ff9f43'
         : '#ff4040';
 
@@ -318,19 +522,24 @@ function computeOracleForecast(rounds, target) {
     hits: hits.length,
     lastHit,
     roundsSince,
-    n,
-    med,
-    p10,
-    p25,
-    p75,
-    p90,
-    p90all,
-    p99all,
-    maxGap,
-    minGap,
-    avgGap,
-    iqr,
-    clusterCenter,
+    n: selectedCount,
+    fullGapCount: allGapsSorted.length,
+    regimeMode,
+    regimeDrift: Math.round(regimeDrift * 100),
+    med: selectedStats.med,
+    p10: selectedStats.p10,
+    p25: selectedStats.p25,
+    p75: selectedStats.p75,
+    p90: selectedStats.p90,
+    p90all: fullStats.p90,
+    p99all: fullStats.p99,
+    maxGap: selectedStats.max,
+    minGap: selectedStats.min,
+    avgGap: selectedStats.avg,
+    iqr: selectedStats.iqr,
+    clusterCenter: primaryCluster?.center ?? selectedStats.med,
+    secondaryClusterCenter: histogram.secondary?.center ?? null,
+    clusterSupportPct: primaryCluster ? Math.round(primaryCluster.supportPct * 100) : 0,
     predBasis,
     predMethod,
     predictedGap,
@@ -343,9 +552,12 @@ function computeOracleForecast(rounds, target) {
     isOverdue,
     isHardGap,
     isExtreme,
-    regimeDrift: Math.round(regimeDrift * 100),
     droughtPct,
     confidence,
+    rawConfidence: Number(rawConfidence.toFixed(1)),
+    calibrationBucket: calibration.bucketLabel,
+    calibrationSupport: calibration.support,
+    calibrationMode: calibration.mode,
     chaseRaw,
     chaseSignal,
     chaseColor,
@@ -356,11 +568,14 @@ function computeOracleForecast(rounds, target) {
     pHitWindow,
     pHitNearWindow,
     nearWindowRounds,
-    baseWindowHitRate: baseConf,
-    recentWindowHitRate,
+    empiricalWindowHitRate: Number(empiricalWindowHitRate.toFixed(1)),
+    chanceWindowRate: Number(chanceWindowRate.toFixed(1)),
+    predictiveLift: Number(predictiveLift.toFixed(1)),
     roundsUntilWindowLo,
     roundsUntilWindowHi,
     inWindow,
+    kmReliable,
+    reliabilityFlags,
   };
 }
 
