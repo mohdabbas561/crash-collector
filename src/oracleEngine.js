@@ -252,7 +252,79 @@ function getIssueThresholds(target) {
   return { minProbability: 7, minLift: 0.8, minClusterSupport: 12, readinessFactor: 0.9 };
 }
 
+function getPatternThresholds(target) {
+  if (target.minVal <= 10) {
+    return {
+      hardWhitePctThreshold: 84,
+      softWhitePctThreshold: 94,
+      hardStreakThreshold: 5,
+      softStreakThreshold: 8,
+      downtrendThreshold: -26,
+      tailPeakRatio: 0.68,
+      b2bBlockRepeatMax: 12,
+      b2bFriendlyRepeatMin: 28,
+      recentHitFactor: 0.45,
+      minRecentHitsForFriendly: 2,
+    };
+  }
+  if (target.minVal <= 30) {
+    return {
+      hardWhitePctThreshold: 74,
+      softWhitePctThreshold: 88,
+      hardStreakThreshold: 4,
+      softStreakThreshold: 6,
+      downtrendThreshold: -22,
+      tailPeakRatio: 0.72,
+      b2bBlockRepeatMax: 16,
+      b2bFriendlyRepeatMin: 26,
+      recentHitFactor: 0.38,
+      minRecentHitsForFriendly: 2,
+    };
+  }
+  if (target.minVal <= 100) {
+    return {
+      hardWhitePctThreshold: 64,
+      softWhitePctThreshold: 82,
+      hardStreakThreshold: 4,
+      softStreakThreshold: 6,
+      downtrendThreshold: -18,
+      tailPeakRatio: 0.78,
+      b2bBlockRepeatMax: 18,
+      b2bFriendlyRepeatMin: 22,
+      recentHitFactor: 0.3,
+      minRecentHitsForFriendly: 1,
+    };
+  }
+  if (target.minVal <= 500) {
+    return {
+      hardWhitePctThreshold: 54,
+      softWhitePctThreshold: 74,
+      hardStreakThreshold: 3,
+      softStreakThreshold: 5,
+      downtrendThreshold: -15,
+      tailPeakRatio: 0.82,
+      b2bBlockRepeatMax: 20,
+      b2bFriendlyRepeatMin: 16,
+      recentHitFactor: 0.22,
+      minRecentHitsForFriendly: 1,
+    };
+  }
+  return {
+    hardWhitePctThreshold: 48,
+    softWhitePctThreshold: 68,
+    hardStreakThreshold: 3,
+    softStreakThreshold: 4,
+    downtrendThreshold: -12,
+    tailPeakRatio: 0.86,
+    b2bBlockRepeatMax: 24,
+    b2bFriendlyRepeatMin: 12,
+    recentHitFactor: 0.18,
+    minRecentHitsForFriendly: 1,
+  };
+}
+
 function computeRecentPatternDiagnostics(rounds, target, roundsSince, allGapsRaw, selectedStats) {
+  const thresholds = getPatternThresholds(target);
   const lookback = clampNumber(Math.max(target.window * 8, 12), 12, 96);
   const recentRounds = rounds.slice(-lookback);
   const values = recentRounds.map((round) => round.val);
@@ -263,6 +335,7 @@ function computeRecentPatternDiagnostics(rounds, target, roundsSince, allGapsRaw
       softWhitePct: 0,
       maxHardWhiteStreak: 0,
       maxSoftWhiteStreak: 0,
+      recentTargetHits: 0,
       downtrend: false,
       downtrendPct: 0,
       shortRepeatRate: 0,
@@ -306,31 +379,45 @@ function computeRecentPatternDiagnostics(rounds, target, roundsSince, allGapsRaw
   const trendDelta = headLogMean > 0 ? ((tailLogMean - headLogMean) / headLogMean) : 0;
   const headPeak = firstHalf.length ? Math.max(...firstHalf) : 0;
   const tailPeak = secondHalf.length ? Math.max(...secondHalf) : 0;
+  const recentTargetHits = values.filter((value) => value >= target.minVal).length;
 
   const hardWhitePct = (hardWhiteCount / values.length) * 100;
   const softWhitePct = (softWhiteCount / values.length) * 100;
-  const whiteHardPctThreshold = target.minVal <= 10 ? 72 : target.minVal <= 50 ? 60 : 52;
-  const whiteSoftPctThreshold = target.minVal <= 10 ? 88 : 80;
-  const hardStreakThreshold = target.minVal <= 10 ? 4 : 3;
-  const softStreakThreshold = target.minVal <= 10 ? 6 : 5;
-  const downtrend = trendDelta <= -0.14 && tailPeak <= (headPeak * 0.82);
+  const downtrend = (
+    trendDelta <= (thresholds.downtrendThreshold / 100) &&
+    tailPeak <= (headPeak * thresholds.tailPeakRatio)
+  );
 
   const shortRepeatWindow = Math.max(2, Math.min(target.window, 6));
   const shortRepeatRate = allGapsRaw.length
     ? allGapsRaw.filter((gap) => gap <= shortRepeatWindow).length / allGapsRaw.length
     : 0;
-  const recentHitThreshold = Math.max(
-    1,
-    Math.min(shortRepeatWindow, Math.max(1, Math.round(selectedStats.p10 || shortRepeatWindow)))
-  );
+  const recentHitThreshold = Math.max(1, Math.min(
+    shortRepeatWindow,
+    Math.max(
+      1,
+      Math.round(selectedStats.med * thresholds.recentHitFactor),
+      Math.round(Math.min(selectedStats.p10 || shortRepeatWindow, shortRepeatWindow))
+    )
+  ));
   const recentHitTooSoon = roundsSince <= recentHitThreshold;
-  const b2bBlocked = recentHitTooSoon && shortRepeatRate < 0.2;
-  const b2bFriendly = recentHitTooSoon && shortRepeatRate >= 0.35;
+  const b2bBlocked = (
+    recentHitTooSoon &&
+    shortRepeatRate < (thresholds.b2bBlockRepeatMax / 100) &&
+    recentTargetHits < thresholds.minRecentHitsForFriendly
+  );
+  const b2bFriendly = (
+    recentHitTooSoon &&
+    (
+      shortRepeatRate >= (thresholds.b2bFriendlyRepeatMin / 100) ||
+      recentTargetHits >= thresholds.minRecentHitsForFriendly
+    )
+  );
   const whiteCluster = (
-    hardWhitePct >= whiteHardPctThreshold ||
-    softWhitePct >= whiteSoftPctThreshold ||
-    maxHardWhiteStreak >= hardStreakThreshold ||
-    maxSoftWhiteStreak >= softStreakThreshold
+    hardWhitePct >= thresholds.hardWhitePctThreshold ||
+    softWhitePct >= thresholds.softWhitePctThreshold ||
+    maxHardWhiteStreak >= thresholds.hardStreakThreshold ||
+    maxSoftWhiteStreak >= thresholds.softStreakThreshold
   );
 
   return {
@@ -339,6 +426,7 @@ function computeRecentPatternDiagnostics(rounds, target, roundsSince, allGapsRaw
     softWhitePct: Number(softWhitePct.toFixed(1)),
     maxHardWhiteStreak,
     maxSoftWhiteStreak,
+    recentTargetHits,
     whiteCluster,
     downtrend,
     downtrendPct: Number((trendDelta * 100).toFixed(1)),
@@ -593,13 +681,15 @@ function computeOracleForecast(rounds, target, options = {}) {
     pHitNearWindow = kmProb(kmTable, roundsSince, nearWindowRounds);
   }
 
+  const thresholds = getIssueThresholds(target);
+  const patternThresholds = getPatternThresholds(target);
   const winGapLo = predictedGap - halfWin;
   const winGapHi = winGapLo + winSize - 1;
   const hitsInWindow = selectedSorted.filter((gap) => gap >= winGapLo && gap <= winGapHi).length;
   const empiricalWindowHitRate = selectedCount > 0 ? (hitsInWindow / selectedCount) * 100 : 0;
   const chanceWindowRate = computeChanceWindowRate(selectedSorted, winSize);
   const predictiveLift = empiricalWindowHitRate - chanceWindowRate;
-  const randomLike = predictiveLift <= 2;
+  const randomLike = predictiveLift <= (target.minVal <= 15 ? 1 : 2);
 
   const rawConfidence = kmReliable && pHitWindow != null
     ? pHitWindow
@@ -627,36 +717,61 @@ function computeOracleForecast(rounds, target, options = {}) {
   if (recentPattern.b2bBlocked) reliabilityFlags.push('b2b_risk');
 
   const clusterSupportPct = primaryCluster ? primaryCluster.supportPct * 100 : 0;
-  const thresholds = getIssueThresholds(target);
   const windowReadyThreshold = Math.max(1, Math.ceil(winSize * thresholds.readinessFactor));
   const windowReady = inWindow || roundsUntilWindowLo <= windowReadyThreshold;
   const signalProb = kmReliable && pHitWindow != null ? pHitWindow : confidence;
   const strongProbability = signalProb >= thresholds.minProbability;
   const strongEdge = predictiveLift >= thresholds.minLift;
   const strongCluster = clusterSupportPct >= thresholds.minClusterSupport;
-  const patternBlocked = recentPattern.whiteCluster || recentPattern.downtrend || recentPattern.b2bBlocked;
+  const severeWhiteCluster = recentPattern.whiteCluster && (
+    recentPattern.hardWhitePct >= (patternThresholds.hardWhitePctThreshold + 8) ||
+    recentPattern.maxHardWhiteStreak >= (patternThresholds.hardStreakThreshold + 1)
+  );
+  const severeDowntrend = recentPattern.downtrend && (
+    recentPattern.downtrendPct <= (patternThresholds.downtrendThreshold - 6)
+  );
+  const positiveB2B = recentPattern.b2bFriendly && !severeWhiteCluster && !severeDowntrend;
+  const patternBlocked = severeWhiteCluster || severeDowntrend || (recentPattern.b2bBlocked && !positiveB2B);
+  const highProbabilitySupport = (
+    windowReady &&
+    signalProb >= Math.max(55, thresholds.minProbability + 10) &&
+    strongCluster &&
+    predictiveLift >= Math.max(0, thresholds.minLift * 0.35) &&
+    !severeWhiteCluster &&
+    !severeDowntrend
+  );
+  const supportiveB2BIssue = (
+    positiveB2B &&
+    windowReady &&
+    signalProb >= Math.max(18, thresholds.minProbability * 0.72) &&
+    clusterSupportPct >= Math.max(16, thresholds.minClusterSupport - 4) &&
+    predictiveLift >= Math.max(0, thresholds.minLift * 0.25)
+  );
+  const randomLikeHardBlock = randomLike && !highProbabilitySupport && !supportiveB2BIssue;
   const issuePrediction = (
     !lowData &&
     kmReliable &&
     !openWindow &&
-    !randomLike &&
+    !randomLikeHardBlock &&
     windowReady &&
     !isTooEarly &&
-    strongProbability &&
-    strongEdge &&
-    strongCluster &&
-    !patternBlocked
+    !patternBlocked &&
+    (
+      (strongProbability && strongEdge && strongCluster) ||
+      highProbabilitySupport ||
+      supportiveB2BIssue
+    )
   );
 
   let avoidReason = null;
   if (!issuePrediction) {
-    if (recentPattern.whiteCluster) avoidReason = 'white_cluster';
-    else if (recentPattern.downtrend) avoidReason = 'downtrend';
-    else if (recentPattern.b2bBlocked) avoidReason = 'recent_b2b_risk';
+    if (severeWhiteCluster) avoidReason = 'white_cluster';
+    else if (severeDowntrend) avoidReason = 'downtrend';
+    else if (recentPattern.b2bBlocked && !positiveB2B) avoidReason = 'recent_b2b_risk';
     else if (lowData) avoidReason = 'low_data';
     else if (!kmReliable) avoidReason = 'km_low_sample';
     else if (openWindow) avoidReason = 'extreme_tail';
-    else if (randomLike) avoidReason = 'random_like';
+    else if (randomLikeHardBlock) avoidReason = 'random_like';
     else if (!windowReady || isTooEarly) avoidReason = 'too_early';
     else if (!strongCluster) avoidReason = 'weak_cluster';
     else if (!strongEdge) avoidReason = 'no_edge';
@@ -672,9 +787,12 @@ function computeOracleForecast(rounds, target, options = {}) {
   if (inWindow) chaseRaw += 10;
   else if (windowReady) chaseRaw += 4;
   else chaseRaw -= 12;
-  if (recentPattern.whiteCluster) chaseRaw -= 18;
-  if (recentPattern.downtrend) chaseRaw -= 14;
-  if (recentPattern.b2bBlocked) chaseRaw -= 16;
+  if (severeWhiteCluster) chaseRaw -= 18;
+  else if (recentPattern.whiteCluster) chaseRaw -= 8;
+  if (severeDowntrend) chaseRaw -= 14;
+  else if (recentPattern.downtrend) chaseRaw -= 7;
+  if (recentPattern.b2bBlocked && !positiveB2B) chaseRaw -= 16;
+  if (positiveB2B) chaseRaw += 8;
   if (lowData) chaseRaw -= 20;
   if (!kmReliable) chaseRaw -= 16;
   if (randomLike) chaseRaw -= 18;
@@ -759,6 +877,9 @@ function computeOracleForecast(rounds, target, options = {}) {
     chaseSignal,
     chaseColor,
     issuePrediction,
+    issueMode: issuePrediction
+      ? (supportiveB2BIssue ? 'b2b_support' : highProbabilitySupport ? 'high_probability' : 'strict')
+      : 'observe',
     avoidReason,
     windowReady,
     windowReadyThreshold,
