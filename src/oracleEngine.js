@@ -1281,6 +1281,16 @@ function computeOracleForecast(rounds, target, options = {}) {
   if (recentPattern.downtrendEarly) reliabilityFlags.push('downtrend_risk');
   if (recentPattern.b2bBlocked) reliabilityFlags.push('b2b_risk');
 
+  const probReliable = kmReliable && selectedCount >= sampleRequirements.minKMGaps;
+  if (!probReliable) {
+    pHit1 = null;
+    pHit5 = null;
+    pHit10 = null;
+    pHit20 = null;
+    pHitWindow = null;
+    pHitNearWindow = null;
+  }
+
   const clusterSupportPct = primaryCluster ? primaryCluster.supportPct * 100 : 0;
   const windowReadyThreshold = Math.max(1, Math.ceil(winSize * thresholds.readinessFactor));
   const windowReady = inWindow || roundsUntilWindowLo <= windowReadyThreshold;
@@ -1429,13 +1439,20 @@ function computeOracleForecast(rounds, target, options = {}) {
     supportMinusRisk >= 0
   );
   const randomLikeHardBlock = randomLike && !transitionDrivenIssue && !supportiveB2BIssue;
+  const transitionFloor = target.minVal <= 15 ? 10 : target.minVal <= 30 ? 12 : target.minVal <= 100 ? 14 : 16;
+  const strongTransition = recentPattern.transitionSupportScore >= transitionFloor;
+  const highTargetNeedsPreview = target.minVal >= 100 ? (recentPattern.tailPreviewHits > 0 || strongTransition) : true;
+  const baseConfidence = signalProb >= thresholds.minProbability;
   const issuePrediction = (
     !lowData &&
     !openWindow &&
     transitionWindowReady &&
     (!isTooEarly || transitionDrivenIssue || earlySupportiveEntry || earlyCompressionEntry) &&
-    strongProbability &&
-    (strongCluster || supportMinusRisk >= -2 || transitionDrivenIssue) &&
+    baseConfidence &&
+    strongTransition &&
+    supportMinusRisk >= 0 &&
+    highTargetNeedsPreview &&
+    (strongCluster || transitionDrivenIssue) &&
     !hardRiskBlock &&
     !randomLikeHardBlock
   );
@@ -1444,7 +1461,7 @@ function computeOracleForecast(rounds, target, options = {}) {
   const calibration = calibrateProbability(rawConfidence, options.calibrationRows || [], issueMode, regimeMode);
   let confidence = calibration.calibrated;
   if (lowData) confidence = Math.min(confidence, 25);
-  if (!kmReliable) confidence = Math.min(confidence, 45);
+  if (!kmReliable) confidence = Math.min(confidence, 20);
   if (randomLike) confidence = Math.min(confidence, Math.max(8, confidence - 12));
   if (openWindow) confidence = Math.min(confidence, 18);
   confidence -= clampNumber(recentPattern.whiteRiskScore * 0.35, 0, 18);
@@ -1556,6 +1573,7 @@ function computeOracleForecast(rounds, target, options = {}) {
     pHit20,
     pHitWindow,
     pHitNearWindow,
+    probReliable,
     nearWindowRounds,
     empiricalWindowHitRate: Number(empiricalWindowHitRate.toFixed(1)),
     chanceWindowRate: Number(chanceWindowRate.toFixed(1)),
