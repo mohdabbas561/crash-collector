@@ -1442,19 +1442,37 @@ function computeOracleForecast(rounds, target, options = {}) {
   const transitionFloor = target.minVal <= 15 ? 10 : target.minVal <= 30 ? 12 : target.minVal <= 100 ? 14 : 16;
   const strongTransition = recentPattern.transitionSupportScore >= transitionFloor;
   const highTargetNeedsPreview = target.minVal >= 100 ? (recentPattern.tailPreviewHits > 0 || strongTransition) : true;
-  const baseConfidence = signalProb >= thresholds.minProbability;
+
+  const lockScore = (
+    (signalProb * 0.35) +
+    Math.min(20, predictiveLift * 2) +
+    Math.min(18, clusterSupportPct * 0.3) +
+    Math.min(18, recentPattern.transitionSupportScore * 0.45) +
+    Math.min(12, Math.max(0, supportMinusRisk) * 0.4) +
+    (positiveB2B ? 8 : 0) +
+    (strongEdge ? 4 : 0) -
+    Math.min(18, recentPattern.whiteRiskScore * 0.35) -
+    Math.min(16, recentPattern.downtrendRiskScore * 0.3) -
+    Math.min(14, recentPattern.b2bRiskScore * 0.3)
+  );
+  const lockThreshold =
+    target.minVal <= 10 ? 38 :
+    target.minVal <= 30 ? 34 :
+    target.minVal <= 100 ? 30 :
+    target.minVal <= 200 ? 28 :
+    target.minVal <= 500 ? 26 : 24;
+
   const issuePrediction = (
     !lowData &&
     !openWindow &&
     transitionWindowReady &&
     (!isTooEarly || transitionDrivenIssue || earlySupportiveEntry || earlyCompressionEntry) &&
-    baseConfidence &&
-    strongTransition &&
-    supportMinusRisk >= 0 &&
+    strongProbability &&
     highTargetNeedsPreview &&
-    (strongCluster || transitionDrivenIssue) &&
     !hardRiskBlock &&
-    !randomLikeHardBlock
+    !randomLikeHardBlock &&
+    (strongCluster || strongTransition || transitionDrivenIssue) &&
+    lockScore >= lockThreshold
   );
   const issueMode = issuePrediction ? 'simple' : 'observe';
 
@@ -1474,10 +1492,13 @@ function computeOracleForecast(rounds, target, options = {}) {
   if (!issuePrediction) {
     if (lowData) avoidReason = 'low_data';
     else if (openWindow) avoidReason = 'extreme_tail';
+    else if (activeWhiteRisk && !strongTransition) avoidReason = 'white_cluster';
+    else if (activeDowntrendRisk && !strongTransition) avoidReason = 'downtrend';
+    else if (unsafeB2B && !positiveB2B) avoidReason = 'recent_b2b_risk';
     else if (!transitionWindowReady || isTooEarly) avoidReason = 'too_early';
     else if (!strongProbability) avoidReason = 'weak_probability';
     else if (randomLikeHardBlock) avoidReason = 'random_like';
-    else if (hardRiskBlock) avoidReason = 'observe_only';
+    else if (lockScore < lockThreshold) avoidReason = 'observe_only';
     else avoidReason = 'observe_only';
   }
 
