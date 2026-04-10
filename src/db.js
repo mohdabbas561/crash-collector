@@ -302,7 +302,7 @@ async function getPredictions({ limit = 500, target = null, source = null } = {}
     `SELECT id, target, min_mult, outcome, window_lo, window_hi, hit_round, generation, source, prob_w, issue_mode, regime_mode, created_at
      FROM predictions ${where}
      ORDER BY
-       COALESCE(hit_round, window_hi) DESC,
+       GREATEST(COALESCE(window_hi, 0), COALESCE(hit_round, 0)) DESC,
        window_hi DESC,
        created_at DESC,
        id DESC
