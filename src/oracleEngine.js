@@ -283,21 +283,21 @@ function computeConditionalExpectedGap(survivors, roundsSince) {
 
 function getIssueThresholds(target) {
   if (target.minVal <= 10) {
-    return { minProbability: 52, minLift: 8, minClusterSupport: 24, readinessFactor: 0.55 };
+    return { minProbability: 22, minLift: 0, minClusterSupport: 8, readinessFactor: 0.4 };
   }
   if (target.minVal <= 30) {
-    return { minProbability: 40, minLift: 6, minClusterSupport: 22, readinessFactor: 0.6 };
+    return { minProbability: 18, minLift: 0, minClusterSupport: 8, readinessFactor: 0.45 };
   }
   if (target.minVal <= 100) {
-    return { minProbability: 28, minLift: 4, minClusterSupport: 18, readinessFactor: 0.68 };
+    return { minProbability: 12, minLift: 0, minClusterSupport: 6, readinessFactor: 0.5 };
   }
   if (target.minVal <= 200) {
-    return { minProbability: 18, minLift: 2.5, minClusterSupport: 16, readinessFactor: 0.74 };
+    return { minProbability: 9, minLift: 0, minClusterSupport: 6, readinessFactor: 0.55 };
   }
   if (target.minVal <= 500) {
-    return { minProbability: 11, minLift: 1.5, minClusterSupport: 14, readinessFactor: 0.82 };
+    return { minProbability: 7, minLift: 0, minClusterSupport: 5, readinessFactor: 0.6 };
   }
-  return { minProbability: 7, minLift: 0.8, minClusterSupport: 12, readinessFactor: 0.9 };
+  return { minProbability: 5, minLift: 0, minClusterSupport: 4, readinessFactor: 0.65 };
 }
 
 function getSampleRequirements(target) {
@@ -1296,7 +1296,7 @@ function computeOracleForecast(rounds, target, options = {}) {
   );
   const signalProb = rawConfidence;
   const strongProbability = signalProb >= thresholds.minProbability;
-  const strongEdge = predictiveLift >= thresholds.minLift || standardizedLift >= 1.15;
+  const strongEdge = predictiveLift >= thresholds.minLift || standardizedLift >= 1.0;
   const strongCluster = clusterSupportPct >= thresholds.minClusterSupport;
   const severeWhiteCluster = recentPattern.whiteRiskScore >= (target.minVal <= 15 ? 34 : target.minVal <= 100 ? 30 : 24);
   const activeTailWhitePressure = (
@@ -1428,35 +1428,18 @@ function computeOracleForecast(rounds, target, options = {}) {
     predictiveLift >= Math.max(0, thresholds.minLift * 0.2) &&
     supportMinusRisk >= 0
   );
-  const randomLikeHardBlock = randomLike
-    && !highProbabilitySupport
-    && !supportiveB2BIssue
-    && !rareCompressionIssue
-    && !transitionDrivenIssue;
+  const randomLikeHardBlock = randomLike && !transitionDrivenIssue && !supportiveB2BIssue;
   const issuePrediction = (
     !lowData &&
     !openWindow &&
-    !randomLikeHardBlock &&
     transitionWindowReady &&
-    (!isTooEarly || earlySupportiveEntry || earlyCompressionEntry || rareCompressionIssue || transitionDrivenIssue) &&
-    !activeWhiteRisk &&
-    !activeDowntrendRisk &&
+    (!isTooEarly || transitionDrivenIssue || earlySupportiveEntry || earlyCompressionEntry) &&
+    strongProbability &&
+    (strongCluster || supportMinusRisk >= -2 || transitionDrivenIssue) &&
     !hardRiskBlock &&
-    (kmReliable || rareCompressionIssue || earlySupportiveEntry || earlyCompressionEntry || transitionDrivenIssue) &&
-    (
-      (strongProbability && strongCluster && (strongEdge || supportMinusRisk >= Math.max(2, thresholds.minLift))) ||
-      earlySupportiveEntry ||
-      earlyCompressionEntry ||
-      patternDrivenIssue ||
-      highProbabilitySupport ||
-      rareCompressionIssue ||
-      supportiveB2BIssue ||
-      transitionDrivenIssue
-    )
+    !randomLikeHardBlock
   );
-  const issueMode = issuePrediction
-    ? (earlySupportiveEntry || supportiveB2BIssue ? 'b2b_support' : earlyCompressionEntry || rareCompressionIssue || patternDrivenIssue || transitionDrivenIssue ? 'pattern_support' : highProbabilitySupport ? 'high_probability' : 'strict')
-    : 'observe';
+  const issueMode = issuePrediction ? 'simple' : 'observe';
 
   const calibration = calibrateProbability(rawConfidence, options.calibrationRows || [], issueMode, regimeMode);
   let confidence = calibration.calibrated;
@@ -1472,17 +1455,12 @@ function computeOracleForecast(rounds, target, options = {}) {
 
   let avoidReason = null;
   if (!issuePrediction) {
-    if (activeWhiteRisk) avoidReason = 'white_cluster';
-    else if (activeDowntrendRisk) avoidReason = 'downtrend';
-    else if (unsafeB2B) avoidReason = 'recent_b2b_risk';
-    else if (lowData) avoidReason = 'low_data';
-    else if (!kmReliable) avoidReason = 'km_low_sample';
+    if (lowData) avoidReason = 'low_data';
     else if (openWindow) avoidReason = 'extreme_tail';
-    else if (randomLikeHardBlock) avoidReason = 'random_like';
-    else if (!windowReady || isTooEarly) avoidReason = 'too_early';
-    else if (!strongCluster) avoidReason = 'weak_cluster';
-    else if (!strongEdge) avoidReason = 'no_edge';
+    else if (!transitionWindowReady || isTooEarly) avoidReason = 'too_early';
     else if (!strongProbability) avoidReason = 'weak_probability';
+    else if (randomLikeHardBlock) avoidReason = 'random_like';
+    else if (hardRiskBlock) avoidReason = 'observe_only';
     else avoidReason = 'observe_only';
   }
 
@@ -1512,37 +1490,7 @@ function computeOracleForecast(rounds, target, options = {}) {
   if (openWindow) chaseRaw -= 24;
   chaseRaw = clampNumber(chaseRaw, 0, 100);
 
-  const watchworthy = (
-    !issuePrediction &&
-    !hardRiskBlock &&
-    !activeWhiteRisk &&
-    !activeDowntrendRisk &&
-    !lowData &&
-    !openWindow &&
-    !randomLikeHardBlock &&
-    signalProb >= (thresholds.minProbability * 0.72) &&
-    predictiveLift >= Math.max(1, thresholds.minLift * 0.45) &&
-    supportMinusRisk >= 0
-  );
-  const waitworthy = (
-    !issuePrediction &&
-    !hardRiskBlock &&
-    !activeWhiteRisk &&
-    !activeDowntrendRisk &&
-    !lowData &&
-    !openWindow &&
-    !randomLikeHardBlock &&
-    signalProb >= (thresholds.minProbability * 0.5) &&
-    supportMinusRisk >= -4
-  );
-
-  const chaseSignal = issuePrediction
-    ? 'CHASE'
-    : watchworthy
-      ? 'WATCH'
-      : waitworthy && windowReady
-        ? 'WAIT'
-        : 'SKIP';
+  const chaseSignal = issuePrediction ? 'CHASE' : 'SKIP';
   const chaseColor = chaseRaw >= 70
     ? '#39ff8a'
     : chaseRaw >= 50
