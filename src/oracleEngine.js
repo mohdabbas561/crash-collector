@@ -490,6 +490,9 @@ function computeRecentPatternDiagnostics(rounds, target, roundsSince, allGapsRaw
     maxSoftWhiteStreak = Math.max(maxSoftWhiteStreak, softWhiteStreak);
     maxLowPressureStreak = Math.max(maxLowPressureStreak, lowPressureStreak);
   }
+  const endingHardWhiteStreak = hardWhiteStreak;
+  const endingSoftWhiteStreak = softWhiteStreak;
+  const endingLowPressureStreak = lowPressureStreak;
 
   const split = Math.max(1, Math.floor(values.length / 2));
   const firstHalf = values.slice(0, split);
@@ -623,10 +626,10 @@ function computeRecentPatternDiagnostics(rounds, target, roundsSince, allGapsRaw
     last4LowPressurePct >= Math.max(50, thresholds.tailLowPressurePctThreshold)
   ) && tailNearHits === 0 && tailTargetHits === 0;
   const releaseWatch = (
-    headLowPressurePct >= Math.max(48, thresholds.lowPressurePctThreshold - 10) &&
-    tailLowPressurePct <= Math.max(38, thresholds.tailLowPressurePctThreshold - 8) &&
-    (headLowPressurePct - tailLowPressurePct) >= 12 &&
-    trendPct > (thresholds.downtrendThreshold * 0.75)
+    headLowPressurePct >= Math.max(42, thresholds.lowPressurePctThreshold - 14) &&
+    tailLowPressurePct <= Math.max(44, thresholds.tailLowPressurePctThreshold - 4) &&
+    (headLowPressurePct - tailLowPressurePct) >= 10 &&
+    trendPct > (thresholds.downtrendThreshold * 0.9)
   );
   const whiteRelease = releaseWatch && (
     tailNearHits > 0 ||
@@ -751,9 +754,9 @@ function computeRecentPatternDiagnostics(rounds, target, roundsSince, allGapsRaw
     maxHardWhiteStreak,
     maxSoftWhiteStreak,
     maxLowPressureStreak,
-    endingHardWhiteStreak: hardWhiteStreak,
-    endingSoftWhiteStreak: softWhiteStreak,
-    endingLowPressureStreak: lowPressureStreak,
+    endingHardWhiteStreak,
+    endingSoftWhiteStreak,
+    endingLowPressureStreak,
     recentTargetHits,
     recentNearHits,
     tailTargetHits,
@@ -1109,8 +1112,9 @@ function computeOracleForecast(rounds, target, options = {}) {
   const halfWin = Math.floor(winSize / 2);
   const windowLo = predictedRound - halfWin;
   const windowHi = windowLo + winSize - 1;
+  const selectedGapsForRates = selectedStats.trimmed;
   const droughtPct = selectedCount > 0
-    ? Math.round((selectedSorted.filter((gap) => gap <= roundsSince).length / selectedCount) * 100)
+    ? Math.round((selectedGapsForRates.filter((gap) => gap <= roundsSince).length / selectedCount) * 100)
     : 0;
   const roundsUntilWindowLo = Math.max(0, windowLo - nowId);
   const roundsUntilWindowHi = Math.max(0, windowHi - nowId);
@@ -1144,9 +1148,9 @@ function computeOracleForecast(rounds, target, options = {}) {
   const thresholds = getIssueThresholds(target);
   const winGapLo = predictedGap - halfWin;
   const winGapHi = winGapLo + winSize - 1;
-  const hitsInWindow = selectedSorted.filter((gap) => gap >= winGapLo && gap <= winGapHi).length;
+  const hitsInWindow = selectedGapsForRates.filter((gap) => gap >= winGapLo && gap <= winGapHi).length;
   const empiricalWindowHitRate = selectedCount > 0 ? (hitsInWindow / selectedCount) * 100 : 0;
-  const chanceWindowRate = computeChanceWindowRate(selectedSorted, winSize);
+  const chanceWindowRate = computeChanceWindowRate(selectedGapsForRates, winSize);
   const predictiveLift = empiricalWindowHitRate - chanceWindowRate;
   const baselineStd = Math.max(
     1,
@@ -1168,6 +1172,7 @@ function computeOracleForecast(rounds, target, options = {}) {
   if (randomLike) reliabilityFlags.push('random_like');
   if (!primaryCluster || primaryCluster.supportPct < 0.18) reliabilityFlags.push('weak_cluster');
   if (recentPattern.whiteCluster) reliabilityFlags.push('white_cluster');
+  if (recentPattern.lowPressureCluster) reliabilityFlags.push('low_pressure_cluster');
   if (recentPattern.emergingWhiteRisk) reliabilityFlags.push('white_risk');
   if (recentPattern.downtrend) reliabilityFlags.push('downtrend');
   if (recentPattern.downtrendEarly) reliabilityFlags.push('downtrend_risk');
@@ -1183,11 +1188,17 @@ function computeOracleForecast(rounds, target, options = {}) {
   const severeWhiteCluster = recentPattern.whiteRiskScore >= (target.minVal <= 15 ? 34 : target.minVal <= 100 ? 30 : 24);
   const activeTailWhitePressure = (
     recentPattern.tailSoftWhitePct >= Math.max(48, patternThresholds.softWhitePctThreshold - 22) ||
-    recentPattern.weightedSoftWhitePct >= Math.max(52, patternThresholds.softWhitePctThreshold - 16) ||
     recentPattern.tailLowPressurePct >= patternThresholds.tailLowPressurePctThreshold ||
-    recentPattern.weightedLowPressurePct >= Math.max(48, patternThresholds.lowPressurePctThreshold - 10) ||
     recentPattern.endingSoftWhiteStreak >= patternThresholds.softStreakThreshold ||
-    recentPattern.endingLowPressureStreak >= Math.max(2, Math.ceil(winSize * 0.4))
+    recentPattern.endingLowPressureStreak >= Math.max(2, Math.ceil(winSize * 0.4)) ||
+    (
+      recentPattern.weightedSoftWhitePct >= Math.max(52, patternThresholds.softWhitePctThreshold - 16) &&
+      recentPattern.tailSoftWhitePct >= Math.max(44, patternThresholds.softWhitePctThreshold - 26)
+    ) ||
+    (
+      recentPattern.weightedLowPressurePct >= Math.max(48, patternThresholds.lowPressurePctThreshold - 10) &&
+      recentPattern.tailLowPressurePct >= Math.max(42, patternThresholds.tailLowPressurePctThreshold - 6)
+    )
   );
   const activeWhiteRisk = (
     (
@@ -1199,7 +1210,7 @@ function computeOracleForecast(rounds, target, options = {}) {
       recentPattern.emergingWhiteRisk &&
       recentPattern.whiteRiskScore >= 18
     )
-  ) && !recentPattern.whiteRelease;
+  ) && !recentPattern.whiteRelease && !recentPattern.releaseWatch;
   const severeDowntrend = recentPattern.downtrendRiskScore >= (target.minVal <= 30 ? 26 : target.minVal <= 100 ? 22 : 18);
   const activeDowntrendRisk = (
     recentPattern.downtrend ||
@@ -1249,6 +1260,8 @@ function computeOracleForecast(rounds, target, options = {}) {
     !randomLikeHardBlock &&
     windowReady &&
     !isTooEarly &&
+    !activeWhiteRisk &&
+    !activeDowntrendRisk &&
     !hardRiskBlock &&
     (
       (strongProbability && strongCluster && (strongEdge || supportMinusRisk >= Math.max(2, thresholds.minLift))) ||
@@ -1261,7 +1274,6 @@ function computeOracleForecast(rounds, target, options = {}) {
     ? (supportiveB2BIssue ? 'b2b_support' : patternDrivenIssue ? 'pattern_support' : highProbabilitySupport ? 'high_probability' : 'strict')
     : 'observe';
 
-  const calibration = calibrateProbability(rawConfidence, options.calibrationRows || [], issueMode);
   const calibration = calibrateProbability(rawConfidence, options.calibrationRows || [], issueMode, regimeMode);
   let confidence = calibration.calibrated;
   if (lowData) confidence = Math.min(confidence, 25);
@@ -1318,8 +1330,11 @@ function computeOracleForecast(rounds, target, options = {}) {
   const watchworthy = (
     !issuePrediction &&
     !hardRiskBlock &&
+    !activeWhiteRisk &&
+    !activeDowntrendRisk &&
     !lowData &&
     !openWindow &&
+    !randomLikeHardBlock &&
     signalProb >= (thresholds.minProbability * 0.72) &&
     predictiveLift >= Math.max(1, thresholds.minLift * 0.45) &&
     supportMinusRisk >= 0
@@ -1327,8 +1342,11 @@ function computeOracleForecast(rounds, target, options = {}) {
   const waitworthy = (
     !issuePrediction &&
     !hardRiskBlock &&
+    !activeWhiteRisk &&
+    !activeDowntrendRisk &&
     !lowData &&
     !openWindow &&
+    !randomLikeHardBlock &&
     signalProb >= (thresholds.minProbability * 0.5) &&
     supportMinusRisk >= -4
   );
@@ -1409,6 +1427,7 @@ function computeOracleForecast(rounds, target, options = {}) {
     empiricalWindowHitRate: Number(empiricalWindowHitRate.toFixed(1)),
     chanceWindowRate: Number(chanceWindowRate.toFixed(1)),
     predictiveLift: Number(predictiveLift.toFixed(1)),
+    standardizedLift: Number(standardizedLift.toFixed(2)),
     roundsUntilWindowLo,
     roundsUntilWindowHi,
     inWindow,
@@ -1438,6 +1457,7 @@ function makeOracleLock(forecast, nowId) {
     droughtAtSnap: forecast.droughtPct,
     signal: forecast.chaseSignal,
     issueMode: forecast.issueMode || null,
+    regimeMode: forecast.regimeMode || null,
     issuePrediction: Boolean(forecast.issuePrediction),
     avoidReason: forecast.avoidReason || null,
   };

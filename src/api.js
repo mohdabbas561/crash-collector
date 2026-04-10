@@ -304,7 +304,7 @@ const dashboardCache = {
 let predictComputeInFlight = null;
 let lockedComputeInFlight = null;
 let oraclePredictInFlight = null;
-const ORACLE_PREDICTION_SOURCE = 'oracle_v25';
+const ORACLE_PREDICTION_SOURCE = 'oracle_v26';
 let lockedBackgroundTimer = null;
 let oracleBackgroundTimer = null;
 let dbState = {
@@ -777,9 +777,10 @@ function findFirstOracleHitAfter(targetHits, afterId) {
 }
 
 function replayOracleTargetState({ rounds, nowId, target, existingLock, forecastOptions = {} }) {
-  let forecast = computeOracleForecast(rounds, target, forecastOptions);
+  let liveForecast = computeOracleForecast(rounds, target, forecastOptions);
+  let replayForecast = liveForecast;
   const resolvedRows = [];
-  if (!forecast) return { forecast: null, activeLock: null, resolvedRows };
+  if (!liveForecast) return { forecast: null, activeLock: null, resolvedRows };
 
   const targetHits = rounds.filter((round) => round.val >= target.minVal);
   let activeLock = existingLock || null;
@@ -821,14 +822,15 @@ function replayOracleTargetState({ rounds, nowId, target, existingLock, forecast
       generation: activeLock.generation || 1,
       source: ORACLE_PREDICTION_SOURCE,
       probW: activeLock.confidence != null ? Number(activeLock.confidence) / 100 : null,
-      issueMode: activeLock.issueMode || forecast.issueMode || null,
+      issueMode: activeLock.issueMode || replayForecast?.issueMode || liveForecast?.issueMode || null,
+      regimeMode: activeLock.regimeMode || replayForecast?.regimeMode || liveForecast?.regimeMode || null,
     });
 
     const replayRounds = sliceRoundsUpTo(rounds, replayCutoffId);
     let nextForecast = computeOracleForecast(replayRounds, target, forecastOptions);
     if (!nextForecast || nextForecast.noData) {
       activeLock = null;
-      forecast = nextForecast || forecast;
+      replayForecast = nextForecast || replayForecast;
       break;
     }
     if (outcome === 'loss') {
@@ -842,28 +844,30 @@ function replayOracleTargetState({ rounds, nowId, target, existingLock, forecast
         }
       : null;
 
-    forecast = computeOracleForecast(rounds, target, forecastOptions) || nextForecast;
+    replayForecast = nextForecast;
     activeLock = nextLock;
   }
 
-  if (!activeLock && forecast && !forecast.noData && forecast.issuePrediction) {
+  liveForecast = computeOracleForecast(rounds, target, forecastOptions) || replayForecast;
+
+  if (!activeLock && liveForecast && !liveForecast.noData && liveForecast.issuePrediction) {
     activeLock = {
-      ...makeOracleLock(forecast, nowId),
+      ...makeOracleLock(liveForecast, nowId),
       generation: 1,
     };
-  } else if (activeLock && forecast && !forecast.noData) {
-    const sameHitChain = Number(activeLock.lastHitId || 0) === Number(forecast?.lastHit?.id || 0);
-    if (!sameHitChain && Number(forecast?.lastHit?.id || 0) > 0) {
-      activeLock = forecast.issuePrediction
+  } else if (activeLock && liveForecast && !liveForecast.noData) {
+    const sameHitChain = Number(activeLock.lastHitId || 0) === Number(liveForecast?.lastHit?.id || 0);
+    if (!sameHitChain && Number(liveForecast?.lastHit?.id || 0) > 0) {
+      activeLock = liveForecast.issuePrediction
         ? {
-            ...makeOracleLock(forecast, nowId),
+            ...makeOracleLock(liveForecast, nowId),
             generation: 1,
           }
         : null;
     }
   }
 
-  return { forecast, activeLock, resolvedRows };
+  return { forecast: liveForecast, activeLock, resolvedRows };
 }
 
 function buildOracleTargetPayload(forecast, activeLock, nowId) {
@@ -890,6 +894,7 @@ function buildOracleTargetPayload(forecast, activeLock, nowId) {
     iqr: activeLock?.iqr ?? forecast.iqr,
     clusterCenter: activeLock?.clusterCenter ?? forecast.clusterCenter,
     issueMode: activeLock?.issueMode ?? forecast.issueMode ?? 'observe',
+    regimeMode: activeLock?.regimeMode ?? forecast.regimeMode ?? 'full',
     activePrediction: Boolean(activeLock),
     issuePrediction: Boolean(activeLock || forecast.issuePrediction),
     avoidReason: activeLock ? null : (forecast.avoidReason || null),
