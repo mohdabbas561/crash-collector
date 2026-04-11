@@ -1,15 +1,15 @@
 'use strict';
 
 const ORACLE_TARGETS = Object.freeze([
-  { label: '5x', minVal: 5, color: '#00ff88', window: 5, scanN: 120, minHits: 5 },
-  { label: '10x', minVal: 10, color: '#00d4ff', window: 7, scanN: 100, minHits: 4 },
-  { label: '15x', minVal: 15, color: '#ff6b9d', window: 9, scanN: 80, minHits: 3 },
-  { label: '30x', minVal: 30, color: '#ff9f43', window: 14, scanN: 60, minHits: 2 },
+  { label: '5x', minVal: 5, color: '#00ff88', window: 4, scanN: 120, minHits: 5 },
+  { label: '10x', minVal: 10, color: '#00d4ff', window: 6, scanN: 100, minHits: 4 },
+  { label: '15x', minVal: 15, color: '#ff6b9d', window: 7, scanN: 80, minHits: 3 },
+  { label: '30x', minVal: 30, color: '#ff9f43', window: 13, scanN: 60, minHits: 2 },
   { label: '50x', minVal: 50, color: '#4db8ff', window: 20, scanN: 50, minHits: 2 },
-  { label: '100x', minVal: 100, color: '#39ff8a', window: 28, scanN: 40, minHits: 2 },
-  { label: '200x', minVal: 200, color: '#c77dff', window: 38, scanN: 30, minHits: 2 },
-  { label: '500x', minVal: 500, color: '#ff4da6', window: 55, scanN: 24, minHits: 2 },
-  { label: '1000x', minVal: 1000, color: '#7aa2ff', window: 80, scanN: 20, minHits: 2 },
+  { label: '100x', minVal: 100, color: '#39ff8a', window: 30, scanN: 40, minHits: 2 },
+  { label: '200x', minVal: 200, color: '#c77dff', window: 50, scanN: 30, minHits: 2 },
+  { label: '500x', minVal: 500, color: '#ff4da6', window: 75, scanN: 24, minHits: 2 },
+  { label: '1000x', minVal: 1000, color: '#7aa2ff', window: 100, scanN: 20, minHits: 2 },
 ]);
 
 const REGIME_DRIFT_THRESHOLD = 0.35;

@@ -716,39 +716,9 @@ function advanceOracleForecastPastExistingWindow(existingLock, forecast) {
   if (!existingLock || !forecast || forecast.noData) return forecast;
   const sameHitChain = Number(existingLock.lastHitId || 0) === Number(forecast?.lastHit?.id || 0);
   if (!sameHitChain) return forecast;
-  if (Number(forecast.windowHi || 0) > Number(existingLock.windowHi || 0)) return forecast;
-
-  // FIX: Use IQR instead of median for step size. Median causes the new window
-  // to jump too far past where the next hit actually is, creating MISSED outcomes.
-  // IQR gives a tighter, more accurate step. Also cap iterations at 6 (was 12)
-  // to prevent runaway advancement chains.
-  const safeStep = Math.max(
-    1,
-    Number(forecast.windowSize || 0),
-    Number(forecast.iqr || Math.round((forecast.med || 0) * 0.5))
-  );
-  let predictedRound = Number(forecast.predictedRound || 0);
-  let windowLo = Number(forecast.windowLo || 0);
-  let windowHi = Number(forecast.windowHi || 0);
-  const maxIterations = 6;
-  let iteration = 0;
-
-  while (windowHi <= Number(existingLock.windowHi || 0) && iteration < maxIterations) {
-    predictedRound += safeStep;
-    windowLo += safeStep;
-    windowHi += safeStep;
-    iteration += 1;
-  }
-
-  return {
-    ...forecast,
-    predictedGap: Number(forecast.lastHit?.id || 0) > 0
-      ? predictedRound - Number(forecast.lastHit.id || 0)
-      : forecast.predictedGap,
-    predictedRound,
-    windowLo,
-    windowHi,
-  };
+  // Keep windows fixed to the forecast output. Sliding after a miss causes
+  // confusing +1 drift for the user and makes lock spans feel unstable.
+  return forecast;
 }
 
 function upperBoundRoundIndex(rounds, maxId) {
