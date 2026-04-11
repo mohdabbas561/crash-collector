@@ -97,7 +97,7 @@ function normalizeRounds(rounds) {
   const mapped = new Map();
   for (const round of rounds || []) {
     const id = Number(round?.roundId ?? round?.id);
-    const val = Number.parseFloat(round?.multiplier ?? round?.val);
+    const val = Number.parseFloat(round?.multiplier ?? round?.val ?? round?.gameResult ?? round?.result);
     if (!Number.isFinite(id) || !Number.isFinite(val) || val <= 0) continue;
     mapped.set(id, { id, val });
   }
@@ -503,6 +503,8 @@ function computeRecentPatternDiagnostics(rounds, target, roundsSince, allGapsRaw
       downtrendExhaustion: false,
       regimeUpshift: false,
       downtrendPct: 0,
+      lowerHighCount: 0,
+      risingHighCount: 0,
       shortRepeatRate: 0,
       localShortRepeatRate: 0,
       shortRepeatMomentum: 0,
@@ -1031,6 +1033,8 @@ function computeRecentPatternDiagnostics(rounds, target, roundsSince, allGapsRaw
     downtrendExhaustion,
     regimeUpshift,
     downtrendPct: Number(trendPct.toFixed(1)),
+    lowerHighCount,
+    risingHighCount,
     shortRepeatRate: Number((shortRepeatRate * 100).toFixed(1)),
     localShortRepeatRate: Number((localShortRepeatRate * 100).toFixed(1)),
     shortRepeatMomentum: Number(shortRepeatMomentum.toFixed(1)),
@@ -1380,12 +1384,13 @@ function computeOracleForecast(rounds, target, options = {}) {
   }
   const totalOutcomes = earlyCount + winCount + lossCount;
   const earlyRate = totalOutcomes >= 10 ? earlyCount / totalOutcomes : 0;
-  // If >15% of outcomes are EARLY, pull window left proportionally
-  if (earlyRate > 0.15 && predictedGap > roundsSince + 1) {
+  // Only react to a clear EARLY bias. A mild global early rate should not
+  // drag every new forecast left and cause premature locks in downtrends.
+  if (earlyRate > 0.22 && predictedGap > roundsSince + 1) {
     const earlyPull = clampNumber(
-      Math.round(selectedStats.iqr * clampNumber((earlyRate - 0.15) * 4, 0, 0.8)),
+      Math.round(selectedStats.iqr * clampNumber((earlyRate - 0.22) * 2.5, 0, 0.35)),
       0,
-      Math.max(1, Math.round(winSize * 0.6))
+      Math.max(1, Math.round(winSize * 0.35))
     );
     if (earlyPull > 0) {
       predictedGap = Math.max(roundsSince + 1, predictedGap - earlyPull);
@@ -1394,21 +1399,31 @@ function computeOracleForecast(rounds, target, options = {}) {
     }
   }
 
-  // FIX: p25-based window left-shift — anchor the prediction toward the
-  // left tail of the gap distribution to catch hits that arrive early.
-  // This directly combats the 93 EARLY outcomes from systematic late placement.
-  if (predMethod !== 'tail' && predictedGap > selectedStats.p25 && !openWindow) {
+  // A left anchor only helps when we also see live recovery pressure. Making
+  // this unconditional was pushing locks too far left and opening into weak
+  // flow before the market actually turned.
+  const leftAnchorActive = (
+    recentPattern.reboundSupport ||
+    recentPattern.whiteRelease ||
+    recentPattern.regimeUpshift ||
+    recentPattern.downtrendExhaustion ||
+    recentPattern.b2bFriendly ||
+    recentPattern.immediateB2BRecent ||
+    recentPattern.nearBurstRecent ||
+    recentPattern.crossTargetB2BSupport
+  );
+  if (leftAnchorActive && predMethod !== 'tail' && predictedGap > selectedStats.p25 && !openWindow) {
     const p25Pull = clampNumber(
       Math.round(
         (predictedGap - selectedStats.p25) * (
-          target.minVal <= 15 ? 0.35
-            : target.minVal <= 30 ? 0.28
-              : target.minVal <= 100 ? 0.22
-                : 0.15
+          target.minVal <= 15 ? 0.22
+            : target.minVal <= 30 ? 0.18
+              : target.minVal <= 100 ? 0.14
+                : 0.1
         )
       ),
       0,
-      Math.max(1, Math.round(winSize * 0.5))
+      Math.max(1, Math.round(winSize * 0.28))
     );
     if (p25Pull > 0 && predictedGap - p25Pull >= roundsSince + 1) {
       predictedGap -= p25Pull;
@@ -1470,39 +1485,34 @@ function computeOracleForecast(rounds, target, options = {}) {
     recentPattern.b2bFriendly ||
     recentPattern.immediateB2BRecent ||
     recentPattern.nearBurstRecent
-  ) ? Math.ceil(winSize * 0.40) : 0;
+  ) ? Math.ceil(winSize * 0.26) : 0;
   const reversalSkewLeft = (
     recentPattern.downtrendExhaustion ||
     recentPattern.reboundSupport
-  ) ? Math.ceil(winSize * 0.25) : 0;
-  // FIX: Apply a baseline left-skew for ALL predictions to combat systematic
-  // late placement. Scale by target — low targets need more left-shift.
-  const baselineSkewLeft = Math.ceil(winSize * (
-    target.minVal <= 15 ? 0.22
-      : target.minVal <= 30 ? 0.16
-        : target.minVal <= 100 ? 0.12
-          : 0.08
-  ));
-  // FIX: Extra EARLY-history-driven skew to correct for observed EARLY pattern
-  const earlyHistorySkew = earlyRate > 0.20
-    ? Math.ceil(winSize * clampNumber((earlyRate - 0.15) * 1.5, 0, 0.35))
+  ) ? Math.ceil(winSize * 0.16) : 0;
+  const earlyHistorySkew = earlyRate > 0.25
+    ? Math.ceil(winSize * clampNumber((earlyRate - 0.22) * 1.0, 0, 0.12))
     : 0;
   const whiteDelayComp = (
     recentPattern.whiteCluster &&
     !recentPattern.whiteRelease &&
     !recentPattern.reboundSupport
-  ) ? Math.ceil(winSize * 0.10) : 0;
+  ) ? Math.ceil(winSize * 0.08) : 0;
   const windowSkewLeft = clampNumber(
-    Math.max(b2bSkewLeft, reversalSkewLeft, baselineSkewLeft) + earlyHistorySkew - whiteDelayComp,
+    Math.max(b2bSkewLeft, reversalSkewLeft, earlyHistorySkew) - whiteDelayComp,
     0,
-    Math.max(0, winSize - 1)
+    Math.max(0, Math.ceil(winSize * 0.45))
   );
-  let windowLo = predictedRound - halfWin - windowSkewLeft;
-  // Shift window forward if it's already started, to guarantee full window span
-  if (windowLo <= nowId) {
-    windowLo = nowId + 1;
-  }
-  const windowHi = windowLo + winSize - 1;
+  const scoredWindowLoGap = Math.max(1, predictedGap - halfWin - windowSkewLeft);
+  const scoredWindowHiGap = scoredWindowLoGap + winSize - 1;
+  const effectiveWindowLoGap = scoredWindowHiGap <= roundsSince
+    ? roundsSince + 1
+    : scoredWindowLoGap;
+  const effectiveWindowHiGap = effectiveWindowLoGap + winSize - 1;
+  predictedGap = clampNumber(predictedGap, effectiveWindowLoGap, effectiveWindowHiGap);
+  predictedRound = lastHit.id + predictedGap;
+  const windowLo = lastHit.id + effectiveWindowLoGap;
+  const windowHi = lastHit.id + effectiveWindowHiGap;
   const selectedGapsForRates = selectedStats.trimmed;
   const droughtPct = selectedCount > 0
     ? Math.round((selectedGapsForRates.filter((gap) => gap <= roundsSince).length / selectedCount) * 100)
@@ -1537,8 +1547,8 @@ function computeOracleForecast(rounds, target, options = {}) {
   }
 
   const thresholds = getIssueThresholds(target);
-  const winGapLo = predictedGap - halfWin - windowSkewLeft;
-  const winGapHi = winGapLo + winSize - 1;
+  const winGapLo = effectiveWindowLoGap;
+  const winGapHi = effectiveWindowHiGap;
   const hitsInWindow = selectedGapsForRates.filter((gap) => gap >= winGapLo && gap <= winGapHi).length;
   const empiricalWindowHitRate = selectedCount > 0 ? (hitsInWindow / selectedCount) * 100 : 0;
   const recentTrimmedBaseline = selectedStats.trimmed;
@@ -1629,6 +1639,22 @@ function computeOracleForecast(rounds, target, options = {}) {
       recentPattern.tailLowPressurePct >= Math.max(42, patternThresholds.tailLowPressurePctThreshold - 6)
     )
   );
+  const recoveryAligned = (
+    recentPattern.whiteRelease ||
+    recentPattern.releaseWatch ||
+    recentPattern.reboundSupport ||
+    recentPattern.downtrendExhaustion ||
+    recentPattern.regimeUpshift ||
+    (
+      recentPattern.transitionSupportScore >= (target.minVal <= 30 ? 14 : target.minVal <= 100 ? 12 : 10) &&
+      (
+        recentPattern.tailPreviewHits > 0 ||
+        recentPattern.tailNearHits > 0 ||
+        recentPattern.crossTargetB2BSupport ||
+        recentPattern.risingHighCount > 0
+      )
+    )
+  );
   const activeWhiteRisk = (
     (
       (recentPattern.whiteCluster || recentPattern.lowPressureCluster) &&
@@ -1639,27 +1665,21 @@ function computeOracleForecast(rounds, target, options = {}) {
       recentPattern.emergingWhiteRisk &&
       recentPattern.whiteRiskScore >= (target.minVal <= 100 ? 18 : 22)
     )
-  ) && !recentPattern.whiteRelease
-    && !recentPattern.releaseWatch
-    && !recentPattern.downtrendExhaustion
-    && !recentPattern.regimeUpshift
-    && !recentPattern.compressionSupport
-    && !(recentPattern.tailNearHits > 0 && recentPattern.transitionSupportScore >= (target.minVal <= 30 ? 10 : 8))
-    && recentPattern.transitionSupportScore < (target.minVal <= 30 ? 18 : target.minVal <= 100 ? 15 : 12);
+  ) && !recentPattern.compressionSupport
+    && !recoveryAligned;
   const severeDowntrend = recentPattern.downtrendRiskScore >= (target.minVal <= 30 ? 26 : target.minVal <= 100 ? 22 : 18);
   const activeDowntrendRisk = (
-    !recentPattern.downtrendExhaustion &&
-    !recentPattern.regimeUpshift &&
     (
       recentPattern.downtrend ||
-      (recentPattern.downtrendEarly && !recentPattern.reboundSupport && recentPattern.downtrendRiskScore >= 14)
-    )
+      (recentPattern.downtrendEarly && recentPattern.downtrendRiskScore >= 14)
+    ) &&
+    !recoveryAligned
   );
   const positiveB2B = (
     recentPattern.b2bFriendly &&
     recentPattern.b2bSupportScore >= Math.max(12, recentPattern.b2bRiskScore + 4) &&
-    !activeWhiteRisk &&
-    !activeDowntrendRisk
+    (!activeWhiteRisk || recoveryAligned) &&
+    (!activeDowntrendRisk || recentPattern.downtrendExhaustion || recentPattern.regimeUpshift)
   );
   const unsafeB2B = recentPattern.b2bBlocked && !positiveB2B;
   const hardRiskBlock = severeWhiteCluster || severeDowntrend || unsafeB2B;
@@ -1764,7 +1784,9 @@ function computeOracleForecast(rounds, target, options = {}) {
     clusterSupportPct >= Math.max(10, thresholds.minClusterSupport - 6) &&
     supportMinusRisk >= -2 &&
     !severeWhiteCluster &&
-    !severeDowntrend
+    !severeDowntrend &&
+    (!activeWhiteRisk || recoveryAligned) &&
+    (!activeDowntrendRisk || recentPattern.downtrendExhaustion || recentPattern.regimeUpshift)
   );
   // FIX: Also fire when downtrendExhaustion is true, not just regimeUpshift.
   // During the critical transition from downtrend to recovery, regimeUpshift
@@ -1808,6 +1830,7 @@ function computeOracleForecast(rounds, target, options = {}) {
     !b2bBurstIssue &&
     !trendReversalIssue &&
     !downtrendRecoveryIssue &&
+    !recoveryAligned &&
     supportMinusRisk < (target.minVal <= 30 ? 2 : 0)
   );
   const transitionFloor = target.minVal <= 15 ? 10 : target.minVal <= 30 ? 12 : target.minVal <= 100 ? 14 : 16;
@@ -1815,12 +1838,13 @@ function computeOracleForecast(rounds, target, options = {}) {
   const highTargetOpportunity = (
     target.minVal >= 100 &&
     transitionWindowReady &&
+    recoveryAligned &&
     (strongTransition || recentPattern.reboundSupport || recentPattern.regimeUpshift) &&
-    clusterSupportPct >= Math.max(8, thresholds.minClusterSupport - 2) &&
+    clusterSupportPct >= Math.max(9, thresholds.minClusterSupport - 1) &&
     signalProb >= Math.max(6, thresholds.minProbability * 0.65) &&
-    (predictiveLift >= -0.2 || standardizedLift >= 0.15) &&
-    !activeWhiteRisk &&
-    !activeDowntrendRisk
+    (predictiveLift >= -0.05 || standardizedLift >= 0.2) &&
+    (!activeWhiteRisk || recentPattern.whiteRelease || recentPattern.regimeUpshift) &&
+    (!activeDowntrendRisk || recentPattern.downtrendExhaustion || recentPattern.regimeUpshift)
   );
   const highTargetNeedsPreview = target.minVal >= 100
     ? (
@@ -1877,6 +1901,15 @@ function computeOracleForecast(rounds, target, options = {}) {
     highProbabilitySupport ||
     rareCompressionIssue ||
     highTargetOpportunity
+  );
+  const acceptableLift = (
+    target.minVal <= 15
+      ? (predictiveLift >= -0.8 || standardizedLift >= -0.2)
+      : target.minVal <= 30
+        ? (predictiveLift >= -0.35 || standardizedLift >= 0.05)
+        : target.minVal <= 100
+          ? (predictiveLift >= -0.2 || standardizedLift >= 0.15)
+          : (predictiveLift >= -0.1 || standardizedLift >= 0.25)
   );
   const allowEarlyIssue = (
     !isTooEarly ||
@@ -1936,7 +1969,15 @@ function computeOracleForecast(rounds, target, options = {}) {
     !softWhiteBlock &&
     !randomLikeHardBlock &&
     clusterOrPatternSupport &&
-    (target.minVal < 100 || predictiveLift >= -0.6 || strongTransition || trendReversalIssue) &&
+    (
+      acceptableLift ||
+      strongTransition ||
+      supportiveB2BIssue ||
+      b2bBurstIssue ||
+      trendReversalIssue ||
+      downtrendRecoveryIssue ||
+      highTargetOpportunity
+    ) &&
     (
       target.minVal < 100 ||
       kmReliable ||
