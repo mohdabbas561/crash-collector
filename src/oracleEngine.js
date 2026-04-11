@@ -289,18 +289,18 @@ function getIssueThresholds(target) {
     return { minProbability: 22, minLift: 0, minClusterSupport: 8, readinessFactor: 0.4 };
   }
   if (target.minVal <= 30) {
-    return { minProbability: 24, minLift: 0, minClusterSupport: 10, readinessFactor: 0.45 };
+    return { minProbability: 26, minLift: 0.02, minClusterSupport: 10, readinessFactor: 0.45 };
   }
   if (target.minVal <= 100) {
-    return { minProbability: 14, minLift: 0.05, minClusterSupport: 8, readinessFactor: 0.5 };
+    return { minProbability: 16, minLift: 0.08, minClusterSupport: 9, readinessFactor: 0.5 };
   }
   if (target.minVal <= 200) {
-    return { minProbability: 10, minLift: 0.1, minClusterSupport: 7, readinessFactor: 0.55 };
+    return { minProbability: 12, minLift: 0.12, minClusterSupport: 8, readinessFactor: 0.56 };
   }
   if (target.minVal <= 500) {
-    return { minProbability: 8, minLift: 0.12, minClusterSupport: 6, readinessFactor: 0.6 };
+    return { minProbability: 10, minLift: 0.16, minClusterSupport: 7, readinessFactor: 0.62 };
   }
-  return { minProbability: 7, minLift: 0.18, minClusterSupport: 5, readinessFactor: 0.65 };
+  return { minProbability: 9, minLift: 0.2, minClusterSupport: 6, readinessFactor: 0.68 };
 }
 
 function getSampleRequirements(target) {
@@ -311,15 +311,15 @@ function getSampleRequirements(target) {
     return { minForecastGaps: 7, minKMGaps: 14 };
   }
   if (target.minVal <= 100) {
-    return { minForecastGaps: 6, minKMGaps: 12 };
+    return { minForecastGaps: 7, minKMGaps: 14 };
   }
   if (target.minVal <= 200) {
-    return { minForecastGaps: 6, minKMGaps: 12 };
+    return { minForecastGaps: 8, minKMGaps: 15 };
   }
   if (target.minVal <= 500) {
-    return { minForecastGaps: 8, minKMGaps: 12 };
+    return { minForecastGaps: 9, minKMGaps: 16 };
   }
-  return { minForecastGaps: 8, minKMGaps: 12 };
+  return { minForecastGaps: 10, minKMGaps: 18 };
 }
 
 function getPatternThresholds(target) {
