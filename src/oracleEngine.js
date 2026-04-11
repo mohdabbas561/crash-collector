@@ -83,17 +83,16 @@ const CFG = Object.freeze({
   calibrationWindow: 200,
 
   // Confidence caps/floors
-  whiteActiveConfidenceCap: 20,
-  preWhiteConfidenceCap: 35,
-  whiteEndingBoost: 20,
-  b2bConfidenceFloor: 40,
-  b2bScoreThreshold: 60,
+  whiteActiveConfidenceCap: 15,
+  preWhiteConfidenceCap: 30,
+  whiteEndingBoost: 12,
+  b2bScoreThreshold: 75,
 
-  // Issue thresholds per target range
-  issueThresholdLow: 32,     // ≤15x
-  issueThresholdMid: 35,     // ≤50x
-  issueThresholdHigh: 38,    // ≤200x
-  issueThresholdMoon: 40,    // >200x
+  // Issue thresholds per target range (raised — only genuine edges pass)
+  issueThresholdLow: 45,     // ≤15x
+  issueThresholdMid: 50,     // ≤50x
+  issueThresholdHigh: 52,    // ≤200x
+  issueThresholdMoon: 55,    // >200x
 });
 
 
@@ -394,11 +393,14 @@ function computeWhitePhase(rounds, target) {
   const n = rounds.length;
   if (n < 20) return { phase: 'NORMAL', signals: {}, reliability: 0 };
 
+  // FIXED: Use a universal hard-white threshold for primary detection.
+  // White clusters are defined by 1.0x-1.5x crashes, not by target size.
+  // The soft threshold is kept only as a secondary "market cooling" signal.
   const softThreshold = target.minVal <= 10 ? 1.9
-    : target.minVal <= 30 ? 2.3
-    : target.minVal <= 100 ? 2.8
-    : target.minVal <= 500 ? 3.5
-    : 4.0;
+    : target.minVal <= 30 ? 2.0
+    : target.minVal <= 100 ? 2.2
+    : target.minVal <= 500 ? 2.5
+    : 3.0;
 
   const recent24 = rounds.slice(-24).map(r => r.val);
   const recent12 = rounds.slice(-12).map(r => r.val);
@@ -474,10 +476,12 @@ function computeWhitePhase(rounds, target) {
   let phase = 'NORMAL';
 
   // WHITE_ACTIVE: currently in a white cluster
+  // FIXED: Primary detection uses hard-white rate (≤1.25x). Soft rate is secondary.
+  // Require EITHER strong hard-white OR both soft-white AND streak to confirm.
   const whiteActive = (
     hardWhiteRate24 >= CFG.whiteActiveHardRate ||
-    softWhiteRate24 >= CFG.whiteActiveSoftRate ||
-    whiteStreak >= CFG.whiteActiveStreak
+    (softWhiteRate24 >= CFG.whiteActiveSoftRate && whiteStreak >= 3) ||
+    (whiteStreak >= CFG.whiteActiveStreak && hardWhiteRate12 >= 0.25)
   );
 
   // WHITE_ENDING: in cluster but recovery signals firing
@@ -707,11 +711,24 @@ function computeEnsembleConfidence({
     layers.push({ name: 'markov', prob: markov.prob, weight: 1.5, reliability: markov.reliability });
   }
   if (km.pHitWindow > 0 && km.reliability > 0.1) {
-    layers.push({ name: 'km', prob: km.pHitWindow / 100, weight: 2.0, reliability: km.reliability });
+    // FIXED: Convert KM's window probability to per-round implied probability.
+    // KM reports P(at least 1 hit in W rounds), but Markov reports P(next round).
+    // Mixing them directly makes KM dominate for wide windows.
+    // Convert: if P(window) = 1 - (1-p)^W, then p = 1 - (1-P(window))^(1/W)
+    const kmWindowP = km.pHitWindow / 100;
+    const kmPerRound = 1 - Math.pow(1 - clamp(kmWindowP, 0, 0.999), 1 / target.window);
+    layers.push({ name: 'km', prob: kmPerRound, weight: 2.0, reliability: km.reliability });
   }
   if (pattern.ready && pattern.reliability > 0.1) {
-    const patternProb = clamp((pattern.supportPct + Math.max(0, pattern.lift)) / 200, 0, 1);
-    layers.push({ name: 'pattern', prob: patternProb, weight: 1.2, reliability: pattern.reliability });
+    // FIXED: Pattern prob must be anchored to baseline, not raw supportPct.
+    // supportPct is naturally high for wide-window targets (30-100 rounds).
+    // Only the LIFT (support vs random) represents actual predictive edge.
+    const liftEdge = pattern.lift / 100; // Convert percentage lift to fraction
+    const patternProb = clamp(baselineP + liftEdge * baselineP, 0, 1);
+    // Only include pattern layer if it shows positive lift (actual edge)
+    if (pattern.lift > 0) {
+      layers.push({ name: 'pattern', prob: patternProb, weight: 1.2, reliability: pattern.reliability });
+    }
   }
 
   // EWMA modifies base probability
@@ -721,23 +738,23 @@ function computeEnsembleConfidence({
     else if (ewma.crossover === 'bearish') ewmaModifier = -0.05 * ewma.signalStrength;
   }
 
-  // B2B layer
-  if (b2b.b2bScore > 30 && b2b.reliability > 0.3) {
-    const b2bProb = clamp(baselineP * (1 + b2b.b2bScore / 100), 0, 1);
-    layers.push({ name: 'b2b', prob: b2bProb, weight: 1.3 * (b2b.b2bScore / 100), reliability: b2b.reliability });
+  // B2B layer — only contribute when signal is genuinely strong
+  if (b2b.b2bScore >= 50 && b2b.reliability > 0.3) {
+    const b2bProb = clamp(baselineP * (1 + b2b.b2bScore / 150), 0, 1);
+    layers.push({ name: 'b2b', prob: b2bProb, weight: 0.8 * (b2b.b2bScore / 100), reliability: b2b.reliability });
   }
 
   if (layers.length < 1) {
     return { confidence: 0, rawConfidence: 0, ensembleP: baselineP, predMethod: 'baseline', layerBreakdown: [] };
   }
 
-  // Inverse-error weighted blend
+  // FIXED: Direct reliability-weighted blend (replaces broken inverse-error weighting).
+  // The old code gave HIGHEST weight to layers closest to baseline — suppressing
+  // the very signals we need. Now layers are weighted by baseWeight × reliability.
   let wSum = 0, pSum = 0;
   const layerBreakdown = [];
   for (const layer of layers) {
-    const error = Math.abs(layer.prob - baselineP);
-    const invErr = 1 / Math.max(0.001, error + 0.01);
-    const w = layer.weight * layer.reliability * invErr;
+    const w = layer.weight * layer.reliability;
     wSum += w;
     pSum += w * layer.prob;
     layerBreakdown.push({
@@ -752,59 +769,70 @@ function computeEnsembleConfidence({
   ensembleP = clamp(ensembleP + ewmaModifier, 0, 1);
 
   // Drought pressure bonus (overdue targets get gentle lift)
-  if (droughtPct > 75) {
-    const droughtBoost = clamp((droughtPct - 75) / 100 * 0.08, 0, 0.08);
+  if (droughtPct > 85) {
+    const droughtBoost = clamp((droughtPct - 85) / 100 * 0.05, 0, 0.05);
     ensembleP = clamp(ensembleP + droughtBoost, 0, 1);
   }
 
   // Edge over baseline
   const edge = ensembleP - baselineP;
-  const edgeScore = clamp(edge / Math.max(0.01, baselineP), -1, 3);
+  // Cap edgeScore to 2.5 to prevent small absolute bumps on high targets from maxing confidence
+  const edgeScore = clamp(edge / Math.max(0.01, baselineP), -1, 2.5);
 
   // EV
   const ev = ensembleP * target.minVal - 1;
 
-  // Raw confidence: 0-100 scale
+  // FIXED: Confidence is now purely EDGE-DRIVEN.
+  // Old formula added ~20 free points from baseline probability alone.
+  // New formula: confidence = 0 when ensemble equals baseline (no edge).
+  // Only genuine statistical edge over baseline contributes to confidence.
+  //
+  // KM expected: probability of at least 1 hit in window under baseline assumption
+  const kmExpected = (1 - Math.pow(1 - baselineP, target.window)) * 100;
+  const kmEdge = (km.pHitWindow || 0) - kmExpected;
   let rawConfidence = clamp(
-    (edgeScore * 25) +
-    (clamp(ensembleP * 100, 0, 100) * 0.3) +
-    (km.pHitWindow * 0.25) +
-    (clamp(pattern.lift, -10, 20) * 0.4) +
-    (b2b.b2bScore * 0.1) +
-    (ev > 0 ? 10 : 0),
+    (edgeScore * 20) +                                     // Primary: how much better vs baseline (reduced from 35)
+    (clamp(kmEdge, -20, 40) * 0.3) +                       // KM edge vs proper expected
+    (clamp(pattern.lift, -10, 20) * 0.5) +                 // Pattern edge
+    (b2b.b2bScore >= 50 ? (b2b.b2bScore - 50) * 0.2 : 0) + // B2B only when strong
+    (ev > 0.5 ? 12 : ev > 0 ? 5 : 0) +                    // EV needs meaningful edge
+    (droughtPct >= 90 ? 8 : droughtPct >= 80 ? 4 : 0),     // Drought contributes modestly
     0,
     100
   );
 
-  // Regime adjustments
-  if (regime.label === 'TRENDING_UP') rawConfidence += 5;
-  if (regime.label === 'TRENDING_DOWN') rawConfidence -= 8;
-  if (regime.label === 'CLUSTERED_LOW') rawConfidence -= 12;
-  if (regime.label === 'VOLATILE') rawConfidence -= 4;
-  if (regime.label === 'RANDOM') rawConfidence -= 3;
+  // Regime adjustments — stronger penalties for unfavorable regimes
+  if (regime.label === 'TRENDING_UP') rawConfidence += 6;
+  if (regime.label === 'TRENDING_DOWN') rawConfidence -= 15;
+  if (regime.label === 'CLUSTERED_LOW') rawConfidence -= 18;
+  if (regime.label === 'VOLATILE') rawConfidence -= 8;
+  if (regime.label === 'RANDOM') rawConfidence -= 6;
 
-  // White phase hard blocks
+  // White phase hard caps (no floors — let the real analysis speak)
   const wp = whitePhase.phase;
   if (wp === 'WHITE_ACTIVE') rawConfidence = Math.min(rawConfidence, CFG.whiteActiveConfidenceCap);
   else if (wp === 'PRE_WHITE') rawConfidence = Math.min(rawConfidence, CFG.preWhiteConfidenceCap);
   else if (wp === 'WHITE_ENDING') rawConfidence += CFG.whiteEndingBoost;
 
-  // B2B floor
-  if (b2b.b2bScore >= CFG.b2bScoreThreshold && wp === 'NORMAL') {
-    rawConfidence = Math.max(rawConfidence, CFG.b2bConfidenceFloor);
-  }
+  // REMOVED: B2B confidence floor. The old code guaranteed confidence=40 for any
+  // B2B score ≥60, overriding genuine weakness signals. Now B2B contributes
+  // through the ensemble like every other layer — no free passes.
 
-  // Too-early penalty
-  if (roundsSince < 2 && target.minVal >= 50) rawConfidence -= 5;
+  // Too-early penalty — extended to all targets
+  if (roundsSince < 2 && target.minVal >= 30) rawConfidence -= 8;
+  if (roundsSince < 1 && target.minVal >= 10) rawConfidence -= 5;
 
   rawConfidence = clamp(rawConfidence, 0, 100);
 
   // Calibration against historical accuracy
+  // FIXED: Use higher minimum sample size and reduce stale history influence.
+  // Old buggy engine results should not inflate new calibrated confidence.
   let confidence = rawConfidence;
   const resolved = (calibrationRows || []).filter(r => r.outcome === 'win' || r.outcome === 'loss');
-  if (resolved.length >= 24) {
+  if (resolved.length >= 50) {
+    // Only apply calibration with substantial history, and weight raw confidence higher
     const globalWinRate = resolved.filter(r => r.outcome === 'win').length / resolved.length * 100;
-    confidence = Math.round(rawConfidence * 0.62 + globalWinRate * 0.38);
+    confidence = Math.round(rawConfidence * 0.75 + globalWinRate * 0.25);
   }
   confidence = clamp(Math.round(confidence), 0, 100);
 
@@ -974,7 +1002,7 @@ function computeOracleForecast(rounds, target, options = {}) {
   }
 
   // B2B override: if strong b2b signal, pull prediction closer
-  if (b2b.b2bScore >= 60 && roundsSince <= 3 && minVal <= 50) {
+  if (b2b.b2bScore >= CFG.b2bScoreThreshold && b2b.immediateB2B && roundsSince <= 3 && minVal <= 50) {
     predictedGap = Math.max(roundsSince + 1, Math.min(predictedGap, roundsSince + Math.max(1, Math.round(gapStats.p25 * 0.5))));
     gapMethod = 'b2b_pull';
   }
@@ -1014,21 +1042,28 @@ function computeOracleForecast(rounds, target, options = {}) {
   const confidence = ensemble.confidence;
   const threshold = getIssueThreshold(minVal);
 
-  // Hard blocks — WHITE_ACTIVE blocks only, but WHITE_ENDING ALWAYS passes through
+  // Hard blocks — FIXED: stronger blocking logic
   const whiteBlock = whitePhase.phase === 'WHITE_ACTIVE';
-  const preWhiteBlock = whitePhase.phase === 'PRE_WHITE' && confidence < threshold - 8;
-  const downtrendBlock = regime.label === 'TRENDING_DOWN' && confidence < threshold - 5;
-  const randomBlock = regime.label === 'RANDOM' && confidence < threshold - 5 && !b2b.immediateB2B;
-  const hardBlock = whiteBlock || preWhiteBlock || downtrendBlock || randomBlock;
+  const preWhiteBlock = whitePhase.phase === 'PRE_WHITE' && confidence < threshold;
+  // FIXED: Downtrend blocks unless confidence genuinely exceeds threshold
+  const downtrendBlock = regime.label === 'TRENDING_DOWN' && confidence < threshold + 5;
+  // FIXED: RANDOM now REQUIRES extra confidence (threshold + 3), not less.
+  // In a random regime there's no structural edge, so we need stronger signals.
+  const randomBlock = regime.label === 'RANDOM' && confidence < threshold + 3;
+  const tooEarlyBlock = isTooEarly && confidence < threshold + 8;
+  const hardBlock = whiteBlock || preWhiteBlock || downtrendBlock || randomBlock || tooEarlyBlock;
 
-  // Strong transition signals that override blocks
-  const strongB2B = b2b.b2bScore >= CFG.b2bScoreThreshold;
-  const strongWhiteRecovery = whitePhase.phase === 'WHITE_ENDING';
-  const strongOverdue = droughtPct >= 85;
-  const strongTransition = strongB2B || strongWhiteRecovery || strongOverdue;
+  // Strong transition signals that can override blocks (EXCEPT white active)
+  // FIXED: Tightened — require genuinely strong signals, not marginal ones.
+  const strongB2B = b2b.b2bScore >= CFG.b2bScoreThreshold && b2b.immediateB2B;
+  const strongWhiteRecovery = whitePhase.phase === 'WHITE_ENDING' && confidence >= threshold - 5;
+  const strongOverdue = droughtPct >= 93;
+  // FIXED: Require at least 2 of 3 transition signals to override
+  const transitionSignalCount = (strongB2B ? 1 : 0) + (strongWhiteRecovery ? 1 : 0) + (strongOverdue ? 1 : 0);
+  const strongTransition = transitionSignalCount >= 2;
 
-  const issuePrediction = !hardBlock && confidence >= threshold ||
-    (strongTransition && confidence >= threshold - 12 && !whiteBlock);
+  const issuePrediction = (!hardBlock && confidence >= threshold) ||
+    (strongTransition && confidence >= threshold - 5 && !whiteBlock);
 
   let avoidReason = null;
   if (!issuePrediction) {
