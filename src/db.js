@@ -51,7 +51,7 @@ const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
   // FIX: connection pool limits — prevent runaway connection growth under high load
-  max: 10,
+  max: 5,  // reduced from 10 — saves RAM on Railway Postgres
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 10000,
 });
