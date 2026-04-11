@@ -857,7 +857,7 @@ function buildOracleTargetPayload(forecast, activeLock, nowId) {
   const liveConfidence = Number(forecast?.confidence ?? 0);
   const liveIssuePrediction = Boolean(forecast?.issuePrediction);
   const liveAvoidReason = forecast?.avoidReason || null;
-  const lockDriftAlert = Boolean(activeLock) && (
+  const lockDriftAlert = Boolean(activeLock) && inWindow && (
     !liveIssuePrediction ||
     (
       Number.isFinite(lockConfidence) &&
