@@ -13,11 +13,11 @@
 
 const TARGETS = [5, 10, 20, 50, 100, 500, 1000];
 const FIXED_WINDOW_SPAN = Object.freeze({
-  5: 5,
-  10: 8,
-  20: 12,
-  50: 20,
-  100: 30,
+  5: 8,    // widened from 5: reduces misses for frequent 5x hits
+  10: 13,  // widened from 8: covers ~1 full expected interval
+  20: 15,  // widened from 12
+  50: 22,
+  100: 32,
   500: 55,
   1000: 80,
 });
@@ -39,18 +39,18 @@ const DEFAULT_CONFIG = Object.freeze({
   knnKMax: 120,
 
   // Hazard model uses rates first; gap only as weak, bounded modifier.
-  hazardRecentWindow: 120,
+  hazardRecentWindow: 60,  // lowered from 120: more responsive to recent hit rate changes
   // Hard-capped by design to avoid gambler's-fallacy style overreaction to gap.
-  hazardGapInfluence: 0.05,
+  hazardGapInfluence: 0.12,  // raised from 0.05: gap signal now has more weight
   hazardMinEvalCount: 80,
   hazardDisableTolerance: 0.0,
 
   // White cluster thresholds from data quantiles.
-  whiteCutQuantile: 0.40,
-  reboundCutQuantile: 0.75,
+  whiteCutQuantile: 0.30,  // lowered: fewer false white classifications
+  reboundCutQuantile: 0.72,
 
   // White effect must remain weak.
-  whiteModifierStrength: 0.08,
+  whiteModifierStrength: 0.22,  // raised from 0.08: white streak now meaningfully shifts p
 
   // Rolling Brier memory.
   brierWindow: 600,
@@ -70,7 +70,7 @@ const DEFAULT_CONFIG = Object.freeze({
   entropyRecentWindow: 300,
   entropyStep: 12,
   entropyQuantile: 0.35,
-  entropyAutoDisable: true,
+  entropyAutoDisable: false,  // was true: auto-disable was killing predictions during normal variance
   entropySpikeStdMult: 1.5,
   entropyTrendPenaltyScale: 4.0,
 
@@ -84,16 +84,18 @@ const DEFAULT_CONFIG = Object.freeze({
   // Contextual KNN.
   // Feature vector order:
   // [prev, prev2, shortMean, longMean, vol, lowRateShort, lowRateLong, hitRateLong, gapNorm, whiteRunNorm]
-  featureWeights: [0.45, 0.35, 0.70, 0.65, 0.45, 0.22, 0.25, 1.00, 0.08, 0.12],
-  knnTemporalDecayRounds: 360,
+  // [prev, prev2, shortMean, longMean, vol, lowRateShort, lowRateLong, hitRateLong, gapNorm, whiteRunNorm, hitRateShort, hitMomentum]
+  // gapNorm raised 0.08->0.45, whiteRunNorm raised 0.12->0.50, added hitRateShort+hitMomentum for 5-15x
+  featureWeights: [0.45, 0.35, 0.70, 0.65, 0.45, 0.22, 0.25, 1.00, 0.45, 0.50, 0.65, 0.55],
+  knnTemporalDecayRounds: 180,  // lowered from 360: recent patterns matter more for 5-15x
   knnDistanceSlack: 1.6,
   knnMinReliability: 0.12,
 
   // B2B exploit is intentionally tiny.
-  b2bMomentumWindowShort: 8,
+  b2bMomentumWindowShort: 15,  // raised from 8: more history for momentum detection
   b2bMomentumWindowLong: 180,
-  b2bBoostCap: 0.05,
-  b2bNearWindow: 5,
+  b2bBoostCap: 0.18,  // raised from 0.05: b2b momentum now meaningfully boosts p
+  b2bNearWindow: 8,  // raised from 5
 
   // Pre-condition detector windows/thresholds (all thresholding is quantile-based).
   // These implement state detection, not hard outcome prediction.
@@ -101,10 +103,10 @@ const DEFAULT_CONFIG = Object.freeze({
   preconditionVolShortWindow: 24,
   preconditionVolLongWindow: 96,
   preconditionCalibrationMin: 220,
-  whiteRegimeThresholdQuantile: 0.72,
-  releaseRunThresholdQuantile: 0.80,
-  releaseThresholdQuantile: 0.70,
-  momentumThresholdQuantile: 0.72,
+  whiteRegimeThresholdQuantile: 0.82,  // raised from 0.72: fewer false WHITE_DOMINANT blocks
+  releaseRunThresholdQuantile: 0.75,  // lowered from 0.80: easier release detection
+  releaseThresholdQuantile: 0.60,  // lowered from 0.70: easier release phase trigger
+  momentumThresholdQuantile: 0.62,  // lowered from 0.72: easier momentum detection
 
   // Risk sizing.
   maxRiskFraction: 0.15,
@@ -616,11 +618,19 @@ function featureAtIndex(state, targetState, idx, cfg) {
   const lowRateShort = (windowSum(state.whitePrefix, shortL, i) || 0) / Math.max(1, i - shortL + 1);
   const lowRateLong = (windowSum(state.whitePrefix, longL, i) || 0) / Math.max(1, i - longL + 1);
   const hitRateLong = rateInWindow(targetState.hitPrefix, i, longW);
-  const gapNorm = Math.min(1, (targetState.gap[i] || 0) / Math.max(10, longW));
-  const whiteRunNorm = Math.min(1, (state.whiteRun[i] || 0) / 20);
+  // FIX: short-term hit rate is critical for 5-15x cluster detection
+  const hitRateShort = rateInWindow(targetState.hitPrefix, i, shortW);
+  const hitMomentum = clamp(hitRateShort - hitRateLong, -1, 1);
+  // FIX: normalize gap by expected gap (1/baseline) not longW — makes signal target-aware
+  const expectedGap = Math.max(3, Math.round(targetState.target > 0 ? targetState.target : longW));
+  const gapNorm = Math.min(1, (targetState.gap[i] || 0) / Math.max(expectedGap, 5));
+  // FIX: normalize by 12 not 20 — more sensitive to shorter white runs (5-15x relevant)
+  const whiteRunNorm = Math.min(1, (state.whiteRun[i] || 0) / 12);
   const prev = Math.log(Math.max(1, state.multipliers[i] || 1));
   const prev2 = Math.log(Math.max(1, state.multipliers[i - 1] || state.multipliers[i] || 1));
 
+  // Feature vector (12 features):
+  // [prev, prev2, shortMean, longMean, vol, lowRateShort, lowRateLong, hitRateLong, gapNorm, whiteRunNorm, hitRateShort, hitMomentum]
   const f = [
     prev,
     prev2,
@@ -632,6 +642,8 @@ function featureAtIndex(state, targetState, idx, cfg) {
     hitRateLong,
     gapNorm,
     whiteRunNorm,
+    hitRateShort,
+    hitMomentum,
   ];
   targetState.featureCache.set(idx, f);
   return f;
@@ -655,7 +667,9 @@ function hazardPredictAt(state, targetState, idx, cfg) {
 
   const globalRate = hitsSoFar / (idx + 1);
   const recentRate = rateInWindow(targetState.hitPrefix, idx, cfg.hazardRecentWindow);
-  let p = 0.65 * recentRate + 0.35 * globalRate;
+  // FIX: weight recent rate higher for low targets (5-15x) where streaks matter most
+  const recentWeight = targetState.target <= 15 ? 0.80 : targetState.target <= 50 ? 0.70 : 0.65;
+  let p = recentWeight * recentRate + (1 - recentWeight) * globalRate;
 
   const m = lowerBound(targetState.hitIdx, idx + 1);
   if (m >= 2) {
@@ -668,7 +682,7 @@ function hazardPredictAt(state, targetState, idx, cfg) {
     const currentGap = targetState.gap[idx] || 0;
     const z = (currentGap - gapMean) / Math.max(1e-6, gapStd);
     const lift = tanh(z);
-    p *= (1 + Math.min(cfg.hazardGapInfluence, 0.05) * lift);
+    p *= (1 + Math.min(cfg.hazardGapInfluence, 0.18) * lift); // cap raised from 0.05
   }
 
   return clamp(p, 0, 1);
@@ -1477,12 +1491,28 @@ function runTargetWalkForward(state, target, cfg) {
     );
     const whiteDominant = whiteRegimeScore > Number(preconditionThresholds.whiteRegimeThreshold || Number.POSITIVE_INFINITY);
 
-    const releaseScore = (
-      (whiteRunNow > Number(preconditionThresholds.releaseRunThreshold || Number.POSITIVE_INFINITY) ? 1 : 0) *
-      preVol.expansion *
-      Math.max(0, previousWhiteRate - currentWhiteRate)
+    // FIX: also detect fresh release — when white run just ended this round (prevRun was high, now 0)
+    const prevWhiteRun = Number(state.whiteRun[idx - 1] || 0);
+    const freshRelease = (
+      whiteRunNow === 0 &&
+      prevWhiteRun >= Number(preconditionThresholds.releaseRunThreshold || Number.POSITIVE_INFINITY)
     );
-    const releasePhase = releaseScore > Number(preconditionThresholds.releaseThreshold || Number.POSITIVE_INFINITY);
+    const releaseScore = freshRelease
+      ? Math.max(
+          // Fresh release gets a strong direct score — the cluster just broke
+          clamp(prevWhiteRun / Math.max(1, Number(preconditionThresholds.releaseRunThreshold || 1)), 0.6, 1.5),
+          (
+            (whiteRunNow > Number(preconditionThresholds.releaseRunThreshold || Number.POSITIVE_INFINITY) ? 1 : 0) *
+            preVol.expansion *
+            Math.max(0, previousWhiteRate - currentWhiteRate)
+          )
+        )
+      : (
+          (whiteRunNow > Number(preconditionThresholds.releaseRunThreshold || Number.POSITIVE_INFINITY) ? 1 : 0) *
+          preVol.expansion *
+          Math.max(0, previousWhiteRate - currentWhiteRate)
+        );
+    const releasePhase = freshRelease || releaseScore > Number(preconditionThresholds.releaseThreshold || Number.POSITIVE_INFINITY);
 
     const recentHitRate = rateInWindow(targetState.hitPrefix, idx, cfg.b2bMomentumWindowShort);
     const longHitRate = rateInWindow(targetState.hitPrefix, idx, cfg.b2bMomentumWindowLong);
@@ -1498,9 +1528,13 @@ function runTargetWalkForward(state, target, cfg) {
       !entropy.disabled
     );
 
-    const entropyBlocked = Boolean(entropy.randomLike || entropy.disabled);
+    const entropyBlocked = Boolean(entropy.disabled); // removed randomLike: normal variance no longer blocks
     const signalBlocked = !releasePhase && !momentumPhase;
-    const preconditionPass = !whiteDominant && !entropyBlocked && !signalBlocked;
+    // hasModelEdge: allow through when recent hit rate or gap pressure suggests positive edge,
+    // even if no formal release/momentum phase has been detected.
+    const hasModelEdge = (recentHitRate > baselineP * 1.05) || (hitRateDrift > 0 && recentHitRate > baselineP);
+    // Pass if: not white dominant AND not entropy disabled AND (explicit signal OR model-level edge)
+    const preconditionPass = !whiteDominant && !entropyBlocked && (!signalBlocked || hasModelEdge);
     const precondition = classifyPreconditionState({
       whiteDominant,
       releasePhase,
@@ -1595,8 +1629,17 @@ function runTargetWalkForward(state, target, cfg) {
     const continueProb = Number.isFinite(whiteEst.continueProb) ? whiteEst.continueProb : 0;
     const reboundProb = Number.isFinite(whiteEst.reboundProb) ? whiteEst.reboundProb : 0;
     const whiteDelta = clamp(reboundProb - continueProb, -1, 1);
-    const whiteStrength = Math.min(Number(cfg.whiteModifierStrength || 0), 0.08);
-    let pAdjModel = clamp(pBlend * (1 + whiteStrength * whiteDelta), 0, 1);
+    const whiteStrength = Math.min(Number(cfg.whiteModifierStrength || 0), 0.35); // cap raised from 0.08
+    // FIX: pre-warming — as white run grows toward threshold, steadily increase rebound probability
+    const releaseRunThresh = Number(preconditionThresholds.releaseRunThreshold || 4);
+    const whiteRunProgress = whiteRunNow > 0
+      ? clamp(whiteRunNow / Math.max(1, releaseRunThresh), 0, 1.5)
+      : 0;
+    // pre-warn boost: rises from 0 as white run grows, peaks at threshold
+    const preWarnBoost = whiteRunProgress >= 0.6
+      ? clamp((whiteRunProgress - 0.6) / 0.4, 0, 1) * Math.min(whiteStrength * 1.2, 0.28)
+      : 0;
+    let pAdjModel = clamp(pBlend * (1 + whiteStrength * whiteDelta) + preWarnBoost, 0, 1);
 
     const b2bImm = rateInWindow(targetState.hitPrefix, idx, 2);
     const b2bNear = rateInWindow(targetState.hitPrefix, idx, cfg.b2bNearWindow);
@@ -1604,9 +1647,11 @@ function runTargetWalkForward(state, target, cfg) {
     const b2bLongRate = rateInWindow(targetState.hitPrefix, idx, cfg.b2bMomentumWindowLong);
     const b2bSampleReady = (idx + 1) >= Math.max(32, cfg.b2bMomentumWindowShort * 2);
     const b2bMomentum = b2bSampleReady ? clamp(b2bNearRate - b2bLongRate, -1, 1) : 0;
-    if (b2bMomentum > 0 && !entropy.randomLike) {
+    // FIX: also boost on fresh white cluster release even if b2b momentum hasn't built yet
+    const freshReleaseBoost = freshRelease ? Math.min(cfg.b2bBoostCap, 0.25) * 0.6 : 0;
+    if ((b2bMomentum > 0 || freshRelease) && !entropy.randomLike) {
       pAdjModel = clamp(
-        pAdjModel * (1 + (Math.min(cfg.b2bBoostCap, 0.05) * b2bMomentum)),
+        pAdjModel * (1 + (Math.min(cfg.b2bBoostCap, 0.25) * b2bMomentum) + freshReleaseBoost),
         0,
         1
       );
@@ -1621,7 +1666,9 @@ function runTargetWalkForward(state, target, cfg) {
 
     const edge = pFinal - baselineP;
     const ev = (pFinal * target) - 1;
-    const evThreshold = (cfg.evThreshold || 0) + (regime.label === 'CLUSTERED' ? regime.evAdjust : 0);
+    // FIX: target-aware EV threshold — low targets need stronger edge signal to avoid noise trades
+    const targetEvBoost = target <= 10 ? 0.04 : target <= 20 ? 0.02 : 0.0;
+    const evThreshold = (cfg.evThreshold || 0) + targetEvBoost + (regime.label === 'CLUSTERED' ? regime.evAdjust : 0);
     const actionable = preconditionPass && !entropySpike && ev > evThreshold;
 
     const modelAgreement = clamp(
@@ -2369,7 +2416,9 @@ function buildLockFromLive(state, targetResult, currentRound, generation, cfg, o
   const lo = currentRound + aheadLo;
   const hi = lo + fixedSpan - 1;
   const p = Number.isFinite(live.pFinal) ? live.pFinal : live.pAdj;
-  const pSoon = clamp(1 - Math.pow(1 - p, 3), 0, 1);
+  // FIX: scale 'soon' horizon with target — low targets need shorter window, high targets longer
+  const soonHorizon = targetResult.target <= 5 ? 2 : targetResult.target <= 15 ? 3 : targetResult.target <= 50 ? 5 : 8;
+  const pSoon = clamp(1 - Math.pow(1 - p, soonHorizon), 0, 1);
   const allowForcedLock = Boolean(forceLock);
   const shouldOpen = Boolean(live?.actionable || allowForcedLock);
   const suspended = !shouldOpen;
