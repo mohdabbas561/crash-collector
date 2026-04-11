@@ -1660,11 +1660,13 @@ function computeOracleForecast(rounds, target, options = {}) {
   const unsafeB2B = recentPattern.b2bBlocked && !positiveB2B;
   const hardRiskBlock = severeWhiteCluster || severeDowntrend || unsafeB2B;
   const supportMinusRisk = recentPattern.supportScore - recentPattern.riskScore;
+  // FIX: Removed target.minVal >= 30 floor — transitions happen at ALL
+  // multiplier levels. Previously 5x/10x/15x could NEVER get transition locks,
+  // causing missed predictions during regime shifts.
   const transitionDrivenIssue = (
-    target.minVal >= 30 &&
     transitionWindowReady &&
     recentPattern.transitionReady &&
-    recentPattern.transitionSupportScore >= (target.minVal <= 30 ? 18 : target.minVal <= 100 ? 16 : 12) &&
+    recentPattern.transitionSupportScore >= (target.minVal <= 15 ? 16 : target.minVal <= 30 ? 18 : target.minVal <= 100 ? 16 : 12) &&
     signalProb >= Math.max(8, thresholds.minProbability * 0.62) &&
     clusterSupportPct >= Math.max(12, thresholds.minClusterSupport - 6) &&
     supportMinusRisk >= -1 &&
@@ -1731,9 +1733,10 @@ function computeOracleForecast(rounds, target, options = {}) {
     recentPattern.transitionSupportScore >= (target.minVal <= 100 ? 14 : 12) &&
     (predictiveLift >= Math.max(-0.5, thresholds.minLift * 0.1) || standardizedLift >= 0.15)
   );
+  // FIX: Lowered from 50x to 15x — compression patterns happen at 15x/30x too.
   const earlyCompressionEntry = (
     isTooEarly &&
-    target.minVal >= 50 &&
+    target.minVal >= 15 &&
     rareCompressionIssue &&
     signalProb >= Math.max(10, thresholds.minProbability * 0.7) &&
     clusterSupportPct >= Math.max(10, thresholds.minClusterSupport - 6) &&
@@ -1747,17 +1750,24 @@ function computeOracleForecast(rounds, target, options = {}) {
     predictiveLift >= Math.max(0, thresholds.minLift * 0.2) &&
     supportMinusRisk >= 0
   );
+  // FIX: b2bBurstIssue now overrides mild activeWhiteRisk when b2b support
+  // is very strong. B2b bursts during white clusters are the strongest recovery
+  // signal — they mean the market is breaking out. Only block on severeWhiteCluster.
   const b2bBurstIssue = (
     recentPattern.recentHitTooSoon &&
     (recentPattern.immediateB2BRecent || recentPattern.nearBurstRecent || recentPattern.b2bSupportScore >= 20) &&
     signalProb >= Math.max(12, thresholds.minProbability * 0.5) &&
     clusterSupportPct >= Math.max(10, thresholds.minClusterSupport - 6) &&
     supportMinusRisk >= -2 &&
-    !activeWhiteRisk &&
-    !activeDowntrendRisk
+    !severeWhiteCluster &&
+    !severeDowntrend
   );
+  // FIX: Also fire when downtrendExhaustion is true, not just regimeUpshift.
+  // During the critical transition from downtrend to recovery, regimeUpshift
+  // may not be set yet but exhaustion signals ARE present — this is the exact
+  // moment we should be opening locks.
   const downtrendRecoveryIssue = (
-    recentPattern.regimeUpshift &&
+    (recentPattern.regimeUpshift || recentPattern.downtrendExhaustion) &&
     transitionWindowReady &&
     signalProb >= Math.max(12, thresholds.minProbability * 0.6) &&
     clusterSupportPct >= Math.max(12, thresholds.minClusterSupport - 5) &&
@@ -1765,11 +1775,13 @@ function computeOracleForecast(rounds, target, options = {}) {
     (predictiveLift >= Math.max(-0.2, thresholds.minLift * 0.1) || standardizedLift >= 0.2) &&
     !activeWhiteRisk
   );
+  // FIX: Lowered from 30x to 10x — trend reversals happen at all levels.
+  // Missing 5x/10x/15x trend reversal locks was causing missed predictions.
   const trendReversalIssue = (
-    target.minVal >= 30 &&
+    target.minVal >= 10 &&
     recentPattern.downtrendExhaustion &&
     transitionWindowReady &&
-    recentPattern.transitionSupportScore >= (target.minVal <= 100 ? 14 : 12) &&
+    recentPattern.transitionSupportScore >= (target.minVal <= 15 ? 12 : target.minVal <= 100 ? 14 : 12) &&
     signalProb >= Math.max(10, thresholds.minProbability * 0.6) &&
     clusterSupportPct >= Math.max(12, thresholds.minClusterSupport - 5) &&
     supportMinusRisk >= -1 &&
@@ -1830,11 +1842,12 @@ function computeOracleForecast(rounds, target, options = {}) {
     Math.min(20, recentPattern.downtrendRiskScore * 0.4) -
     Math.min(16, recentPattern.b2bRiskScore * 0.35)
   );
-  // FIX: Raised lockThreshold for very low targets (5x/10x) which fire
-  // on nearly every round, generating noisy predictions that dilute accuracy.
+  // FIX: Balanced lockThreshold — high enough to filter noise, low enough
+  // to not miss valid locks. Previous values (44/40) were too aggressive
+  // and caused missed predictions for high-frequency targets.
   const lockThreshold =
-    target.minVal <= 10 ? 44 :
-    target.minVal <= 15 ? 40 :
+    target.minVal <= 10 ? 42 :
+    target.minVal <= 15 ? 38 :
     target.minVal <= 30 ? 34 :
     target.minVal <= 100 ? 28 :
     target.minVal <= 200 ? 26 :
@@ -1881,13 +1894,19 @@ function computeOracleForecast(rounds, target, options = {}) {
     patternDrivenIssue ||
     highTargetOpportunity
   );
+  // FIX: Added b2bBurstIssue and rareCompressionIssue to riskOverride.
+  // Previously b2bBurstIssue was listed but softWhiteBlock/softDowntrendBlock
+  // could still block it because riskOverride sits between them and issuePrediction.
+  // Also added earlyCompressionEntry so compression locks survive risk checks.
   const riskOverride = (
     transitionDrivenIssue ||
     supportiveB2BIssue ||
     b2bBurstIssue ||
     downtrendRecoveryIssue ||
     trendReversalIssue ||
-    highProbabilitySupport
+    highProbabilitySupport ||
+    rareCompressionIssue ||
+    earlyCompressionEntry
   );
   const softDowntrendBlock = (
     activeDowntrendRisk &&
