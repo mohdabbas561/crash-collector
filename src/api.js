@@ -782,8 +782,8 @@ function replayOracleTargetState({ rounds, nowId, target, existingLock, forecast
       outcome = historyHitRound < Number(activeLock.windowLo || 0) ? 'early' : 'win';
     } else if (missedBeforeLaterHit) {
       historyHitRound = Number(hit.id || 0);
-      // Move replay to the actual later hit so the next lock is generated from
-      // fresh post-hit state instead of repeatedly chaining stale loss windows.
+      // FIXED: Move replay to the hit point for fresh state computation.
+      // No window sliding — next lock will be computed from scratch.
       replayCutoffId = historyHitRound;
       outcome = 'loss';
     }
@@ -809,9 +809,7 @@ function replayOracleTargetState({ rounds, nowId, target, existingLock, forecast
       replayForecast = nextForecast || replayForecast;
       break;
     }
-    if (outcome === 'loss') {
-      nextForecast = advanceOracleForecastPastExistingWindow(activeLock, nextForecast);
-    }
+    // FIXED: No window advancement on miss. Always compute fresh lock.
  
     const nextLock = nextForecast.issuePrediction
       ? {

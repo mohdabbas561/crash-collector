@@ -19,12 +19,12 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const ORACLE_TARGETS = Object.freeze([
-  { label: '5x',    minVal: 5,    color: '#00ff88', window: 5,   scanN: 150, minHits: 7 },
-  { label: '10x',   minVal: 10,   color: '#00d4ff', window: 7,   scanN: 130, minHits: 6 },
-  { label: '15x',   minVal: 15,   color: '#ff6b9d', window: 8,   scanN: 110, minHits: 5 },
-  { label: '30x',   minVal: 30,   color: '#ff9f43', window: 14,  scanN: 90,  minHits: 4 },
-  { label: '50x',   minVal: 50,   color: '#4db8ff', window: 22,  scanN: 75,  minHits: 4 },
-  { label: '100x',  minVal: 100,  color: '#39ff8a', window: 32,  scanN: 65,  minHits: 4 },
+  { label: '5x',    minVal: 5,    color: '#00ff88', window: 4,   scanN: 150, minHits: 7 },
+  { label: '10x',   minVal: 10,   color: '#00d4ff', window: 6,   scanN: 130, minHits: 6 },
+  { label: '15x',   minVal: 15,   color: '#ff6b9d', window: 7,   scanN: 110, minHits: 5 },
+  { label: '30x',   minVal: 30,   color: '#ff9f43', window: 13,  scanN: 90,  minHits: 4 },
+  { label: '50x',   minVal: 50,   color: '#4db8ff', window: 20,  scanN: 75,  minHits: 4 },
+  { label: '100x',  minVal: 100,  color: '#39ff8a', window: 30,  scanN: 65,  minHits: 4 },
   { label: '200x',  minVal: 200,  color: '#c77dff', window: 50,  scanN: 55,  minHits: 3 },
   { label: '500x',  minVal: 500,  color: '#ff4da6', window: 75,  scanN: 48,  minHits: 3 },
   { label: '1000x', minVal: 1000, color: '#7aa2ff', window: 100, scanN: 42,  minHits: 3 },
@@ -60,12 +60,12 @@ const CFG = Object.freeze({
   whitePreEntryTrendRounds: 6,
   whitePreEntryLowConcentration: 0.55,
   whitePreEntryVolCompression: 0.35,
-  whiteActiveHardRate: 0.38,
-  whiteActiveSoftRate: 0.68,
-  whiteActiveStreak: 4,
-  whiteEndingReboundMultiple: 3.0,
-  whiteEndingEwmaReversal: 2,
-  whiteEndingTailRecovery: 2,
+  whiteActiveHardRate: 0.42,
+  whiteActiveSoftRate: 0.72,
+  whiteActiveStreak: 5,
+  whiteEndingReboundMultiple: 2.2,
+  whiteEndingEwmaReversal: 1,
+  whiteEndingTailRecovery: 1,
 
   // Pattern similarity
   patternLen: 15,
@@ -83,17 +83,17 @@ const CFG = Object.freeze({
   calibrationWindow: 200,
 
   // Confidence caps/floors
-  whiteActiveConfidenceCap: 15,
-  preWhiteConfidenceCap: 30,
-  whiteEndingBoost: 15,
-  b2bConfidenceFloor: 45,
-  b2bScoreThreshold: 70,
+  whiteActiveConfidenceCap: 20,
+  preWhiteConfidenceCap: 35,
+  whiteEndingBoost: 20,
+  b2bConfidenceFloor: 40,
+  b2bScoreThreshold: 60,
 
   // Issue thresholds per target range
-  issueThresholdLow: 38,     // ≤15x
-  issueThresholdMid: 40,     // ≤50x
-  issueThresholdHigh: 42,    // ≤200x
-  issueThresholdMoon: 45,    // >200x
+  issueThresholdLow: 32,     // ≤15x
+  issueThresholdMid: 35,     // ≤50x
+  issueThresholdHigh: 38,    // ≤200x
+  issueThresholdMoon: 40,    // >200x
 });
 
 
@@ -1002,13 +1002,9 @@ function computeOracleForecast(rounds, target, options = {}) {
   let windowLo = lastHit.id + windowLoGap;
   let windowHi = lastHit.id + windowHiGap;
 
-  // If window has already passed, shift forward
-  if (windowHi <= nowId) {
-    const drift = nowId - windowHi + 1;
-    windowLo += drift;
-    windowHi += drift;
-    predictedRound = clamp(predictedRound + drift, windowLo, windowHi);
-  }
+  // FIXED: Do NOT shift window forward. If window has passed, it stays as-is.
+  // The replay loop in api.js will detect the miss and create a fresh lock.
+  // Shifting causes the +1 slide bug the user reported.
 
   const roundsUntilWindowLo = Math.max(0, windowLo - nowId);
   const roundsUntilWindowHi = Math.max(0, windowHi - nowId);
@@ -1018,20 +1014,21 @@ function computeOracleForecast(rounds, target, options = {}) {
   const confidence = ensemble.confidence;
   const threshold = getIssueThreshold(minVal);
 
-  // Hard blocks
+  // Hard blocks — WHITE_ACTIVE blocks only, but WHITE_ENDING ALWAYS passes through
   const whiteBlock = whitePhase.phase === 'WHITE_ACTIVE';
-  const preWhiteBlock = whitePhase.phase === 'PRE_WHITE' && confidence < threshold - 5;
-  const downtrendBlock = regime.label === 'TRENDING_DOWN' && confidence < threshold;
-  const randomBlock = regime.label === 'RANDOM' && confidence < threshold - 3 && !b2b.immediateB2B;
+  const preWhiteBlock = whitePhase.phase === 'PRE_WHITE' && confidence < threshold - 8;
+  const downtrendBlock = regime.label === 'TRENDING_DOWN' && confidence < threshold - 5;
+  const randomBlock = regime.label === 'RANDOM' && confidence < threshold - 5 && !b2b.immediateB2B;
   const hardBlock = whiteBlock || preWhiteBlock || downtrendBlock || randomBlock;
 
   // Strong transition signals that override blocks
   const strongB2B = b2b.b2bScore >= CFG.b2bScoreThreshold;
   const strongWhiteRecovery = whitePhase.phase === 'WHITE_ENDING';
-  const strongTransition = strongB2B || strongWhiteRecovery;
+  const strongOverdue = droughtPct >= 85;
+  const strongTransition = strongB2B || strongWhiteRecovery || strongOverdue;
 
   const issuePrediction = !hardBlock && confidence >= threshold ||
-    (strongTransition && confidence >= threshold - 8 && !whiteBlock);
+    (strongTransition && confidence >= threshold - 12 && !whiteBlock);
 
   let avoidReason = null;
   if (!issuePrediction) {
