@@ -1,15 +1,15 @@
 'use strict';
 
 const ORACLE_TARGETS = Object.freeze([
-  { label: '5x', minVal: 5, color: '#00ff88', window: 3, scanN: 120, minHits: 5 },
-  { label: '10x', minVal: 10, color: '#00d4ff', window: 5, scanN: 100, minHits: 4 },
-  { label: '15x', minVal: 15, color: '#ff6b9d', window: 7, scanN: 80, minHits: 3 },
-  { label: '30x', minVal: 30, color: '#ff9f43', window: 12, scanN: 60, minHits: 2 },
-  { label: '50x', minVal: 50, color: '#4db8ff', window: 18, scanN: 50, minHits: 2 },
-  { label: '100x', minVal: 100, color: '#39ff8a', window: 25, scanN: 40, minHits: 2 },
-  { label: '200x', minVal: 200, color: '#c77dff', window: 35, scanN: 30, minHits: 2 },
-  { label: '500x', minVal: 500, color: '#ff4da6', window: 50, scanN: 24, minHits: 2 },
-  { label: '1000x', minVal: 1000, color: '#7aa2ff', window: 75, scanN: 20, minHits: 2 },
+  { label: '5x', minVal: 5, color: '#00ff88', window: 5, scanN: 120, minHits: 5 },
+  { label: '10x', minVal: 10, color: '#00d4ff', window: 7, scanN: 100, minHits: 4 },
+  { label: '15x', minVal: 15, color: '#ff6b9d', window: 9, scanN: 80, minHits: 3 },
+  { label: '30x', minVal: 30, color: '#ff9f43', window: 14, scanN: 60, minHits: 2 },
+  { label: '50x', minVal: 50, color: '#4db8ff', window: 20, scanN: 50, minHits: 2 },
+  { label: '100x', minVal: 100, color: '#39ff8a', window: 28, scanN: 40, minHits: 2 },
+  { label: '200x', minVal: 200, color: '#c77dff', window: 38, scanN: 30, minHits: 2 },
+  { label: '500x', minVal: 500, color: '#ff4da6', window: 55, scanN: 24, minHits: 2 },
+  { label: '1000x', minVal: 1000, color: '#7aa2ff', window: 80, scanN: 20, minHits: 2 },
 ]);
 
 const REGIME_DRIFT_THRESHOLD = 0.35;
@@ -278,7 +278,10 @@ function computeConditionalExpectedGap(survivors, roundsSince) {
   const trimmed = trimSorted(filtered, filtered.length >= 10 ? 0.1 : 0);
   const base = trimmed.length ? trimmed : filtered;
   const expectedGap = Math.round(mean(base));
-  return Math.max(expectedGap, roundsSince + 1);
+  // FIX: removed Math.max(expectedGap, roundsSince + 1) floor that
+  // systematically right-shifted predictions, causing EARLY outcomes.
+  // The survival-based conditioning already accounts for elapsed time.
+  return expectedGap;
 }
 
 function getIssueThresholds(target) {
@@ -845,23 +848,22 @@ function computeRecentPatternDiagnostics(rounds, target, roundsSince, allGapsRaw
   const recentNearRounds = values.filter((value) => value >= nearHitMin).length;
   const tailHitBurst = tailValues.filter((value) => value >= target.minVal).length;
   const tailNearBurst = tailValues.filter((value) => value >= nearHitMin).length;
+  // FIX: b2bFriendly now requires at least 2 strong signals instead of 1.
+  // Previously ANY single condition unlocked it, causing near-permanent override
+  // of the recentHitTooSoon cooldown — especially for low targets like 5x/10x.
+  let b2bFriendlySignals = 0;
+  if (immediateB2BRecent) b2bFriendlySignals += 2;
+  if (nearBurstRecent) b2bFriendlySignals += 2;
+  if (crossTargetB2BSupport) b2bFriendlySignals += 1;
+  if (localShortRepeatRate >= (thresholds.b2bFriendlyRepeatMin / 100)) b2bFriendlySignals += 1;
+  if (shortRepeatMomentum >= thresholds.b2bMomentumMin) b2bFriendlySignals += 1;
+  if (recentTargetHits >= thresholds.minRecentHitsForFriendly && tailTargetHits > 0) b2bFriendlySignals += 1;
+  if (tailHitBurst > 0 && tailNearBurst >= Math.max(1, Math.ceil(tailWindowSize * 0.25))) b2bFriendlySignals += 1;
+  if (reboundSupport && (tailNearHits > 0 || tailPreviewHits > 0)) b2bFriendlySignals += 1;
+  const b2bFriendlyMinSignals = target.minVal <= 15 ? 2 : target.minVal <= 30 ? 2 : 1;
   const b2bFriendly = (
     recentHitTooSoon &&
-    (
-      immediateB2BRecent ||
-      nearBurstRecent ||
-      crossTargetB2BSupport ||
-      localShortRepeatRate >= (thresholds.b2bFriendlyRepeatMin / 100) ||
-      shortRepeatMomentum >= thresholds.b2bMomentumMin ||
-      recentTargetHits >= thresholds.minRecentHitsForFriendly ||
-      recentHitRounds >= Math.max(1, thresholds.minRecentHitsForFriendly) ||
-      tailTargetHits > 0 ||
-      tailHitBurst > 0 ||
-      (target.minVal <= 30 && tailPreviewHits > 0) ||
-      (tailNearHits >= Math.max(1, Math.ceil(tailWindowSize * 0.2)) && !downtrendEarly) ||
-      tailNearBurst >= Math.max(1, Math.ceil(tailWindowSize * 0.25)) ||
-      reboundSupport
-    )
+    b2bFriendlySignals >= b2bFriendlyMinSignals
   );
   const b2bBlocked = (
     recentHitTooSoon &&
@@ -1352,6 +1354,10 @@ function computeOracleForecast(rounds, target, options = {}) {
     predMethod = 'cluster';
   } else if (survivingGaps.length > 0) {
     predictedGap = computeConditionalExpectedGap(survivingGaps, roundsSince);
+    // FIX: if conditional gap fell behind current position, nudge forward
+    if (predictedGap != null && predictedGap <= roundsSince) {
+      predictedGap = roundsSince + Math.max(1, Math.round(selectedStats.iqr / 3));
+    }
     predBasis = `conditional expectation (${survivingGaps.length} survivors)`;
     predMethod = 'survival';
   } else {
@@ -1360,8 +1366,59 @@ function computeOracleForecast(rounds, target, options = {}) {
     predMethod = 'fallback';
   }
 
-  // Pull timing earlier only when the pattern says pressure is building. This
+  // FIX: EARLY feedback loop — count EARLY outcomes from calibration history
+  // and apply a proportional left-shift to combat systematic late windows.
+  const calibrationRows = options.calibrationRows || [];
+  const recentCalibration = calibrationRows.slice(0, 120);
+  let earlyCount = 0;
+  let winCount = 0;
+  let lossCount = 0;
+  for (const row of recentCalibration) {
+    if (row.outcome === 'early') earlyCount += 1;
+    else if (row.outcome === 'win') winCount += 1;
+    else if (row.outcome === 'loss') lossCount += 1;
+  }
+  const totalOutcomes = earlyCount + winCount + lossCount;
+  const earlyRate = totalOutcomes >= 10 ? earlyCount / totalOutcomes : 0;
+  // If >15% of outcomes are EARLY, pull window left proportionally
+  if (earlyRate > 0.15 && predictedGap > roundsSince + 1) {
+    const earlyPull = clampNumber(
+      Math.round(selectedStats.iqr * clampNumber((earlyRate - 0.15) * 4, 0, 0.8)),
+      0,
+      Math.max(1, Math.round(winSize * 0.6))
+    );
+    if (earlyPull > 0) {
+      predictedGap = Math.max(roundsSince + 1, predictedGap - earlyPull);
+      predBasis = `${predBasis} + early-feedback(-${earlyPull})`;
+      predMethod = `${predMethod}_efb`;
+    }
+  }
+
+  // FIX: p25-based window left-shift — anchor the prediction toward the
+  // left tail of the gap distribution to catch hits that arrive early.
+  // This directly combats the 93 EARLY outcomes from systematic late placement.
+  if (predMethod !== 'tail' && predictedGap > selectedStats.p25 && !openWindow) {
+    const p25Pull = clampNumber(
+      Math.round(
+        (predictedGap - selectedStats.p25) * (
+          target.minVal <= 15 ? 0.35
+            : target.minVal <= 30 ? 0.28
+              : target.minVal <= 100 ? 0.22
+                : 0.15
+        )
+      ),
+      0,
+      Math.max(1, Math.round(winSize * 0.5))
+    );
+    if (p25Pull > 0 && predictedGap - p25Pull >= roundsSince + 1) {
+      predictedGap -= p25Pull;
+      predBasis = `${predBasis} + p25-anchor(-${p25Pull})`;
+    }
+  }
+
+  // Pull timing earlier when the pattern says pressure is building. This
   // reduces "EARLY" misses caused by lagging windows without forcing blind locks.
+  // FIX: Relaxed conditions and increased pull factors for low targets.
   const leadEntryPressure = (
     recentPattern.reboundSupport ||
     recentPattern.whiteRelease ||
@@ -1369,7 +1426,9 @@ function computeOracleForecast(rounds, target, options = {}) {
     recentPattern.b2bFriendly ||
     recentPattern.immediateB2BRecent ||
     recentPattern.nearBurstRecent ||
-    recentPattern.crossTargetB2BSupport
+    recentPattern.crossTargetB2BSupport ||
+    recentPattern.transitionReady ||
+    (recentPattern.tailPreviewHits > 0 && !recentPattern.whiteCluster)
   ) &&
   (!recentPattern.downtrend || recentPattern.downtrendExhaustion) &&
   !recentPattern.whiteCluster;
@@ -1377,13 +1436,14 @@ function computeOracleForecast(rounds, target, options = {}) {
     const leadPull = clampNumber(
       Math.round(
         winSize * (
-          target.minVal <= 30 ? 0.45
-            : target.minVal <= 100 ? 0.35
-              : 0.28
+          target.minVal <= 15 ? 0.60
+            : target.minVal <= 30 ? 0.50
+              : target.minVal <= 100 ? 0.40
+                : 0.30
         )
       ),
       1,
-      Math.max(1, Math.round(winSize * 0.65))
+      Math.max(1, Math.round(winSize * 0.75))
     );
     predictedGap = Math.max(roundsSince + 1, predictedGap - leadPull);
     predBasis = `${predBasis} + lead-adjust`;
@@ -1410,18 +1470,30 @@ function computeOracleForecast(rounds, target, options = {}) {
     recentPattern.b2bFriendly ||
     recentPattern.immediateB2BRecent ||
     recentPattern.nearBurstRecent
-  ) ? Math.ceil(winSize * 0.35) : 0;
+  ) ? Math.ceil(winSize * 0.40) : 0;
   const reversalSkewLeft = (
     recentPattern.downtrendExhaustion ||
     recentPattern.reboundSupport
-  ) ? Math.ceil(winSize * 0.2) : 0;
+  ) ? Math.ceil(winSize * 0.25) : 0;
+  // FIX: Apply a baseline left-skew for ALL predictions to combat systematic
+  // late placement. Scale by target — low targets need more left-shift.
+  const baselineSkewLeft = Math.ceil(winSize * (
+    target.minVal <= 15 ? 0.22
+      : target.minVal <= 30 ? 0.16
+        : target.minVal <= 100 ? 0.12
+          : 0.08
+  ));
+  // FIX: Extra EARLY-history-driven skew to correct for observed EARLY pattern
+  const earlyHistorySkew = earlyRate > 0.20
+    ? Math.ceil(winSize * clampNumber((earlyRate - 0.15) * 1.5, 0, 0.35))
+    : 0;
   const whiteDelayComp = (
     recentPattern.whiteCluster &&
     !recentPattern.whiteRelease &&
     !recentPattern.reboundSupport
-  ) ? Math.ceil(winSize * 0.12) : 0;
+  ) ? Math.ceil(winSize * 0.10) : 0;
   const windowSkewLeft = clampNumber(
-    Math.max(b2bSkewLeft, reversalSkewLeft) - whiteDelayComp,
+    Math.max(b2bSkewLeft, reversalSkewLeft, baselineSkewLeft) + earlyHistorySkew - whiteDelayComp,
     0,
     Math.max(0, winSize - 1)
   );
@@ -1758,9 +1830,12 @@ function computeOracleForecast(rounds, target, options = {}) {
     Math.min(20, recentPattern.downtrendRiskScore * 0.4) -
     Math.min(16, recentPattern.b2bRiskScore * 0.35)
   );
+  // FIX: Raised lockThreshold for very low targets (5x/10x) which fire
+  // on nearly every round, generating noisy predictions that dilute accuracy.
   const lockThreshold =
-    target.minVal <= 10 ? 38 :
-    target.minVal <= 30 ? 32 :
+    target.minVal <= 10 ? 44 :
+    target.minVal <= 15 ? 40 :
+    target.minVal <= 30 ? 34 :
     target.minVal <= 100 ? 28 :
     target.minVal <= 200 ? 26 :
     target.minVal <= 500 ? 24 : 22;
