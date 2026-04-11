@@ -122,6 +122,17 @@ function computeTrendPercent(values) {
   return ((slope * (n - 1)) / Math.abs(meanY)) * 100;
 }
 
+function getLowPressureSoftThreshold(minVal) {
+  if (minVal <= 10) return 1.9;
+  if (minVal <= 15) return 2.1;
+  if (minVal <= 30) return 2.4;
+  if (minVal <= 50) return 2.7;
+  if (minVal <= 100) return 3.0;
+  if (minVal <= 200) return 3.3;
+  if (minVal <= 500) return 3.7;
+  return 4.0;
+}
+
 function computeRegimeMode(allSorted, recentSorted, rounds, target) {
   if (recentSorted.length < 24 || allSorted.length < 40) return 'full';
   const medAll = quantile(allSorted, 50);
@@ -130,7 +141,7 @@ function computeRegimeMode(allSorted, recentSorted, rounds, target) {
 
   const lastValues = rounds.slice(-24).map((round) => round.val);
   const prevValues = rounds.slice(-48, -24).map((round) => round.val);
-  const lowSoft = clampNumber(1.2 + (Math.log10(target.minVal + 1) * 1.8), 1.8, 6.0);
+  const lowSoft = getLowPressureSoftThreshold(target.minVal);
   const recentLowRate = lastValues.length ? (lastValues.filter((value) => value <= lowSoft).length / lastValues.length) : 0;
   const prevLowRate = prevValues.length ? (prevValues.filter((value) => value <= lowSoft).length / prevValues.length) : 0;
   const pressureShift = recentLowRate - prevLowRate;
@@ -410,7 +421,8 @@ function computeRecentPatternDiagnostics(rounds, target, roundsSince, allGapsRaw
   const shorter = rounds.slice(-12).map((round) => round.val);
   const veryShort = rounds.slice(-6).map((round) => round.val);
 
-  const lowSoft = clampNumber(1.2 + (Math.log10(target.minVal + 1) * 1.8), 1.8, 6.0);
+  const lowSoft = getLowPressureSoftThreshold(target.minVal);
+  const highTarget = target.minVal >= 100;
   const hardWhiteRate = recentValues.length
     ? (recentValues.filter((value) => value <= LOW_HARD_CAP).length / recentValues.length)
     : 0;
@@ -424,8 +436,24 @@ function computeRecentPatternDiagnostics(rounds, target, roundsSince, allGapsRaw
   const trend12 = computeTrendPercent(shorter);
   const trend6 = computeTrendPercent(veryShort);
 
-  const nearHitThreshold = Math.max(2, Math.pow(target.minVal, 0.72));
-  const strongRoundThreshold = Math.max(2.2, Math.pow(target.minVal, 0.82));
+  const nearHitThreshold = target.minVal <= 30
+    ? Math.max(2, Math.pow(target.minVal, 0.72))
+    : target.minVal <= 100
+      ? 6
+      : target.minVal <= 200
+        ? 8
+        : target.minVal <= 500
+          ? 12
+          : 16;
+  const strongRoundThreshold = target.minVal <= 30
+    ? Math.max(2.2, Math.pow(target.minVal, 0.82))
+    : target.minVal <= 100
+      ? 10
+      : target.minVal <= 200
+        ? 14
+        : target.minVal <= 500
+          ? 20
+          : 30;
   const nearHitRate = shorter.length
     ? (shorter.filter((value) => value >= nearHitThreshold).length / shorter.length)
     : 0;
@@ -452,19 +480,33 @@ function computeRecentPatternDiagnostics(rounds, target, roundsSince, allGapsRaw
     100
   );
 
-  const preWhiteCluster = (
-    softWhiteRate >= 0.58 &&
-    hardWhiteRate >= 0.22 &&
-    trend12 < -4 &&
-    trend6 <= 0
-  );
+  const preWhiteCluster = highTarget
+    ? (
+      softWhiteRate >= 0.66 &&
+      hardWhiteRate >= 0.28 &&
+      trend12 < -5 &&
+      trend6 <= -1
+    )
+    : (
+      softWhiteRate >= 0.58 &&
+      hardWhiteRate >= 0.22 &&
+      trend12 < -4 &&
+      trend6 <= 0
+    );
 
-  const whiteCluster = (
-    hardWhiteRate >= 0.40 ||
-    (softWhiteRate >= 0.72 && trend24 < -3) ||
-    hardWhiteStreak >= 4 ||
-    softWhiteStreak >= 7
-  );
+  const whiteCluster = highTarget
+    ? (
+      hardWhiteRate >= 0.52 ||
+      (softWhiteRate >= 0.82 && trend24 < -5) ||
+      hardWhiteStreak >= 6 ||
+      softWhiteStreak >= 10
+    )
+    : (
+      hardWhiteRate >= 0.40 ||
+      (softWhiteRate >= 0.72 && trend24 < -3) ||
+      hardWhiteStreak >= 4 ||
+      softWhiteStreak >= 7
+    );
 
   const whiteEndingSignal = (
     whiteCluster &&
@@ -473,18 +515,31 @@ function computeRecentPatternDiagnostics(rounds, target, roundsSince, allGapsRaw
     strongRate >= 0.16
   );
 
-  const downtrend = (
-    trend24 < -7 &&
-    trend12 < -4 &&
-    nearHitRate < 0.18 &&
-    softWhiteRate > 0.5
-  );
+  const downtrend = highTarget
+    ? (
+      trend24 < -8 &&
+      trend12 < -5 &&
+      nearHitRate < 0.14 &&
+      softWhiteRate > 0.58
+    )
+    : (
+      trend24 < -7 &&
+      trend12 < -4 &&
+      nearHitRate < 18 &&
+      softWhiteRate > 0.5
+    );
 
-  const upshift = (
-    trend12 > 4 &&
-    nearHitRate >= 0.24 &&
-    strongRate >= 0.14
-  );
+  const upshift = highTarget
+    ? (
+      trend12 > 3 &&
+      nearHitRate >= 0.14 &&
+      strongRate >= 0.10
+    )
+    : (
+      trend12 > 4 &&
+      nearHitRate >= 24 &&
+      strongRate >= 14
+    );
 
   const randomLike = (
     Math.abs(trend24) < 1.4 &&
@@ -560,15 +615,15 @@ function calibrateConfidence(rawConfidence, calibrationRows = []) {
 }
 
 function getIssueThreshold(minVal) {
-  if (minVal >= 1000) return 53;
-  if (minVal >= 500) return 51;
-  if (minVal >= 200) return 49;
-  if (minVal >= 100) return 47;
-  if (minVal >= 50) return 46;
+  if (minVal >= 1000) return 48;
+  if (minVal >= 500) return 46;
+  if (minVal >= 200) return 44;
+  if (minVal >= 100) return 42;
+  if (minVal >= 50) return 43;
   if (minVal >= 30) return 44;
-  if (minVal >= 15) return 42;
+  if (minVal >= 15) return 41;
   if (minVal >= 10) return 40;
-  return 38;
+  return 37;
 }
 
 function computeOracleForecast(rounds, target, options = {}) {
@@ -686,6 +741,16 @@ function computeOracleForecast(rounds, target, options = {}) {
     predMethod = 'b2b_support';
   }
 
+  if (
+    minVal >= 100 &&
+    (recentPattern.upshift || recentPattern.whiteEndingSignal || recentPattern.b2bSupportScore >= 58) &&
+    predictedGap > selectedStats.p25
+  ) {
+    const transitionGap = Math.round((selectedStats.p25 * 0.65) + (selectedStats.med * 0.35));
+    predictedGap = Math.max(roundsSince + 1, Math.min(predictedGap, transitionGap));
+    predMethod = 'high_target_transition';
+  }
+
   if (recentPattern.whiteCluster && !recentPattern.whiteEndingSignal && predictedGap < selectedStats.p25) {
     predictedGap = selectedStats.p25;
     predMethod = 'white_safety';
@@ -770,7 +835,7 @@ function computeOracleForecast(rounds, target, options = {}) {
   if (recentPattern.whiteCluster && !recentPattern.whiteEndingSignal) rawConfidence -= 19;
   if (recentPattern.downtrend) rawConfidence -= 11;
   if (recentPattern.randomLike || randomLiftWeak) rawConfidence -= 8;
-  if (!kmReliable && minVal >= 100) rawConfidence -= 7;
+  if (!kmReliable && minVal >= 100) rawConfidence -= 4;
   if (isTooEarly) rawConfidence -= 6;
   if (openWindow) rawConfidence -= 5;
 
@@ -779,14 +844,16 @@ function computeOracleForecast(rounds, target, options = {}) {
   const confidence = calibration.confidence;
 
   const threshold = getIssueThreshold(minVal);
-  const strongTransition = recentPattern.whiteEndingSignal || recentPattern.upshift || (recentPattern.b2bSupportScore >= 65);
+  const highTargetMomentum = minVal >= 100 && recentPattern.nearHitRate >= 14 && recentPattern.trend6 > 2;
+  const strongTransition = recentPattern.whiteEndingSignal || recentPattern.upshift || highTargetMomentum || (recentPattern.b2bSupportScore >= 65);
   const strongEdge = (pHitWindow >= (threshold - 6)) || (predictiveLift >= 3.5) || (patternSupport.ready && patternSupport.lift >= 4);
 
+  const whiteEscapeScore = minVal >= 100 ? 56 : 68;
   const hardWhiteBlock = (
     recentPattern.whiteCluster &&
     !recentPattern.whiteEndingSignal &&
     !recentPattern.upshift &&
-    recentPattern.b2bSupportScore < 68
+    recentPattern.b2bSupportScore < whiteEscapeScore
   );
   const hardDowntrendBlock = (
     recentPattern.downtrend &&
@@ -794,7 +861,13 @@ function computeOracleForecast(rounds, target, options = {}) {
     recentPattern.b2bSupportScore < 60
   );
   const randomHardBlock = randomLiftWeak && !strongTransition && pHitWindow < 26;
-  const kmHardBlock = (!kmReliable && minVal >= 200 && !strongTransition && pHitWindow < 32);
+  const kmHardBlock = (
+    !kmReliable &&
+    minVal >= 500 &&
+    !strongTransition &&
+    pHitWindow < 18 &&
+    predictiveLift < 0
+  );
   const hardBlock = hardWhiteBlock || hardDowntrendBlock || randomHardBlock || kmHardBlock;
 
   let avoidReason = null;
