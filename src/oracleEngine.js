@@ -394,6 +394,9 @@ function computeWhitePhase(rounds, target) {
   const n = rounds.length;
   if (n < 20) return { phase: 'NORMAL', signals: {}, reliability: 0 };
 
+
+
+
   const softThreshold = target.minVal <= 10 ? 1.9
     : target.minVal <= 30 ? 2.3
     : target.minVal <= 100 ? 2.8
@@ -474,6 +477,8 @@ function computeWhitePhase(rounds, target) {
   let phase = 'NORMAL';
 
   // WHITE_ACTIVE: currently in a white cluster
+
+
   const whiteActive = (
     hardWhiteRate24 >= CFG.whiteActiveHardRate ||
     softWhiteRate24 >= CFG.whiteActiveSoftRate ||
@@ -708,10 +713,23 @@ function computeEnsembleConfidence({
   }
   if (km.pHitWindow > 0 && km.reliability > 0.1) {
     layers.push({ name: 'km', prob: km.pHitWindow / 100, weight: 2.0, reliability: km.reliability });
+
+
+
+
+
+
   }
   if (pattern.ready && pattern.reliability > 0.1) {
     const patternProb = clamp((pattern.supportPct + Math.max(0, pattern.lift)) / 200, 0, 1);
     layers.push({ name: 'pattern', prob: patternProb, weight: 1.2, reliability: pattern.reliability });
+
+
+
+
+
+
+
   }
 
   // EWMA modifies base probability
@@ -732,6 +750,8 @@ function computeEnsembleConfidence({
   }
 
   // Inverse-error weighted blend
+
+
   let wSum = 0, pSum = 0;
   const layerBreakdown = [];
   for (const layer of layers) {
@@ -761,10 +781,18 @@ function computeEnsembleConfidence({
   const edge = ensembleP - baselineP;
   const edgeScore = clamp(edge / Math.max(0.01, baselineP), -1, 3);
 
+
   // EV
   const ev = ensembleP * target.minVal - 1;
 
   // Raw confidence: 0-100 scale
+
+
+
+
+
+
+
   let rawConfidence = clamp(
     (edgeScore * 25) +
     (clamp(ensembleP * 100, 0, 100) * 0.3) +
@@ -797,12 +825,16 @@ function computeEnsembleConfidence({
   // Too-early penalty
   if (roundsSince < 2 && target.minVal >= 50) rawConfidence -= 5;
 
+
   rawConfidence = clamp(rawConfidence, 0, 100);
 
   // Calibration against historical accuracy
+
+
   let confidence = rawConfidence;
   const resolved = (calibrationRows || []).filter(r => r.outcome === 'win' || r.outcome === 'loss');
   if (resolved.length >= 24) {
+
     const globalWinRate = resolved.filter(r => r.outcome === 'win').length / resolved.length * 100;
     confidence = Math.round(rawConfidence * 0.62 + globalWinRate * 0.38);
   }
@@ -1029,6 +1061,13 @@ function computeOracleForecast(rounds, target, options = {}) {
 
   const issuePrediction = !hardBlock && confidence >= threshold ||
     (strongTransition && confidence >= threshold - 12 && !whiteBlock);
+
+
+
+
+
+
+
 
   let avoidReason = null;
   if (!issuePrediction) {
