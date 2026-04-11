@@ -1497,7 +1497,11 @@ function computeOracleForecast(rounds, target, options = {}) {
     0,
     Math.max(0, winSize - 1)
   );
-  const windowLo = predictedRound - halfWin - windowSkewLeft;
+  let windowLo = predictedRound - halfWin - windowSkewLeft;
+  // Shift window forward if it's already started, to guarantee full window span
+  if (windowLo <= nowId) {
+    windowLo = nowId + 1;
+  }
   const windowHi = windowLo + winSize - 1;
   const selectedGapsForRates = selectedStats.trimmed;
   const droughtPct = selectedCount > 0
