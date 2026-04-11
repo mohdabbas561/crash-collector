@@ -1,34 +1,28 @@
 'use strict';
 
 const ORACLE_TARGETS = Object.freeze([
-  { label: '5x', minVal: 5, color: '#00ff88', window: 4, scanN: 120, minHits: 5 },
-  { label: '10x', minVal: 10, color: '#00d4ff', window: 6, scanN: 100, minHits: 4 },
-  { label: '15x', minVal: 15, color: '#ff6b9d', window: 7, scanN: 80, minHits: 3 },
-  { label: '30x', minVal: 30, color: '#ff9f43', window: 13, scanN: 60, minHits: 2 },
-  { label: '50x', minVal: 50, color: '#4db8ff', window: 20, scanN: 50, minHits: 2 },
-  { label: '100x', minVal: 100, color: '#39ff8a', window: 30, scanN: 40, minHits: 2 },
-  { label: '200x', minVal: 200, color: '#c77dff', window: 50, scanN: 30, minHits: 2 },
-  { label: '500x', minVal: 500, color: '#ff4da6', window: 75, scanN: 24, minHits: 2 },
-  { label: '1000x', minVal: 1000, color: '#7aa2ff', window: 100, scanN: 20, minHits: 2 },
+  { label: '5x', minVal: 5, color: '#00ff88', window: 4, scanN: 150, minHits: 7 },
+  { label: '10x', minVal: 10, color: '#00d4ff', window: 6, scanN: 130, minHits: 6 },
+  { label: '15x', minVal: 15, color: '#ff6b9d', window: 7, scanN: 110, minHits: 5 },
+  { label: '30x', minVal: 30, color: '#ff9f43', window: 13, scanN: 90, minHits: 4 },
+  { label: '50x', minVal: 50, color: '#4db8ff', window: 20, scanN: 75, minHits: 4 },
+  { label: '100x', minVal: 100, color: '#39ff8a', window: 30, scanN: 65, minHits: 4 },
+  { label: '200x', minVal: 200, color: '#c77dff', window: 50, scanN: 55, minHits: 3 },
+  { label: '500x', minVal: 500, color: '#ff4da6', window: 75, scanN: 48, minHits: 3 },
+  { label: '1000x', minVal: 1000, color: '#7aa2ff', window: 100, scanN: 42, minHits: 3 },
 ]);
 
-const REGIME_DRIFT_THRESHOLD = 0.35;
-const MIN_FORECAST_GAPS = 8;
+const REGIME_DRIFT_THRESHOLD = 0.30;
+const MIN_FORECAST_GAPS = 10;
 const MIN_KM_GAPS = 20;
-const MIN_HIGH_QUANTILE_GAPS = 30;
-const MIN_EXTREME_QUANTILE_GAPS = 60;
 const MIN_BUCKET_CALIBRATION = 8;
-const MIN_GLOBAL_CALIBRATION = 20;
-const CALIBRATION_RECENT_LIMIT = 240;
-const WHITE_CLUSTER_HARD_MAX = 1.25;
-const WHITE_CLUSTER_SOFT_MAX = 1.6;
+const MIN_GLOBAL_CALIBRATION = 24;
+const LOW_HARD_CAP = 1.25;
 
 function clampNumber(value, min, max) {
   return Math.min(Math.max(value, min), max);
 }
 
-// Robust linear-interpolation quantile. We reuse this everywhere so the engine
-// stays interpretable and deterministic.
 function quantile(sorted, p) {
   if (!sorted.length) return 0;
   if (sorted.length === 1) return sorted[0];
@@ -43,26 +37,71 @@ function mean(values) {
   return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
-function meanLog(values) {
-  if (!values.length) return 0;
-  return mean(values.map((value) => Math.log(Math.max(1.0001, value))));
+function stddev(values, avg) {
+  if (values.length < 2) return 0;
+  const center = Number.isFinite(avg) ? avg : mean(values);
+  const variance = values.reduce((sum, value) => sum + ((value - center) ** 2), 0) / (values.length - 1);
+  return Math.sqrt(Math.max(0, variance));
 }
 
-function maxOrZero(values) {
-  return values.length ? Math.max(...values) : 0;
-}
-
-function weightedPct(values, predicate) {
-  if (!values.length) return 0;
-  let hits = 0;
-  let total = 0;
-  const denom = Math.max(1, values.length - 1);
-  for (let i = 0; i < values.length; i += 1) {
-    const weight = 0.65 + ((i / denom) * 1.35);
-    total += weight;
-    if (predicate(values[i])) hits += weight;
+function normalizeRounds(rounds) {
+  const map = new Map();
+  for (const round of rounds || []) {
+    const id = Number(round?.roundId ?? round?.id);
+    const val = Number.parseFloat(round?.multiplier ?? round?.val ?? round?.gameResult ?? round?.result);
+    if (!Number.isFinite(id) || !Number.isFinite(val) || val <= 0) continue;
+    map.set(id, { id, val: Number(val.toFixed(4)) });
   }
-  return total > 0 ? (hits / total) * 100 : 0;
+  return [...map.values()].sort((a, b) => a.id - b.id);
+}
+
+function trimSorted(sorted, trimRatio = 0.1) {
+  if (!sorted.length) return [];
+  if (sorted.length < 10) return sorted.slice();
+  const trimCount = Math.floor(sorted.length * trimRatio);
+  if (trimCount <= 0 || (trimCount * 2) >= sorted.length) return sorted.slice();
+  return sorted.slice(trimCount, sorted.length - trimCount);
+}
+
+function tukeyFilterSorted(sorted) {
+  if (sorted.length < 8) return sorted.slice();
+  const q1 = quantile(sorted, 25);
+  const q3 = quantile(sorted, 75);
+  const iqr = Math.max(1, q3 - q1);
+  const lo = q1 - (1.5 * iqr);
+  const hi = q3 + (1.5 * iqr);
+  const filtered = sorted.filter((gap) => gap >= lo && gap <= hi);
+  return filtered.length >= Math.max(6, Math.floor(sorted.length * 0.55))
+    ? filtered
+    : sorted.slice();
+}
+
+function buildRobustStats(sourceSorted) {
+  const filtered = tukeyFilterSorted(sourceSorted);
+  const trimmed = trimSorted(filtered, filtered.length >= 12 ? 0.1 : 0);
+  const working = trimmed.length ? trimmed : filtered;
+
+  const p10 = quantile(working, 10);
+  const p25 = quantile(working, 25);
+  const med = quantile(working, 50);
+  const p75 = quantile(working, 75);
+  const p90 = quantile(working, 90);
+  const p99 = quantile(working, 99);
+
+  return {
+    filtered,
+    trimmed: working,
+    min: working[0],
+    max: working[working.length - 1],
+    p10: Math.round(p10),
+    p25: Math.round(p25),
+    med: Math.round(med),
+    p75: Math.round(p75),
+    p90: Math.round(p90),
+    p99: Math.round(p99),
+    iqr: Math.max(1, Math.round(p75 - p25)),
+    avg: Math.round(mean(working)),
+  };
 }
 
 function computeTrendPercent(values) {
@@ -78,79 +117,28 @@ function computeTrendPercent(values) {
     numer += dx * (logs[i] - meanY);
     denom += dx * dx;
   }
-  if (denom <= 0 || meanY === 0) return 0;
+  if (denom <= 0 || Math.abs(meanY) < 0.00001) return 0;
   const slope = numer / denom;
-  return ((slope * (n - 1)) / Math.max(0.0001, Math.abs(meanY))) * 100;
+  return ((slope * (n - 1)) / Math.abs(meanY)) * 100;
 }
 
-function buildSegmentPeaks(values, segments = 4) {
-  if (!values.length) return [];
-  const size = Math.max(1, Math.ceil(values.length / segments));
-  const peaks = [];
-  for (let start = 0; start < values.length; start += size) {
-    peaks.push(maxOrZero(values.slice(start, start + size)));
+function computeRegimeMode(allSorted, recentSorted, rounds, target) {
+  if (recentSorted.length < 24 || allSorted.length < 40) return 'full';
+  const medAll = quantile(allSorted, 50);
+  const medRecent = quantile(recentSorted, 50);
+  const drift = medAll > 0 ? Math.abs(medRecent - medAll) / medAll : 0;
+
+  const lastValues = rounds.slice(-24).map((round) => round.val);
+  const prevValues = rounds.slice(-48, -24).map((round) => round.val);
+  const lowSoft = clampNumber(1.2 + (Math.log10(target.minVal + 1) * 1.8), 1.8, 6.0);
+  const recentLowRate = lastValues.length ? (lastValues.filter((value) => value <= lowSoft).length / lastValues.length) : 0;
+  const prevLowRate = prevValues.length ? (prevValues.filter((value) => value <= lowSoft).length / prevValues.length) : 0;
+  const pressureShift = recentLowRate - prevLowRate;
+
+  if (drift > REGIME_DRIFT_THRESHOLD || pressureShift > 0.24 || pressureShift < -0.24) {
+    return 'recent';
   }
-  return peaks.filter((value) => value > 0);
-}
-
-function normalizeRounds(rounds) {
-  const mapped = new Map();
-  for (const round of rounds || []) {
-    const id = Number(round?.roundId ?? round?.id);
-    const val = Number.parseFloat(round?.multiplier ?? round?.val ?? round?.gameResult ?? round?.result);
-    if (!Number.isFinite(id) || !Number.isFinite(val) || val <= 0) continue;
-    mapped.set(id, { id, val });
-  }
-  return [...mapped.values()].sort((a, b) => a.id - b.id);
-}
-
-function trimSorted(sorted, trimRatio) {
-  if (!sorted.length) return [];
-  const trimCount = Math.floor(sorted.length * trimRatio);
-  if (trimCount <= 0 || (trimCount * 2) >= sorted.length) return sorted.slice();
-  return sorted.slice(trimCount, sorted.length - trimCount);
-}
-
-function tukeyFilterSorted(sorted) {
-  if (sorted.length < 8) return sorted.slice();
-  const q1 = quantile(sorted, 25);
-  const q3 = quantile(sorted, 75);
-  const iqr = Math.max(1, q3 - q1);
-  const lo = q1 - (1.5 * iqr);
-  const hi = q3 + (1.5 * iqr);
-  const filtered = sorted.filter((gap) => gap >= lo && gap <= hi);
-  return filtered.length >= Math.max(5, Math.floor(sorted.length * 0.6))
-    ? filtered
-    : sorted.slice();
-}
-
-// Robust stats are taken from the selected regime only. We never blend recent
-// and full data once regime selection is made.
-function buildRobustStats(sourceSorted) {
-  const filtered = tukeyFilterSorted(sourceSorted);
-  const trimmed = trimSorted(filtered, filtered.length >= 10 ? 0.1 : 0);
-  const working = trimmed.length ? trimmed : filtered;
-  const q25 = quantile(working, 25);
-  const q50 = quantile(working, 50);
-  const q75 = quantile(working, 75);
-  const iqr = Math.max(1, q75 - q25);
-  const p10 = working.length >= 10 ? quantile(working, 10) : working[0];
-  const p90 = working.length >= MIN_HIGH_QUANTILE_GAPS ? quantile(working, 90) : q75;
-  const p99 = working.length >= MIN_EXTREME_QUANTILE_GAPS ? quantile(working, 99) : p90;
-  return {
-    filtered,
-    trimmed: working,
-    min: working[0],
-    max: working[working.length - 1],
-    p10: Math.round(p10),
-    p25: Math.round(q25),
-    med: Math.round(q50),
-    p75: Math.round(q75),
-    p90: Math.round(p90),
-    p99: Math.round(p99),
-    iqr: Math.max(1, Math.round(iqr)),
-    avg: Math.round(mean(working)),
-  };
+  return 'full';
 }
 
 function deriveBinWidth(sorted) {
@@ -158,32 +146,23 @@ function deriveBinWidth(sorted) {
   const q25 = quantile(sorted, 25);
   const q75 = quantile(sorted, 75);
   const iqr = Math.max(1, q75 - q25);
-  const fdWidth = Math.max(1, Math.round((2 * iqr) / Math.cbrt(sorted.length)));
-  const spread = Math.max(1, sorted[sorted.length - 1] - sorted[0]);
-  const sqrtWidth = Math.max(1, Math.round(spread / Math.max(2, Math.sqrt(sorted.length))));
-  return Math.max(1, Math.min(fdWidth, sqrtWidth));
+  const fd = Math.max(1, Math.round((2 * iqr) / Math.cbrt(sorted.length)));
+  const span = Math.max(1, sorted[sorted.length - 1] - sorted[0]);
+  const sqrtRule = Math.max(1, Math.round(span / Math.max(2, Math.sqrt(sorted.length))));
+  return clampNumber(Math.min(fd, sqrtRule), 1, Math.max(1, Math.round(span / 3)));
 }
 
-// Histogram clustering is more stable than KDE here. It is discrete, supports
-// multiple peaks, and lets us measure support directly.
 function buildHistogramClusters(sorted) {
-  if (!sorted.length) {
-    return {
-      binWidth: 1,
-      primary: null,
-      secondary: null,
-      bins: [],
-    };
-  }
-
+  if (!sorted.length) return { binWidth: 1, primary: null, secondary: null, bins: [] };
   const min = sorted[0];
   const max = sorted[sorted.length - 1];
   const binWidth = deriveBinWidth(sorted);
   const binCount = Math.max(1, Math.floor((max - min) / binWidth) + 1);
-  const bins = Array.from({ length: binCount }, (_, index) => ({
-    index,
-    lo: min + (index * binWidth),
-    hi: min + ((index + 1) * binWidth) - 1,
+
+  const bins = Array.from({ length: binCount }, (_, idx) => ({
+    index: idx,
+    lo: min + (idx * binWidth),
+    hi: min + ((idx + 1) * binWidth) - 1,
     count: 0,
     sum: 0,
   }));
@@ -194,51 +173,50 @@ function buildHistogramClusters(sorted) {
     bins[idx].sum += gap;
   }
 
-  const smoothed = bins.map((bin, index) => {
-    const prev = bins[index - 1]?.count || 0;
-    const next = bins[index + 1]?.count || 0;
-    return bin.count + ((prev + next) * 0.55);
+  const smooth = bins.map((bin, idx) => {
+    const left = bins[idx - 1]?.count || 0;
+    const right = bins[idx + 1]?.count || 0;
+    return bin.count + ((left + right) * 0.55);
   });
 
   const peaks = [];
   for (let i = 0; i < bins.length; i += 1) {
-    const left = smoothed[i - 1] ?? -Infinity;
-    const right = smoothed[i + 1] ?? -Infinity;
-    if (smoothed[i] >= left && smoothed[i] >= right && bins[i].count > 0) {
-      peaks.push({ index: i, strength: smoothed[i] });
+    const left = smooth[i - 1] ?? -Infinity;
+    const right = smooth[i + 1] ?? -Infinity;
+    if (smooth[i] >= left && smooth[i] >= right && bins[i].count > 0) {
+      peaks.push({ index: i, strength: smooth[i] });
     }
   }
-
   peaks.sort((a, b) => b.strength - a.strength);
 
-  function expandCluster(peakIndex) {
-    const peakStrength = smoothed[peakIndex];
+  function expand(peakIndex) {
+    const peakStrength = smooth[peakIndex];
     const threshold = peakStrength * 0.42;
     let lo = peakIndex;
     let hi = peakIndex;
-    while (lo > 0 && smoothed[lo - 1] >= threshold) lo -= 1;
-    while (hi < bins.length - 1 && smoothed[hi + 1] >= threshold) hi += 1;
-    const clusterBins = bins.slice(lo, hi + 1);
-    const supportCount = clusterBins.reduce((sum, bin) => sum + bin.count, 0);
-    const weightedSum = clusterBins.reduce((sum, bin) => sum + bin.sum, 0);
+    while (lo > 0 && smooth[lo - 1] >= threshold) lo -= 1;
+    while (hi < bins.length - 1 && smooth[hi + 1] >= threshold) hi += 1;
+    const region = bins.slice(lo, hi + 1);
+    const supportCount = region.reduce((sum, bin) => sum + bin.count, 0);
+    const weightedSum = region.reduce((sum, bin) => sum + bin.sum, 0);
     return {
-      lo: clusterBins[0].lo,
-      hi: clusterBins[clusterBins.length - 1].hi,
-      center: supportCount > 0 ? Math.round(weightedSum / supportCount) : Math.round((clusterBins[0].lo + clusterBins[clusterBins.length - 1].hi) / 2),
+      lo: region[0].lo,
+      hi: region[region.length - 1].hi,
+      center: supportCount > 0 ? Math.round(weightedSum / supportCount) : Math.round((region[0].lo + region[region.length - 1].hi) / 2),
       supportCount,
       supportPct: supportCount / sorted.length,
       peakStrength,
     };
   }
 
-  const primary = peaks.length ? expandCluster(peaks[0].index) : null;
+  const primary = peaks.length ? expand(peaks[0].index) : null;
   let secondary = null;
   for (const peak of peaks.slice(1)) {
-    const candidate = expandCluster(peak.index);
+    const candidate = expand(peak.index);
     if (
       primary &&
       Math.abs(candidate.center - primary.center) >= binWidth &&
-      candidate.supportPct >= Math.max(0.12, primary.supportPct * 0.45)
+      candidate.supportPct >= Math.max(0.12, primary.supportPct * 0.4)
     ) {
       secondary = candidate;
       break;
@@ -248,1158 +226,386 @@ function buildHistogramClusters(sorted) {
   return { binWidth, bins, primary, secondary };
 }
 
-// In an orderless gap model, a shuffled-gap null is identical. The honest null
-// comparison is: "how often would a random window of the same size hit?".
-function computeChanceWindowRate(sorted, width) {
-  if (!sorted.length) return 0;
-  const min = sorted[0];
-  const max = sorted[sorted.length - 1];
-  if (max <= min) return 100;
-  const startMin = min;
-  const startMax = Math.max(min, max - width + 1);
-  const totalWindows = Math.max(1, startMax - startMin + 1);
-  let coveredStarts = 0;
-
-  // Exact mean occupancy across all integer-aligned windows of this width.
-  for (const gap of sorted) {
-    const loStart = Math.max(startMin, gap - width + 1);
-    const hiStart = Math.min(startMax, gap);
-    if (loStart <= hiStart) {
-      coveredStarts += (hiStart - loStart + 1);
+function buildKMTable(allGapsSorted) {
+  if (!allGapsSorted.length) return new Float32Array(2).fill(1);
+  const n = allGapsSorted.length;
+  const maxGap = allGapsSorted[n - 1];
+  const limit = maxGap + 120;
+  const table = new Float32Array(limit + 1).fill(1);
+  let survival = 1;
+  let left = 0;
+  for (let t = 1; t <= limit; t += 1) {
+    while (left < n && allGapsSorted[left] < t) left += 1;
+    let right = left;
+    while (right < n && allGapsSorted[right] === t) right += 1;
+    const atRisk = n - left;
+    const events = right - left;
+    if (atRisk > 0) {
+      survival *= (1 - (events / atRisk));
+      survival = clampNumber(survival, 0, 1);
     }
+    table[t] = survival;
   }
+  return table;
+}
 
-  return (coveredStarts / (totalWindows * sorted.length)) * 100;
+function kmProb(table, roundsSince, k) {
+  if (!table?.length) return 0;
+  const from = clampNumber(Math.round(roundsSince), 0, table.length - 1);
+  const to = clampNumber(Math.round(roundsSince + k), 0, table.length - 1);
+  const sFrom = table[from];
+  if (sFrom <= 0) return 100;
+  return clampNumber((1 - (table[to] / sFrom)) * 100, 0, 100);
 }
 
 function computeConditionalExpectedGap(survivors, roundsSince) {
   if (!survivors.length) return null;
-  const filtered = tukeyFilterSorted(survivors);
-  const trimmed = trimSorted(filtered, filtered.length >= 10 ? 0.1 : 0);
-  const base = trimmed.length ? trimmed : filtered;
-  const expectedGap = Math.round(mean(base));
-  // FIX: removed Math.max(expectedGap, roundsSince + 1) floor that
-  // systematically right-shifted predictions, causing EARLY outcomes.
-  // The survival-based conditioning already accounts for elapsed time.
-  return expectedGap;
+  const sorted = survivors.slice().sort((a, b) => a - b);
+  const trimmed = trimSorted(sorted, sorted.length >= 12 ? 0.1 : 0);
+  const working = trimmed.length ? trimmed : sorted;
+  const expected = mean(working);
+  return Math.max(roundsSince + 1, Math.round(expected));
 }
 
-function getIssueThresholds(target) {
-  if (target.minVal <= 10) {
-    return { minProbability: 22, minLift: 0, minClusterSupport: 8, readinessFactor: 0.4 };
+function computeChanceWindowRate(sorted, width, maxSamples = 4000) {
+  if (!sorted.length) return { rate: 0, std: 0 };
+  const winWidth = Math.max(1, Math.round(width));
+  const min = sorted[0];
+  const max = sorted[sorted.length - 1];
+  if (max <= min) return { rate: 100, std: 0 };
+
+  const startMin = min;
+  const startMax = Math.max(min, max - winWidth + 1);
+  const totalWindows = Math.max(1, startMax - startMin + 1);
+
+  let starts = [];
+  if (totalWindows <= maxSamples) {
+    starts = Array.from({ length: totalWindows }, (_, idx) => startMin + idx);
+  } else {
+    const step = (totalWindows - 1) / (maxSamples - 1);
+    for (let i = 0; i < maxSamples; i += 1) {
+      starts.push(startMin + Math.round(i * step));
+    }
+    starts = [...new Set(starts)].sort((a, b) => a - b);
   }
-  if (target.minVal <= 30) {
-    return { minProbability: 26, minLift: 0.02, minClusterSupport: 10, readinessFactor: 0.45 };
+
+  const n = sorted.length;
+  let lo = 0;
+  let hi = 0;
+  const rates = [];
+  for (const start of starts) {
+    const end = start + winWidth - 1;
+    while (lo < n && sorted[lo] < start) lo += 1;
+    while (hi < n && sorted[hi] <= end) hi += 1;
+    const windowCount = Math.max(0, hi - lo);
+    rates.push((windowCount / n) * 100);
   }
-  if (target.minVal <= 100) {
-    return { minProbability: 16, minLift: 0.08, minClusterSupport: 9, readinessFactor: 0.5 };
-  }
-  if (target.minVal <= 200) {
-    return { minProbability: 12, minLift: 0.12, minClusterSupport: 8, readinessFactor: 0.56 };
-  }
-  if (target.minVal <= 500) {
-    return { minProbability: 10, minLift: 0.16, minClusterSupport: 7, readinessFactor: 0.62 };
-  }
-  return { minProbability: 9, minLift: 0.2, minClusterSupport: 6, readinessFactor: 0.68 };
+
+  const avg = mean(rates);
+  return { rate: avg, std: stddev(rates, avg) };
 }
 
-function getSampleRequirements(target) {
-  if (target.minVal <= 10) {
-    return { minForecastGaps: 8, minKMGaps: 16 };
+function longestStreak(values, predicate) {
+  let best = 0;
+  let run = 0;
+  for (const value of values) {
+    if (predicate(value)) {
+      run += 1;
+      if (run > best) best = run;
+    } else {
+      run = 0;
+    }
   }
-  if (target.minVal <= 30) {
-    return { minForecastGaps: 7, minKMGaps: 14 };
-  }
-  if (target.minVal <= 100) {
-    return { minForecastGaps: 7, minKMGaps: 14 };
-  }
-  if (target.minVal <= 200) {
-    return { minForecastGaps: 8, minKMGaps: 15 };
-  }
-  if (target.minVal <= 500) {
-    return { minForecastGaps: 9, minKMGaps: 16 };
-  }
-  return { minForecastGaps: 10, minKMGaps: 18 };
+  return best;
 }
 
-function getPatternThresholds(target) {
-  if (target.minVal <= 10) {
+function computePatternSupport(rounds, target, windowSize) {
+  const values = rounds.map((round) => Number(round.val || 0));
+  const n = values.length;
+  const patternLen = target.minVal <= 30 ? 12 : target.minVal <= 100 ? 10 : 8;
+  if (n < (patternLen + windowSize + 30)) {
     return {
-      hardWhitePctThreshold: 84,
-      softWhitePctThreshold: 94,
-      lowPressureFactor: 0.48,
-      previewFactor: 0.84,
-      lowPressurePctThreshold: 72,
-      tailLowPressurePctThreshold: 62,
-      hardStreakThreshold: 5,
-      softStreakThreshold: 8,
-      downtrendThreshold: -26,
-      tailPeakRatio: 0.68,
-      b2bBlockRepeatMax: 12,
-      b2bFriendlyRepeatMin: 28,
-      b2bMomentumMin: 6,
-      recentHitFactor: 0.45,
-      minRecentHitsForFriendly: 2,
+      ready: false,
+      supportPct: 0,
+      randomPct: 0,
+      lift: 0,
+      bestDistance: null,
+      matches: 0,
+      sampleSize: 0,
     };
   }
-  if (target.minVal <= 30) {
+
+  const transformed = values.map((value) => Math.log(Math.max(1.0001, value)));
+  const currentStart = n - patternLen;
+  const currentPattern = transformed.slice(currentStart, n);
+  const candidateMaxStart = currentStart - windowSize - 1;
+  if (candidateMaxStart < 0) {
     return {
-      hardWhitePctThreshold: 74,
-      softWhitePctThreshold: 88,
-      lowPressureFactor: 0.26,
-      previewFactor: 0.56,
-      lowPressurePctThreshold: 66,
-      tailLowPressurePctThreshold: 56,
-      hardStreakThreshold: 4,
-      softStreakThreshold: 6,
-      downtrendThreshold: -22,
-      tailPeakRatio: 0.72,
-      b2bBlockRepeatMax: 16,
-      b2bFriendlyRepeatMin: 26,
-      b2bMomentumMin: 7,
-      recentHitFactor: 0.38,
-      minRecentHitsForFriendly: 2,
+      ready: false,
+      supportPct: 0,
+      randomPct: 0,
+      lift: 0,
+      bestDistance: null,
+      matches: 0,
+      sampleSize: 0,
     };
   }
-  if (target.minVal <= 100) {
-    return {
-      hardWhitePctThreshold: 64,
-      softWhitePctThreshold: 82,
-      lowPressureFactor: 0.18,
-      previewFactor: 0.36,
-      lowPressurePctThreshold: 60,
-      tailLowPressurePctThreshold: 52,
-      hardStreakThreshold: 4,
-      softStreakThreshold: 6,
-      downtrendThreshold: -18,
-      tailPeakRatio: 0.78,
-      b2bBlockRepeatMax: 18,
-      b2bFriendlyRepeatMin: 22,
-      b2bMomentumMin: 8,
-      recentHitFactor: 0.3,
-      minRecentHitsForFriendly: 1,
-    };
+
+  const maxCandidates = 5500;
+  const stride = Math.max(1, Math.ceil((candidateMaxStart + 1) / maxCandidates));
+  const topK = 24;
+  const top = [];
+  let sampleSize = 0;
+  let randomHits = 0;
+
+  function nextWindowHit(startIdx) {
+    const lo = startIdx + patternLen;
+    const hi = lo + windowSize - 1;
+    for (let i = lo; i <= hi && i < values.length; i += 1) {
+      if (values[i] >= target.minVal) return true;
+    }
+    return false;
   }
-  if (target.minVal <= 500) {
-    return {
-      hardWhitePctThreshold: 54,
-      softWhitePctThreshold: 74,
-      lowPressureFactor: 0.08,
-      previewFactor: 0.18,
-      lowPressurePctThreshold: 54,
-      tailLowPressurePctThreshold: 48,
-      hardStreakThreshold: 3,
-      softStreakThreshold: 5,
-      downtrendThreshold: -15,
-      tailPeakRatio: 0.82,
-      b2bBlockRepeatMax: 20,
-      b2bFriendlyRepeatMin: 16,
-      b2bMomentumMin: 9,
-      recentHitFactor: 0.22,
-      minRecentHitsForFriendly: 1,
-    };
+
+  function pushTop(item) {
+    if (top.length < topK) {
+      top.push(item);
+      top.sort((a, b) => a.distance - b.distance);
+      return;
+    }
+    if (item.distance >= top[top.length - 1].distance) return;
+    top[top.length - 1] = item;
+    top.sort((a, b) => a.distance - b.distance);
   }
+
+  for (let start = 0; start <= candidateMaxStart; start += stride) {
+    sampleSize += 1;
+    const hit = nextWindowHit(start);
+    if (hit) randomHits += 1;
+
+    let distance = 0;
+    for (let i = 0; i < patternLen; i += 1) {
+      distance += Math.abs(transformed[start + i] - currentPattern[i]);
+    }
+    distance /= patternLen;
+    pushTop({ start, distance, hit });
+  }
+
+  const matchHits = top.filter((item) => item.hit).length;
+  const supportPct = top.length ? (matchHits / top.length) * 100 : 0;
+  const randomPct = sampleSize ? (randomHits / sampleSize) * 100 : 0;
   return {
-    hardWhitePctThreshold: 48,
-    softWhitePctThreshold: 68,
-    lowPressureFactor: 0.05,
-    previewFactor: 0.1,
-    lowPressurePctThreshold: 48,
-    tailLowPressurePctThreshold: 44,
-    hardStreakThreshold: 3,
-    softStreakThreshold: 4,
-    downtrendThreshold: -12,
-    tailPeakRatio: 0.86,
-    b2bBlockRepeatMax: 24,
-    b2bFriendlyRepeatMin: 12,
-    b2bMomentumMin: 10,
-    recentHitFactor: 0.18,
-    minRecentHitsForFriendly: 1,
+    ready: top.length >= 8,
+    supportPct,
+    randomPct,
+    lift: supportPct - randomPct,
+    bestDistance: top.length ? top[0].distance : null,
+    matches: top.length,
+    sampleSize,
   };
-}
-
-function getNearHitFactor(target) {
-  if (target.minVal <= 10) return 0.7;
-  if (target.minVal <= 30) return 0.58;
-  if (target.minVal <= 100) return 0.46;
-  if (target.minVal <= 500) return 0.34;
-  return 0.28;
-}
-
-// White/low-pressure zones should be game-behavior-relative, not proportional
-// to very large targets (500x/1000x). Using target-scaled low-pressure bounds
-// can falsely classify almost every normal round as "white pressure".
-function getWhiteBandCeilings(target) {
-  if (target.minVal <= 10) {
-    return { lowPressureMax: 2.7, targetLowPressureBand: 3.2 };
-  }
-  if (target.minVal <= 30) {
-    return { lowPressureMax: 2.45, targetLowPressureBand: 2.95 };
-  }
-  if (target.minVal <= 100) {
-    return { lowPressureMax: 2.25, targetLowPressureBand: 2.75 };
-  }
-  if (target.minVal <= 200) {
-    return { lowPressureMax: 2.1, targetLowPressureBand: 2.6 };
-  }
-  if (target.minVal <= 500) {
-    return { lowPressureMax: 1.95, targetLowPressureBand: 2.4 };
-  }
-  return { lowPressureMax: 1.85, targetLowPressureBand: 2.3 };
 }
 
 function computeRecentPatternDiagnostics(rounds, target, roundsSince, allGapsRaw, selectedStats) {
-  const thresholds = getPatternThresholds(target);
-  const lookback = clampNumber(Math.max(target.window * 8, 12), 12, 96);
-  const recentRounds = rounds.slice(-lookback);
-  const values = recentRounds.map((round) => round.val);
-  const nearHitMin = Math.max(1.2, target.minVal * getNearHitFactor(target));
-  const whiteBands = getWhiteBandCeilings(target);
-  const lowPressureMax = whiteBands.lowPressureMax;
-  const targetLowPressureBand = whiteBands.targetLowPressureBand;
-  const previewMin = Math.max(
-    lowPressureMax * (target.minVal >= 100 ? 1.8 : 1.45),
-    target.minVal * thresholds.previewFactor
-  );
-  if (!values.length) {
-    return {
-      lookback,
-      hardWhitePct: 0,
-      softWhitePct: 0,
-      lowPressurePct: 0,
-      maxHardWhiteStreak: 0,
-      maxSoftWhiteStreak: 0,
-      maxLowPressureStreak: 0,
-      tailMaxHardWhiteStreak: 0,
-      tailMaxSoftWhiteStreak: 0,
-      tailMaxLowPressureStreak: 0,
-      recentTargetHits: 0,
-      recentNearHits: 0,
-      recentPreviewHits: 0,
-      tailTargetHits: 0,
-      tailNearHits: 0,
-      tailPreviewHits: 0,
-      headPreviewHits: 0,
-      weightedHardWhitePct: 0,
-      weightedSoftWhitePct: 0,
-      weightedLowPressurePct: 0,
-      headSoftWhitePct: 0,
-      tailSoftWhitePct: 0,
-      headLowPressurePct: 0,
-      tailLowPressurePct: 0,
-      endingHardWhiteStreak: 0,
-      endingSoftWhiteStreak: 0,
-      endingLowPressureStreak: 0,
-      lowPressureCluster: false,
-      compressionSupport: false,
-      emergingWhiteRisk: false,
-      preWhiteCluster: false,
-      releaseWatch: false,
-      whiteRelease: false,
-      reboundSupport: false,
-      transitionSupportScore: 0,
-      transitionReady: false,
-      patternScore: 0,
-      supportScore: 0,
-      riskScore: 0,
-      downtrend: false,
-      downtrendEarly: false,
-      downtrendExhaustion: false,
-      regimeUpshift: false,
-      downtrendPct: 0,
-      lowerHighCount: 0,
-      risingHighCount: 0,
-      shortRepeatRate: 0,
-      localShortRepeatRate: 0,
-      shortRepeatMomentum: 0,
-      recentHitThreshold: 0,
-      b2bRiskScore: 0,
-      b2bSupportScore: 0,
-      whiteRiskScore: 0,
-      whiteLeadRiskScore: 0,
-      downtrendRiskScore: 0,
-      b2bBlocked: false,
-      b2bFriendly: false,
-      immediateB2BRecent: false,
-      nearBurstRecent: false,
-      crossTargetB2BSupport: false,
-      recentHitTooSoon: false,
-      previewMin,
-    };
-  }
+  const recentValues = rounds.slice(-24).map((round) => round.val);
+  const shorter = rounds.slice(-12).map((round) => round.val);
+  const veryShort = rounds.slice(-6).map((round) => round.val);
 
-  let hardWhiteCount = 0;
-  let softWhiteCount = 0;
-  let lowPressureCount = 0;
-  let hardWhiteStreak = 0;
-  let softWhiteStreak = 0;
-  let lowPressureStreak = 0;
-  let maxHardWhiteStreak = 0;
-  let maxSoftWhiteStreak = 0;
-  let maxLowPressureStreak = 0;
+  const lowSoft = clampNumber(1.2 + (Math.log10(target.minVal + 1) * 1.8), 1.8, 6.0);
+  const hardWhiteRate = recentValues.length
+    ? (recentValues.filter((value) => value <= LOW_HARD_CAP).length / recentValues.length)
+    : 0;
+  const softWhiteRate = recentValues.length
+    ? (recentValues.filter((value) => value <= lowSoft).length / recentValues.length)
+    : 0;
+  const hardWhiteStreak = longestStreak(recentValues, (value) => value <= LOW_HARD_CAP);
+  const softWhiteStreak = longestStreak(recentValues, (value) => value <= lowSoft);
 
-  for (const value of values) {
-    if (value <= WHITE_CLUSTER_HARD_MAX) {
-      hardWhiteCount += 1;
-      hardWhiteStreak += 1;
-    } else {
-      hardWhiteStreak = 0;
-    }
+  const trend24 = computeTrendPercent(recentValues);
+  const trend12 = computeTrendPercent(shorter);
+  const trend6 = computeTrendPercent(veryShort);
 
-    if (value <= WHITE_CLUSTER_SOFT_MAX) {
-      softWhiteCount += 1;
-      softWhiteStreak += 1;
-    } else {
-      softWhiteStreak = 0;
-    }
+  const nearHitThreshold = Math.max(2, Math.pow(target.minVal, 0.72));
+  const strongRoundThreshold = Math.max(2.2, Math.pow(target.minVal, 0.82));
+  const nearHitRate = shorter.length
+    ? (shorter.filter((value) => value >= nearHitThreshold).length / shorter.length)
+    : 0;
+  const strongRate = shorter.length
+    ? (shorter.filter((value) => value >= strongRoundThreshold).length / shorter.length)
+    : 0;
 
-    if (value <= lowPressureMax) {
-      lowPressureCount += 1;
-      lowPressureStreak += 1;
-    } else {
-      lowPressureStreak = 0;
-    }
+  const tailRebound = veryShort.filter((value) => value >= nearHitThreshold).length;
+  const recentGaps = allGapsRaw.slice(-Math.min(14, allGapsRaw.length));
+  const shortGapRate = recentGaps.length
+    ? (recentGaps.filter((gap) => gap <= Math.max(2, Math.round(selectedStats.p25 * 0.55))).length / recentGaps.length)
+    : 0;
+  const immediateGapRate = recentGaps.length
+    ? (recentGaps.filter((gap) => gap <= 2).length / recentGaps.length)
+    : 0;
 
-    maxHardWhiteStreak = Math.max(maxHardWhiteStreak, hardWhiteStreak);
-    maxSoftWhiteStreak = Math.max(maxSoftWhiteStreak, softWhiteStreak);
-    maxLowPressureStreak = Math.max(maxLowPressureStreak, lowPressureStreak);
-  }
-  const endingHardWhiteStreak = hardWhiteStreak;
-  const endingSoftWhiteStreak = softWhiteStreak;
-  const endingLowPressureStreak = lowPressureStreak;
-
-  const split = Math.max(1, Math.floor(values.length / 2));
-  const firstHalf = values.slice(0, split);
-  const secondHalf = values.slice(split);
-  const last4 = values.slice(-Math.min(4, values.length));
-  const prev4 = values.slice(-Math.min(8, values.length), -Math.min(4, values.length));
-  const surgeWindowSize = Math.max(3, Math.min(values.length, Math.max(4, Math.ceil(target.window * 0.35))));
-  const recentSurgeValues = values.slice(-surgeWindowSize);
-  const prevSurgeValues = values.slice(
-    -Math.min(values.length, surgeWindowSize * 2),
-    -surgeWindowSize
-  );
-  const last1 = values.length ? values[values.length - 1] : 0;
-  const last2 = values.length > 1 ? values[values.length - 2] : 0;
-  const tailWindowSize = Math.max(4, Math.min(values.length, Math.max(target.window * 2, 6)));
-  const tailValues = values.slice(-tailWindowSize);
-  const headValues = values.slice(0, Math.max(1, values.length - tailWindowSize));
-  let tailHardWhiteStreak = 0;
-  let tailSoftWhiteStreak = 0;
-  let tailLowPressureStreak = 0;
-  let tailMaxHardWhiteStreak = 0;
-  let tailMaxSoftWhiteStreak = 0;
-  let tailMaxLowPressureStreak = 0;
-  for (const value of tailValues) {
-    if (value <= WHITE_CLUSTER_HARD_MAX) tailHardWhiteStreak += 1;
-    else tailHardWhiteStreak = 0;
-    if (value <= WHITE_CLUSTER_SOFT_MAX) tailSoftWhiteStreak += 1;
-    else tailSoftWhiteStreak = 0;
-    if (value <= lowPressureMax) tailLowPressureStreak += 1;
-    else tailLowPressureStreak = 0;
-    tailMaxHardWhiteStreak = Math.max(tailMaxHardWhiteStreak, tailHardWhiteStreak);
-    tailMaxSoftWhiteStreak = Math.max(tailMaxSoftWhiteStreak, tailSoftWhiteStreak);
-    tailMaxLowPressureStreak = Math.max(tailMaxLowPressureStreak, tailLowPressureStreak);
-  }
-  const headLogMean = meanLog(firstHalf);
-  const tailLogMean = meanLog(secondHalf);
-  const trendDelta = headLogMean > 0 ? ((tailLogMean - headLogMean) / headLogMean) : 0;
-  const trendPct = computeTrendPercent(values);
-  const headPeak = maxOrZero(firstHalf);
-  const tailPeak = maxOrZero(secondHalf);
-  const recentTargetHits = values.filter((value) => value >= target.minVal).length;
-  const recentNearHits = values.filter((value) => value >= nearHitMin).length;
-  const recentPreviewHits = values.filter((value) => value >= previewMin).length;
-  const tailTargetHits = tailValues.filter((value) => value >= target.minVal).length;
-  const tailNearHits = tailValues.filter((value) => value >= nearHitMin).length;
-  const tailPreviewHits = tailValues.filter((value) => value >= previewMin).length;
-  const headPreviewHits = headValues.filter((value) => value >= previewMin).length;
-  const weightedHardWhitePct = weightedPct(values, (value) => value <= WHITE_CLUSTER_HARD_MAX);
-  const weightedSoftWhitePct = weightedPct(values, (value) => value <= WHITE_CLUSTER_SOFT_MAX);
-  const weightedLowPressurePct = weightedPct(values, (value) => value <= lowPressureMax);
-  const weightedTargetLowPct = weightedPct(values, (value) => value <= targetLowPressureBand);
-  const headSoftWhitePct = headValues.length
-    ? (headValues.filter((value) => value <= WHITE_CLUSTER_SOFT_MAX).length / headValues.length) * 100
-    : 0;
-  const tailSoftWhitePct = tailValues.length
-    ? (tailValues.filter((value) => value <= WHITE_CLUSTER_SOFT_MAX).length / tailValues.length) * 100
-    : 0;
-  const headLowPressurePct = headValues.length
-    ? (headValues.filter((value) => value <= lowPressureMax).length / headValues.length) * 100
-    : 0;
-  const tailLowPressurePct = tailValues.length
-    ? (tailValues.filter((value) => value <= lowPressureMax).length / tailValues.length) * 100
-    : 0;
-  const tailTargetLowPct = tailValues.length
-    ? (tailValues.filter((value) => value <= targetLowPressureBand).length / tailValues.length) * 100
-    : 0;
-  const last4SoftWhitePct = last4.length
-    ? (last4.filter((value) => value <= WHITE_CLUSTER_SOFT_MAX).length / last4.length) * 100
-    : 0;
-  const last4HardWhitePct = last4.length
-    ? (last4.filter((value) => value <= WHITE_CLUSTER_HARD_MAX).length / last4.length) * 100
-    : 0;
-  const last4LowPressurePct = last4.length
-    ? (last4.filter((value) => value <= lowPressureMax).length / last4.length) * 100
-    : 0;
-  const last4TargetLowPct = last4.length
-    ? (last4.filter((value) => value <= targetLowPressureBand).length / last4.length) * 100
-    : 0;
-  const recentSurgeSoftWhitePct = recentSurgeValues.length
-    ? (recentSurgeValues.filter((value) => value <= WHITE_CLUSTER_SOFT_MAX).length / recentSurgeValues.length) * 100
-    : 0;
-  const prevSurgeSoftWhitePct = prevSurgeValues.length
-    ? (prevSurgeValues.filter((value) => value <= WHITE_CLUSTER_SOFT_MAX).length / prevSurgeValues.length) * 100
-    : 0;
-  const recentSurgeLowPressurePct = recentSurgeValues.length
-    ? (recentSurgeValues.filter((value) => value <= lowPressureMax).length / recentSurgeValues.length) * 100
-    : 0;
-  const prevSurgeLowPressurePct = prevSurgeValues.length
-    ? (prevSurgeValues.filter((value) => value <= lowPressureMax).length / prevSurgeValues.length) * 100
-    : 0;
-  const recentSurgeTargetLowPct = recentSurgeValues.length
-    ? (recentSurgeValues.filter((value) => value <= targetLowPressureBand).length / recentSurgeValues.length) * 100
-    : 0;
-  const prevSurgeTargetLowPct = prevSurgeValues.length
-    ? (prevSurgeValues.filter((value) => value <= targetLowPressureBand).length / prevSurgeValues.length) * 100
-    : 0;
-  const recentSurgeTargetHits = recentSurgeValues.filter((value) => value >= target.minVal).length;
-  const recentSurgeNearHits = recentSurgeValues.filter((value) => value >= nearHitMin).length;
-  const recentSurgePreviewHits = recentSurgeValues.filter((value) => value >= previewMin).length;
-  const recentSurgePeak = maxOrZero(recentSurgeValues);
-  const prevSurgePeak = maxOrZero(prevSurgeValues);
-  const prevSurgeLogMean = meanLog(prevSurgeValues);
-  const recentSurgeLogMean = meanLog(recentSurgeValues);
-  const recentSurgeLogDeltaPct = prevSurgeLogMean > 0
-    ? ((recentSurgeLogMean - prevSurgeLogMean) / prevSurgeLogMean) * 100
-    : 0;
-  const softWhiteAcceleration = recentSurgeSoftWhitePct - prevSurgeSoftWhitePct;
-  const lowPressureAcceleration = recentSurgeLowPressurePct - prevSurgeLowPressurePct;
-  const targetLowAcceleration = recentSurgeTargetLowPct - prevSurgeTargetLowPct;
-  const segmentCount = clampNumber(
-    Math.round(values.length / Math.max(4, Math.min(18, target.window))),
-    3,
-    6
-  );
-  const segmentPeaks = buildSegmentPeaks(values, segmentCount);
-  let lowerHighCount = 0;
-  let risingHighCount = 0;
-  for (let i = 1; i < segmentPeaks.length; i += 1) {
-    const declineFactor = target.minVal <= 30 ? 0.9 : target.minVal <= 100 ? 0.87 : 0.84;
-    const riseFactor = target.minVal <= 30 ? 1.07 : target.minVal <= 100 ? 1.1 : 1.14;
-    if (segmentPeaks[i] <= segmentPeaks[i - 1] * declineFactor) lowerHighCount += 1;
-    if (segmentPeaks[i] >= segmentPeaks[i - 1] * riseFactor) risingHighCount += 1;
-  }
-
-  const hardWhitePct = (hardWhiteCount / values.length) * 100;
-  const softWhitePct = (softWhiteCount / values.length) * 100;
-  const lowPressurePct = (lowPressureCount / values.length) * 100;
-  const earlyDowntrendPct = thresholds.downtrendThreshold * 0.72;
-  const downtrend = (
-    trendDelta <= (thresholds.downtrendThreshold / 100) &&
-    tailPeak <= (headPeak * thresholds.tailPeakRatio)
-  );
-  const lowerHighRequirement = target.minVal <= 30 ? 2 : 3;
-  const downtrendEarly = (
-    trendPct <= earlyDowntrendPct ||
-    (
-      lowerHighCount >= lowerHighRequirement &&
-      tailPeak <= Math.max(nearHitMin, headPeak * (thresholds.tailPeakRatio + 0.08))
-    ) ||
-    (
-      prev4.length > 0 &&
-      last4.length > 0 &&
-      meanLog(last4) < meanLog(prev4) * 0.92 &&
-      tailNearHits === 0 &&
-      tailLowPressurePct >= thresholds.tailLowPressurePctThreshold
-    )
-  );
-  const shortRepeatWindow = Math.max(2, Math.min(target.window, 6));
-  const shortRepeatRate = allGapsRaw.length
-    ? allGapsRaw.filter((gap) => gap <= shortRepeatWindow).length / allGapsRaw.length
-    : 0;
-  const localGapSample = allGapsRaw.slice(-Math.min(Math.max(8, target.window * 2), 24));
-  const localShortRepeatRate = localGapSample.length
-    ? localGapSample.filter((gap) => gap <= shortRepeatWindow).length / localGapSample.length
-    : shortRepeatRate;
-  const olderGapSample = allGapsRaw.slice(
-    Math.max(0, allGapsRaw.length - (localGapSample.length * 2)),
-    Math.max(0, allGapsRaw.length - localGapSample.length)
-  );
-  const olderShortRepeatRate = olderGapSample.length
-    ? olderGapSample.filter((gap) => gap <= shortRepeatWindow).length / olderGapSample.length
-    : shortRepeatRate;
-  const shortRepeatMomentum = (localShortRepeatRate - olderShortRepeatRate) * 100;
-  const localGapSorted = [...localGapSample].sort((a, b) => a - b);
-  const localGapP25 = localGapSorted.length >= 4
-    ? Math.round(quantile(localGapSorted, 25))
-    : shortRepeatWindow;
-  const recentHitThreshold = Math.max(1, Math.min(
-    target.window,
-    localGapP25,
-    Math.max(1, Math.round(selectedStats.med * thresholds.recentHitFactor))
-  ));
-  const recentHitTooSoon = roundsSince <= recentHitThreshold;
-  const recentTargetHitIds = recentRounds
-    .filter((round) => round.val >= target.minVal)
-    .map((round) => Number(round.id || 0))
-    .filter((id) => Number.isFinite(id) && id > 0);
-  const recentNearHitIds = recentRounds
-    .filter((round) => round.val >= nearHitMin)
-    .map((round) => Number(round.id || 0))
-    .filter((id) => Number.isFinite(id) && id > 0);
-  const lastTargetGap = recentTargetHitIds.length >= 2
-    ? recentTargetHitIds[recentTargetHitIds.length - 1] - recentTargetHitIds[recentTargetHitIds.length - 2]
-    : null;
-  const lastNearGap = recentNearHitIds.length >= 2
-    ? recentNearHitIds[recentNearHitIds.length - 1] - recentNearHitIds[recentNearHitIds.length - 2]
-    : null;
-  const immediateB2BRecent = Number.isFinite(lastTargetGap)
-    && lastTargetGap <= Math.max(1, Math.round(target.window * 0.5));
-  const nearBurstRecent = Number.isFinite(lastNearGap)
-    && lastNearGap <= Math.max(1, Math.round(target.window * 0.4));
-  const recentSpikeFloor = Math.max(nearHitMin, previewMin, lowPressureMax * 1.5);
-  const recentSpikeSeen = (
-    (last1 >= recentSpikeFloor) ||
-    (last2 >= recentSpikeFloor) ||
-    last4.some((value) => value >= recentSpikeFloor * 1.08)
-  );
-  const recentRecoverySeen = (
-    last1 >= Math.max(lowPressureMax * 1.05, nearHitMin * 0.52) ||
-    last2 >= nearHitMin ||
-    mean(last4) >= Math.max(lowPressureMax, nearHitMin * 0.5)
-  );
-  const crossTargetB2BSupport = recentSpikeSeen && recentRecoverySeen;
-  const lowPressureCluster = (
-    (
-      (
-        tailLowPressurePct >= thresholds.tailLowPressurePctThreshold &&
-        tailLowPressurePct >= (headLowPressurePct + 6)
-      ) ||
-      (
-        tailTargetLowPct >= Math.max(30, thresholds.tailLowPressurePctThreshold - 8) &&
-        tailTargetLowPct >= (headLowPressurePct + 4)
-      ) ||
-      endingLowPressureStreak >= Math.max(2, Math.ceil(target.window * 0.4))
-    ) &&
-    (
-      weightedLowPressurePct >= Math.max(38, thresholds.lowPressurePctThreshold - 10) ||
-      tailTargetLowPct >= Math.max(30, thresholds.tailLowPressurePctThreshold - 8) ||
-      weightedTargetLowPct >= Math.max(30, thresholds.lowPressurePctThreshold - 12)
-    )
-  );
-  const tailWhiteSurge = (
-    tailSoftWhitePct >= Math.max(52, thresholds.softWhitePctThreshold - 16) &&
-    tailSoftWhitePct >= (headSoftWhitePct + 10)
-  );
-  const hardTailSpike = (
-    last4HardWhitePct >= Math.max(45, thresholds.hardWhitePctThreshold - 22) &&
-    last4LowPressurePct >= Math.max(50, thresholds.tailLowPressurePctThreshold - 2)
-  );
-  const whiteCluster = (
-    (
-      endingHardWhiteStreak >= thresholds.hardStreakThreshold ||
-      endingSoftWhiteStreak >= thresholds.softStreakThreshold ||
-      tailMaxHardWhiteStreak >= thresholds.hardStreakThreshold ||
-      tailMaxSoftWhiteStreak >= thresholds.softStreakThreshold
-    ) ||
-    tailWhiteSurge ||
-    hardTailSpike ||
-    (
-      weightedSoftWhitePct >= thresholds.softWhitePctThreshold &&
-      tailSoftWhitePct >= (headSoftWhitePct + 8)
-    ) ||
-    (
-      target.minVal >= 30 &&
-      lowPressureCluster &&
-      tailMaxLowPressureStreak >= Math.max(3, Math.ceil(target.window * 0.45))
-    )
-  );
-  const preWhiteAccelerationSignal = (
-    lowPressureAcceleration >= (target.minVal <= 15 ? 14 : target.minVal <= 100 ? 11 : 9) ||
-    softWhiteAcceleration >= (target.minVal <= 15 ? 12 : target.minVal <= 100 ? 10 : 8) ||
-    targetLowAcceleration >= (target.minVal <= 15 ? 10 : target.minVal <= 100 ? 9 : 7)
-  );
-  const preWhiteCompressionSignal = (
-    recentSurgeLogDeltaPct <= (target.minVal <= 30 ? -9 : target.minVal <= 100 ? -8 : -6) ||
-    (
-      prevSurgePeak > 0 &&
-      recentSurgePeak <= prevSurgePeak * (target.minVal <= 30 ? 0.86 : target.minVal <= 100 ? 0.88 : 0.9)
-    )
-  );
-  const preWhiteDominanceSignal = (
-    recentSurgeLowPressurePct >= Math.max(40, thresholds.tailLowPressurePctThreshold - 10) ||
-    recentSurgeSoftWhitePct >= Math.max(46, thresholds.softWhitePctThreshold - 22) ||
-    recentSurgeTargetLowPct >= Math.max(34, thresholds.tailLowPressurePctThreshold - 12)
-  );
-  const preWhiteNoSupportSignal = (
-    recentSurgeTargetHits === 0 &&
-    recentSurgeNearHits === 0 &&
-    recentSurgePreviewHits === 0 &&
-    tailNearHits === 0 &&
-    tailPreviewHits === 0 &&
-    tailTargetHits === 0
-  );
-  const preWhiteCandidate = (
-    !whiteCluster &&
-    preWhiteAccelerationSignal &&
-    preWhiteCompressionSignal &&
-    preWhiteDominanceSignal &&
-    preWhiteNoSupportSignal &&
-    endingLowPressureStreak >= Math.max(1, Math.ceil(target.window * 0.3))
-  );
-  const emergingWhiteRisk = !whiteCluster && (
-    weightedSoftWhitePct >= Math.max(54, thresholds.softWhitePctThreshold - 12) ||
-    weightedHardWhitePct >= Math.max(28, thresholds.hardWhitePctThreshold - 12) ||
-    (tailSoftWhitePct - headSoftWhitePct) >= 16 ||
-    weightedLowPressurePct >= Math.max(46, thresholds.lowPressurePctThreshold - 10) ||
-    weightedTargetLowPct >= Math.max(32, thresholds.lowPressurePctThreshold - 12) ||
-    (tailLowPressurePct - headLowPressurePct) >= 12 ||
-    last4HardWhitePct >= Math.max(45, thresholds.hardWhitePctThreshold - 20) ||
-    last4SoftWhitePct >= Math.max(50, thresholds.softWhitePctThreshold - 22) ||
-    last4LowPressurePct >= Math.max(50, thresholds.tailLowPressurePctThreshold) ||
-    last4TargetLowPct >= Math.max(42, thresholds.tailLowPressurePctThreshold - 6)
-  ) && tailNearHits === 0 && tailTargetHits === 0 && tailPreviewHits === 0;
-  const downtrendExhaustion = (
-    (downtrend || downtrendEarly) &&
-    !whiteCluster &&
-    (
-      risingHighCount > 0 ||
-      tailPreviewHits > headPreviewHits ||
-      (tailLowPressurePct + 4) < headLowPressurePct
-    ) &&
-    (
-      trendPct > (thresholds.downtrendThreshold * 0.55) ||
-      last4.some((value) => value >= nearHitMin) ||
-      tailNearHits > 0
-    )
-  );
-  const regimeUpshift = (
-    downtrendExhaustion ||
-    (
-      !whiteCluster &&
-      (
-        trendPct >= Math.max(4, Math.abs(thresholds.downtrendThreshold) * 0.25) ||
-        (risingHighCount > 0 && tailNearHits > 0) ||
-        (tailPreviewHits > headPreviewHits && tailLowPressurePct < headLowPressurePct)
-      )
-    )
-  );
-  const releaseWatch = (
-    headLowPressurePct >= Math.max(42, thresholds.lowPressurePctThreshold - 14) &&
-    tailLowPressurePct <= Math.max(44, thresholds.tailLowPressurePctThreshold - 4) &&
-    (headLowPressurePct - tailLowPressurePct) >= 10 &&
-    (
-      trendPct > (thresholds.downtrendThreshold * 0.9) ||
-      risingHighCount > 0 ||
-      tailPreviewHits > 0 ||
-      tailPeak >= previewMin
-    )
-  );
-  const whiteRelease = releaseWatch && (
-    tailNearHits > 0 ||
-    tailTargetHits > 0 ||
-    tailPreviewHits > 0 ||
-    (last4.some((value) => value >= nearHitMin) && risingHighCount > 0)
-  );
-  const previewHitFloor = Math.max(1, Math.ceil(tailWindowSize * (target.minVal <= 30 ? 0.18 : target.minVal <= 100 ? 0.14 : 0.1)));
-  const compressionSupport = (
-    target.minVal >= 30 &&
-    tailLowPressurePct >= Math.max(36, thresholds.tailLowPressurePctThreshold - 8) &&
-    !downtrend &&
-    !downtrendEarly &&
-    (
-      risingHighCount > 0 ||
-      trendPct > (thresholds.downtrendThreshold * 0.45) ||
-      tailPreviewHits >= previewHitFloor
-    ) &&
-    (
-      tailPeak >= Math.max(lowPressureMax * 1.55, previewMin) ||
-      last4.some((value) => value >= Math.max(lowPressureMax * 1.35, previewMin * 0.82))
-    ) &&
-    (
-      tailPreviewHits > 0 ||
-      tailNearHits > 0 ||
-      tailTargetHits > 0 ||
-      last4LowPressurePct < tailLowPressurePct ||
-      tailPeak >= Math.max(headPeak * 0.92, previewMin)
-    )
-  );
-  const reboundSupport = (
-    whiteRelease ||
-    compressionSupport ||
-    downtrendExhaustion ||
-    (releaseWatch && risingHighCount > 0) ||
-    (tailPreviewHits >= previewHitFloor) ||
-    (tailNearHits >= Math.max(1, Math.ceil(tailWindowSize * 0.18))) ||
-    (
-      tailPeak >= Math.max(lowPressureMax * 1.12, previewMin, headPeak * 0.9) &&
-      trendDelta >= -0.04 &&
-      risingHighCount > 0
-    )
-  );
-  let whiteLeadRiskScore = 0;
-  if (preWhiteCandidate) whiteLeadRiskScore += 12;
-  whiteLeadRiskScore += clampNumber(lowPressureAcceleration * 0.65, 0, 14);
-  whiteLeadRiskScore += clampNumber(softWhiteAcceleration * 0.55, 0, 12);
-  whiteLeadRiskScore += clampNumber(targetLowAcceleration * 0.48, 0, 10);
-  whiteLeadRiskScore += clampNumber((Math.abs(Math.min(0, recentSurgeLogDeltaPct)) - 4) * 0.9, 0, 10);
-  whiteLeadRiskScore += clampNumber(
-    (endingLowPressureStreak - Math.max(1, Math.ceil(target.window * 0.24))) * 3.2,
+  const b2bSupportScore = clampNumber(
+    (shortGapRate * 45) +
+    (immediateGapRate * 30) +
+    (tailRebound >= 2 ? 12 : 0) +
+    (roundsSince <= 2 ? 8 : 0) +
+    (nearHitRate * 18),
     0,
-    10
+    100
   );
-  if (releaseWatch) whiteLeadRiskScore -= 7;
-  if (whiteRelease) whiteLeadRiskScore -= 12;
-  if (reboundSupport) whiteLeadRiskScore -= 10;
-  if (regimeUpshift) whiteLeadRiskScore -= 8;
-  if (recentSurgeNearHits > 0 || recentSurgePreviewHits > 0 || tailPreviewHits > 0) {
-    whiteLeadRiskScore -= 8;
-  }
-  whiteLeadRiskScore = Math.round(clampNumber(whiteLeadRiskScore, 0, 50));
+
   const preWhiteCluster = (
-    preWhiteCandidate &&
-    whiteLeadRiskScore >= (target.minVal <= 30 ? 18 : target.minVal <= 100 ? 16 : 14) &&
-    !whiteRelease &&
-    !reboundSupport &&
-    !regimeUpshift
-  );
-  const recentHitRounds = values.filter((value) => value >= target.minVal).length;
-  const recentNearRounds = values.filter((value) => value >= nearHitMin).length;
-  const tailHitBurst = tailValues.filter((value) => value >= target.minVal).length;
-  const tailNearBurst = tailValues.filter((value) => value >= nearHitMin).length;
-  // FIX: b2bFriendly now requires at least 2 strong signals instead of 1.
-  // Previously ANY single condition unlocked it, causing near-permanent override
-  // of the recentHitTooSoon cooldown — especially for low targets like 5x/10x.
-  let b2bFriendlySignals = 0;
-  if (immediateB2BRecent) b2bFriendlySignals += 2;
-  if (nearBurstRecent) b2bFriendlySignals += 2;
-  if (crossTargetB2BSupport) b2bFriendlySignals += 1;
-  if (localShortRepeatRate >= (thresholds.b2bFriendlyRepeatMin / 100)) b2bFriendlySignals += 1;
-  if (shortRepeatMomentum >= thresholds.b2bMomentumMin) b2bFriendlySignals += 1;
-  if (recentTargetHits >= thresholds.minRecentHitsForFriendly && tailTargetHits > 0) b2bFriendlySignals += 1;
-  if (tailHitBurst > 0 && tailNearBurst >= Math.max(1, Math.ceil(tailWindowSize * 0.25))) b2bFriendlySignals += 1;
-  if (reboundSupport && (tailNearHits > 0 || tailPreviewHits > 0)) b2bFriendlySignals += 1;
-  const b2bFriendlyMinSignals = target.minVal <= 15 ? 2 : target.minVal <= 30 ? 2 : 1;
-  const b2bFriendly = (
-    recentHitTooSoon &&
-    b2bFriendlySignals >= b2bFriendlyMinSignals
-  );
-  const b2bBlocked = (
-    recentHitTooSoon &&
-    !b2bFriendly &&
-    !immediateB2BRecent &&
-    !nearBurstRecent &&
-    !crossTargetB2BSupport &&
-    localShortRepeatRate < (thresholds.b2bBlockRepeatMax / 100) &&
-    shortRepeatMomentum < thresholds.b2bMomentumMin &&
-    tailNearHits === 0 &&
-    tailTargetHits === 0 &&
-    recentNearRounds === 0 &&
-    !reboundSupport
+    softWhiteRate >= 0.58 &&
+    hardWhiteRate >= 0.22 &&
+    trend12 < -4 &&
+    trend6 <= 0
   );
 
-  let whiteRiskScore = 0;
-  if (whiteCluster) whiteRiskScore += 24;
-  if (preWhiteCluster) whiteRiskScore += 14;
-  if (lowPressureCluster) whiteRiskScore += 12;
-  if (emergingWhiteRisk) whiteRiskScore += 18;
-  whiteRiskScore += clampNumber(whiteLeadRiskScore * 0.35, 0, 16);
-  whiteRiskScore += clampNumber((weightedSoftWhitePct - Math.max(44, thresholds.softWhitePctThreshold - 20)) * 0.28, 0, 14);
-  whiteRiskScore += clampNumber((weightedHardWhitePct - Math.max(20, thresholds.hardWhitePctThreshold - 18)) * 0.36, 0, 12);
-  whiteRiskScore += clampNumber((weightedLowPressurePct - Math.max(40, thresholds.lowPressurePctThreshold - 14)) * 0.24, 0, 12);
-  whiteRiskScore += clampNumber((tailSoftWhitePct - headSoftWhitePct) * 0.38, 0, 14);
-  whiteRiskScore += clampNumber((tailLowPressurePct - headLowPressurePct) * 0.36, 0, 14);
-  whiteRiskScore += clampNumber((endingLowPressureStreak - Math.max(1, Math.ceil(target.window * 0.25))) * 3, 0, 12);
-  if (whiteRelease) whiteRiskScore -= 12;
-  if (releaseWatch) whiteRiskScore -= 6;
-  if (compressionSupport) whiteRiskScore -= 8;
-  if (reboundSupport) whiteRiskScore -= 6;
-  if (regimeUpshift) whiteRiskScore -= 8;
-  if (tailNearHits > 0) whiteRiskScore -= Math.min(8, tailNearHits * 2);
-  whiteRiskScore -= clampNumber(tailPreviewHits * (target.minVal <= 30 ? 4 : target.minVal <= 100 ? 3 : 2), 0, 10);
-  whiteRiskScore = Math.round(clampNumber(whiteRiskScore, 0, 80));
-
-  let downtrendRiskScore = 0;
-  if (downtrendEarly) downtrendRiskScore += 12;
-  if (downtrend) downtrendRiskScore += 16;
-  downtrendRiskScore += clampNumber((Math.abs(Math.min(0, trendPct)) - Math.abs(earlyDowntrendPct)) * 0.4, 0, 12);
-  downtrendRiskScore += clampNumber(
-    lowerHighCount * (target.minVal <= 30 ? 3 : target.minVal <= 100 ? 2.5 : 2),
-    0,
-    12
-  );
-  if (risingHighCount > 0) downtrendRiskScore -= 6;
-  if (reboundSupport) downtrendRiskScore -= 5;
-  if (tailPreviewHits > 0) downtrendRiskScore -= Math.min(6, tailPreviewHits * 2);
-  if (downtrendExhaustion) downtrendRiskScore -= 8;
-  downtrendRiskScore = Math.round(clampNumber(downtrendRiskScore, 0, 70));
-
-  let b2bSupportScore = 0;
-  if (recentHitTooSoon) {
-    if (immediateB2BRecent) b2bSupportScore += 16;
-    if (nearBurstRecent) b2bSupportScore += 10;
-    if (crossTargetB2BSupport) b2bSupportScore += 8;
-    b2bSupportScore += clampNumber((localShortRepeatRate * 100) - thresholds.b2bFriendlyRepeatMin, 0, 18);
-    b2bSupportScore += clampNumber(shortRepeatMomentum - thresholds.b2bMomentumMin + 3, 0, 12);
-    if (recentTargetHits >= thresholds.minRecentHitsForFriendly) b2bSupportScore += 10;
-    if (tailTargetHits > 0) b2bSupportScore += 10;
-    if (tailNearHits >= Math.max(1, Math.ceil(tailWindowSize * 0.2))) b2bSupportScore += 8;
-    if (target.minVal <= 30 && tailPreviewHits > 0) b2bSupportScore += 6;
-    if (reboundSupport) b2bSupportScore += 6;
-  }
-  b2bSupportScore = Math.round(clampNumber(b2bSupportScore, 0, 60));
-
-  let b2bRiskScore = 0;
-  if (recentHitTooSoon) {
-    if (localShortRepeatRate < (thresholds.b2bBlockRepeatMax / 100)) {
-      b2bRiskScore += clampNumber(((thresholds.b2bBlockRepeatMax / 100) - localShortRepeatRate) * 100, 0, 18);
-    }
-    if (tailNearHits === 0 && tailTargetHits === 0) b2bRiskScore += 10;
-    if (
-      tailSoftWhitePct >= Math.max(50, thresholds.softWhitePctThreshold - 18) ||
-      tailLowPressurePct >= thresholds.tailLowPressurePctThreshold
-    ) b2bRiskScore += 10;
-    if (immediateB2BRecent) b2bRiskScore -= 8;
-    if (nearBurstRecent) b2bRiskScore -= 5;
-    if (crossTargetB2BSupport) b2bRiskScore -= 6;
-    if (tailPreviewHits > 0) b2bRiskScore -= Math.min(6, tailPreviewHits * 2);
-    if (downtrendEarly) b2bRiskScore += 8;
-  }
-  if (b2bSupportScore > 0) b2bRiskScore -= Math.round(Math.min(10, b2bSupportScore * 0.35));
-  b2bRiskScore = Math.round(clampNumber(b2bRiskScore, 0, 60));
-
-  let transitionSupportScore = 0;
-  if (releaseWatch) transitionSupportScore += 8;
-  if (whiteRelease) transitionSupportScore += 16;
-  if (compressionSupport) transitionSupportScore += target.minVal >= 100 ? 18 : 12;
-  transitionSupportScore += clampNumber((tailPreviewHits - headPreviewHits) * 4, 0, 16);
-  transitionSupportScore += clampNumber(tailPreviewHits * (target.minVal <= 30 ? 4 : target.minVal <= 100 ? 3 : 2), 0, 12);
-  transitionSupportScore += clampNumber(risingHighCount * 4, 0, 12);
-  transitionSupportScore += clampNumber((headLowPressurePct - tailLowPressurePct) * 0.22, 0, 10);
-  if (trendPct > (thresholds.downtrendThreshold * 0.35)) transitionSupportScore += 6;
-  transitionSupportScore = Math.round(clampNumber(transitionSupportScore, 0, 80));
-  const transitionReady = (
-    whiteRelease ||
-    compressionSupport ||
-    (releaseWatch && (tailPreviewHits > 0 || risingHighCount > 0)) ||
-    transitionSupportScore >= (target.minVal <= 30 ? 16 : target.minVal <= 100 ? 14 : 12)
+  const whiteCluster = (
+    hardWhiteRate >= 0.40 ||
+    (softWhiteRate >= 0.72 && trend24 < -3) ||
+    hardWhiteStreak >= 4 ||
+    softWhiteStreak >= 7
   );
 
-  const supportScore = Math.round(clampNumber(
-    Math.min(20, recentTargetHits * 6) +
-    Math.min(14, Math.max(0, recentNearHits - recentTargetHits) * 3) +
-    Math.min(14, Math.max(0, recentPreviewHits - recentNearHits) * (target.minVal <= 30 ? 3.5 : target.minVal <= 100 ? 3 : 2.5)) +
-    Math.min(18, tailTargetHits * 8) +
-    Math.min(12, Math.max(0, tailNearHits - tailTargetHits) * 2.5) +
-    Math.min(14, Math.max(0, tailPreviewHits - tailNearHits) * (target.minVal <= 30 ? 4 : target.minVal <= 100 ? 3.5 : 3)) +
-    (releaseWatch ? 10 : 0) +
-    (whiteRelease ? 18 : 0) +
-    (reboundSupport ? 12 : 0) +
-    (trendPct > 4 ? 8 : 0) +
-    Math.min(20, b2bSupportScore) +
-    Math.min(20, transitionSupportScore * 0.45),
-    0,
-    100
-  ));
-  const riskScore = Math.round(clampNumber(
-    whiteRiskScore +
-    downtrendRiskScore +
-    b2bRiskScore,
-    0,
-    100
-  ));
-  const patternScore = Math.round(clampNumber(supportScore - (riskScore * 0.75), -40, 100));
+  const whiteEndingSignal = (
+    whiteCluster &&
+    tailRebound >= 2 &&
+    trend6 > 4 &&
+    strongRate >= 0.16
+  );
+
+  const downtrend = (
+    trend24 < -7 &&
+    trend12 < -4 &&
+    nearHitRate < 0.18 &&
+    softWhiteRate > 0.5
+  );
+
+  const upshift = (
+    trend12 > 4 &&
+    nearHitRate >= 0.24 &&
+    strongRate >= 0.14
+  );
+
+  const randomLike = (
+    Math.abs(trend24) < 1.4 &&
+    Math.abs(trend12) < 1.2 &&
+    Math.abs(nearHitRate - strongRate) < 0.06 &&
+    shortGapRate < 0.12
+  );
 
   return {
-    lookback,
-    hardWhitePct: Number(hardWhitePct.toFixed(1)),
-    softWhitePct: Number(softWhitePct.toFixed(1)),
-    lowPressurePct: Number(lowPressurePct.toFixed(1)),
-    weightedHardWhitePct: Number(weightedHardWhitePct.toFixed(1)),
-    weightedSoftWhitePct: Number(weightedSoftWhitePct.toFixed(1)),
-    weightedLowPressurePct: Number(weightedLowPressurePct.toFixed(1)),
-    maxHardWhiteStreak,
-    maxSoftWhiteStreak,
-    maxLowPressureStreak,
-    tailMaxHardWhiteStreak,
-    tailMaxSoftWhiteStreak,
-    tailMaxLowPressureStreak,
-    endingHardWhiteStreak,
-    endingSoftWhiteStreak,
-    endingLowPressureStreak,
-    recentTargetHits,
-    recentNearHits,
-    recentPreviewHits,
-    tailTargetHits,
-    tailNearHits,
-    tailPreviewHits,
-    headPreviewHits,
-    whiteCluster,
+    lowSoftThreshold: Number(lowSoft.toFixed(2)),
+    hardWhiteRate: Number((hardWhiteRate * 100).toFixed(1)),
+    softWhiteRate: Number((softWhiteRate * 100).toFixed(1)),
+    hardWhiteStreak,
+    softWhiteStreak,
+    trend24: Number(trend24.toFixed(2)),
+    trend12: Number(trend12.toFixed(2)),
+    trend6: Number(trend6.toFixed(2)),
+    nearHitThreshold: Number(nearHitThreshold.toFixed(2)),
+    strongRoundThreshold: Number(strongRoundThreshold.toFixed(2)),
+    nearHitRate: Number((nearHitRate * 100).toFixed(1)),
+    strongRate: Number((strongRate * 100).toFixed(1)),
+    shortGapRate: Number((shortGapRate * 100).toFixed(1)),
+    immediateGapRate: Number((immediateGapRate * 100).toFixed(1)),
+    b2bSupportScore: Number(b2bSupportScore.toFixed(1)),
     preWhiteCluster,
-    lowPressureCluster,
-    compressionSupport,
-    emergingWhiteRisk,
-    headSoftWhitePct: Number(headSoftWhitePct.toFixed(1)),
-    tailSoftWhitePct: Number(tailSoftWhitePct.toFixed(1)),
-    headLowPressurePct: Number(headLowPressurePct.toFixed(1)),
-    tailLowPressurePct: Number(tailLowPressurePct.toFixed(1)),
-    releaseWatch,
-    whiteRelease,
-    reboundSupport,
-    transitionSupportScore,
-    transitionReady,
-    patternScore,
-    supportScore,
-    riskScore,
+    whiteCluster,
+    whiteEndingSignal,
     downtrend,
-    downtrendEarly,
-    downtrendExhaustion,
-    regimeUpshift,
-    downtrendPct: Number(trendPct.toFixed(1)),
-    lowerHighCount,
-    risingHighCount,
-    shortRepeatRate: Number((shortRepeatRate * 100).toFixed(1)),
-    localShortRepeatRate: Number((localShortRepeatRate * 100).toFixed(1)),
-    shortRepeatMomentum: Number(shortRepeatMomentum.toFixed(1)),
-    recentHitThreshold,
-    b2bRiskScore,
-    b2bSupportScore,
-    whiteRiskScore,
-    whiteLeadRiskScore,
-    downtrendRiskScore,
-    b2bBlocked,
-    b2bFriendly,
-    immediateB2BRecent,
-    nearBurstRecent,
-    crossTargetB2BSupport,
-    recentHitTooSoon,
-    previewMin: Number(previewMin.toFixed(1)),
+    upshift,
+    randomLike,
   };
 }
 
-function buildKMTable(allGapsSorted, maxHorizon = null) {
-  if (!allGapsSorted.length) return new Float32Array(1).fill(1);
-  const n = allGapsSorted.length;
-  const naturalLimit = allGapsSorted[n - 1] + 30;
-  const limit = Math.max(
-    1,
-    Math.min(
-      naturalLimit,
-      Number.isFinite(maxHorizon) ? Math.max(1, Math.round(maxHorizon)) : naturalLimit
-    )
-  );
-  const table = new Float32Array(limit + 1).fill(1);
-  let surv = 1;
-  let leftPointer = 0;
-
-  for (let t = 1; t <= limit; t += 1) {
-    while (leftPointer < n && allGapsSorted[leftPointer] < t) leftPointer += 1;
-    let rightPointer = leftPointer;
-    while (rightPointer < n && allGapsSorted[rightPointer] === t) rightPointer += 1;
-    const atRisk = n - leftPointer;
-    const events = rightPointer - leftPointer;
-    if (atRisk === 0) {
-      table[t] = table[t - 1];
-      continue;
-    }
-    surv *= (1 - (events / atRisk));
-    table[t] = surv;
+function calibrateConfidence(rawConfidence, calibrationRows = []) {
+  const rows = (calibrationRows || []).filter((row) => row && (row.outcome === 'win' || row.outcome === 'loss' || row.outcome === 'early'));
+  const resolved = rows.filter((row) => row.outcome === 'win' || row.outcome === 'loss');
+  if (resolved.length < MIN_GLOBAL_CALIBRATION) {
+    const b = Math.floor(rawConfidence / 10) * 10;
+    return {
+      confidence: Math.round(rawConfidence),
+      bucketLabel: `${b}-${b + 9}`,
+      support: resolved.length,
+      mode: 'raw',
+    };
   }
 
-  return table;
-}
+  const globalWinRate = (resolved.filter((row) => row.outcome === 'win').length / resolved.length) * 100;
+  const bucketStart = Math.floor(clampNumber(rawConfidence, 0, 99.9) / 10) * 10;
+  const bucketRows = resolved.filter((row) => {
+    const p = Number(row.probW);
+    if (!Number.isFinite(p)) return false;
+    const pct = clampNumber(p * 100, 0, 100);
+    const b = Math.floor(Math.min(99.9, pct) / 10) * 10;
+    return b === bucketStart;
+  });
 
-function kmProb(kmTable, roundsSince, roundsAhead) {
-  const from = Math.min(roundsSince, kmTable.length - 1);
-  const to = Math.min(roundsSince + roundsAhead, kmTable.length - 1);
-  const sFrom = kmTable[from];
-  if (sFrom <= 0) return 100;
-  return clampNumber(Math.round((1 - (kmTable[to] / sFrom)) * 1000) / 10, 0, 100);
-}
-
-function kmIntervalProb(kmTable, roundsSince, startAhead, endAhead) {
-  const from = Math.min(roundsSince, kmTable.length - 1);
-  const startExclusive = Math.min(
-    roundsSince + Math.max(0, startAhead) - 1,
-    kmTable.length - 1
-  );
-  const end = Math.min(roundsSince + Math.max(0, endAhead), kmTable.length - 1);
-  const sFrom = kmTable[from];
-  if (sFrom <= 0 || end <= startExclusive) return 0;
-  const startSurvival = kmTable[Math.max(from, startExclusive)];
-  const endSurvival = kmTable[end];
-  return clampNumber(
-    Math.round((((startSurvival - endSurvival) / sFrom) * 1000)) / 10,
-    0,
-    100
-  );
-}
-
-function summarizeCalibrationRows(rows) {
-  const buckets = Array.from({ length: 10 }, (_, index) => ({
-    lo: index * 10,
-    hi: (index * 10) + 9,
-    wins: 0,
-    total: 0,
-  }));
-
-  let globalWins = 0;
-  let globalLosses = 0;
-
-  for (const row of rows) {
-    const probPercent = clampNumber(Math.round(Number(row.probW || 0) * 100), 0, 99);
-    const bucketIndex = clampNumber(Math.floor(probPercent / 10), 0, 9);
-    buckets[bucketIndex].total += 1;
-    if (row.outcome === 'win') {
-      buckets[bucketIndex].wins += 1;
-      globalWins += 1;
-    } else if (row.outcome === 'loss') {
-      globalLosses += 1;
-    }
+  let empirical = globalWinRate;
+  let support = resolved.length;
+  let mode = 'global';
+  if (bucketRows.length >= MIN_BUCKET_CALIBRATION) {
+    empirical = (bucketRows.filter((row) => row.outcome === 'win').length / bucketRows.length) * 100;
+    support = bucketRows.length;
+    mode = 'bucket';
   }
 
-  const globalTotal = globalWins + globalLosses;
+  const mixed = (rawConfidence * 0.62) + (empirical * 0.38);
   return {
-    buckets,
-    globalTotal,
-    globalRate: globalTotal >= MIN_GLOBAL_CALIBRATION ? (globalWins / globalTotal) * 100 : null,
+    confidence: Math.round(clampNumber(mixed, 3, 96)),
+    bucketLabel: `${bucketStart}-${bucketStart + 9}`,
+    support,
+    mode,
   };
 }
 
-function buildCalibrationModel(rows, issueMode, regimeMode) {
-  const usable = (rows || [])
-    .filter((row) => row && row.probW != null && row.outcome !== 'early')
-    .slice(0, CALIBRATION_RECENT_LIMIT);
-  const sameRegimeRows = regimeMode
-    ? usable.filter((row) => String(row.regimeMode || 'full') === String(regimeMode))
-    : usable;
-  const sameModeRows = issueMode
-    ? usable.filter((row) => String(row.issueMode || '') === String(issueMode))
-    : [];
-  const sameModeSameRegimeRows = (issueMode && regimeMode)
-    ? sameModeRows.filter((row) => String(row.regimeMode || 'full') === String(regimeMode))
-    : sameModeRows;
-
-  return {
-    sameModeSameRegime: summarizeCalibrationRows(sameModeSameRegimeRows),
-    sameMode: summarizeCalibrationRows(sameModeRows),
-    sameRegime: summarizeCalibrationRows(sameRegimeRows),
-    allModes: summarizeCalibrationRows(usable),
-  };
-}
-
-function calibrateProbability(rawPercent, calibrationRows, issueMode, regimeMode) {
-  const raw = clampNumber(Number(rawPercent || 0), 0, 100);
-  const bucketIndex = clampNumber(Math.floor(Math.min(raw, 99) / 10), 0, 9);
-  const model = buildCalibrationModel(calibrationRows, issueMode, regimeMode);
-  const sameModeSameRegimeBucket = model.sameModeSameRegime.buckets[bucketIndex];
-  const sameModeBucket = model.sameMode.buckets[bucketIndex];
-  const sameRegimeBucket = model.sameRegime.buckets[bucketIndex];
-  const allModesBucket = model.allModes.buckets[bucketIndex];
-
-  if (issueMode && regimeMode && sameModeSameRegimeBucket.total >= MIN_BUCKET_CALIBRATION) {
-    return {
-      calibrated: clampNumber((sameModeSameRegimeBucket.wins / sameModeSameRegimeBucket.total) * 100, 0, 100),
-      bucketLabel: `${sameModeSameRegimeBucket.lo}-${sameModeSameRegimeBucket.hi}%`,
-      support: sameModeSameRegimeBucket.total,
-      mode: `${issueMode}_${regimeMode}_bucket`,
-    };
-  }
-
-  if (issueMode && regimeMode && model.sameModeSameRegime.globalRate != null) {
-    return {
-      calibrated: model.sameModeSameRegime.globalRate,
-      bucketLabel: 'global',
-      support: model.sameModeSameRegime.globalTotal,
-      mode: `${issueMode}_${regimeMode}_global`,
-    };
-  }
-
-  if (issueMode && sameModeBucket.total >= MIN_BUCKET_CALIBRATION) {
-    return {
-      calibrated: clampNumber((sameModeBucket.wins / sameModeBucket.total) * 100, 0, 100),
-      bucketLabel: `${sameModeBucket.lo}-${sameModeBucket.hi}%`,
-      support: sameModeBucket.total,
-      mode: `${issueMode}_bucket`,
-    };
-  }
-
-  if (issueMode && model.sameMode.globalRate != null) {
-    return {
-      calibrated: model.sameMode.globalRate,
-      bucketLabel: 'global',
-      support: model.sameMode.globalTotal,
-      mode: `${issueMode}_global`,
-    };
-  }
-
-  if (regimeMode && sameRegimeBucket.total >= MIN_BUCKET_CALIBRATION) {
-    return {
-      calibrated: clampNumber((sameRegimeBucket.wins / sameRegimeBucket.total) * 100, 0, 100),
-      bucketLabel: `${sameRegimeBucket.lo}-${sameRegimeBucket.hi}%`,
-      support: sameRegimeBucket.total,
-      mode: `${regimeMode}_bucket`,
-    };
-  }
-
-  if (regimeMode && model.sameRegime.globalRate != null) {
-    return {
-      calibrated: model.sameRegime.globalRate,
-      bucketLabel: 'global',
-      support: model.sameRegime.globalTotal,
-      mode: `${regimeMode}_global`,
-    };
-  }
-
-  if (allModesBucket.total >= MIN_BUCKET_CALIBRATION) {
-    return {
-      calibrated: clampNumber((allModesBucket.wins / allModesBucket.total) * 100, 0, 100),
-      bucketLabel: `${allModesBucket.lo}-${allModesBucket.hi}%`,
-      support: allModesBucket.total,
-      mode: 'target_bucket',
-    };
-  }
-
-  if (model.allModes.globalRate != null) {
-    return {
-      calibrated: model.allModes.globalRate,
-      bucketLabel: 'global',
-      support: model.allModes.globalTotal,
-      mode: 'target_global',
-    };
-  }
-
-  return {
-    calibrated: raw,
-    bucketLabel: `${allModesBucket.lo}-${allModesBucket.hi}%`,
-    support: allModesBucket.total,
-    mode: 'raw',
-  };
+function getIssueThreshold(minVal) {
+  if (minVal >= 1000) return 53;
+  if (minVal >= 500) return 51;
+  if (minVal >= 200) return 49;
+  if (minVal >= 100) return 47;
+  if (minVal >= 50) return 46;
+  if (minVal >= 30) return 44;
+  if (minVal >= 15) return 42;
+  if (minVal >= 10) return 40;
+  return 38;
 }
 
 function computeOracleForecast(rounds, target, options = {}) {
-  const normalizedRounds = Array.isArray(rounds)
-    && rounds.every((round) => Number.isFinite(round?.id) && Number.isFinite(round?.val))
-      ? rounds
-      : normalizeRounds(rounds);
-  const { minVal, scanN, window: winSize, minHits } = target;
-  if (!normalizedRounds.length) return null;
+  const cleanRounds = Array.isArray(rounds) && rounds.length && rounds[0]?.id
+    ? rounds
+    : normalizeRounds(rounds);
 
-  const nowId = normalizedRounds[normalizedRounds.length - 1].id;
-  const hits = normalizedRounds.filter((round) => round.val >= minVal);
+  const {
+    label, minVal, color, scanN, window: winSize, minHits,
+  } = target;
+  if (!cleanRounds.length) return null;
 
-  if (hits.length < minHits + 1) {
-    if (!hits.length) {
-      return { ...target, noData: true, hits: 0, nowId, reason: 'No hits yet' };
-    }
+  const nowId = cleanRounds[cleanRounds.length - 1].id;
+  const hits = cleanRounds.filter((round) => round.val >= minVal);
+  if (hits.length < (minHits + 1)) {
     return {
       ...target,
       noData: true,
-      hits: hits.length,
       nowId,
-      reason: `Need ${minHits + 1} hits to predict`,
-      lastHit: hits[hits.length - 1],
+      hits: hits.length,
+      reason: hits.length ? `Need ${minHits + 1} hits to predict` : 'No hits yet',
+      lastHit: hits[hits.length - 1] || null,
+      predictedRound: 0,
+      windowLo: 0,
+      windowHi: 0,
+      roundsUntilWindowLo: 0,
+      roundsUntilWindowHi: 0,
+      inWindow: false,
+      confidence: 0,
+      liveConfidence: 0,
+      issuePrediction: false,
+      activePrediction: false,
+      issueMode: 'observe',
+      regimeMode: 'full',
+      avoidReason: 'weak_probability',
+      lockDriftAlert: false,
+      lockDriftReason: null,
     };
   }
 
@@ -1407,857 +613,264 @@ function computeOracleForecast(rounds, target, options = {}) {
   for (let i = 1; i < hits.length; i += 1) {
     allGapsRaw.push(hits[i].id - hits[i - 1].id);
   }
-  if (!allGapsRaw.length) {
-    return { ...target, noData: true, hits: hits.length, nowId, reason: 'Not enough gap data' };
+  if (allGapsRaw.length < MIN_FORECAST_GAPS) {
+    return {
+      ...target,
+      noData: true,
+      nowId,
+      hits: hits.length,
+      reason: `Need at least ${MIN_FORECAST_GAPS} gaps`,
+      lastHit: hits[hits.length - 1],
+      predictedRound: 0,
+      windowLo: 0,
+      windowHi: 0,
+      roundsUntilWindowLo: 0,
+      roundsUntilWindowHi: 0,
+      inWindow: false,
+      confidence: 0,
+      liveConfidence: 0,
+      issuePrediction: false,
+      activePrediction: false,
+      issueMode: 'observe',
+      regimeMode: 'full',
+      avoidReason: 'weak_probability',
+      lockDriftAlert: false,
+      lockDriftReason: null,
+    };
   }
 
-  const allGapsSorted = [...allGapsRaw].sort((a, b) => a - b);
-  const fullStats = buildRobustStats(allGapsSorted);
-  const fullHistogram = buildHistogramClusters(fullStats.trimmed);
-  const recentCount = Math.min(scanN, allGapsRaw.length);
-  const recentSorted = [...allGapsRaw.slice(-recentCount)].sort((a, b) => a - b);
-  const recentStats = buildRobustStats(recentSorted);
-  const recentHistogram = buildHistogramClusters(recentStats.trimmed);
-  const medDrift = fullStats.med > 0 ? Math.abs(recentStats.med - fullStats.med) / fullStats.med : 0;
-  const iqrDrift = fullStats.iqr > 0 ? Math.abs(recentStats.iqr - fullStats.iqr) / fullStats.iqr : 0;
-  const upperDrift = fullStats.p75 > 0 ? Math.abs(recentStats.p75 - fullStats.p75) / fullStats.p75 : 0;
-  const clusterDrift = (
-    fullHistogram.primary?.center > 0 &&
-    recentHistogram.primary?.center > 0
-  )
-    ? Math.abs(recentHistogram.primary.center - fullHistogram.primary.center) / fullHistogram.primary.center
-    : medDrift;
-  const regimeDrift = (
-    (medDrift * 0.45) +
-    (iqrDrift * 0.2) +
-    (upperDrift * 0.15) +
-    (clusterDrift * 0.2)
-  );
-  const regimeMode = regimeDrift > REGIME_DRIFT_THRESHOLD ? 'recent' : 'full';
+  const allGapsSorted = allGapsRaw.slice().sort((a, b) => a - b);
+  const recentN = Math.min(allGapsRaw.length, Math.max(scanN, 24));
+  const recentSorted = allGapsRaw.slice(-recentN).sort((a, b) => a - b);
+  const regimeMode = computeRegimeMode(allGapsSorted, recentSorted, cleanRounds, target);
   const selectedSorted = regimeMode === 'recent' ? recentSorted : allGapsSorted;
-  const selectedStats = regimeMode === 'recent' ? recentStats : fullStats;
-  const selectedCount = selectedStats.trimmed.length;
-  const sampleRequirements = getSampleRequirements(target);
-
+  const selectedStats = buildRobustStats(selectedSorted);
   const lastHit = hits[hits.length - 1];
   const roundsSince = nowId - lastHit.id;
+  const droughtPct = Math.round((selectedSorted.filter((gap) => gap <= roundsSince).length / selectedSorted.length) * 100);
   const isTooEarly = roundsSince < selectedStats.p10;
   const isOverdue = roundsSince > selectedStats.med;
   const isHardGap = roundsSince > selectedStats.p90;
   const isExtreme = roundsSince > selectedStats.p99;
-  const survivingGaps = selectedStats.trimmed.filter((gap) => gap > roundsSince);
-  const histogram = buildHistogramClusters(selectedStats.trimmed);
-  const candidateClusters = [histogram.primary, histogram.secondary].filter(Boolean);
-  const futureCluster = candidateClusters
-    .filter((cluster) => cluster.center > roundsSince)
-    .sort((a, b) => a.center - b.center)[0];
-  const primaryCluster = futureCluster || (!isOverdue ? histogram.primary : null);
-  const openWindow = isExtreme && survivingGaps.length === 0;
-  const lowData = selectedCount < sampleRequirements.minForecastGaps;
-  const kmReliable = selectedCount >= sampleRequirements.minKMGaps;
-  const recentPattern = computeRecentPatternDiagnostics(
-    normalizedRounds,
-    target,
-    roundsSince,
-    allGapsRaw,
-    selectedStats
-  );
+  const survivors = selectedSorted.filter((gap) => gap > roundsSince);
+  const openWindow = survivors.length === 0;
 
-  let predictedGap;
-  let predBasis;
-  let predMethod;
+  const clusters = buildHistogramClusters(selectedStats.trimmed.length ? selectedStats.trimmed : selectedSorted);
+  const primaryCluster = clusters.primary;
+  const secondaryCluster = clusters.secondary;
 
-  if (openWindow) {
-    const tailStep = Math.max(
-      1,
-      selectedStats.iqr,
-      selectedStats.max - selectedStats.p75,
-      Math.round(selectedStats.med * 0.25)
-    );
-    predictedGap = selectedStats.max + tailStep;
-    predBasis = `tail extrapolation (${regimeMode}, no survivor gaps)`;
-    predMethod = 'tail';
-  } else if (!isOverdue && primaryCluster) {
-    predictedGap = Math.max(primaryCluster.center, roundsSince + 1);
-    predBasis = `histogram cluster (${regimeMode}, ${selectedCount} gaps)`;
+  const recentPattern = computeRecentPatternDiagnostics(cleanRounds, target, roundsSince, allGapsRaw, selectedStats);
+  const patternSupport = computePatternSupport(cleanRounds, target, winSize);
+
+  let predictedGap = null;
+  let predMethod = 'cluster';
+  if (!openWindow && primaryCluster && !isOverdue) {
+    predictedGap = Math.max(roundsSince + 1, primaryCluster.center);
     predMethod = 'cluster';
-  } else if (survivingGaps.length > 0) {
-    predictedGap = computeConditionalExpectedGap(survivingGaps, roundsSince);
-    // FIX: if conditional gap fell behind current position, nudge forward
-    if (predictedGap != null && predictedGap <= roundsSince) {
-      predictedGap = roundsSince + Math.max(1, Math.round(selectedStats.iqr / 3));
-    }
-    predBasis = `conditional expectation (${survivingGaps.length} survivors)`;
-    predMethod = 'survival';
+  } else if (!openWindow) {
+    predictedGap = computeConditionalExpectedGap(survivors, roundsSince);
+    predMethod = 'survivor_expectation';
   } else {
-    predictedGap = Math.max(selectedStats.med, roundsSince + 1);
-    predBasis = `fallback median (${regimeMode})`;
-    predMethod = 'fallback';
-  }
-
-  // FIX: EARLY feedback loop — count EARLY outcomes from calibration history
-  // and apply a proportional left-shift to combat systematic late windows.
-  const calibrationRows = options.calibrationRows || [];
-  const recentCalibration = calibrationRows.slice(0, 120);
-  let earlyCount = 0;
-  let winCount = 0;
-  let lossCount = 0;
-  for (const row of recentCalibration) {
-    if (row.outcome === 'early') earlyCount += 1;
-    else if (row.outcome === 'win') winCount += 1;
-    else if (row.outcome === 'loss') lossCount += 1;
-  }
-  const totalOutcomes = earlyCount + winCount + lossCount;
-  const earlyRate = totalOutcomes >= 10 ? earlyCount / totalOutcomes : 0;
-  // Only react to a clear EARLY bias. A mild global early rate should not
-  // drag every new forecast left and cause premature locks in downtrends.
-  if (earlyRate > 0.22 && predictedGap > roundsSince + 1) {
-    const earlyPull = clampNumber(
-      Math.round(selectedStats.iqr * clampNumber((earlyRate - 0.22) * 2.5, 0, 0.35)),
-      0,
-      Math.max(1, Math.round(winSize * 0.35))
-    );
-    if (earlyPull > 0) {
-      predictedGap = Math.max(roundsSince + 1, predictedGap - earlyPull);
-      predBasis = `${predBasis} + early-feedback(-${earlyPull})`;
-      predMethod = `${predMethod}_efb`;
+    const tail = selectedSorted.slice(Math.max(0, Math.floor(selectedSorted.length * 0.85)));
+    const tailDiffs = [];
+    for (let i = 1; i < tail.length; i += 1) {
+      tailDiffs.push(tail[i] - tail[i - 1]);
     }
+    const tailStep = clampNumber(Math.round(mean(tailDiffs) || selectedStats.iqr || 1), 1, Math.max(1, selectedStats.iqr * 2));
+    predictedGap = Math.max(roundsSince + 1, selectedStats.max + tailStep);
+    predMethod = 'tail_extrapolation';
   }
 
-  // A left anchor only helps when we also see live recovery pressure. Making
-  // this unconditional was pushing locks too far left and opening into weak
-  // flow before the market actually turned.
-  const leftAnchorActive = (
-    recentPattern.reboundSupport ||
-    recentPattern.whiteRelease ||
-    recentPattern.regimeUpshift ||
-    recentPattern.downtrendExhaustion ||
-    recentPattern.b2bFriendly ||
-    recentPattern.immediateB2BRecent ||
-    recentPattern.nearBurstRecent ||
-    recentPattern.crossTargetB2BSupport
-  );
-  if (leftAnchorActive && predMethod !== 'tail' && predictedGap > selectedStats.p25 && !openWindow) {
-    const p25Pull = clampNumber(
-      Math.round(
-        (predictedGap - selectedStats.p25) * (
-          target.minVal <= 15 ? 0.22
-            : target.minVal <= 30 ? 0.18
-              : target.minVal <= 100 ? 0.14
-                : 0.1
-        )
-      ),
-      0,
-      Math.max(1, Math.round(winSize * 0.28))
-    );
-    if (p25Pull > 0 && predictedGap - p25Pull >= roundsSince + 1) {
-      predictedGap -= p25Pull;
-      predBasis = `${predBasis} + p25-anchor(-${p25Pull})`;
-    }
+  if (recentPattern.b2bSupportScore >= 62 && roundsSince <= 2 && minVal <= 50) {
+    predictedGap = Math.max(roundsSince + 1, Math.min(predictedGap, roundsSince + Math.max(1, Math.round(selectedStats.p25 * 0.5))));
+    predMethod = 'b2b_support';
   }
 
-  // Pull timing earlier when the pattern says pressure is building. This
-  // reduces "EARLY" misses caused by lagging windows without forcing blind locks.
-  // FIX: Relaxed conditions and increased pull factors for low targets.
-  const leadEntryPressure = (
-    recentPattern.reboundSupport ||
-    recentPattern.whiteRelease ||
-    recentPattern.regimeUpshift ||
-    recentPattern.b2bFriendly ||
-    recentPattern.immediateB2BRecent ||
-    recentPattern.nearBurstRecent ||
-    recentPattern.crossTargetB2BSupport ||
-    recentPattern.transitionReady ||
-    (recentPattern.tailPreviewHits > 0 && !recentPattern.whiteCluster)
-  ) &&
-  (!recentPattern.downtrend || recentPattern.downtrendExhaustion) &&
-  !recentPattern.whiteCluster;
-  if (leadEntryPressure) {
-    const leadPull = clampNumber(
-      Math.round(
-        winSize * (
-          target.minVal <= 15 ? 0.60
-            : target.minVal <= 30 ? 0.50
-              : target.minVal <= 100 ? 0.40
-                : 0.30
-        )
-      ),
-      1,
-      Math.max(1, Math.round(winSize * 0.75))
-    );
-    predictedGap = Math.max(roundsSince + 1, predictedGap - leadPull);
-    predBasis = `${predBasis} + lead-adjust`;
-    predMethod = `${predMethod}_lead`;
+  if (recentPattern.whiteCluster && !recentPattern.whiteEndingSignal && predictedGap < selectedStats.p25) {
+    predictedGap = selectedStats.p25;
+    predMethod = 'white_safety';
   }
+
+  predictedGap = Math.max(roundsSince + 1, Math.round(predictedGap || selectedStats.med || roundsSince + 1));
+  const halfWin = Math.floor(winSize / 2);
+  const windowLoGap = Math.max(1, predictedGap - halfWin);
+  const windowHiGap = windowLoGap + winSize - 1;
 
   let predictedRound = lastHit.id + predictedGap;
-  if (predictedRound <= nowId) {
-    const fastReentry = (
-      recentPattern.b2bFriendly ||
-      recentPattern.immediateB2BRecent ||
-      recentPattern.nearBurstRecent ||
-      recentPattern.downtrendExhaustion
-    );
-    const fallbackStep = fastReentry
-      ? Math.max(1, Math.round(Math.min(winSize, selectedStats.iqr) / 3))
-      : Math.max(1, Math.round(selectedStats.iqr / 2));
-    predictedGap = roundsSince + fallbackStep;
-    predictedRound = lastHit.id + predictedGap;
+  let windowLo = lastHit.id + windowLoGap;
+  let windowHi = lastHit.id + windowHiGap;
+
+  if (windowHi <= nowId) {
+    const drift = (nowId - windowHi) + 1;
+    windowLo += drift;
+    windowHi += drift;
+    predictedRound = clampNumber(predictedRound + drift, windowLo, windowHi);
   }
 
-  const halfWin = Math.floor(winSize / 2);
-  const b2bSkewLeft = (
-    recentPattern.b2bFriendly ||
-    recentPattern.immediateB2BRecent ||
-    recentPattern.nearBurstRecent
-  ) ? Math.ceil(winSize * 0.26) : 0;
-  const reversalSkewLeft = (
-    recentPattern.downtrendExhaustion ||
-    recentPattern.reboundSupport
-  ) ? Math.ceil(winSize * 0.16) : 0;
-  const earlyHistorySkew = earlyRate > 0.25
-    ? Math.ceil(winSize * clampNumber((earlyRate - 0.22) * 1.0, 0, 0.12))
-    : 0;
-  const whiteDelayComp = (
-    recentPattern.whiteCluster &&
-    !recentPattern.whiteRelease &&
-    !recentPattern.reboundSupport
-  ) ? Math.ceil(winSize * 0.08) : 0;
-  const windowSkewLeft = clampNumber(
-    Math.max(b2bSkewLeft, reversalSkewLeft, earlyHistorySkew) - whiteDelayComp,
-    0,
-    Math.max(0, Math.ceil(winSize * 0.45))
-  );
-  const scoredWindowLoGap = Math.max(1, predictedGap - halfWin - windowSkewLeft);
-  const scoredWindowHiGap = scoredWindowLoGap + winSize - 1;
-  const effectiveWindowLoGap = scoredWindowHiGap <= roundsSince
-    ? roundsSince + 1
-    : scoredWindowLoGap;
-  const effectiveWindowHiGap = effectiveWindowLoGap + winSize - 1;
-  predictedGap = clampNumber(predictedGap, effectiveWindowLoGap, effectiveWindowHiGap);
-  predictedRound = lastHit.id + predictedGap;
-  const windowLo = lastHit.id + effectiveWindowLoGap;
-  const windowHi = lastHit.id + effectiveWindowHiGap;
-  const selectedGapsForRates = selectedStats.trimmed;
-  const droughtPct = selectedCount > 0
-    ? Math.round((selectedGapsForRates.filter((gap) => gap <= roundsSince).length / selectedCount) * 100)
-    : 0;
   const roundsUntilWindowLo = Math.max(0, windowLo - nowId);
   const roundsUntilWindowHi = Math.max(0, windowHi - nowId);
   const inWindow = nowId >= windowLo && nowId <= windowHi;
+  const nearWindowRounds = Math.max(0, roundsUntilWindowLo - Math.min(10, Math.round(winSize * 0.6)));
 
-  let pHit1 = null;
-  let pHit5 = null;
-  let pHit10 = null;
-  let pHit20 = null;
-  let pHitWindow = null;
-  let pHitNearWindow = null;
-  const nearWindowRounds = Math.max(1, Math.min(75, Math.max(winSize, Math.round(selectedStats.med * 0.35))));
-
-  if (kmReliable) {
-    const kmHorizon = Math.max(
-      roundsSince + nearWindowRounds + 5,
-      predictedGap + winSize + 5,
-      selectedStats.p99 + winSize + 5
+  const kmReliable = selectedSorted.length >= MIN_KM_GAPS;
+  const kmTable = kmReliable ? buildKMTable(selectedSorted) : null;
+  const pHit1 = kmReliable ? kmProb(kmTable, roundsSince, 1) : 0;
+  const pHit5 = kmReliable ? kmProb(kmTable, roundsSince, 5) : 0;
+  const pHit10 = kmReliable ? kmProb(kmTable, roundsSince, 10) : 0;
+  const pHit20 = kmReliable ? kmProb(kmTable, roundsSince, 20) : 0;
+  const pHitWindow = kmReliable
+    ? clampNumber(
+      kmProb(kmTable, roundsSince, roundsUntilWindowHi) - kmProb(kmTable, roundsSince, roundsUntilWindowLo),
+      0,
+      100
+    )
+    : clampNumber(
+      (selectedSorted.filter((gap) => gap >= (roundsSince + roundsUntilWindowLo) && gap <= (roundsSince + roundsUntilWindowHi)).length / selectedSorted.length) * 100,
+      0,
+      100
     );
-    const kmTable = buildKMTable(selectedSorted, kmHorizon);
-    pHit1 = kmProb(kmTable, roundsSince, 1);
-    pHit5 = kmProb(kmTable, roundsSince, 5);
-    pHit10 = kmProb(kmTable, roundsSince, 10);
-    pHit20 = kmProb(kmTable, roundsSince, 20);
-    pHitWindow = roundsUntilWindowHi <= 0
-      ? 0
-      : kmIntervalProb(kmTable, roundsSince, roundsUntilWindowLo, roundsUntilWindowHi);
-    pHitNearWindow = kmProb(kmTable, roundsSince, nearWindowRounds);
-  }
 
-  const thresholds = getIssueThresholds(target);
-  const winGapLo = effectiveWindowLoGap;
-  const winGapHi = effectiveWindowHiGap;
-  const hitsInWindow = selectedGapsForRates.filter((gap) => gap >= winGapLo && gap <= winGapHi).length;
-  const empiricalWindowHitRate = selectedCount > 0 ? (hitsInWindow / selectedCount) * 100 : 0;
-  const recentTrimmedBaseline = selectedStats.trimmed;
-  const chanceWindowRate = regimeMode === 'recent'
-    ? computeChanceWindowRate(recentTrimmedBaseline, winSize)
-    : computeChanceWindowRate(selectedGapsForRates, winSize);
+  const pHitNearWindow = kmReliable
+    ? kmProb(kmTable, roundsSince, Math.max(1, roundsUntilWindowHi + Math.round(winSize * 0.35)))
+    : clampNumber(
+      (selectedSorted.filter((gap) => gap >= (roundsSince + Math.max(1, roundsUntilWindowLo - Math.round(winSize * 0.5))) && gap <= (roundsSince + roundsUntilWindowHi + Math.round(winSize * 0.35))).length / selectedSorted.length) * 100,
+      0,
+      100
+    );
+
+  const scoredWindowLoGap = Math.max(1, windowLo - lastHit.id);
+  const scoredWindowHiGap = Math.max(scoredWindowLoGap, windowHi - lastHit.id);
+  const hitsInWindow = selectedSorted.filter((gap) => gap >= scoredWindowLoGap && gap <= scoredWindowHiGap).length;
+  const empiricalWindowHitRate = (hitsInWindow / selectedSorted.length) * 100;
+
+  const chanceSource = regimeMode === 'recent'
+    ? trimSorted(tukeyFilterSorted(recentSorted), recentSorted.length >= 12 ? 0.1 : 0)
+    : selectedSorted;
+  const chance = computeChanceWindowRate(chanceSource, winSize);
+  const chanceWindowRate = chance.rate;
   const predictiveLift = empiricalWindowHitRate - chanceWindowRate;
-  const baselineStd = Math.max(
-    1,
-    Math.sqrt((chanceWindowRate * Math.max(1, 100 - chanceWindowRate)) / Math.max(1, selectedCount))
-  );
-  const standardizedLift = predictiveLift / baselineStd;
-  const randomLike = standardizedLift <= (target.minVal <= 15 ? 0.85 : target.minVal <= 100 ? 0.65 : 0.45);
-  const patternThresholds = getPatternThresholds(target);
+  const standardizedLift = chance.std > 0.0001 ? predictiveLift / chance.std : 0;
 
-  const rawConfidence = kmReliable && pHitWindow != null
-    ? pHitWindow
-    : empiricalWindowHitRate;
+  const randomLiftWeak = patternSupport.ready
+    ? (patternSupport.lift < 1.2 && predictiveLift < 0.8)
+    : predictiveLift < -0.2;
 
-  const reliabilityFlags = [];
-  if (regimeMode === 'recent') reliabilityFlags.push('recent_regime');
-  if (lowData) reliabilityFlags.push('low_data');
-  if (!kmReliable) reliabilityFlags.push('km_low_sample');
-  if (openWindow) reliabilityFlags.push('extreme_tail');
-  if (randomLike) reliabilityFlags.push('random_like');
-  if (!primaryCluster || primaryCluster.supportPct < 0.18) reliabilityFlags.push('weak_cluster');
-  if (recentPattern.whiteCluster) reliabilityFlags.push('white_cluster');
-  if (recentPattern.preWhiteCluster) reliabilityFlags.push('pre_white_cluster');
-  if (recentPattern.lowPressureCluster) reliabilityFlags.push('low_pressure_cluster');
-  if (recentPattern.emergingWhiteRisk) reliabilityFlags.push('white_risk');
-  if (recentPattern.downtrend) reliabilityFlags.push('downtrend');
-  if (recentPattern.downtrendEarly) reliabilityFlags.push('downtrend_risk');
-  if (recentPattern.b2bBlocked) reliabilityFlags.push('b2b_risk');
-
-  const probReliable = kmReliable && selectedCount >= sampleRequirements.minKMGaps;
-  if (!probReliable) {
-    pHit1 = null;
-    pHit5 = null;
-    pHit10 = null;
-    pHit20 = null;
-    pHitWindow = null;
-    pHitNearWindow = null;
-  }
-
-  const clusterSupportPct = primaryCluster ? primaryCluster.supportPct * 100 : 0;
-  const windowReadyThreshold = Math.max(1, Math.ceil(winSize * thresholds.readinessFactor));
-  const windowReady = inWindow || roundsUntilWindowLo <= windowReadyThreshold;
-  const transitionPreviewAllowance = (
-    recentPattern.reboundSupport ||
-    recentPattern.whiteRelease ||
-    recentPattern.regimeUpshift ||
-    recentPattern.b2bFriendly ||
-    recentPattern.crossTargetB2BSupport
-  )
-    ? Math.ceil(
-      winSize * (
-        target.minVal <= 30 ? 1.2
-          : target.minVal <= 100 ? 0.95
-            : 0.8
-      )
-    )
-    : Math.ceil(winSize * 0.6);
-  const transitionWindowReady = (
-    windowReady ||
-    (
-      recentPattern.transitionReady &&
-      roundsUntilWindowLo <= Math.max(
-        windowReadyThreshold + transitionPreviewAllowance,
-        target.minVal <= 30 ? 6 : target.minVal <= 100 ? 10 : Math.ceil(winSize * 0.9)
-      )
-    )
-  );
-  const signalProb = rawConfidence;
-  const strongProbability = signalProb >= thresholds.minProbability;
-  const strongEdge = predictiveLift >= thresholds.minLift || standardizedLift >= 1.0;
-  const strongCluster = clusterSupportPct >= thresholds.minClusterSupport;
-  const severeWhiteCluster = recentPattern.whiteRiskScore >= (target.minVal <= 15 ? 34 : target.minVal <= 100 ? 32 : 28);
-  const preWhiteActiveThreshold = target.minVal <= 30 ? 16 : target.minVal <= 100 ? 14 : 12;
-  const preWhiteHardThreshold = target.minVal <= 30 ? 24 : target.minVal <= 100 ? 22 : 20;
-  const activeTailWhitePressure = (
-    recentPattern.tailSoftWhitePct >= Math.max(48, patternThresholds.softWhitePctThreshold - 22) ||
-    recentPattern.tailLowPressurePct >= patternThresholds.tailLowPressurePctThreshold ||
-    recentPattern.endingSoftWhiteStreak >= patternThresholds.softStreakThreshold ||
-    recentPattern.endingLowPressureStreak >= Math.max(2, Math.ceil(winSize * 0.4)) ||
-    (
-      recentPattern.weightedSoftWhitePct >= Math.max(52, patternThresholds.softWhitePctThreshold - 16) &&
-      recentPattern.tailSoftWhitePct >= Math.max(44, patternThresholds.softWhitePctThreshold - 26)
-    ) ||
-    (
-      recentPattern.weightedLowPressurePct >= Math.max(48, patternThresholds.lowPressurePctThreshold - 10) &&
-      recentPattern.tailLowPressurePct >= Math.max(42, patternThresholds.tailLowPressurePctThreshold - 6)
-    )
-  );
-  const recoveryAligned = (
-    recentPattern.whiteRelease ||
-    recentPattern.releaseWatch ||
-    recentPattern.reboundSupport ||
-    recentPattern.downtrendExhaustion ||
-    recentPattern.regimeUpshift ||
-    (
-      recentPattern.transitionSupportScore >= (target.minVal <= 30 ? 14 : target.minVal <= 100 ? 12 : 10) &&
-      (
-        recentPattern.tailPreviewHits > 0 ||
-        recentPattern.tailNearHits > 0 ||
-        recentPattern.crossTargetB2BSupport ||
-        recentPattern.risingHighCount > 0
-      )
-    )
-  );
-  const preWhiteRecoveryOverride = (
-    recoveryAligned &&
-    recentPattern.transitionSupportScore >= (target.minVal <= 30 ? 18 : target.minVal <= 100 ? 15 : 12) &&
-    (recentPattern.tailPreviewHits > 0 || recentPattern.tailNearHits > 0)
-  );
-  const structuralWhiteRisk = (
-    (
-      (recentPattern.whiteCluster || recentPattern.lowPressureCluster) &&
-      activeTailWhitePressure &&
-      recentPattern.whiteRiskScore >= (target.minVal <= 15 ? 20 : target.minVal <= 100 ? 18 : 24)
-    ) ||
-    (
-      recentPattern.emergingWhiteRisk &&
-      recentPattern.whiteRiskScore >= (target.minVal <= 100 ? 18 : 22)
-    )
-  ) && !recentPattern.compressionSupport
-    && !recoveryAligned;
-  const preWhiteRisk = (
-    recentPattern.preWhiteCluster &&
-    recentPattern.whiteLeadRiskScore >= preWhiteActiveThreshold &&
-    !preWhiteRecoveryOverride
-  );
-  const preWhiteHardBlock = (
-    recentPattern.preWhiteCluster &&
-    recentPattern.whiteLeadRiskScore >= preWhiteHardThreshold &&
-    !preWhiteRecoveryOverride
-  );
-  const activeWhiteRisk = structuralWhiteRisk || preWhiteRisk;
-  const unresolvedWhitePressure = (
-    activeWhiteRisk &&
-    recentPattern.whiteRiskScore >= (target.minVal <= 30 ? 24 : target.minVal <= 100 ? 22 : 20) &&
-    recentPattern.tailNearHits === 0 &&
-    recentPattern.tailPreviewHits === 0
-  );
-  const severeDowntrend = recentPattern.downtrendRiskScore >= (target.minVal <= 30 ? 26 : target.minVal <= 100 ? 22 : 18);
-  const activeDowntrendRisk = (
-    (
-      recentPattern.downtrend ||
-      (recentPattern.downtrendEarly && recentPattern.downtrendRiskScore >= 14)
-    ) &&
-    !recoveryAligned
-  );
-  const unresolvedDowntrend = (
-    activeDowntrendRisk &&
-    recentPattern.downtrendRiskScore >= (target.minVal <= 30 ? 20 : target.minVal <= 100 ? 18 : 15) &&
-    !recentPattern.downtrendExhaustion &&
-    recentPattern.tailNearHits === 0 &&
-    recentPattern.tailPreviewHits === 0
-  );
-  const positiveB2B = (
-    recentPattern.b2bFriendly &&
-    recentPattern.b2bSupportScore >= Math.max(12, recentPattern.b2bRiskScore + 4) &&
-    (!activeWhiteRisk || recoveryAligned) &&
-    (!activeDowntrendRisk || recentPattern.downtrendExhaustion || recentPattern.regimeUpshift)
-  );
-  const unsafeB2B = recentPattern.b2bBlocked && !positiveB2B;
-  const hardRiskBlock = (
-    severeWhiteCluster ||
-    preWhiteHardBlock ||
-    unresolvedWhitePressure ||
-    severeDowntrend ||
-    unresolvedDowntrend ||
-    unsafeB2B
-  );
-  const supportMinusRisk = recentPattern.supportScore - recentPattern.riskScore;
-  // FIX: Removed target.minVal >= 30 floor — transitions happen at ALL
-  // multiplier levels. Previously 5x/10x/15x could NEVER get transition locks,
-  // causing missed predictions during regime shifts.
-  const transitionDrivenIssue = (
-    transitionWindowReady &&
-    recentPattern.transitionReady &&
-    recentPattern.transitionSupportScore >= (target.minVal <= 15 ? 16 : target.minVal <= 30 ? 18 : target.minVal <= 100 ? 16 : 12) &&
-    signalProb >= Math.max(8, thresholds.minProbability * 0.62) &&
-    clusterSupportPct >= Math.max(12, thresholds.minClusterSupport - 6) &&
-    supportMinusRisk >= -1 &&
-    (predictiveLift >= Math.max(-0.5, thresholds.minLift * 0.15) || standardizedLift >= 0.15) &&
-    !activeWhiteRisk &&
-    !activeDowntrendRisk &&
-    !unsafeB2B
-  );
-  const earlyB2BEligible = (
-    target.minVal <= 15 ||
-    (
-      target.minVal <= 30 &&
-      recentPattern.b2bSupportScore >= 18 &&
-      recentPattern.transitionSupportScore >= 8
-    )
-  );
-  const earlySupportiveEntry = (
-    isTooEarly &&
-    recentPattern.recentHitTooSoon &&
-    earlyB2BEligible &&
-    (
-      positiveB2B ||
-      (
-        recentPattern.b2bFriendly &&
-        recentPattern.b2bSupportScore >= Math.max(14, recentPattern.b2bRiskScore + 6)
-      )
-    ) &&
-    transitionWindowReady &&
-    signalProb >= Math.max(20, thresholds.minProbability * 0.55) &&
-    clusterSupportPct >= Math.max(10, thresholds.minClusterSupport - 12) &&
-    supportMinusRisk >= -4 &&
-    !activeWhiteRisk &&
-    !activeDowntrendRisk
-  );
-  const patternDrivenIssue = (
-    transitionWindowReady &&
-    recentPattern.patternScore >= (target.minVal <= 15 ? 18 : target.minVal <= 100 ? 14 : 10) &&
-    signalProb >= Math.max(14, thresholds.minProbability * 0.55) &&
-    clusterSupportPct >= Math.max(14, thresholds.minClusterSupport - 4) &&
-    (recentPattern.reboundSupport || recentPattern.transitionSupportScore >= (target.minVal <= 30 ? 14 : 11)) &&
-    supportMinusRisk >= Math.max(4, target.minVal <= 15 ? 8 : 5) &&
-    !activeWhiteRisk &&
-    !activeDowntrendRisk
-  );
-  const highProbabilitySupport = (
-    windowReady &&
-    signalProb >= Math.max(55, thresholds.minProbability + 10) &&
-    strongCluster &&
-    predictiveLift >= Math.max(0, thresholds.minLift * 0.35) &&
-    supportMinusRisk >= 0 &&
-    !activeWhiteRisk &&
-    !activeDowntrendRisk
-  );
-  const rareCompressionIssue = (
-    target.minVal >= 50 &&
-    recentPattern.compressionSupport &&
-    !activeWhiteRisk &&
-    !activeDowntrendRisk &&
-    !unsafeB2B &&
-    transitionWindowReady &&
-    signalProb >= Math.max(8, thresholds.minProbability * 0.72) &&
-    clusterSupportPct >= Math.max(12, thresholds.minClusterSupport - 5) &&
-    supportMinusRisk >= -2 &&
-    recentPattern.transitionSupportScore >= (target.minVal <= 100 ? 14 : 12) &&
-    (predictiveLift >= Math.max(-0.5, thresholds.minLift * 0.1) || standardizedLift >= 0.15)
-  );
-  // FIX: Lowered from 50x to 15x — compression patterns happen at 15x/30x too.
-  const earlyCompressionEntry = (
-    isTooEarly &&
-    target.minVal >= 15 &&
-    rareCompressionIssue &&
-    signalProb >= Math.max(10, thresholds.minProbability * 0.7) &&
-    clusterSupportPct >= Math.max(10, thresholds.minClusterSupport - 6) &&
-    supportMinusRisk >= -3
-  );
-  const supportiveB2BIssue = (
-    positiveB2B &&
-    transitionWindowReady &&
-    signalProb >= Math.max(18, thresholds.minProbability * 0.72) &&
-    clusterSupportPct >= Math.max(16, thresholds.minClusterSupport - 4) &&
-    predictiveLift >= Math.max(0, thresholds.minLift * 0.2) &&
-    supportMinusRisk >= 0
-  );
-  // FIX: b2bBurstIssue now overrides mild activeWhiteRisk when b2b support
-  // is very strong. B2b bursts during white clusters are the strongest recovery
-  // signal — they mean the market is breaking out. Only block on severeWhiteCluster.
-  const b2bBurstIssue = (
-    recentPattern.recentHitTooSoon &&
-    (recentPattern.immediateB2BRecent || recentPattern.nearBurstRecent || recentPattern.b2bSupportScore >= 20) &&
-    signalProb >= Math.max(12, thresholds.minProbability * 0.5) &&
-    clusterSupportPct >= Math.max(10, thresholds.minClusterSupport - 6) &&
-    supportMinusRisk >= -2 &&
-    !severeWhiteCluster &&
-    !severeDowntrend &&
-    (!activeWhiteRisk || recoveryAligned) &&
-    (!activeDowntrendRisk || recentPattern.downtrendExhaustion || recentPattern.regimeUpshift)
-  );
-  // FIX: Also fire when downtrendExhaustion is true, not just regimeUpshift.
-  // During the critical transition from downtrend to recovery, regimeUpshift
-  // may not be set yet but exhaustion signals ARE present — this is the exact
-  // moment we should be opening locks.
-  const downtrendRecoveryIssue = (
-    (recentPattern.regimeUpshift || recentPattern.downtrendExhaustion) &&
-    transitionWindowReady &&
-    signalProb >= Math.max(12, thresholds.minProbability * 0.6) &&
-    clusterSupportPct >= Math.max(12, thresholds.minClusterSupport - 5) &&
-    supportMinusRisk >= -1 &&
-    (predictiveLift >= Math.max(-0.2, thresholds.minLift * 0.1) || standardizedLift >= 0.2) &&
-    !activeWhiteRisk
-  );
-  // FIX: Lowered from 30x to 10x — trend reversals happen at all levels.
-  // Missing 5x/10x/15x trend reversal locks was causing missed predictions.
-  const trendReversalIssue = (
-    target.minVal >= 10 &&
-    recentPattern.downtrendExhaustion &&
-    transitionWindowReady &&
-    recentPattern.transitionSupportScore >= (target.minVal <= 15 ? 12 : target.minVal <= 100 ? 14 : 12) &&
-    signalProb >= Math.max(10, thresholds.minProbability * 0.6) &&
-    clusterSupportPct >= Math.max(12, thresholds.minClusterSupport - 5) &&
-    supportMinusRisk >= -1 &&
-    !activeWhiteRisk
-  );
-  const negativeLiftBlock = standardizedLift < 0 && signalProb < thresholds.minProbability;
-  const randomWeakBlock = (
-    standardizedLift < -0.25 &&
-    signalProb < Math.max(thresholds.minProbability, chanceWindowRate + 1.5) &&
-    !transitionDrivenIssue &&
-    !supportiveB2BIssue &&
-    !b2bBurstIssue &&
-    !trendReversalIssue &&
-    !downtrendRecoveryIssue
-  );
-  const randomLikeHardBlock = (
-    (randomLike || negativeLiftBlock || randomWeakBlock) &&
-    !transitionDrivenIssue &&
-    !supportiveB2BIssue &&
-    !b2bBurstIssue &&
-    !trendReversalIssue &&
-    !downtrendRecoveryIssue &&
-    !recoveryAligned &&
-    supportMinusRisk < (target.minVal <= 30 ? 2 : 0)
-  );
-  const transitionFloor = target.minVal <= 15 ? 10 : target.minVal <= 30 ? 12 : target.minVal <= 100 ? 14 : 16;
-  const strongTransition = recentPattern.transitionSupportScore >= transitionFloor;
-  const highTargetOpportunity = (
-    target.minVal >= 100 &&
-    transitionWindowReady &&
-    recoveryAligned &&
-    (strongTransition || recentPattern.reboundSupport || recentPattern.regimeUpshift) &&
-    clusterSupportPct >= Math.max(9, thresholds.minClusterSupport - 1) &&
-    signalProb >= Math.max(6, thresholds.minProbability * 0.65) &&
-    (predictiveLift >= -0.05 || standardizedLift >= 0.2) &&
-    (!activeWhiteRisk || recentPattern.whiteRelease || recentPattern.regimeUpshift) &&
-    (!activeDowntrendRisk || recentPattern.downtrendExhaustion || recentPattern.regimeUpshift)
-  );
-  const highTargetNeedsPreview = target.minVal >= 100
-    ? (
-      recentPattern.tailPreviewHits > 0 ||
-      strongTransition ||
-      recentPattern.reboundSupport ||
-      recentPattern.downtrendExhaustion ||
-      recentPattern.regimeUpshift ||
-      b2bBurstIssue ||
-      highTargetOpportunity
-    )
-    : true;
-
-  const lockScore = (
-    (signalProb * 0.35) +
-    Math.min(20, predictiveLift * 2) +
-    Math.min(18, clusterSupportPct * 0.3) +
-    Math.min(18, recentPattern.transitionSupportScore * 0.45) +
-    Math.min(12, Math.max(0, supportMinusRisk) * 0.4) +
-    (positiveB2B ? 8 : 0) +
-    (strongEdge ? 4 : 0) -
-    Math.min(22, recentPattern.whiteRiskScore * 0.42) -
-    Math.min(20, recentPattern.downtrendRiskScore * 0.4) -
-    Math.min(16, recentPattern.b2bRiskScore * 0.35)
-  );
-  // FIX: Balanced lockThreshold — high enough to filter noise, low enough
-  // to not miss valid locks. Previous values (44/40) were too aggressive
-  // and caused missed predictions for high-frequency targets.
-  const lockThreshold =
-    target.minVal <= 10 ? 42 :
-    target.minVal <= 15 ? 38 :
-    target.minVal <= 30 ? 34 :
-    target.minVal <= 100 ? 28 :
-    target.minVal <= 200 ? 26 :
-    target.minVal <= 500 ? 24 : 22;
-  const thresholdRelief = (
-    (recentPattern.regimeUpshift ? 3 : 0) +
-    (positiveB2B ? 2 : 0) +
-    (downtrendRecoveryIssue ? 2 : 0)
-  );
-  const effectiveLockThreshold = Math.max(
-    target.minVal <= 30 ? 26 : target.minVal <= 100 ? 22 : 18,
-    lockThreshold - thresholdRelief
+  let rawConfidence = (
+    (pHitWindow * 0.56) +
+    (pHit10 * 0.18) +
+    (empiricalWindowHitRate * 0.16) +
+    (clampNumber(patternSupport.lift, -15, 20) * 0.5) +
+    (clampNumber(standardizedLift * 4, -12, 16))
   );
 
-  const probabilityFloorMet = (
-    strongProbability ||
-    transitionDrivenIssue ||
-    supportiveB2BIssue ||
-    b2bBurstIssue ||
-    downtrendRecoveryIssue ||
-    trendReversalIssue ||
-    patternDrivenIssue ||
-    highProbabilitySupport ||
-    rareCompressionIssue ||
-    highTargetOpportunity
+  if (recentPattern.b2bSupportScore >= 58) rawConfidence += 6;
+  if (recentPattern.upshift) rawConfidence += 6;
+  if (recentPattern.whiteEndingSignal) rawConfidence += 8;
+  if (recentPattern.preWhiteCluster) rawConfidence -= 12;
+  if (recentPattern.whiteCluster && !recentPattern.whiteEndingSignal) rawConfidence -= 19;
+  if (recentPattern.downtrend) rawConfidence -= 11;
+  if (recentPattern.randomLike || randomLiftWeak) rawConfidence -= 8;
+  if (!kmReliable && minVal >= 100) rawConfidence -= 7;
+  if (isTooEarly) rawConfidence -= 6;
+  if (openWindow) rawConfidence -= 5;
+
+  rawConfidence = clampNumber(rawConfidence, 0, 100);
+  const calibration = calibrateConfidence(rawConfidence, options.calibrationRows || []);
+  const confidence = calibration.confidence;
+
+  const threshold = getIssueThreshold(minVal);
+  const strongTransition = recentPattern.whiteEndingSignal || recentPattern.upshift || (recentPattern.b2bSupportScore >= 65);
+  const strongEdge = (pHitWindow >= (threshold - 6)) || (predictiveLift >= 3.5) || (patternSupport.ready && patternSupport.lift >= 4);
+
+  const hardWhiteBlock = (
+    recentPattern.whiteCluster &&
+    !recentPattern.whiteEndingSignal &&
+    !recentPattern.upshift &&
+    recentPattern.b2bSupportScore < 68
   );
-  const acceptableLift = (
-    target.minVal <= 15
-      ? (predictiveLift >= -0.8 || standardizedLift >= -0.2)
-      : target.minVal <= 30
-        ? (predictiveLift >= -0.35 || standardizedLift >= 0.05)
-        : target.minVal <= 100
-          ? (predictiveLift >= -0.2 || standardizedLift >= 0.15)
-          : (predictiveLift >= -0.1 || standardizedLift >= 0.25)
+  const hardDowntrendBlock = (
+    recentPattern.downtrend &&
+    !strongTransition &&
+    recentPattern.b2bSupportScore < 60
   );
-  const allowEarlyIssue = (
-    !isTooEarly ||
-    transitionDrivenIssue ||
-    earlySupportiveEntry ||
-    earlyCompressionEntry ||
-    b2bBurstIssue ||
-    downtrendRecoveryIssue ||
-    highTargetOpportunity
+  const randomHardBlock = randomLiftWeak && !strongTransition && pHitWindow < 26;
+  const kmHardBlock = (!kmReliable && minVal >= 200 && !strongTransition && pHitWindow < 32);
+  const hardBlock = hardWhiteBlock || hardDowntrendBlock || randomHardBlock || kmHardBlock;
+
+  let avoidReason = null;
+  if (hardWhiteBlock) avoidReason = recentPattern.preWhiteCluster ? 'pre_white_cluster' : 'white_cluster';
+  else if (hardDowntrendBlock) avoidReason = 'downtrend';
+  else if (randomHardBlock) avoidReason = 'random_like';
+  else if (kmHardBlock) avoidReason = 'weak_probability';
+  else if (isTooEarly && confidence < threshold) avoidReason = 'too_early';
+  else if (confidence < threshold) avoidReason = 'weak_probability';
+
+  const issuePrediction = !hardBlock && (
+    confidence >= threshold ||
+    (strongTransition && confidence >= (threshold - 7) && strongEdge)
   );
-  const clusterOrPatternSupport = (
-    strongCluster ||
-    strongTransition ||
-    transitionDrivenIssue ||
-    supportiveB2BIssue ||
-    b2bBurstIssue ||
-    downtrendRecoveryIssue ||
-    trendReversalIssue ||
-    patternDrivenIssue ||
-    highTargetOpportunity
-  );
-  // FIX: Added b2bBurstIssue and rareCompressionIssue to riskOverride.
-  // Previously b2bBurstIssue was listed but softWhiteBlock/softDowntrendBlock
-  // could still block it because riskOverride sits between them and issuePrediction.
-  // Also added earlyCompressionEntry so compression locks survive risk checks.
-  const riskOverride = (
-    transitionDrivenIssue ||
-    supportiveB2BIssue ||
-    b2bBurstIssue ||
-    downtrendRecoveryIssue ||
-    trendReversalIssue ||
-    highProbabilitySupport ||
-    rareCompressionIssue ||
-    earlyCompressionEntry
-  );
-  const softDowntrendBlock = (
-    activeDowntrendRisk &&
-    !recentPattern.downtrendExhaustion &&
-    !recentPattern.reboundSupport &&
-    !riskOverride
-  );
-  const softWhiteBlock = (
-    activeWhiteRisk &&
-    !recentPattern.whiteRelease &&
-    !recentPattern.reboundSupport &&
-    !riskOverride
-  );
-  const issuePrediction = (
-    !lowData &&
-    !openWindow &&
-    transitionWindowReady &&
-    allowEarlyIssue &&
-    probabilityFloorMet &&
-    highTargetNeedsPreview &&
-    !hardRiskBlock &&
-    !softDowntrendBlock &&
-    !softWhiteBlock &&
-    !randomLikeHardBlock &&
-    clusterOrPatternSupport &&
-    (
-      acceptableLift ||
-      strongTransition ||
-      supportiveB2BIssue ||
-      b2bBurstIssue ||
-      trendReversalIssue ||
-      downtrendRecoveryIssue ||
-      highTargetOpportunity
-    ) &&
-    (
-      target.minVal < 100 ||
-      kmReliable ||
-      highTargetOpportunity ||
-      ((strongTransition || trendReversalIssue || downtrendRecoveryIssue) && selectedCount >= sampleRequirements.minForecastGaps + 2)
-    ) &&
-    lockScore >= (
-      b2bBurstIssue || trendReversalIssue || downtrendRecoveryIssue || highTargetOpportunity
-        ? effectiveLockThreshold - 2
-        : effectiveLockThreshold
-    )
-  );
+
   const issueMode = issuePrediction
     ? (
-      supportiveB2BIssue || b2bBurstIssue
-        ? 'b2b_support'
-        : (
-          transitionDrivenIssue ||
-          patternDrivenIssue ||
-          trendReversalIssue ||
-          downtrendRecoveryIssue ||
-          rareCompressionIssue ||
-          earlyCompressionEntry
-            ? 'pattern_support'
-            : (highProbabilitySupport ? 'high_probability' : 'simple')
-        )
+      recentPattern.b2bSupportScore >= 66 && roundsSince <= 2 ? 'b2b_support'
+        : recentPattern.whiteEndingSignal ? 'white_rebound'
+          : patternSupport.ready && patternSupport.lift >= 4 ? 'pattern_support'
+            : strongTransition ? 'transition_support'
+              : 'strict'
     )
     : 'observe';
 
-  const calibration = calibrateProbability(rawConfidence, options.calibrationRows || [], issueMode, regimeMode);
-  let confidence = calibration.calibrated;
-  if (lowData) confidence = Math.min(confidence, 25);
-  if (!kmReliable) confidence = Math.min(confidence, 20);
-  if (randomLike) confidence = Math.min(confidence, Math.max(8, confidence - 12));
-  if (openWindow) confidence = Math.min(confidence, 18);
-  confidence -= clampNumber(recentPattern.whiteRiskScore * 0.35, 0, 18);
-  confidence -= clampNumber(recentPattern.downtrendRiskScore * 0.32, 0, 16);
-  confidence -= clampNumber(recentPattern.b2bRiskScore * 0.35, 0, 14);
-  confidence += clampNumber(recentPattern.supportScore * 0.12, 0, 10);
-  confidence = Math.round(clampNumber(confidence, 4, 95));
-
-  let avoidReason = null;
-  if (!issuePrediction) {
-    if (lowData) avoidReason = 'low_data';
-    else if (openWindow) avoidReason = 'extreme_tail';
-    else if (preWhiteRisk && !strongTransition) avoidReason = 'pre_white_cluster';
-    else if (activeWhiteRisk && !strongTransition) avoidReason = 'white_cluster';
-    else if (activeDowntrendRisk && !strongTransition) avoidReason = 'downtrend';
-    else if (unsafeB2B && !positiveB2B) avoidReason = 'recent_b2b_risk';
-    else if (!transitionWindowReady || isTooEarly) avoidReason = 'too_early';
-    else if (!probabilityFloorMet) avoidReason = 'weak_probability';
-    else if (randomLikeHardBlock) avoidReason = 'random_like';
-    else if (lockScore < effectiveLockThreshold) avoidReason = 'observe_only';
-    else avoidReason = 'observe_only';
-  }
-
-  let chaseRaw = Math.round(
-    (signalProb * 0.68) +
-    (clusterSupportPct * 0.18) +
-    clampNumber(Math.max(0, predictiveLift) * 4, 0, 20) +
-    clampNumber(recentPattern.supportScore * 0.18, 0, 18) -
-    clampNumber(recentPattern.riskScore * 0.16, 0, 16) +
-    clampNumber(recentPattern.patternScore * 0.08, -8, 10) +
-    clampNumber(recentPattern.transitionSupportScore * 0.16, 0, 12)
-  );
-  if (inWindow) chaseRaw += 10;
-  else if (windowReady) chaseRaw += 4;
-  else chaseRaw -= 12;
-  if (severeWhiteCluster) chaseRaw -= 18;
-  else if (activeWhiteRisk) chaseRaw -= 10;
-  if (severeDowntrend) chaseRaw -= 14;
-  else if (activeDowntrendRisk) chaseRaw -= 8;
-  if (unsafeB2B) chaseRaw -= 16;
-  if (positiveB2B) chaseRaw += 8;
-  if (recentPattern.whiteRelease) chaseRaw += 6;
-  if (recentPattern.reboundSupport) chaseRaw += 5;
-  if (lowData) chaseRaw -= 20;
-  if (!kmReliable) chaseRaw -= 16;
-  if (randomLike) chaseRaw -= 18;
-  if (openWindow) chaseRaw -= 24;
-  chaseRaw = clampNumber(chaseRaw, 0, 100);
-
+  const windowReadyThreshold = Math.max(1, Math.round(winSize * 0.75));
+  const windowReady = roundsUntilWindowLo <= windowReadyThreshold;
+  const chaseRaw = Math.round(clampNumber(
+    confidence +
+    (issuePrediction ? 14 : -6) +
+    (inWindow ? 10 : 0) +
+    (strongTransition ? 6 : 0) -
+    (hardWhiteBlock ? 14 : 0) -
+    (hardDowntrendBlock ? 10 : 0),
+    0,
+    100
+  ));
   const chaseSignal = issuePrediction ? 'CHASE' : 'SKIP';
-  const chaseColor = chaseRaw >= 70
-    ? '#39ff8a'
-    : chaseRaw >= 50
-      ? '#ffd250'
-      : chaseRaw >= 30
-        ? '#ff9f43'
-        : '#ff4040';
+  const chaseColor = issuePrediction ? '#39ff8a' : '#ff5555';
+
+  const predBasis = `${predMethod} (${regimeMode}, ${selectedSorted.length} gaps)` +
+    (patternSupport.ready ? ` + pattern lift ${patternSupport.lift.toFixed(1)}%` : '');
+
+  const reliabilityFlags = [];
+  if (selectedSorted.length < MIN_FORECAST_GAPS) reliabilityFlags.push('low_data');
+  if (!kmReliable) reliabilityFlags.push('km_unreliable');
+  if (regimeMode === 'recent') reliabilityFlags.push('regime_shift');
+  if (recentPattern.preWhiteCluster) reliabilityFlags.push('pre_white_cluster');
+  if (recentPattern.whiteCluster) reliabilityFlags.push('white_cluster');
+  if (recentPattern.downtrend) reliabilityFlags.push('downtrend');
+  if (randomLiftWeak || recentPattern.randomLike) reliabilityFlags.push('random_like');
+  if (!patternSupport.ready) reliabilityFlags.push('pattern_low_sample');
 
   return {
     ...target,
     noData: false,
     nowId,
     hits: hits.length,
+    n: selectedSorted.length,
     lastHit,
     roundsSince,
-    n: selectedCount,
-    fullGapCount: allGapsSorted.length,
-    regimeMode,
-    regimeDrift: Math.round(regimeDrift * 100),
+    allGapsRaw,
+    allGapsSorted,
+    recentSorted,
     med: selectedStats.med,
     p10: selectedStats.p10,
     p25: selectedStats.p25,
     p75: selectedStats.p75,
     p90: selectedStats.p90,
-    p90all: fullStats.p90,
-    p99all: fullStats.p99,
-    maxGap: selectedStats.max,
+    p99: selectedStats.p99,
     minGap: selectedStats.min,
+    maxGap: selectedStats.max,
     avgGap: selectedStats.avg,
     iqr: selectedStats.iqr,
     clusterCenter: primaryCluster?.center ?? selectedStats.med,
-    secondaryClusterCenter: histogram.secondary?.center ?? null,
-    clusterSupportPct: Math.round(clusterSupportPct),
+    secondaryClusterCenter: secondaryCluster?.center ?? null,
     predBasis,
     predMethod,
     predictedGap,
@@ -2282,18 +895,18 @@ function computeOracleForecast(rounds, target, options = {}) {
     issuePrediction,
     issueMode,
     avoidReason,
-    riskOverride,
-    softDowntrendBlock,
-    softWhiteBlock,
+    riskOverride: !issuePrediction,
+    softDowntrendBlock: hardDowntrendBlock,
+    softWhiteBlock: hardWhiteBlock,
     windowReady,
     windowReadyThreshold,
-    pHit1,
-    pHit5,
-    pHit10,
-    pHit20,
-    pHitWindow,
-    pHitNearWindow,
-    probReliable,
+    pHit1: Number(pHit1.toFixed(1)),
+    pHit5: Number(pHit5.toFixed(1)),
+    pHit10: Number(pHit10.toFixed(1)),
+    pHit20: Number(pHit20.toFixed(1)),
+    pHitWindow: Number(pHitWindow.toFixed(1)),
+    pHitNearWindow: Number(pHitNearWindow.toFixed(1)),
+    probReliable: kmReliable,
     nearWindowRounds,
     empiricalWindowHitRate: Number(empiricalWindowHitRate.toFixed(1)),
     chanceWindowRate: Number(chanceWindowRate.toFixed(1)),
@@ -2304,7 +917,17 @@ function computeOracleForecast(rounds, target, options = {}) {
     inWindow,
     kmReliable,
     reliabilityFlags,
-    recentPattern,
+    recentPattern: {
+      ...recentPattern,
+      patternSupportPct: Number(patternSupport.supportPct.toFixed(1)),
+      patternRandomPct: Number(patternSupport.randomPct.toFixed(1)),
+      patternLift: Number(patternSupport.lift.toFixed(1)),
+      patternMatches: patternSupport.matches,
+      patternSampleSize: patternSupport.sampleSize,
+      patternReady: patternSupport.ready,
+      bestPatternDistance: patternSupport.bestDistance != null ? Number(patternSupport.bestDistance.toFixed(4)) : null,
+    },
+    regimeMode,
   };
 }
 
