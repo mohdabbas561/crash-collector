@@ -1,26 +1,121 @@
 'use strict';
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Oracle Engine V3 — Multi-Layer Crash Prediction System
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// 7 Prediction Layers:
+//   1. Adaptive Markov Chain (bucket state transitions)
+//   2. Regime-Aware Kaplan-Meier Survival
+//   3. EWMA Cluster Tracker (crossover-based white cluster detection)
+//   4. B2B Momentum Detector (gap acceleration + hit rate surge)
+//   5. White Cluster 5-Phase Lifecycle (PRE_WHITE → WHITE_ACTIVE → WHITE_ENDING)
+//   6. Pattern Similarity Engine (DTW-lite)
+//   7. Enhanced Regime Detector (JS divergence + multi-classification)
+//
+// Ensemble: inverse-error weighted average with hard blocks and floors.
+//
+// Designed for 40k+ historical round datasets.
+// ═══════════════════════════════════════════════════════════════════════════════
+
 const ORACLE_TARGETS = Object.freeze([
-  { label: '5x', minVal: 5, color: '#00ff88', window: 4, scanN: 150, minHits: 7 },
-  { label: '10x', minVal: 10, color: '#00d4ff', window: 6, scanN: 130, minHits: 6 },
-  { label: '15x', minVal: 15, color: '#ff6b9d', window: 7, scanN: 110, minHits: 5 },
-  { label: '30x', minVal: 30, color: '#ff9f43', window: 13, scanN: 90, minHits: 4 },
-  { label: '50x', minVal: 50, color: '#4db8ff', window: 20, scanN: 75, minHits: 4 },
-  { label: '100x', minVal: 100, color: '#39ff8a', window: 30, scanN: 65, minHits: 4 },
-  { label: '200x', minVal: 200, color: '#c77dff', window: 50, scanN: 55, minHits: 3 },
-  { label: '500x', minVal: 500, color: '#ff4da6', window: 75, scanN: 48, minHits: 3 },
-  { label: '1000x', minVal: 1000, color: '#7aa2ff', window: 100, scanN: 42, minHits: 3 },
+  { label: '5x',    minVal: 5,    color: '#00ff88', window: 5,   scanN: 150, minHits: 7 },
+  { label: '10x',   minVal: 10,   color: '#00d4ff', window: 7,   scanN: 130, minHits: 6 },
+  { label: '15x',   minVal: 15,   color: '#ff6b9d', window: 8,   scanN: 110, minHits: 5 },
+  { label: '30x',   minVal: 30,   color: '#ff9f43', window: 14,  scanN: 90,  minHits: 4 },
+  { label: '50x',   minVal: 50,   color: '#4db8ff', window: 22,  scanN: 75,  minHits: 4 },
+  { label: '100x',  minVal: 100,  color: '#39ff8a', window: 32,  scanN: 65,  minHits: 4 },
+  { label: '200x',  minVal: 200,  color: '#c77dff', window: 50,  scanN: 55,  minHits: 3 },
+  { label: '500x',  minVal: 500,  color: '#ff4da6', window: 75,  scanN: 48,  minHits: 3 },
+  { label: '1000x', minVal: 1000, color: '#7aa2ff', window: 100, scanN: 42,  minHits: 3 },
 ]);
 
-const REGIME_DRIFT_THRESHOLD = 0.30;
-const MIN_FORECAST_GAPS = 10;
-const MIN_KM_GAPS = 20;
-const MIN_BUCKET_CALIBRATION = 8;
-const MIN_GLOBAL_CALIBRATION = 24;
-const LOW_HARD_CAP = 1.25;
+// ─── Configuration ───────────────────────────────────────────────────────────
+const CFG = Object.freeze({
+  // Markov chain
+  markovRecentWeight: 0.60,
+  markovRecentWindow: 500,
+  markovBuckets: [1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 25.0, 50.0, 100.0, Infinity],
 
-function clampNumber(value, min, max) {
-  return Math.min(Math.max(value, min), max);
+  // Kaplan-Meier
+  kmMinGaps: 20,
+  kmRegimeRecentN: 200,
+  kmRegimeBlendRecent: 0.55,
+
+  // EWMA
+  ewmaAlphaShort: 0.25,
+  ewmaAlphaLong: 0.08,
+  ewmaCrossoverThreshold: 0.04,
+
+  // B2B
+  b2bGapWindow: 20,
+  b2bShortHitWindow: 12,
+  b2bLongHitWindow: 120,
+  b2bImmediateGapMax: 2,
+  b2bAccelerationThreshold: -0.15,
+
+  // White cluster lifecycle
+  whiteHardCap: 1.25,
+  whiteSoftMultiplier: 2.0,
+  whitePreEntryTrendRounds: 6,
+  whitePreEntryLowConcentration: 0.55,
+  whitePreEntryVolCompression: 0.35,
+  whiteActiveHardRate: 0.38,
+  whiteActiveSoftRate: 0.68,
+  whiteActiveStreak: 4,
+  whiteEndingReboundMultiple: 3.0,
+  whiteEndingEwmaReversal: 2,
+  whiteEndingTailRecovery: 2,
+
+  // Pattern similarity
+  patternLen: 15,
+  patternTopK: 24,
+  patternMaxCandidates: 5000,
+
+  // Regime detector
+  regimeRecentWindow: 300,
+  regimeJsThreshold: 0.015,
+  regimeLagThreshold: 0.12,
+  regimeDriftThreshold: 0.06,
+
+  // Ensemble
+  ensembleMinLayers: 2,
+  calibrationWindow: 200,
+
+  // Confidence caps/floors
+  whiteActiveConfidenceCap: 15,
+  preWhiteConfidenceCap: 30,
+  whiteEndingBoost: 15,
+  b2bConfidenceFloor: 45,
+  b2bScoreThreshold: 70,
+
+  // Issue thresholds per target range
+  issueThresholdLow: 38,     // ≤15x
+  issueThresholdMid: 40,     // ≤50x
+  issueThresholdHigh: 42,    // ≤200x
+  issueThresholdMoon: 45,    // >200x
+});
+
+
+// ─── Utilities ───────────────────────────────────────────────────────────────
+
+function clamp(v, lo, hi) {
+  return Math.min(Math.max(v, lo), hi);
+}
+
+function mean(arr) {
+  if (!arr.length) return 0;
+  let s = 0;
+  for (let i = 0; i < arr.length; i++) s += arr[i];
+  return s / arr.length;
+}
+
+function stddev(arr) {
+  if (arr.length < 2) return 0;
+  const m = mean(arr);
+  let s = 0;
+  for (let i = 0; i < arr.length; i++) s += (arr[i] - m) ** 2;
+  return Math.sqrt(s / (arr.length - 1));
 }
 
 function quantile(sorted, p) {
@@ -29,231 +124,112 @@ function quantile(sorted, p) {
   const idx = (p / 100) * (sorted.length - 1);
   const lo = Math.floor(idx);
   const hi = Math.ceil(idx);
-  return sorted[lo] + ((sorted[hi] - sorted[lo]) * (idx - lo));
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
 }
 
-function mean(values) {
-  if (!values.length) return 0;
-  return values.reduce((sum, value) => sum + value, 0) / values.length;
-}
-
-function stddev(values, avg) {
-  if (values.length < 2) return 0;
-  const center = Number.isFinite(avg) ? avg : mean(values);
-  const variance = values.reduce((sum, value) => sum + ((value - center) ** 2), 0) / (values.length - 1);
-  return Math.sqrt(Math.max(0, variance));
+function sortedCopy(arr) {
+  return arr.slice().sort((a, b) => a - b);
 }
 
 function normalizeRounds(rounds) {
   const map = new Map();
-  for (const round of rounds || []) {
-    const id = Number(round?.roundId ?? round?.id);
-    const val = Number.parseFloat(round?.multiplier ?? round?.val ?? round?.gameResult ?? round?.result);
+  for (const r of rounds || []) {
+    const id = Number(r?.roundId ?? r?.id);
+    const val = Number.parseFloat(r?.multiplier ?? r?.val ?? r?.gameResult ?? r?.result);
     if (!Number.isFinite(id) || !Number.isFinite(val) || val <= 0) continue;
     map.set(id, { id, val: Number(val.toFixed(4)) });
   }
   return [...map.values()].sort((a, b) => a.id - b.id);
 }
 
-function trimSorted(sorted, trimRatio = 0.1) {
-  if (!sorted.length) return [];
-  if (sorted.length < 10) return sorted.slice();
-  const trimCount = Math.floor(sorted.length * trimRatio);
-  if (trimCount <= 0 || (trimCount * 2) >= sorted.length) return sorted.slice();
-  return sorted.slice(trimCount, sorted.length - trimCount);
-}
-
-function tukeyFilterSorted(sorted) {
-  if (sorted.length < 8) return sorted.slice();
-  const q1 = quantile(sorted, 25);
-  const q3 = quantile(sorted, 75);
-  const iqr = Math.max(1, q3 - q1);
-  const lo = q1 - (1.5 * iqr);
-  const hi = q3 + (1.5 * iqr);
-  const filtered = sorted.filter((gap) => gap >= lo && gap <= hi);
-  return filtered.length >= Math.max(6, Math.floor(sorted.length * 0.55))
-    ? filtered
-    : sorted.slice();
-}
-
-function buildRobustStats(sourceSorted) {
-  const filtered = tukeyFilterSorted(sourceSorted);
-  const trimmed = trimSorted(filtered, filtered.length >= 12 ? 0.1 : 0);
-  const working = trimmed.length ? trimmed : filtered;
-
-  const p10 = quantile(working, 10);
-  const p25 = quantile(working, 25);
-  const med = quantile(working, 50);
-  const p75 = quantile(working, 75);
-  const p90 = quantile(working, 90);
-  const p99 = quantile(working, 99);
-
-  return {
-    filtered,
-    trimmed: working,
-    min: working[0],
-    max: working[working.length - 1],
-    p10: Math.round(p10),
-    p25: Math.round(p25),
-    med: Math.round(med),
-    p75: Math.round(p75),
-    p90: Math.round(p90),
-    p99: Math.round(p99),
-    iqr: Math.max(1, Math.round(p75 - p25)),
-    avg: Math.round(mean(working)),
-  };
-}
-
-function computeTrendPercent(values) {
-  if (values.length < 4) return 0;
-  const logs = values.map((value) => Math.log(Math.max(1.0001, value)));
-  const n = logs.length;
-  const meanX = (n - 1) / 2;
-  const meanY = mean(logs);
-  let numer = 0;
-  let denom = 0;
-  for (let i = 0; i < n; i += 1) {
-    const dx = i - meanX;
-    numer += dx * (logs[i] - meanY);
-    denom += dx * dx;
+function getBucketIndex(val) {
+  const buckets = CFG.markovBuckets;
+  for (let i = 0; i < buckets.length; i++) {
+    if (val < buckets[i]) return i;
   }
-  if (denom <= 0 || Math.abs(meanY) < 0.00001) return 0;
-  const slope = numer / denom;
-  return ((slope * (n - 1)) / Math.abs(meanY)) * 100;
+  return buckets.length - 1;
 }
 
-function getLowPressureSoftThreshold(minVal) {
-  if (minVal <= 10) return 1.9;
-  if (minVal <= 15) return 2.1;
-  if (minVal <= 30) return 2.4;
-  if (minVal <= 50) return 2.7;
-  if (minVal <= 100) return 3.0;
-  if (minVal <= 200) return 3.3;
-  if (minVal <= 500) return 3.7;
-  return 4.0;
+function getIssueThreshold(minVal) {
+  if (minVal <= 15) return CFG.issueThresholdLow;
+  if (minVal <= 50) return CFG.issueThresholdMid;
+  if (minVal <= 200) return CFG.issueThresholdHigh;
+  return CFG.issueThresholdMoon;
 }
 
-function computeRegimeMode(allSorted, recentSorted, rounds, target) {
-  if (recentSorted.length < 24 || allSorted.length < 40) return 'full';
-  const medAll = quantile(allSorted, 50);
-  const medRecent = quantile(recentSorted, 50);
-  const drift = medAll > 0 ? Math.abs(medRecent - medAll) / medAll : 0;
 
-  const lastValues = rounds.slice(-24).map((round) => round.val);
-  const prevValues = rounds.slice(-48, -24).map((round) => round.val);
-  const lowSoft = getLowPressureSoftThreshold(target.minVal);
-  const recentLowRate = lastValues.length ? (lastValues.filter((value) => value <= lowSoft).length / lastValues.length) : 0;
-  const prevLowRate = prevValues.length ? (prevValues.filter((value) => value <= lowSoft).length / prevValues.length) : 0;
-  const pressureShift = recentLowRate - prevLowRate;
+// ─── Layer 1: Adaptive Markov Chain ──────────────────────────────────────────
 
-  if (drift > REGIME_DRIFT_THRESHOLD || pressureShift > 0.24 || pressureShift < -0.24) {
-    return 'recent';
-  }
-  return 'full';
-}
+function buildMarkovLayer(rounds, target) {
+  const nBuckets = CFG.markovBuckets.length;
+  const n = rounds.length;
+  if (n < 30) return { prob: null, reliability: 0 };
 
-function deriveBinWidth(sorted) {
-  if (sorted.length < 3) return 1;
-  const q25 = quantile(sorted, 25);
-  const q75 = quantile(sorted, 75);
-  const iqr = Math.max(1, q75 - q25);
-  const fd = Math.max(1, Math.round((2 * iqr) / Math.cbrt(sorted.length)));
-  const span = Math.max(1, sorted[sorted.length - 1] - sorted[0]);
-  const sqrtRule = Math.max(1, Math.round(span / Math.max(2, Math.sqrt(sorted.length))));
-  return clampNumber(Math.min(fd, sqrtRule), 1, Math.max(1, Math.round(span / 3)));
-}
+  // Build 2nd-order transition counts: (state_t-2, state_t-1) → state_t
+  const recentStart = Math.max(0, n - CFG.markovRecentWindow);
+  const countAll = new Float64Array(nBuckets * nBuckets * nBuckets);
+  const countRecent = new Float64Array(nBuckets * nBuckets * nBuckets);
 
-function buildHistogramClusters(sorted) {
-  if (!sorted.length) return { binWidth: 1, primary: null, secondary: null, bins: [] };
-  const min = sorted[0];
-  const max = sorted[sorted.length - 1];
-  const binWidth = deriveBinWidth(sorted);
-  const binCount = Math.max(1, Math.floor((max - min) / binWidth) + 1);
-
-  const bins = Array.from({ length: binCount }, (_, idx) => ({
-    index: idx,
-    lo: min + (idx * binWidth),
-    hi: min + ((idx + 1) * binWidth) - 1,
-    count: 0,
-    sum: 0,
-  }));
-
-  for (const gap of sorted) {
-    const idx = clampNumber(Math.floor((gap - min) / binWidth), 0, binCount - 1);
-    bins[idx].count += 1;
-    bins[idx].sum += gap;
+  for (let i = 2; i < n; i++) {
+    const s0 = getBucketIndex(rounds[i - 2].val);
+    const s1 = getBucketIndex(rounds[i - 1].val);
+    const s2 = getBucketIndex(rounds[i].val);
+    const idx = s0 * nBuckets * nBuckets + s1 * nBuckets + s2;
+    countAll[idx]++;
+    if (i >= recentStart) countRecent[idx]++;
   }
 
-  const smooth = bins.map((bin, idx) => {
-    const left = bins[idx - 1]?.count || 0;
-    const right = bins[idx + 1]?.count || 0;
-    return bin.count + ((left + right) * 0.55);
-  });
+  // Current state
+  if (n < 2) return { prob: null, reliability: 0 };
+  const prev2 = getBucketIndex(rounds[n - 2].val);
+  const prev1 = getBucketIndex(rounds[n - 1].val);
 
-  const peaks = [];
-  for (let i = 0; i < bins.length; i += 1) {
-    const left = smooth[i - 1] ?? -Infinity;
-    const right = smooth[i + 1] ?? -Infinity;
-    if (smooth[i] >= left && smooth[i] >= right && bins[i].count > 0) {
-      peaks.push({ index: i, strength: smooth[i] });
-    }
-  }
-  peaks.sort((a, b) => b.strength - a.strength);
+  // P(next bucket >= target bucket)
+  const targetBucket = getBucketIndex(target.minVal);
 
-  function expand(peakIndex) {
-    const peakStrength = smooth[peakIndex];
-    const threshold = peakStrength * 0.42;
-    let lo = peakIndex;
-    let hi = peakIndex;
-    while (lo > 0 && smooth[lo - 1] >= threshold) lo -= 1;
-    while (hi < bins.length - 1 && smooth[hi + 1] >= threshold) hi += 1;
-    const region = bins.slice(lo, hi + 1);
-    const supportCount = region.reduce((sum, bin) => sum + bin.count, 0);
-    const weightedSum = region.reduce((sum, bin) => sum + bin.sum, 0);
-    return {
-      lo: region[0].lo,
-      hi: region[region.length - 1].hi,
-      center: supportCount > 0 ? Math.round(weightedSum / supportCount) : Math.round((region[0].lo + region[region.length - 1].hi) / 2),
-      supportCount,
-      supportPct: supportCount / sorted.length,
-      peakStrength,
-    };
-  }
+  let totalAll = 0, hitsAll = 0;
+  let totalRecent = 0, hitsRecent = 0;
 
-  const primary = peaks.length ? expand(peaks[0].index) : null;
-  let secondary = null;
-  for (const peak of peaks.slice(1)) {
-    const candidate = expand(peak.index);
-    if (
-      primary &&
-      Math.abs(candidate.center - primary.center) >= binWidth &&
-      candidate.supportPct >= Math.max(0.12, primary.supportPct * 0.4)
-    ) {
-      secondary = candidate;
-      break;
+  for (let s2 = 0; s2 < nBuckets; s2++) {
+    const idx = prev2 * nBuckets * nBuckets + prev1 * nBuckets + s2;
+    totalAll += countAll[idx];
+    totalRecent += countRecent[idx];
+    if (s2 >= targetBucket) {
+      hitsAll += countAll[idx];
+      hitsRecent += countRecent[idx];
     }
   }
 
-  return { binWidth, bins, primary, secondary };
+  const pAll = totalAll > 0 ? hitsAll / totalAll : 0;
+  const pRecent = totalRecent > 0 ? hitsRecent / totalRecent : pAll;
+  const w = CFG.markovRecentWeight;
+  const prob = totalRecent >= 10 ? (w * pRecent + (1 - w) * pAll) : pAll;
+  const sampleSize = totalAll + totalRecent;
+  const reliability = clamp(Math.min(sampleSize / 100, 1), 0, 1);
+
+  return { prob: clamp(prob, 0, 1), reliability };
 }
 
-function buildKMTable(allGapsSorted) {
-  if (!allGapsSorted.length) return new Float32Array(2).fill(1);
-  const n = allGapsSorted.length;
-  const maxGap = allGapsSorted[n - 1];
+
+// ─── Layer 2: Regime-Aware Kaplan-Meier ──────────────────────────────────────
+
+function buildKMTable(gapsSorted) {
+  if (!gapsSorted.length) return new Float32Array(2).fill(1);
+  const n = gapsSorted.length;
+  const maxGap = gapsSorted[n - 1];
   const limit = maxGap + 120;
   const table = new Float32Array(limit + 1).fill(1);
   let survival = 1;
   let left = 0;
-  for (let t = 1; t <= limit; t += 1) {
-    while (left < n && allGapsSorted[left] < t) left += 1;
+  for (let t = 1; t <= limit; t++) {
+    while (left < n && gapsSorted[left] < t) left++;
     let right = left;
-    while (right < n && allGapsSorted[right] === t) right += 1;
+    while (right < n && gapsSorted[right] === t) right++;
     const atRisk = n - left;
     const events = right - left;
     if (atRisk > 0) {
-      survival *= (1 - (events / atRisk));
-      survival = clampNumber(survival, 0, 1);
+      survival *= (1 - events / atRisk);
+      survival = clamp(survival, 0, 1);
     }
     table[t] = survival;
   }
@@ -261,384 +237,612 @@ function buildKMTable(allGapsSorted) {
 }
 
 function kmProb(table, roundsSince, k) {
-  if (!table?.length) return 0;
-  const from = clampNumber(Math.round(roundsSince), 0, table.length - 1);
-  const to = clampNumber(Math.round(roundsSince + k), 0, table.length - 1);
+  if (!table || !table.length) return 0;
+  const from = clamp(Math.round(roundsSince), 0, table.length - 1);
+  const to = clamp(Math.round(roundsSince + k), 0, table.length - 1);
   const sFrom = table[from];
   if (sFrom <= 0) return 100;
-  return clampNumber((1 - (table[to] / sFrom)) * 100, 0, 100);
+  return clamp((1 - table[to] / sFrom) * 100, 0, 100);
 }
 
-function computeConditionalExpectedGap(survivors, roundsSince) {
-  if (!survivors.length) return null;
-  const sorted = survivors.slice().sort((a, b) => a - b);
-  const trimmed = trimSorted(sorted, sorted.length >= 12 ? 0.1 : 0);
-  const working = trimmed.length ? trimmed : sorted;
-  const expected = mean(working);
-  return Math.max(roundsSince + 1, Math.round(expected));
-}
+function buildKMLayer(allGaps, recentGaps, roundsSince, winSize, regimeLabel) {
+  if (allGaps.length < CFG.kmMinGaps) return { pHitWindow: 0, pHit1: 0, pHit5: 0, reliability: 0 };
 
-function computeChanceWindowRate(sorted, width, maxSamples = 4000) {
-  if (!sorted.length) return { rate: 0, std: 0 };
-  const winWidth = Math.max(1, Math.round(width));
-  const min = sorted[0];
-  const max = sorted[sorted.length - 1];
-  if (max <= min) return { rate: 100, std: 0 };
+  const allSorted = sortedCopy(allGaps);
+  const recentSorted = sortedCopy(recentGaps);
 
-  const startMin = min;
-  const startMax = Math.max(min, max - winWidth + 1);
-  const totalWindows = Math.max(1, startMax - startMin + 1);
-
-  let starts = [];
-  if (totalWindows <= maxSamples) {
-    starts = Array.from({ length: totalWindows }, (_, idx) => startMin + idx);
+  // In white/clustered regimes, lean heavier on recent gaps
+  const useRecent = regimeLabel === 'CLUSTERED_LOW' || regimeLabel === 'TRENDING_DOWN';
+  let blendedGaps;
+  if (useRecent && recentSorted.length >= 15) {
+    // Weighted merge: more recent bias
+    const w = CFG.kmRegimeBlendRecent;
+    const mergedLen = Math.max(allSorted.length, recentSorted.length);
+    blendedGaps = [];
+    for (let i = 0; i < mergedLen; i++) {
+      const fromAll = i < allSorted.length ? allSorted[i] : allSorted[allSorted.length - 1];
+      const fromRecent = i < recentSorted.length ? recentSorted[i % recentSorted.length] : recentSorted[recentSorted.length - 1];
+      blendedGaps.push(Math.round(w * fromRecent + (1 - w) * fromAll));
+    }
+    blendedGaps.sort((a, b) => a - b);
   } else {
-    const step = (totalWindows - 1) / (maxSamples - 1);
-    for (let i = 0; i < maxSamples; i += 1) {
-      starts.push(startMin + Math.round(i * step));
-    }
-    starts = [...new Set(starts)].sort((a, b) => a - b);
+    blendedGaps = allSorted;
   }
 
-  const n = sorted.length;
-  let lo = 0;
-  let hi = 0;
-  const rates = [];
-  for (const start of starts) {
-    const end = start + winWidth - 1;
-    while (lo < n && sorted[lo] < start) lo += 1;
-    while (hi < n && sorted[hi] <= end) hi += 1;
-    const windowCount = Math.max(0, hi - lo);
-    rates.push((windowCount / n) * 100);
-  }
+  const table = buildKMTable(blendedGaps);
 
-  const avg = mean(rates);
-  return { rate: avg, std: stddev(rates, avg) };
+  const pHit1 = kmProb(table, roundsSince, 1);
+  const pHit5 = kmProb(table, roundsSince, 5);
+  const pHitWindow = kmProb(table, roundsSince, winSize);
+
+  const reliability = clamp(allGaps.length / (CFG.kmMinGaps * 3), 0, 1);
+
+  return { pHitWindow, pHit1, pHit5, reliability, table };
 }
 
-function longestStreak(values, predicate) {
-  let best = 0;
-  let run = 0;
-  for (const value of values) {
-    if (predicate(value)) {
-      run += 1;
-      if (run > best) best = run;
-    } else {
-      run = 0;
-    }
+
+// ─── Layer 3: EWMA Cluster Tracker ───────────────────────────────────────────
+
+function computeEWMA(values, alpha) {
+  if (!values.length) return 0;
+  let ewma = values[0];
+  for (let i = 1; i < values.length; i++) {
+    ewma = alpha * values[i] + (1 - alpha) * ewma;
   }
-  return best;
+  return ewma;
 }
 
-function computePatternSupport(rounds, target, windowSize) {
-  const values = rounds.map((round) => Number(round.val || 0));
-  const n = values.length;
-  const patternLen = target.minVal <= 30 ? 12 : target.minVal <= 100 ? 10 : 8;
-  if (n < (patternLen + windowSize + 30)) {
-    return {
-      ready: false,
-      supportPct: 0,
-      randomPct: 0,
-      lift: 0,
-      bestDistance: null,
-      matches: 0,
-      sampleSize: 0,
-    };
+function buildEWMALayer(rounds, target) {
+  const n = rounds.length;
+  if (n < 30) return { shortEwma: 0, longEwma: 0, crossover: 'none', signalStrength: 0, reliability: 0 };
+
+  // Binary hit series: 1 if >= target, 0 otherwise
+  const hitSeries = rounds.map(r => r.val >= target.minVal ? 1.0 : 0.0);
+
+  const shortEwma = computeEWMA(hitSeries, CFG.ewmaAlphaShort);
+  const longEwma = computeEWMA(hitSeries, CFG.ewmaAlphaLong);
+
+  // Check recent crossover history for stability
+  const recentLen = Math.min(20, n);
+  const recentShorts = [];
+  const recentLongs = [];
+  {
+    let s = hitSeries[0], l = hitSeries[0];
+    for (let i = 1; i < n; i++) {
+      s = CFG.ewmaAlphaShort * hitSeries[i] + (1 - CFG.ewmaAlphaShort) * s;
+      l = CFG.ewmaAlphaLong * hitSeries[i] + (1 - CFG.ewmaAlphaLong) * l;
+      if (i >= n - recentLen) {
+        recentShorts.push(s);
+        recentLongs.push(l);
+      }
+    }
   }
 
-  const transformed = values.map((value) => Math.log(Math.max(1.0001, value)));
-  const currentStart = n - patternLen;
-  const currentPattern = transformed.slice(currentStart, n);
-  const candidateMaxStart = currentStart - windowSize - 1;
-  if (candidateMaxStart < 0) {
-    return {
-      ready: false,
-      supportPct: 0,
-      randomPct: 0,
-      lift: 0,
-      bestDistance: null,
-      matches: 0,
-      sampleSize: 0,
-    };
+  const gap = shortEwma - longEwma;
+  let crossover = 'none';
+  if (gap > CFG.ewmaCrossoverThreshold) crossover = 'bullish';   // cluster ending, hits returning
+  else if (gap < -CFG.ewmaCrossoverThreshold) crossover = 'bearish'; // cluster entering, hits declining
+
+  const signalStrength = Math.abs(gap) / Math.max(0.001, longEwma || 0.05);
+  const reliability = clamp(n / 200, 0, 1);
+
+  return {
+    shortEwma: Number(shortEwma.toFixed(6)),
+    longEwma: Number(longEwma.toFixed(6)),
+    crossover,
+    signalStrength: Number(clamp(signalStrength, 0, 5).toFixed(4)),
+    reliability,
+  };
+}
+
+
+// ─── Layer 4: B2B Momentum Detector ──────────────────────────────────────────
+
+function buildB2BLayer(allGaps, rounds, target, roundsSince) {
+  const n = rounds.length;
+  if (allGaps.length < 5) return { b2bScore: 0, gapAcceleration: 0, hitRateSurge: 0, immediateB2B: false, reliability: 0 };
+
+  // Gap acceleration: are gaps between hits shrinking?
+  const recentGaps = allGaps.slice(-CFG.b2bGapWindow);
+  let gapAcceleration = 0;
+  if (recentGaps.length >= 4) {
+    const firstHalf = recentGaps.slice(0, Math.floor(recentGaps.length / 2));
+    const secondHalf = recentGaps.slice(Math.floor(recentGaps.length / 2));
+    const firstMean = mean(firstHalf);
+    const secondMean = mean(secondHalf);
+    if (firstMean > 0) {
+      gapAcceleration = (secondMean - firstMean) / firstMean;
+    }
   }
 
-  const maxCandidates = 5500;
-  const stride = Math.max(1, Math.ceil((candidateMaxStart + 1) / maxCandidates));
-  const topK = 24;
+  // Hit rate surge: short-term hit rate vs long-term
+  const shortHits = rounds.slice(-CFG.b2bShortHitWindow).filter(r => r.val >= target.minVal).length;
+  const longHits = rounds.slice(-CFG.b2bLongHitWindow).filter(r => r.val >= target.minVal).length;
+  const shortRate = shortHits / Math.max(1, Math.min(n, CFG.b2bShortHitWindow));
+  const longRate = longHits / Math.max(1, Math.min(n, CFG.b2bLongHitWindow));
+  const hitRateSurge = longRate > 0 ? (shortRate - longRate) / longRate : 0;
+
+  // Immediate b2b: last gaps were very short
+  const lastFewGaps = allGaps.slice(-3);
+  const immediateB2B = (
+    roundsSince <= CFG.b2bImmediateGapMax &&
+    lastFewGaps.filter(g => g <= CFG.b2bImmediateGapMax).length >= 2
+  );
+
+  // Composite score
+  const accelerationScore = clamp(-gapAcceleration * 100, 0, 40); // negative accel = shrinking gaps = bullish
+  const surgeScore = clamp(hitRateSurge * 30, 0, 30);
+  const immediateScore = immediateB2B ? 20 : 0;
+  const recencyScore = roundsSince <= 2 ? 10 : roundsSince <= 5 ? 5 : 0;
+  const b2bScore = clamp(accelerationScore + surgeScore + immediateScore + recencyScore, 0, 100);
+
+  const reliability = clamp(allGaps.length / 15, 0, 1);
+
+  return {
+    b2bScore: Number(b2bScore.toFixed(1)),
+    gapAcceleration: Number(gapAcceleration.toFixed(4)),
+    hitRateSurge: Number(hitRateSurge.toFixed(4)),
+    immediateB2B,
+    reliability,
+  };
+}
+
+
+// ─── Layer 5: White Cluster 5-Phase Lifecycle ────────────────────────────────
+
+function computeWhitePhase(rounds, target) {
+  const n = rounds.length;
+  if (n < 20) return { phase: 'NORMAL', signals: {}, reliability: 0 };
+
+  const softThreshold = target.minVal <= 10 ? 1.9
+    : target.minVal <= 30 ? 2.3
+    : target.minVal <= 100 ? 2.8
+    : target.minVal <= 500 ? 3.5
+    : 4.0;
+
+  const recent24 = rounds.slice(-24).map(r => r.val);
+  const recent12 = rounds.slice(-12).map(r => r.val);
+  const recent6 = rounds.slice(-6).map(r => r.val);
+  const recent4 = rounds.slice(-4).map(r => r.val);
+
+  // Hard white rate (≤1.25x)
+  const hardWhiteRate24 = recent24.filter(v => v <= CFG.whiteHardCap).length / recent24.length;
+  const hardWhiteRate12 = recent12.filter(v => v <= CFG.whiteHardCap).length / recent12.length;
+
+  // Soft white rate (below target-dependent threshold)
+  const softWhiteRate24 = recent24.filter(v => v <= softThreshold).length / recent24.length;
+  const softWhiteRate12 = recent12.filter(v => v <= softThreshold).length / recent12.length;
+
+  // Trend (log-multiplier slope)
+  const logRecent = recent12.map(v => Math.log(Math.max(1.0001, v)));
+  let trend12 = 0;
+  if (logRecent.length >= 4) {
+    const mX = (logRecent.length - 1) / 2;
+    const mY = mean(logRecent);
+    let num = 0, den = 0;
+    for (let i = 0; i < logRecent.length; i++) {
+      const dx = i - mX;
+      num += dx * (logRecent[i] - mY);
+      den += dx * dx;
+    }
+    trend12 = den > 0 ? (num / den) * (logRecent.length - 1) / Math.max(0.0001, Math.abs(mY)) * 100 : 0;
+  }
+  const logRecent6 = recent6.map(v => Math.log(Math.max(1.0001, v)));
+  let trend6 = 0;
+  if (logRecent6.length >= 3) {
+    const mX = (logRecent6.length - 1) / 2;
+    const mY = mean(logRecent6);
+    let num = 0, den = 0;
+    for (let i = 0; i < logRecent6.length; i++) {
+      const dx = i - mX;
+      num += dx * (logRecent6[i] - mY);
+      den += dx * dx;
+    }
+    trend6 = den > 0 ? (num / den) * (logRecent6.length - 1) / Math.max(0.0001, Math.abs(mY)) * 100 : 0;
+  }
+
+  // Volatility (stddev of log-multipliers)
+  const vol12 = stddev(logRecent);
+  const longLog = rounds.slice(-60).map(r => Math.log(Math.max(1.0001, r.val)));
+  const vol60 = stddev(longLog);
+  const volCompression = vol60 > 0.01 ? 1 - (vol12 / vol60) : 0;
+
+  // White streak
+  let whiteStreak = 0;
+  for (let i = n - 1; i >= 0; i--) {
+    if (rounds[i].val <= softThreshold) whiteStreak++;
+    else break;
+  }
+
+  // Strongest recent multiplier (for rebound detection)
+  const maxRecent4 = Math.max(...recent4);
+  const maxRecent6 = Math.max(...recent6);
+  const medianAll = quantile(sortedCopy(rounds.slice(-200).map(r => r.val)), 50);
+
+  // Recovery signals
+  const reboundSpike = maxRecent4 >= softThreshold * CFG.whiteEndingReboundMultiple;
+  const ewmaReversalCount = (() => {
+    let count = 0;
+    for (let i = Math.max(0, recent6.length - CFG.whiteEndingEwmaReversal); i < recent6.length; i++) {
+      if (recent6[i] > softThreshold) count++;
+    }
+    return count;
+  })();
+  const tailRecovery = recent4.filter(v => v >= medianAll).length >= CFG.whiteEndingTailRecovery;
+
+  // ── Phase classification ──
+  let phase = 'NORMAL';
+
+  // WHITE_ACTIVE: currently in a white cluster
+  const whiteActive = (
+    hardWhiteRate24 >= CFG.whiteActiveHardRate ||
+    softWhiteRate24 >= CFG.whiteActiveSoftRate ||
+    whiteStreak >= CFG.whiteActiveStreak
+  );
+
+  // WHITE_ENDING: in cluster but recovery signals firing
+  const whiteEnding = whiteActive && (
+    reboundSpike ||
+    ewmaReversalCount >= CFG.whiteEndingEwmaReversal ||
+    (tailRecovery && trend6 > 3)
+  );
+
+  // PRE_WHITE: not yet in cluster but signals approaching
+  const preWhite = !whiteActive && (
+    (trend12 < -4 && softWhiteRate12 >= CFG.whitePreEntryLowConcentration) ||
+    (softWhiteRate12 >= 0.5 && volCompression >= CFG.whitePreEntryVolCompression) ||
+    (trend12 < -6 && hardWhiteRate12 >= 0.18)
+  );
+
+  if (whiteEnding) phase = 'WHITE_ENDING';
+  else if (whiteActive) phase = 'WHITE_ACTIVE';
+  else if (preWhite) phase = 'PRE_WHITE';
+  else phase = 'NORMAL';
+
+  const signals = {
+    hardWhiteRate24: Number((hardWhiteRate24 * 100).toFixed(1)),
+    softWhiteRate24: Number((softWhiteRate24 * 100).toFixed(1)),
+    hardWhiteRate12: Number((hardWhiteRate12 * 100).toFixed(1)),
+    softWhiteRate12: Number((softWhiteRate12 * 100).toFixed(1)),
+    trend12: Number(trend12.toFixed(2)),
+    trend6: Number(trend6.toFixed(2)),
+    volCompression: Number(volCompression.toFixed(3)),
+    whiteStreak,
+    softThreshold: Number(softThreshold.toFixed(2)),
+    reboundSpike,
+    ewmaReversalCount,
+    tailRecovery,
+    maxRecent4: Number(maxRecent4.toFixed(2)),
+  };
+
+  return { phase, signals, reliability: clamp(n / 50, 0, 1) };
+}
+
+
+// ─── Layer 6: Pattern Similarity (DTW-lite) ──────────────────────────────────
+
+function buildPatternLayer(rounds, target, winSize) {
+  const n = rounds.length;
+  const pLen = CFG.patternLen;
+  if (n < pLen + winSize + 30) return { supportPct: 0, lift: 0, bestDistance: null, ready: false, reliability: 0 };
+
+  const transformed = rounds.map(r => Math.log(Math.max(1.0001, r.val)));
+  const currentPattern = transformed.slice(n - pLen, n);
+  const candidateMaxStart = n - pLen - winSize - 1;
+  if (candidateMaxStart < 0) return { supportPct: 0, lift: 0, bestDistance: null, ready: false, reliability: 0 };
+
+  const stride = Math.max(1, Math.ceil((candidateMaxStart + 1) / CFG.patternMaxCandidates));
+  const topK = CFG.patternTopK;
   const top = [];
   let sampleSize = 0;
   let randomHits = 0;
 
-  function nextWindowHit(startIdx) {
-    const lo = startIdx + patternLen;
-    const hi = lo + windowSize - 1;
-    for (let i = lo; i <= hi && i < values.length; i += 1) {
-      if (values[i] >= target.minVal) return true;
-    }
-    return false;
-  }
-
-  function pushTop(item) {
-    if (top.length < topK) {
-      top.push(item);
-      top.sort((a, b) => a.distance - b.distance);
-      return;
-    }
-    if (item.distance >= top[top.length - 1].distance) return;
-    top[top.length - 1] = item;
-    top.sort((a, b) => a.distance - b.distance);
-  }
-
   for (let start = 0; start <= candidateMaxStart; start += stride) {
-    sampleSize += 1;
-    const hit = nextWindowHit(start);
-    if (hit) randomHits += 1;
+    sampleSize++;
 
-    let distance = 0;
-    for (let i = 0; i < patternLen; i += 1) {
-      distance += Math.abs(transformed[start + i] - currentPattern[i]);
+    // Check if hit occurred in window after this pattern
+    const lo = start + pLen;
+    const hi = lo + winSize - 1;
+    let hit = false;
+    for (let i = lo; i <= hi && i < n; i++) {
+      if (rounds[i].val >= target.minVal) { hit = true; break; }
     }
-    distance /= patternLen;
-    pushTop({ start, distance, hit });
+    if (hit) randomHits++;
+
+    // DTW-lite distance (simplified: allow ±1 warp)
+    let distance = 0;
+    for (let i = 0; i < pLen; i++) {
+      const ci = currentPattern[i];
+      const pi = transformed[start + i];
+      // Check neighbors for better alignment
+      const piPrev = i > 0 ? transformed[start + i - 1] : pi;
+      const piNext = i < pLen - 1 ? transformed[start + i + 1] : pi;
+      const bestMatch = Math.min(Math.abs(ci - pi), Math.abs(ci - piPrev), Math.abs(ci - piNext));
+      distance += bestMatch;
+    }
+    distance /= pLen;
+
+    // Maintain top-K
+    if (top.length < topK) {
+      top.push({ distance, hit });
+      top.sort((a, b) => a.distance - b.distance);
+    } else if (distance < top[top.length - 1].distance) {
+      top[top.length - 1] = { distance, hit };
+      top.sort((a, b) => a.distance - b.distance);
+    }
   }
 
-  const matchHits = top.filter((item) => item.hit).length;
+  const matchHits = top.filter(item => item.hit).length;
   const supportPct = top.length ? (matchHits / top.length) * 100 : 0;
   const randomPct = sampleSize ? (randomHits / sampleSize) * 100 : 0;
+  const lift = supportPct - randomPct;
+
   return {
+    supportPct: Number(supportPct.toFixed(1)),
+    randomPct: Number(randomPct.toFixed(1)),
+    lift: Number(lift.toFixed(1)),
+    bestDistance: top.length ? Number(top[0].distance.toFixed(4)) : null,
     ready: top.length >= 8,
-    supportPct,
-    randomPct,
-    lift: supportPct - randomPct,
-    bestDistance: top.length ? top[0].distance : null,
-    matches: top.length,
-    sampleSize,
+    reliability: clamp(sampleSize / 500, 0, 1),
   };
 }
 
-function computeRecentPatternDiagnostics(rounds, target, roundsSince, allGapsRaw, selectedStats) {
-  const recentValues = rounds.slice(-24).map((round) => round.val);
-  const shorter = rounds.slice(-12).map((round) => round.val);
-  const veryShort = rounds.slice(-6).map((round) => round.val);
 
-  const lowSoft = getLowPressureSoftThreshold(target.minVal);
-  const highTarget = target.minVal >= 100;
-  const hardWhiteRate = recentValues.length
-    ? (recentValues.filter((value) => value <= LOW_HARD_CAP).length / recentValues.length)
-    : 0;
-  const softWhiteRate = recentValues.length
-    ? (recentValues.filter((value) => value <= lowSoft).length / recentValues.length)
-    : 0;
-  const hardWhiteStreak = longestStreak(recentValues, (value) => value <= LOW_HARD_CAP);
-  const softWhiteStreak = longestStreak(recentValues, (value) => value <= lowSoft);
+// ─── Layer 7: Enhanced Regime Detector ───────────────────────────────────────
 
-  const trend24 = computeTrendPercent(recentValues);
-  const trend12 = computeTrendPercent(shorter);
-  const trend6 = computeTrendPercent(veryShort);
+function buildRegimeLayer(rounds, target) {
+  const n = rounds.length;
+  const w = CFG.regimeRecentWindow;
+  if (n < w * 2) return { label: 'RANDOM', score: 0, reliability: 0 };
 
-  const nearHitThreshold = target.minVal <= 30
-    ? Math.max(2, Math.pow(target.minVal, 0.72))
-    : target.minVal <= 100
-      ? 6
-      : target.minVal <= 200
-        ? 8
-        : target.minVal <= 500
-          ? 12
-          : 16;
-  const strongRoundThreshold = target.minVal <= 30
-    ? Math.max(2.2, Math.pow(target.minVal, 0.82))
-    : target.minVal <= 100
-      ? 10
-      : target.minVal <= 200
-        ? 14
-        : target.minVal <= 500
-          ? 20
-          : 30;
-  const nearHitRate = shorter.length
-    ? (shorter.filter((value) => value >= nearHitThreshold).length / shorter.length)
-    : 0;
-  const strongRate = shorter.length
-    ? (shorter.filter((value) => value >= strongRoundThreshold).length / shorter.length)
-    : 0;
+  const recentVals = rounds.slice(-w).map(r => r.val);
+  const prevVals = rounds.slice(-w * 2, -w).map(r => r.val);
+  if (!recentVals.length || !prevVals.length) return { label: 'RANDOM', score: 0, reliability: 0 };
 
-  const tailRebound = veryShort.filter((value) => value >= nearHitThreshold).length;
-  const recentGaps = allGapsRaw.slice(-Math.min(14, allGapsRaw.length));
-  const shortGapRate = recentGaps.length
-    ? (recentGaps.filter((gap) => gap <= Math.max(2, Math.round(selectedStats.p25 * 0.55))).length / recentGaps.length)
-    : 0;
-  const immediateGapRate = recentGaps.length
-    ? (recentGaps.filter((gap) => gap <= 2).length / recentGaps.length)
-    : 0;
+  // Jensen-Shannon divergence between recent and previous distributions
+  const bins = [1, 1.5, 2, 3, 5, 10, 25, 50, 100, 500, Infinity];
+  function histogram(vals) {
+    const counts = new Array(bins.length - 1).fill(0);
+    for (const v of vals) {
+      for (let j = 0; j < bins.length - 1; j++) {
+        if (v >= bins[j] && v < bins[j + 1]) { counts[j]++; break; }
+      }
+    }
+    const total = counts.reduce((s, x) => s + x, 0);
+    return total > 0 ? counts.map(c => c / total) : counts.map(() => 1 / counts.length);
+  }
 
-  const b2bSupportScore = clampNumber(
-    (shortGapRate * 45) +
-    (immediateGapRate * 30) +
-    (tailRebound >= 2 ? 12 : 0) +
-    (roundsSince <= 2 ? 8 : 0) +
-    (nearHitRate * 18),
+  const pRecent = histogram(recentVals);
+  const pPrev = histogram(prevVals);
+  const pMid = pRecent.map((x, i) => 0.5 * (x + pPrev[i]));
+
+  function klDiv(p, q) {
+    let s = 0;
+    for (let i = 0; i < p.length; i++) {
+      if (p[i] <= 0) continue;
+      const qSafe = q[i] <= 0 ? 1e-12 : q[i];
+      s += p[i] * Math.log(p[i] / qSafe);
+    }
+    return s;
+  }
+  const js = 0.5 * klDiv(pRecent, pMid) + 0.5 * klDiv(pPrev, pMid);
+
+  // Hit rate drift
+  const recentHitRate = recentVals.filter(v => v >= target.minVal).length / recentVals.length;
+  const prevHitRate = prevVals.filter(v => v >= target.minVal).length / prevVals.length;
+  const baseline = 1 / target.minVal;
+  const drift = Math.abs(recentHitRate - baseline);
+
+  // Lag-1 correlation
+  const recentHits = recentVals.map(v => v >= target.minVal ? 1 : 0);
+  let lagCorr = 0;
+  if (recentHits.length > 3) {
+    const x = recentHits.slice(0, -1);
+    const y = recentHits.slice(1);
+    const mx = mean(x), my = mean(y);
+    let num = 0, dx2 = 0, dy2 = 0;
+    for (let i = 0; i < x.length; i++) {
+      const dx = x[i] - mx, dy = y[i] - my;
+      num += dx * dy;
+      dx2 += dx * dx;
+      dy2 += dy * dy;
+    }
+    lagCorr = (dx2 > 0 && dy2 > 0) ? num / Math.sqrt(dx2 * dy2) : 0;
+  }
+
+  // Low-rate dominance
+  const lowRateRecent = recentVals.filter(v => v < 2).length / recentVals.length;
+  const lowRatePrev = prevVals.filter(v => v < 2).length / prevVals.length;
+
+  // Classify
+  let label = 'RANDOM';
+  if (lowRateRecent >= 0.50 && lowRateRecent > lowRatePrev + 0.1) {
+    label = 'CLUSTERED_LOW';
+  } else if (js > CFG.regimeJsThreshold * 2 && recentHitRate > prevHitRate + 0.03) {
+    label = 'TRENDING_UP';
+  } else if (js > CFG.regimeJsThreshold * 2 && recentHitRate < prevHitRate - 0.03) {
+    label = 'TRENDING_DOWN';
+  } else if (js > CFG.regimeJsThreshold && stddev(recentVals) > stddev(prevVals) * 1.3) {
+    label = 'VOLATILE';
+  } else if (Math.abs(lagCorr) > CFG.regimeLagThreshold) {
+    label = 'CLUSTERED';
+  } else if (js <= CFG.regimeJsThreshold && drift <= CFG.regimeDriftThreshold) {
+    label = 'RANDOM';
+  } else {
+    label = 'DISPERSED';
+  }
+
+  return {
+    label,
+    js: Number(js.toFixed(6)),
+    drift: Number(drift.toFixed(6)),
+    lagCorr: Number(lagCorr.toFixed(4)),
+    lowRateRecent: Number((lowRateRecent * 100).toFixed(1)),
+    hitRateDrift: Number(((recentHitRate - prevHitRate) * 100).toFixed(2)),
+    reliability: clamp(n / (w * 2), 0, 1),
+  };
+}
+
+
+// ─── Ensemble Confidence Scorer ──────────────────────────────────────────────
+
+function computeEnsembleConfidence({
+  markov,
+  km,
+  ewma,
+  b2b,
+  whitePhase,
+  pattern,
+  regime,
+  target,
+  roundsSince,
+  droughtPct,
+  calibrationRows,
+}) {
+  // Collect layer probabilities and weights
+  const layers = [];
+  const baselineP = 1 / target.minVal;
+
+  if (markov.prob !== null && markov.reliability > 0.1) {
+    layers.push({ name: 'markov', prob: markov.prob, weight: 1.5, reliability: markov.reliability });
+  }
+  if (km.pHitWindow > 0 && km.reliability > 0.1) {
+    layers.push({ name: 'km', prob: km.pHitWindow / 100, weight: 2.0, reliability: km.reliability });
+  }
+  if (pattern.ready && pattern.reliability > 0.1) {
+    const patternProb = clamp((pattern.supportPct + Math.max(0, pattern.lift)) / 200, 0, 1);
+    layers.push({ name: 'pattern', prob: patternProb, weight: 1.2, reliability: pattern.reliability });
+  }
+
+  // EWMA modifies base probability
+  let ewmaModifier = 0;
+  if (ewma.reliability > 0.1) {
+    if (ewma.crossover === 'bullish') ewmaModifier = 0.05 * ewma.signalStrength;
+    else if (ewma.crossover === 'bearish') ewmaModifier = -0.05 * ewma.signalStrength;
+  }
+
+  // B2B layer
+  if (b2b.b2bScore > 30 && b2b.reliability > 0.3) {
+    const b2bProb = clamp(baselineP * (1 + b2b.b2bScore / 100), 0, 1);
+    layers.push({ name: 'b2b', prob: b2bProb, weight: 1.3 * (b2b.b2bScore / 100), reliability: b2b.reliability });
+  }
+
+  if (layers.length < 1) {
+    return { confidence: 0, rawConfidence: 0, ensembleP: baselineP, predMethod: 'baseline', layerBreakdown: [] };
+  }
+
+  // Inverse-error weighted blend
+  let wSum = 0, pSum = 0;
+  const layerBreakdown = [];
+  for (const layer of layers) {
+    const error = Math.abs(layer.prob - baselineP);
+    const invErr = 1 / Math.max(0.001, error + 0.01);
+    const w = layer.weight * layer.reliability * invErr;
+    wSum += w;
+    pSum += w * layer.prob;
+    layerBreakdown.push({
+      name: layer.name,
+      prob: Number((layer.prob * 100).toFixed(1)),
+      weight: Number(w.toFixed(3)),
+      reliability: Number(layer.reliability.toFixed(2)),
+    });
+  }
+
+  let ensembleP = wSum > 0 ? pSum / wSum : baselineP;
+  ensembleP = clamp(ensembleP + ewmaModifier, 0, 1);
+
+  // Drought pressure bonus (overdue targets get gentle lift)
+  if (droughtPct > 75) {
+    const droughtBoost = clamp((droughtPct - 75) / 100 * 0.08, 0, 0.08);
+    ensembleP = clamp(ensembleP + droughtBoost, 0, 1);
+  }
+
+  // Edge over baseline
+  const edge = ensembleP - baselineP;
+  const edgeScore = clamp(edge / Math.max(0.01, baselineP), -1, 3);
+
+  // EV
+  const ev = ensembleP * target.minVal - 1;
+
+  // Raw confidence: 0-100 scale
+  let rawConfidence = clamp(
+    (edgeScore * 25) +
+    (clamp(ensembleP * 100, 0, 100) * 0.3) +
+    (km.pHitWindow * 0.25) +
+    (clamp(pattern.lift, -10, 20) * 0.4) +
+    (b2b.b2bScore * 0.1) +
+    (ev > 0 ? 10 : 0),
     0,
     100
   );
 
-  const preWhiteCluster = highTarget
-    ? (
-      softWhiteRate >= 0.66 &&
-      hardWhiteRate >= 0.28 &&
-      trend12 < -5 &&
-      trend6 <= -1
-    )
-    : (
-      softWhiteRate >= 0.58 &&
-      hardWhiteRate >= 0.22 &&
-      trend12 < -4 &&
-      trend6 <= 0
-    );
+  // Regime adjustments
+  if (regime.label === 'TRENDING_UP') rawConfidence += 5;
+  if (regime.label === 'TRENDING_DOWN') rawConfidence -= 8;
+  if (regime.label === 'CLUSTERED_LOW') rawConfidence -= 12;
+  if (regime.label === 'VOLATILE') rawConfidence -= 4;
+  if (regime.label === 'RANDOM') rawConfidence -= 3;
 
-  const whiteCluster = highTarget
-    ? (
-      hardWhiteRate >= 0.52 ||
-      (softWhiteRate >= 0.82 && trend24 < -5) ||
-      hardWhiteStreak >= 6 ||
-      softWhiteStreak >= 10
-    )
-    : (
-      hardWhiteRate >= 0.40 ||
-      (softWhiteRate >= 0.72 && trend24 < -3) ||
-      hardWhiteStreak >= 4 ||
-      softWhiteStreak >= 7
-    );
+  // White phase hard blocks
+  const wp = whitePhase.phase;
+  if (wp === 'WHITE_ACTIVE') rawConfidence = Math.min(rawConfidence, CFG.whiteActiveConfidenceCap);
+  else if (wp === 'PRE_WHITE') rawConfidence = Math.min(rawConfidence, CFG.preWhiteConfidenceCap);
+  else if (wp === 'WHITE_ENDING') rawConfidence += CFG.whiteEndingBoost;
 
-  const whiteEndingSignal = (
-    whiteCluster &&
-    tailRebound >= 2 &&
-    trend6 > 4 &&
-    strongRate >= 0.16
-  );
+  // B2B floor
+  if (b2b.b2bScore >= CFG.b2bScoreThreshold && wp === 'NORMAL') {
+    rawConfidence = Math.max(rawConfidence, CFG.b2bConfidenceFloor);
+  }
 
-  const downtrend = highTarget
-    ? (
-      trend24 < -8 &&
-      trend12 < -5 &&
-      nearHitRate < 0.14 &&
-      softWhiteRate > 0.58
-    )
-    : (
-      trend24 < -7 &&
-      trend12 < -4 &&
-      nearHitRate < 18 &&
-      softWhiteRate > 0.5
-    );
+  // Too-early penalty
+  if (roundsSince < 2 && target.minVal >= 50) rawConfidence -= 5;
 
-  const upshift = highTarget
-    ? (
-      trend12 > 3 &&
-      nearHitRate >= 0.14 &&
-      strongRate >= 0.10
-    )
-    : (
-      trend12 > 4 &&
-      nearHitRate >= 24 &&
-      strongRate >= 14
-    );
+  rawConfidence = clamp(rawConfidence, 0, 100);
 
-  const randomLike = (
-    Math.abs(trend24) < 1.4 &&
-    Math.abs(trend12) < 1.2 &&
-    Math.abs(nearHitRate - strongRate) < 0.06 &&
-    shortGapRate < 0.12
-  );
+  // Calibration against historical accuracy
+  let confidence = rawConfidence;
+  const resolved = (calibrationRows || []).filter(r => r.outcome === 'win' || r.outcome === 'loss');
+  if (resolved.length >= 24) {
+    const globalWinRate = resolved.filter(r => r.outcome === 'win').length / resolved.length * 100;
+    confidence = Math.round(rawConfidence * 0.62 + globalWinRate * 0.38);
+  }
+  confidence = clamp(Math.round(confidence), 0, 100);
+
+  // Determine best prediction method
+  let predMethod = 'ensemble';
+  if (layers.length === 1) predMethod = layers[0].name;
+  else {
+    const topLayer = layerBreakdown.reduce((best, l) => l.weight > best.weight ? l : best, layerBreakdown[0]);
+    predMethod = `ensemble_${topLayer.name}_lead`;
+  }
 
   return {
-    lowSoftThreshold: Number(lowSoft.toFixed(2)),
-    hardWhiteRate: Number((hardWhiteRate * 100).toFixed(1)),
-    softWhiteRate: Number((softWhiteRate * 100).toFixed(1)),
-    hardWhiteStreak,
-    softWhiteStreak,
-    trend24: Number(trend24.toFixed(2)),
-    trend12: Number(trend12.toFixed(2)),
-    trend6: Number(trend6.toFixed(2)),
-    nearHitThreshold: Number(nearHitThreshold.toFixed(2)),
-    strongRoundThreshold: Number(strongRoundThreshold.toFixed(2)),
-    nearHitRate: Number((nearHitRate * 100).toFixed(1)),
-    strongRate: Number((strongRate * 100).toFixed(1)),
-    shortGapRate: Number((shortGapRate * 100).toFixed(1)),
-    immediateGapRate: Number((immediateGapRate * 100).toFixed(1)),
-    b2bSupportScore: Number(b2bSupportScore.toFixed(1)),
-    preWhiteCluster,
-    whiteCluster,
-    whiteEndingSignal,
-    downtrend,
-    upshift,
-    randomLike,
+    confidence,
+    rawConfidence: Number(rawConfidence.toFixed(1)),
+    ensembleP: Number(ensembleP.toFixed(6)),
+    baselineP: Number(baselineP.toFixed(6)),
+    edge: Number(edge.toFixed(6)),
+    ev: Number(ev.toFixed(4)),
+    predMethod,
+    layerBreakdown,
   };
 }
 
-function calibrateConfidence(rawConfidence, calibrationRows = []) {
-  const rows = (calibrationRows || []).filter((row) => row && (row.outcome === 'win' || row.outcome === 'loss' || row.outcome === 'early'));
-  const resolved = rows.filter((row) => row.outcome === 'win' || row.outcome === 'loss');
-  if (resolved.length < MIN_GLOBAL_CALIBRATION) {
-    const b = Math.floor(rawConfidence / 10) * 10;
-    return {
-      confidence: Math.round(rawConfidence),
-      bucketLabel: `${b}-${b + 9}`,
-      support: resolved.length,
-      mode: 'raw',
-    };
-  }
 
-  const globalWinRate = (resolved.filter((row) => row.outcome === 'win').length / resolved.length) * 100;
-  const bucketStart = Math.floor(clampNumber(rawConfidence, 0, 99.9) / 10) * 10;
-  const bucketRows = resolved.filter((row) => {
-    const p = Number(row.probW);
-    if (!Number.isFinite(p)) return false;
-    const pct = clampNumber(p * 100, 0, 100);
-    const b = Math.floor(Math.min(99.9, pct) / 10) * 10;
-    return b === bucketStart;
-  });
-
-  let empirical = globalWinRate;
-  let support = resolved.length;
-  let mode = 'global';
-  if (bucketRows.length >= MIN_BUCKET_CALIBRATION) {
-    empirical = (bucketRows.filter((row) => row.outcome === 'win').length / bucketRows.length) * 100;
-    support = bucketRows.length;
-    mode = 'bucket';
-  }
-
-  const mixed = (rawConfidence * 0.62) + (empirical * 0.38);
-  return {
-    confidence: Math.round(clampNumber(mixed, 3, 96)),
-    bucketLabel: `${bucketStart}-${bucketStart + 9}`,
-    support,
-    mode,
-  };
-}
-
-function getIssueThreshold(minVal) {
-  if (minVal >= 1000) return 48;
-  if (minVal >= 500) return 46;
-  if (minVal >= 200) return 44;
-  if (minVal >= 100) return 42;
-  if (minVal >= 50) return 43;
-  if (minVal >= 30) return 44;
-  if (minVal >= 15) return 41;
-  if (minVal >= 10) return 40;
-  return 37;
-}
+// ─── Main Forecast Function ──────────────────────────────────────────────────
 
 function computeOracleForecast(rounds, target, options = {}) {
   const cleanRounds = Array.isArray(rounds) && rounds.length && rounds[0]?.id
     ? rounds
     : normalizeRounds(rounds);
 
-  const {
-    label, minVal, color, scanN, window: winSize, minHits,
-  } = target;
+  const { label, minVal, color, window: winSize, minHits } = target;
   if (!cleanRounds.length) return null;
 
   const nowId = cleanRounds[cleanRounds.length - 1].id;
-  const hits = cleanRounds.filter((round) => round.val >= minVal);
-  if (hits.length < (minHits + 1)) {
+  const hits = cleanRounds.filter(r => r.val >= minVal);
+
+  if (hits.length < minHits + 1) {
     return {
       ...target,
       noData: true,
@@ -657,106 +861,139 @@ function computeOracleForecast(rounds, target, options = {}) {
       issuePrediction: false,
       activePrediction: false,
       issueMode: 'observe',
-      regimeMode: 'full',
-      avoidReason: 'weak_probability',
-      lockDriftAlert: false,
-      lockDriftReason: null,
+      avoidReason: 'insufficient_data',
+      whitePhase: 'NORMAL',
+      b2bScore: 0,
+      regimeLabel: 'RANDOM',
+      layerBreakdown: [],
+      engineVersion: 'oracle_v3',
     };
   }
 
+  // Build gap series
   const allGapsRaw = [];
-  for (let i = 1; i < hits.length; i += 1) {
+  for (let i = 1; i < hits.length; i++) {
     allGapsRaw.push(hits[i].id - hits[i - 1].id);
   }
-  if (allGapsRaw.length < MIN_FORECAST_GAPS) {
+
+  if (allGapsRaw.length < 10) {
     return {
       ...target,
       noData: true,
       nowId,
       hits: hits.length,
-      reason: `Need at least ${MIN_FORECAST_GAPS} gaps`,
+      reason: `Need at least 10 gaps (have ${allGapsRaw.length})`,
       lastHit: hits[hits.length - 1],
-      predictedRound: 0,
-      windowLo: 0,
-      windowHi: 0,
-      roundsUntilWindowLo: 0,
-      roundsUntilWindowHi: 0,
-      inWindow: false,
-      confidence: 0,
-      liveConfidence: 0,
-      issuePrediction: false,
-      activePrediction: false,
-      issueMode: 'observe',
-      regimeMode: 'full',
-      avoidReason: 'weak_probability',
-      lockDriftAlert: false,
-      lockDriftReason: null,
+      predictedRound: 0, windowLo: 0, windowHi: 0,
+      roundsUntilWindowLo: 0, roundsUntilWindowHi: 0,
+      inWindow: false, confidence: 0, liveConfidence: 0,
+      issuePrediction: false, activePrediction: false,
+      issueMode: 'observe', avoidReason: 'insufficient_gaps',
+      whitePhase: 'NORMAL', b2bScore: 0, regimeLabel: 'RANDOM',
+      layerBreakdown: [], engineVersion: 'oracle_v3',
     };
   }
 
-  const allGapsSorted = allGapsRaw.slice().sort((a, b) => a - b);
-  const recentN = Math.min(allGapsRaw.length, Math.max(scanN, 24));
-  const recentSorted = allGapsRaw.slice(-recentN).sort((a, b) => a - b);
-  const regimeMode = computeRegimeMode(allGapsSorted, recentSorted, cleanRounds, target);
-  const selectedSorted = regimeMode === 'recent' ? recentSorted : allGapsSorted;
-  const selectedStats = buildRobustStats(selectedSorted);
   const lastHit = hits[hits.length - 1];
   const roundsSince = nowId - lastHit.id;
-  const droughtPct = Math.round((selectedSorted.filter((gap) => gap <= roundsSince).length / selectedSorted.length) * 100);
-  const isTooEarly = roundsSince < selectedStats.p10;
-  const isOverdue = roundsSince > selectedStats.med;
-  const isHardGap = roundsSince > selectedStats.p90;
-  const isExtreme = roundsSince > selectedStats.p99;
-  const survivors = selectedSorted.filter((gap) => gap > roundsSince);
-  const openWindow = survivors.length === 0;
+  const allGapsSorted = sortedCopy(allGapsRaw);
+  const recentN = Math.min(allGapsRaw.length, Math.max(target.scanN, 24));
+  const recentGaps = allGapsRaw.slice(-recentN);
 
-  const clusters = buildHistogramClusters(selectedStats.trimmed.length ? selectedStats.trimmed : selectedSorted);
-  const primaryCluster = clusters.primary;
-  const secondaryCluster = clusters.secondary;
+  // Gap statistics
+  const gapStats = {
+    min: allGapsSorted[0],
+    max: allGapsSorted[allGapsSorted.length - 1],
+    med: Math.round(quantile(allGapsSorted, 50)),
+    p10: Math.round(quantile(allGapsSorted, 10)),
+    p25: Math.round(quantile(allGapsSorted, 25)),
+    p75: Math.round(quantile(allGapsSorted, 75)),
+    p90: Math.round(quantile(allGapsSorted, 90)),
+    p99: Math.round(quantile(allGapsSorted, 99)),
+    avg: Math.round(mean(allGapsSorted)),
+    iqr: Math.max(1, Math.round(quantile(allGapsSorted, 75) - quantile(allGapsSorted, 25))),
+  };
 
-  const recentPattern = computeRecentPatternDiagnostics(cleanRounds, target, roundsSince, allGapsRaw, selectedStats);
-  const patternSupport = computePatternSupport(cleanRounds, target, winSize);
+  const droughtPct = Math.round(allGapsSorted.filter(g => g <= roundsSince).length / allGapsSorted.length * 100);
+  const isTooEarly = roundsSince < gapStats.p10;
+  const isOverdue = roundsSince > gapStats.med;
+  const isHardGap = roundsSince > gapStats.p90;
 
-  let predictedGap = null;
-  let predMethod = 'cluster';
-  if (!openWindow && primaryCluster && !isOverdue) {
-    predictedGap = Math.max(roundsSince + 1, primaryCluster.center);
-    predMethod = 'cluster';
-  } else if (!openWindow) {
-    predictedGap = computeConditionalExpectedGap(survivors, roundsSince);
-    predMethod = 'survivor_expectation';
-  } else {
-    const tail = selectedSorted.slice(Math.max(0, Math.floor(selectedSorted.length * 0.85)));
-    const tailDiffs = [];
-    for (let i = 1; i < tail.length; i += 1) {
-      tailDiffs.push(tail[i] - tail[i - 1]);
+  // ── Run all 7 layers ──
+
+  // Layer 7 first (regime affects other layers)
+  const regime = buildRegimeLayer(cleanRounds, target);
+
+  // Layer 1: Markov
+  const markov = buildMarkovLayer(cleanRounds, target);
+
+  // Layer 2: KM
+  const km = buildKMLayer(allGapsRaw, recentGaps, roundsSince, winSize, regime.label);
+
+  // Layer 3: EWMA
+  const ewma = buildEWMALayer(cleanRounds, target);
+
+  // Layer 4: B2B
+  const b2b = buildB2BLayer(allGapsRaw, cleanRounds, target, roundsSince);
+
+  // Layer 5: White Phase
+  const whitePhase = computeWhitePhase(cleanRounds, target);
+
+  // Layer 6: Pattern
+  const pattern = buildPatternLayer(cleanRounds, target, winSize);
+
+  // ── Ensemble ──
+  const ensemble = computeEnsembleConfidence({
+    markov, km, ewma, b2b,
+    whitePhase,
+    pattern,
+    regime,
+    target,
+    roundsSince,
+    droughtPct,
+    calibrationRows: options.calibrationRows || [],
+  });
+
+  // ── Predict gap and window ──
+  let predictedGap;
+  let gapMethod = ensemble.predMethod;
+
+  // Use KM survival median as base prediction
+  if (km.table && km.table.length > roundsSince + 1) {
+    // Find the gap at which survival drops to 50% conditional on current drought
+    const sNow = km.table[Math.min(roundsSince, km.table.length - 1)];
+    let medianGap = gapStats.med;
+    if (sNow > 0) {
+      for (let g = roundsSince + 1; g < km.table.length; g++) {
+        if (km.table[g] / sNow <= 0.5) { medianGap = g; break; }
+      }
     }
-    const tailStep = clampNumber(Math.round(mean(tailDiffs) || selectedStats.iqr || 1), 1, Math.max(1, selectedStats.iqr * 2));
-    predictedGap = Math.max(roundsSince + 1, selectedStats.max + tailStep);
-    predMethod = 'tail_extrapolation';
+    predictedGap = Math.max(roundsSince + 1, medianGap);
+  } else {
+    predictedGap = Math.max(roundsSince + 1, gapStats.med);
   }
 
-  if (recentPattern.b2bSupportScore >= 62 && roundsSince <= 2 && minVal <= 50) {
-    predictedGap = Math.max(roundsSince + 1, Math.min(predictedGap, roundsSince + Math.max(1, Math.round(selectedStats.p25 * 0.5))));
-    predMethod = 'b2b_support';
+  // B2B override: if strong b2b signal, pull prediction closer
+  if (b2b.b2bScore >= 60 && roundsSince <= 3 && minVal <= 50) {
+    predictedGap = Math.max(roundsSince + 1, Math.min(predictedGap, roundsSince + Math.max(1, Math.round(gapStats.p25 * 0.5))));
+    gapMethod = 'b2b_pull';
   }
 
-  if (
-    minVal >= 100 &&
-    (recentPattern.upshift || recentPattern.whiteEndingSignal || recentPattern.b2bSupportScore >= 58) &&
-    predictedGap > selectedStats.p25
-  ) {
-    const transitionGap = Math.round((selectedStats.p25 * 0.65) + (selectedStats.med * 0.35));
-    predictedGap = Math.max(roundsSince + 1, Math.min(predictedGap, transitionGap));
-    predMethod = 'high_target_transition';
+  // White cluster override: push prediction further out
+  if (whitePhase.phase === 'WHITE_ACTIVE' && predictedGap < gapStats.p75) {
+    predictedGap = Math.max(predictedGap, gapStats.p75);
+    gapMethod = 'white_delay';
   }
 
-  if (recentPattern.whiteCluster && !recentPattern.whiteEndingSignal && predictedGap < selectedStats.p25) {
-    predictedGap = selectedStats.p25;
-    predMethod = 'white_safety';
+  // White ending override: pull prediction closer
+  if (whitePhase.phase === 'WHITE_ENDING' && predictedGap > gapStats.p25) {
+    predictedGap = Math.max(roundsSince + 1, Math.round((gapStats.p25 * 0.6 + gapStats.med * 0.4)));
+    gapMethod = 'white_recovery';
   }
 
-  predictedGap = Math.max(roundsSince + 1, Math.round(predictedGap || selectedStats.med || roundsSince + 1));
+  predictedGap = Math.max(roundsSince + 1, Math.round(predictedGap));
+
+  // Window positioning
   const halfWin = Math.floor(winSize / 2);
   const windowLoGap = Math.max(1, predictedGap - halfWin);
   const windowHiGap = windowLoGap + winSize - 1;
@@ -765,244 +1002,164 @@ function computeOracleForecast(rounds, target, options = {}) {
   let windowLo = lastHit.id + windowLoGap;
   let windowHi = lastHit.id + windowHiGap;
 
+  // If window has already passed, shift forward
   if (windowHi <= nowId) {
-    const drift = (nowId - windowHi) + 1;
+    const drift = nowId - windowHi + 1;
     windowLo += drift;
     windowHi += drift;
-    predictedRound = clampNumber(predictedRound + drift, windowLo, windowHi);
+    predictedRound = clamp(predictedRound + drift, windowLo, windowHi);
   }
 
   const roundsUntilWindowLo = Math.max(0, windowLo - nowId);
   const roundsUntilWindowHi = Math.max(0, windowHi - nowId);
   const inWindow = nowId >= windowLo && nowId <= windowHi;
-  const nearWindowRounds = Math.max(0, roundsUntilWindowLo - Math.min(10, Math.round(winSize * 0.6)));
 
-  const kmReliable = selectedSorted.length >= MIN_KM_GAPS;
-  const kmTable = kmReliable ? buildKMTable(selectedSorted) : null;
-  const pHit1 = kmReliable ? kmProb(kmTable, roundsSince, 1) : 0;
-  const pHit5 = kmReliable ? kmProb(kmTable, roundsSince, 5) : 0;
-  const pHit10 = kmReliable ? kmProb(kmTable, roundsSince, 10) : 0;
-  const pHit20 = kmReliable ? kmProb(kmTable, roundsSince, 20) : 0;
-  const pHitWindow = kmReliable
-    ? clampNumber(
-      kmProb(kmTable, roundsSince, roundsUntilWindowHi) - kmProb(kmTable, roundsSince, roundsUntilWindowLo),
-      0,
-      100
-    )
-    : clampNumber(
-      (selectedSorted.filter((gap) => gap >= (roundsSince + roundsUntilWindowLo) && gap <= (roundsSince + roundsUntilWindowHi)).length / selectedSorted.length) * 100,
-      0,
-      100
-    );
-
-  const pHitNearWindow = kmReliable
-    ? kmProb(kmTable, roundsSince, Math.max(1, roundsUntilWindowHi + Math.round(winSize * 0.35)))
-    : clampNumber(
-      (selectedSorted.filter((gap) => gap >= (roundsSince + Math.max(1, roundsUntilWindowLo - Math.round(winSize * 0.5))) && gap <= (roundsSince + roundsUntilWindowHi + Math.round(winSize * 0.35))).length / selectedSorted.length) * 100,
-      0,
-      100
-    );
-
-  const scoredWindowLoGap = Math.max(1, windowLo - lastHit.id);
-  const scoredWindowHiGap = Math.max(scoredWindowLoGap, windowHi - lastHit.id);
-  const hitsInWindow = selectedSorted.filter((gap) => gap >= scoredWindowLoGap && gap <= scoredWindowHiGap).length;
-  const empiricalWindowHitRate = (hitsInWindow / selectedSorted.length) * 100;
-
-  const chanceSource = regimeMode === 'recent'
-    ? trimSorted(tukeyFilterSorted(recentSorted), recentSorted.length >= 12 ? 0.1 : 0)
-    : selectedSorted;
-  const chance = computeChanceWindowRate(chanceSource, winSize);
-  const chanceWindowRate = chance.rate;
-  const predictiveLift = empiricalWindowHitRate - chanceWindowRate;
-  const standardizedLift = chance.std > 0.0001 ? predictiveLift / chance.std : 0;
-
-  const randomLiftWeak = patternSupport.ready
-    ? (patternSupport.lift < 1.2 && predictiveLift < 0.8)
-    : predictiveLift < -0.2;
-
-  let rawConfidence = (
-    (pHitWindow * 0.56) +
-    (pHit10 * 0.18) +
-    (empiricalWindowHitRate * 0.16) +
-    (clampNumber(patternSupport.lift, -15, 20) * 0.5) +
-    (clampNumber(standardizedLift * 4, -12, 16))
-  );
-
-  if (recentPattern.b2bSupportScore >= 58) rawConfidence += 6;
-  if (recentPattern.upshift) rawConfidence += 6;
-  if (recentPattern.whiteEndingSignal) rawConfidence += 8;
-  if (recentPattern.preWhiteCluster) rawConfidence -= 12;
-  if (recentPattern.whiteCluster && !recentPattern.whiteEndingSignal) rawConfidence -= 19;
-  if (recentPattern.downtrend) rawConfidence -= 11;
-  if (recentPattern.randomLike || randomLiftWeak) rawConfidence -= 8;
-  if (!kmReliable && minVal >= 100) rawConfidence -= 4;
-  if (isTooEarly) rawConfidence -= 6;
-  if (openWindow) rawConfidence -= 5;
-
-  rawConfidence = clampNumber(rawConfidence, 0, 100);
-  const calibration = calibrateConfidence(rawConfidence, options.calibrationRows || []);
-  const confidence = calibration.confidence;
-
+  // ── Issue decision ──
+  const confidence = ensemble.confidence;
   const threshold = getIssueThreshold(minVal);
-  const highTargetMomentum = minVal >= 100 && recentPattern.nearHitRate >= 14 && recentPattern.trend6 > 2;
-  const strongTransition = recentPattern.whiteEndingSignal || recentPattern.upshift || highTargetMomentum || (recentPattern.b2bSupportScore >= 65);
-  const strongEdge = (pHitWindow >= (threshold - 6)) || (predictiveLift >= 3.5) || (patternSupport.ready && patternSupport.lift >= 4);
 
-  const whiteEscapeScore = minVal >= 100 ? 56 : 68;
-  const hardWhiteBlock = (
-    recentPattern.whiteCluster &&
-    !recentPattern.whiteEndingSignal &&
-    !recentPattern.upshift &&
-    recentPattern.b2bSupportScore < whiteEscapeScore
-  );
-  const hardDowntrendBlock = (
-    recentPattern.downtrend &&
-    !strongTransition &&
-    recentPattern.b2bSupportScore < 60
-  );
-  const randomHardBlock = randomLiftWeak && !strongTransition && pHitWindow < 26;
-  const kmHardBlock = (
-    !kmReliable &&
-    minVal >= 500 &&
-    !strongTransition &&
-    pHitWindow < 18 &&
-    predictiveLift < 0
-  );
-  const hardBlock = hardWhiteBlock || hardDowntrendBlock || randomHardBlock || kmHardBlock;
+  // Hard blocks
+  const whiteBlock = whitePhase.phase === 'WHITE_ACTIVE';
+  const preWhiteBlock = whitePhase.phase === 'PRE_WHITE' && confidence < threshold - 5;
+  const downtrendBlock = regime.label === 'TRENDING_DOWN' && confidence < threshold;
+  const randomBlock = regime.label === 'RANDOM' && confidence < threshold - 3 && !b2b.immediateB2B;
+  const hardBlock = whiteBlock || preWhiteBlock || downtrendBlock || randomBlock;
+
+  // Strong transition signals that override blocks
+  const strongB2B = b2b.b2bScore >= CFG.b2bScoreThreshold;
+  const strongWhiteRecovery = whitePhase.phase === 'WHITE_ENDING';
+  const strongTransition = strongB2B || strongWhiteRecovery;
+
+  const issuePrediction = !hardBlock && confidence >= threshold ||
+    (strongTransition && confidence >= threshold - 8 && !whiteBlock);
 
   let avoidReason = null;
-  if (hardWhiteBlock) avoidReason = recentPattern.preWhiteCluster ? 'pre_white_cluster' : 'white_cluster';
-  else if (hardDowntrendBlock) avoidReason = 'downtrend';
-  else if (randomHardBlock) avoidReason = 'random_like';
-  else if (kmHardBlock) avoidReason = 'weak_probability';
-  else if (isTooEarly && confidence < threshold) avoidReason = 'too_early';
-  else if (confidence < threshold) avoidReason = 'weak_probability';
+  if (!issuePrediction) {
+    if (whiteBlock) avoidReason = 'white_cluster';
+    else if (preWhiteBlock) avoidReason = 'pre_white_cluster';
+    else if (downtrendBlock) avoidReason = 'downtrend';
+    else if (randomBlock) avoidReason = 'random_like';
+    else if (isTooEarly) avoidReason = 'too_early';
+    else avoidReason = 'weak_probability';
+  }
 
-  const issuePrediction = !hardBlock && (
-    confidence >= threshold ||
-    (strongTransition && confidence >= (threshold - 7) && strongEdge)
-  );
+  let issueMode = 'observe';
+  if (issuePrediction) {
+    if (strongB2B && roundsSince <= 3) issueMode = 'b2b_support';
+    else if (strongWhiteRecovery) issueMode = 'white_rebound';
+    else if (pattern.ready && pattern.lift >= 4) issueMode = 'pattern_support';
+    else if (regime.label === 'TRENDING_UP') issueMode = 'trend_support';
+    else issueMode = 'strict';
+  }
 
-  const issueMode = issuePrediction
-    ? (
-      recentPattern.b2bSupportScore >= 66 && roundsSince <= 2 ? 'b2b_support'
-        : recentPattern.whiteEndingSignal ? 'white_rebound'
-          : patternSupport.ready && patternSupport.lift >= 4 ? 'pattern_support'
-            : strongTransition ? 'transition_support'
-              : 'strict'
-    )
-    : 'observe';
-
-  const windowReadyThreshold = Math.max(1, Math.round(winSize * 0.75));
-  const windowReady = roundsUntilWindowLo <= windowReadyThreshold;
-  const chaseRaw = Math.round(clampNumber(
-    confidence +
-    (issuePrediction ? 14 : -6) +
-    (inWindow ? 10 : 0) +
-    (strongTransition ? 6 : 0) -
-    (hardWhiteBlock ? 14 : 0) -
-    (hardDowntrendBlock ? 10 : 0),
-    0,
-    100
-  ));
+  // Chase signal
   const chaseSignal = issuePrediction ? 'CHASE' : 'SKIP';
   const chaseColor = issuePrediction ? '#39ff8a' : '#ff5555';
-
-  const predBasis = `${predMethod} (${regimeMode}, ${selectedSorted.length} gaps)` +
-    (patternSupport.ready ? ` + pattern lift ${patternSupport.lift.toFixed(1)}%` : '');
-
-  const reliabilityFlags = [];
-  if (selectedSorted.length < MIN_FORECAST_GAPS) reliabilityFlags.push('low_data');
-  if (!kmReliable) reliabilityFlags.push('km_unreliable');
-  if (regimeMode === 'recent') reliabilityFlags.push('regime_shift');
-  if (recentPattern.preWhiteCluster) reliabilityFlags.push('pre_white_cluster');
-  if (recentPattern.whiteCluster) reliabilityFlags.push('white_cluster');
-  if (recentPattern.downtrend) reliabilityFlags.push('downtrend');
-  if (randomLiftWeak || recentPattern.randomLike) reliabilityFlags.push('random_like');
-  if (!patternSupport.ready) reliabilityFlags.push('pattern_low_sample');
 
   return {
     ...target,
     noData: false,
     nowId,
     hits: hits.length,
-    n: selectedSorted.length,
+    n: allGapsSorted.length,
     lastHit,
     roundsSince,
     allGapsRaw,
     allGapsSorted,
-    recentSorted,
-    med: selectedStats.med,
-    p10: selectedStats.p10,
-    p25: selectedStats.p25,
-    p75: selectedStats.p75,
-    p90: selectedStats.p90,
-    p99: selectedStats.p99,
-    minGap: selectedStats.min,
-    maxGap: selectedStats.max,
-    avgGap: selectedStats.avg,
-    iqr: selectedStats.iqr,
-    clusterCenter: primaryCluster?.center ?? selectedStats.med,
-    secondaryClusterCenter: secondaryCluster?.center ?? null,
-    predBasis,
-    predMethod,
+
+    // Gap stats
+    med: gapStats.med,
+    p10: gapStats.p10,
+    p25: gapStats.p25,
+    p75: gapStats.p75,
+    p90: gapStats.p90,
+    p99: gapStats.p99,
+    minGap: gapStats.min,
+    maxGap: gapStats.max,
+    avgGap: gapStats.avg,
+    iqr: gapStats.iqr,
+
+    // Prediction
+    predMethod: gapMethod,
+    predBasis: `${gapMethod} (${regime.label}, ${allGapsSorted.length} gaps)`,
     predictedGap,
     predictedRound,
     windowLo,
     windowHi,
     windowSize: winSize,
-    openWindow,
+
+    // Status flags
     isTooEarly,
     isOverdue,
     isHardGap,
-    isExtreme,
     droughtPct,
+
+    // Confluence
     confidence,
-    rawConfidence: Number(rawConfidence.toFixed(1)),
-    calibrationBucket: calibration.bucketLabel,
-    calibrationSupport: calibration.support,
-    calibrationMode: calibration.mode,
-    chaseRaw,
-    chaseSignal,
-    chaseColor,
-    issuePrediction,
-    issueMode,
-    avoidReason,
-    riskOverride: !issuePrediction,
-    softDowntrendBlock: hardDowntrendBlock,
-    softWhiteBlock: hardWhiteBlock,
-    windowReady,
-    windowReadyThreshold,
-    pHit1: Number(pHit1.toFixed(1)),
-    pHit5: Number(pHit5.toFixed(1)),
-    pHit10: Number(pHit10.toFixed(1)),
-    pHit20: Number(pHit20.toFixed(1)),
-    pHitWindow: Number(pHitWindow.toFixed(1)),
-    pHitNearWindow: Number(pHitNearWindow.toFixed(1)),
-    probReliable: kmReliable,
-    nearWindowRounds,
-    empiricalWindowHitRate: Number(empiricalWindowHitRate.toFixed(1)),
-    chanceWindowRate: Number(chanceWindowRate.toFixed(1)),
-    predictiveLift: Number(predictiveLift.toFixed(1)),
-    standardizedLift: Number(standardizedLift.toFixed(2)),
+    rawConfidence: ensemble.rawConfidence,
+    ensembleP: ensemble.ensembleP,
+    baselineP: ensemble.baselineP,
+    ensembleEdge: ensemble.edge,
+    ensembleEV: ensemble.ev,
+
+    // Window
     roundsUntilWindowLo,
     roundsUntilWindowHi,
     inWindow,
-    kmReliable,
-    reliabilityFlags,
-    recentPattern: {
-      ...recentPattern,
-      patternSupportPct: Number(patternSupport.supportPct.toFixed(1)),
-      patternRandomPct: Number(patternSupport.randomPct.toFixed(1)),
-      patternLift: Number(patternSupport.lift.toFixed(1)),
-      patternMatches: patternSupport.matches,
-      patternSampleSize: patternSupport.sampleSize,
-      patternReady: patternSupport.ready,
-      bestPatternDistance: patternSupport.bestDistance != null ? Number(patternSupport.bestDistance.toFixed(4)) : null,
+
+    // Issue
+    issuePrediction,
+    activePrediction: false,
+    issueMode,
+    avoidReason,
+    chaseSignal,
+    chaseColor,
+
+    // KM probabilities
+    pHit1: Number((km.pHit1 || 0).toFixed(1)),
+    pHit5: Number((km.pHit5 || 0).toFixed(1)),
+    pHitWindow: Number((km.pHitWindow || 0).toFixed(1)),
+    kmReliable: km.reliability > 0.3,
+
+    // Layer signals (new — exposed to frontend)
+    whitePhase: whitePhase.phase,
+    whiteSignals: whitePhase.signals,
+    b2bScore: b2b.b2bScore,
+    b2bDetails: {
+      gapAcceleration: b2b.gapAcceleration,
+      hitRateSurge: b2b.hitRateSurge,
+      immediateB2B: b2b.immediateB2B,
     },
-    regimeMode,
+    regimeLabel: regime.label,
+    regimeDetails: {
+      js: regime.js,
+      drift: regime.drift,
+      lagCorr: regime.lagCorr,
+      lowRateRecent: regime.lowRateRecent,
+      hitRateDrift: regime.hitRateDrift,
+    },
+    ewmaSignal: {
+      crossover: ewma.crossover,
+      signalStrength: ewma.signalStrength,
+      shortEwma: ewma.shortEwma,
+      longEwma: ewma.longEwma,
+    },
+    markovProb: markov.prob !== null ? Number((markov.prob * 100).toFixed(1)) : null,
+    patternSupport: {
+      supportPct: pattern.supportPct,
+      lift: pattern.lift,
+      bestDistance: pattern.bestDistance,
+      ready: pattern.ready,
+    },
+    layerBreakdown: ensemble.layerBreakdown,
+
+    // Engine version
+    engineVersion: 'oracle_v3',
   };
 }
+
+
+// ─── Lock Builder ────────────────────────────────────────────────────────────
 
 function makeOracleLock(forecast, nowId) {
   return {
@@ -1020,15 +1177,19 @@ function makeOracleLock(forecast, nowId) {
     predMethod: forecast.predMethod,
     med: forecast.med,
     iqr: forecast.iqr,
-    clusterCenter: forecast.clusterCenter,
+    clusterCenter: forecast.med,
     droughtAtSnap: forecast.droughtPct,
     signal: forecast.chaseSignal,
     issueMode: forecast.issueMode || null,
-    regimeMode: forecast.regimeMode || null,
+    regimeMode: forecast.regimeLabel || null,
     issuePrediction: Boolean(forecast.issuePrediction),
     avoidReason: forecast.avoidReason || null,
+    generation: 1,
   };
 }
+
+
+// ─── Exports ─────────────────────────────────────────────────────────────────
 
 module.exports = {
   ORACLE_TARGETS,

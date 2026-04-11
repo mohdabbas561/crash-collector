@@ -304,7 +304,7 @@ const dashboardCache = {
 let predictComputeInFlight = null;
 let lockedComputeInFlight = null;
 let oraclePredictInFlight = null;
-const ORACLE_PREDICTION_SOURCE = 'oracle_v27';
+const ORACLE_PREDICTION_SOURCE = 'oracle_v3';
 let lockedBackgroundTimer = null;
 let oracleBackgroundTimer = null;
 let dbState = {
@@ -886,7 +886,7 @@ function buildOracleTargetPayload(forecast, activeLock, nowId) {
     iqr: activeLock?.iqr ?? forecast.iqr,
     clusterCenter: activeLock?.clusterCenter ?? forecast.clusterCenter,
     issueMode: activeLock?.issueMode ?? forecast.issueMode ?? 'observe',
-    regimeMode: activeLock?.regimeMode ?? forecast.regimeMode ?? 'full',
+    regimeMode: activeLock?.regimeMode ?? forecast.regimeLabel ?? 'RANDOM',
     activePrediction: Boolean(activeLock),
     issuePrediction: Boolean(activeLock || forecast.issuePrediction),
     liveIssuePrediction,
@@ -894,6 +894,27 @@ function buildOracleTargetPayload(forecast, activeLock, nowId) {
     lockDriftAlert,
     lockDriftReason,
     avoidReason: activeLock ? null : (forecast.avoidReason || null),
+    // ── Oracle V3 signals ──
+    whitePhase: forecast.whitePhase || 'NORMAL',
+    whiteSignals: forecast.whiteSignals || {},
+    b2bScore: Number(forecast.b2bScore || 0),
+    b2bDetails: forecast.b2bDetails || {},
+    regimeLabel: forecast.regimeLabel || 'RANDOM',
+    regimeDetails: forecast.regimeDetails || {},
+    ewmaSignal: forecast.ewmaSignal || {},
+    markovProb: forecast.markovProb ?? null,
+    patternSupport: forecast.patternSupport || {},
+    layerBreakdown: forecast.layerBreakdown || [],
+    ensembleP: forecast.ensembleP ?? null,
+    baselineP: forecast.baselineP ?? null,
+    ensembleEdge: forecast.ensembleEdge ?? null,
+    ensembleEV: forecast.ensembleEV ?? null,
+    rawConfidence: forecast.rawConfidence ?? null,
+    pHit1: forecast.pHit1 ?? null,
+    pHit5: forecast.pHit5 ?? null,
+    pHitWindow: forecast.pHitWindow ?? null,
+    droughtPct: forecast.droughtPct ?? null,
+    engineVersion: forecast.engineVersion || 'oracle_v3',
   };
 }
  
@@ -968,6 +989,24 @@ async function computeOraclePredictionPayload() {
     nowId
   ));
  
+  // Compute global white phase from all forecasts
+  const globalWhitePhases = forecasts.map(f => f.whitePhase || 'NORMAL');
+  const globalWhiteActive = globalWhitePhases.filter(p => p === 'WHITE_ACTIVE').length;
+  const globalWhiteEnding = globalWhitePhases.filter(p => p === 'WHITE_ENDING').length;
+  const globalPreWhite = globalWhitePhases.filter(p => p === 'PRE_WHITE').length;
+  const globalWhitePhase = globalWhiteActive > 3 ? 'WHITE_ACTIVE'
+    : globalWhiteEnding > 2 ? 'WHITE_ENDING'
+    : globalPreWhite > 3 ? 'PRE_WHITE'
+    : 'NORMAL';
+
+  // Dominant regime
+  const regimeCounts = {};
+  for (const f of forecasts) {
+    const r = f.regimeLabel || 'RANDOM';
+    regimeCounts[r] = (regimeCounts[r] || 0) + 1;
+  }
+  const dominantRegime = Object.keys(regimeCounts).reduce((a, b) => regimeCounts[a] >= regimeCounts[b] ? a : b, 'RANDOM');
+
   return {
     ok: true,
     generatedAt: new Date().toISOString(),
@@ -978,6 +1017,10 @@ async function computeOraclePredictionPayload() {
     targets,
     history,
     historyByTarget: summarizeOracleHistoryByTarget(persistedHistory),
+    // ── Oracle V3 global signals ──
+    globalWhitePhase,
+    dominantRegime,
+    engineVersion: 'oracle_v3',
   };
 }
  
