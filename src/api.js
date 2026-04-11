@@ -853,6 +853,21 @@ function buildOracleTargetPayload(forecast, activeLock, nowId) {
   const roundsUntilWindowLo = Math.max(0, windowLo - nowId);
   const roundsUntilWindowHi = Math.max(0, windowHi - nowId);
   const inWindow = nowId >= windowLo && nowId <= windowHi;
+  const lockConfidence = activeLock?.confidence ?? forecast.confidence;
+  const liveConfidence = Number(forecast?.confidence ?? 0);
+  const liveIssuePrediction = Boolean(forecast?.issuePrediction);
+  const liveAvoidReason = forecast?.avoidReason || null;
+  const lockDriftAlert = Boolean(activeLock) && (
+    !liveIssuePrediction ||
+    (
+      Number.isFinite(lockConfidence) &&
+      Number.isFinite(liveConfidence) &&
+      liveConfidence <= (lockConfidence - 12)
+    )
+  );
+  const lockDriftReason = !liveIssuePrediction
+    ? (liveAvoidReason || 'observe_only')
+    : 'confidence_drop';
 
   return {
     ...forecast,
@@ -863,7 +878,8 @@ function buildOracleTargetPayload(forecast, activeLock, nowId) {
     roundsUntilWindowLo,
     roundsUntilWindowHi,
     inWindow,
-    confidence: activeLock?.confidence ?? forecast.confidence,
+    confidence: lockConfidence,
+    liveConfidence,
     predBasis: activeLock?.predBasis ?? forecast.predBasis,
     predMethod: activeLock?.predMethod ?? forecast.predMethod,
     med: activeLock?.med ?? forecast.med,
@@ -873,6 +889,10 @@ function buildOracleTargetPayload(forecast, activeLock, nowId) {
     regimeMode: activeLock?.regimeMode ?? forecast.regimeMode ?? 'full',
     activePrediction: Boolean(activeLock),
     issuePrediction: Boolean(activeLock || forecast.issuePrediction),
+    liveIssuePrediction,
+    liveAvoidReason,
+    lockDriftAlert,
+    lockDriftReason,
     avoidReason: activeLock ? null : (forecast.avoidReason || null),
   };
 }
