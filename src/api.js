@@ -808,7 +808,9 @@ function replayOracleTargetState({ rounds, nowId, target, existingLock, forecast
       outcome = historyHitRound < Number(activeLock.windowLo || 0) ? 'early' : 'win';
     } else if (missedBeforeLaterHit) {
       historyHitRound = Number(hit.id || 0);
-      replayCutoffId = Number(activeLock.windowHi || nowId);
+      // Move replay to the actual later hit so the next lock is generated from
+      // fresh post-hit state instead of repeatedly chaining stale loss windows.
+      replayCutoffId = historyHitRound;
       outcome = 'loss';
     }
 
