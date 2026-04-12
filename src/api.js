@@ -304,7 +304,7 @@ const dashboardCache = {
 let predictComputeInFlight = null;
 let lockedComputeInFlight = null;
 let oraclePredictInFlight = null;
-const ORACLE_PREDICTION_SOURCE = 'oracle_v3';
+const ORACLE_PREDICTION_SOURCE = 'oracle_v4';
 let lockedBackgroundTimer = null;
 let oracleBackgroundTimer = null;
 let dbState = {
@@ -892,7 +892,7 @@ function buildOracleTargetPayload(forecast, activeLock, nowId) {
     lockDriftAlert,
     lockDriftReason,
     avoidReason: activeLock ? null : (forecast.avoidReason || null),
-    // ── Oracle V3 signals ──
+    // ── Oracle V4 signals ──
     whitePhase: forecast.whitePhase || 'NORMAL',
     whiteSignals: forecast.whiteSignals || {},
     b2bScore: Number(forecast.b2bScore || 0),
@@ -912,7 +912,7 @@ function buildOracleTargetPayload(forecast, activeLock, nowId) {
     pHit5: forecast.pHit5 ?? null,
     pHitWindow: forecast.pHitWindow ?? null,
     droughtPct: forecast.droughtPct ?? null,
-    engineVersion: forecast.engineVersion || 'oracle_v3',
+    engineVersion: forecast.engineVersion || 'oracle_v4',
   };
 }
  
@@ -1015,10 +1015,10 @@ async function computeOraclePredictionPayload() {
     targets,
     history,
     historyByTarget: summarizeOracleHistoryByTarget(persistedHistory),
-    // ── Oracle V3 global signals ──
+    // ── Oracle V4 global signals ──
     globalWhitePhase,
     dominantRegime,
-    engineVersion: 'oracle_v3',
+    engineVersion: 'oracle_v4',
   };
 }
  

@@ -1,7 +1,7 @@
 'use strict';
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Oracle Engine V3 — Multi-Layer Crash Prediction System
+// Oracle Engine V4 — Multi-Layer Crash Prediction System
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // 7 Prediction Layers:
@@ -83,17 +83,17 @@ const CFG = Object.freeze({
   calibrationWindow: 200,
 
   // Confidence caps/floors
-  whiteActiveConfidenceCap: 20,
-  preWhiteConfidenceCap: 35,
-  whiteEndingBoost: 20,
+  whiteActiveConfidenceCap: 24,
+  preWhiteConfidenceCap: 42,
+  whiteEndingBoost: 14,
   b2bConfidenceFloor: 40,
   b2bScoreThreshold: 60,
 
   // Issue thresholds per target range
-  issueThresholdLow: 30,     // ≤15x
-  issueThresholdMid: 33,     // ≤50x
-  issueThresholdHigh: 36,    // ≤200x
-  issueThresholdMoon: 38,    // >200x
+  issueThresholdLow: 26,     // ≤15x
+  issueThresholdMid: 30,     // ≤50x
+  issueThresholdHigh: 33,    // ≤200x
+  issueThresholdMoon: 35,    // >200x
 });
 
 
@@ -131,6 +131,15 @@ function sortedCopy(arr) {
   return arr.slice().sort((a, b) => a - b);
 }
 
+function trimSortedRange(sorted, loPct = 5, hiPct = 95) {
+  if (!Array.isArray(sorted) || !sorted.length) return [];
+  if (sorted.length < 12) return sorted.slice();
+  const loIdx = clamp(Math.floor((loPct / 100) * (sorted.length - 1)), 0, sorted.length - 1);
+  const hiIdx = clamp(Math.ceil((hiPct / 100) * (sorted.length - 1)), loIdx, sorted.length - 1);
+  const trimmed = sorted.slice(loIdx, hiIdx + 1);
+  return trimmed.length >= 8 ? trimmed : sorted.slice();
+}
+
 function normalizeRounds(rounds) {
   const map = new Map();
   for (const r of rounds || []) {
@@ -157,91 +166,103 @@ function getIssueThreshold(minVal) {
   return CFG.issueThresholdMoon;
 }
 
+function getWindowBaselineProbability(minVal, winSize) {
+  const oneRoundBase = clamp(1 / Math.max(1, minVal), 0, 1);
+  return clamp(1 - ((1 - oneRoundBase) ** Math.max(1, winSize)), 0, 1);
+}
+
 
 // ─── Layer 1: Adaptive Markov Chain ──────────────────────────────────────────
 
-function buildMarkovLayer(rounds, target) {
+function buildMarkovLayer(rounds, target, winSize) {
   const nBuckets = CFG.markovBuckets.length;
   const n = rounds.length;
-  if (n < 30) return { prob: null, reliability: 0 };
+  if (n < Math.max(30, winSize + 8)) return { prob: null, reliability: 0 };
 
-  // Build 2nd-order transition counts: (state_t-2, state_t-1) → state_t
-  const recentStart = Math.max(0, n - CFG.markovRecentWindow);
-  const countAll = new Float64Array(nBuckets * nBuckets * nBuckets);
-  const countRecent = new Float64Array(nBuckets * nBuckets * nBuckets);
+  const hitPrefix = new Int32Array(n + 1);
+  for (let i = 0; i < n; i++) {
+    hitPrefix[i + 1] = hitPrefix[i] + (rounds[i].val >= target.minVal ? 1 : 0);
+  }
+  const hasHitInWindow = (lo, hi) => {
+    const left = clamp(lo, 0, n - 1);
+    const right = clamp(hi, left, n - 1);
+    return (hitPrefix[right + 1] - hitPrefix[left]) > 0;
+  };
 
-  for (let i = 2; i < n; i++) {
-    const s0 = getBucketIndex(rounds[i - 2].val);
-    const s1 = getBucketIndex(rounds[i - 1].val);
-    const s2 = getBucketIndex(rounds[i].val);
-    const idx = s0 * nBuckets * nBuckets + s1 * nBuckets + s2;
-    countAll[idx]++;
-    if (i >= recentStart) countRecent[idx]++;
+  const recentStart = Math.max(1, n - CFG.markovRecentWindow - winSize);
+  const pairTotalAll = new Float64Array(nBuckets * nBuckets);
+  const pairHitsAll = new Float64Array(nBuckets * nBuckets);
+  const pairTotalRecent = new Float64Array(nBuckets * nBuckets);
+  const pairHitsRecent = new Float64Array(nBuckets * nBuckets);
+  const singleTotalAll = new Float64Array(nBuckets);
+  const singleHitsAll = new Float64Array(nBuckets);
+  const singleTotalRecent = new Float64Array(nBuckets);
+  const singleHitsRecent = new Float64Array(nBuckets);
+
+  let unconditionalTotal = 0;
+  let unconditionalHits = 0;
+  let unconditionalRecentTotal = 0;
+  let unconditionalRecentHits = 0;
+
+  for (let i = 1; i < (n - winSize); i++) {
+    const prev2 = getBucketIndex(rounds[i - 1].val);
+    const prev1 = getBucketIndex(rounds[i].val);
+    const pairIdx = prev2 * nBuckets + prev1;
+    const futureHit = hasHitInWindow(i + 1, i + winSize) ? 1 : 0;
+    const inRecent = i >= recentStart;
+
+    pairTotalAll[pairIdx] += 1;
+    pairHitsAll[pairIdx] += futureHit;
+    singleTotalAll[prev1] += 1;
+    singleHitsAll[prev1] += futureHit;
+    unconditionalTotal += 1;
+    unconditionalHits += futureHit;
+
+    if (inRecent) {
+      pairTotalRecent[pairIdx] += 1;
+      pairHitsRecent[pairIdx] += futureHit;
+      singleTotalRecent[prev1] += 1;
+      singleHitsRecent[prev1] += futureHit;
+      unconditionalRecentTotal += 1;
+      unconditionalRecentHits += futureHit;
+    }
   }
 
-  // Current state
   if (n < 2) return { prob: null, reliability: 0 };
   const prev2 = getBucketIndex(rounds[n - 2].val);
   const prev1 = getBucketIndex(rounds[n - 1].val);
+  const pairIdx = prev2 * nBuckets + prev1;
 
-  // P(next bucket >= target bucket)
-  const targetBucket = getBucketIndex(target.minVal);
+  let totalAll = pairTotalAll[pairIdx];
+  let hitsAll = pairHitsAll[pairIdx];
+  let totalRecent = pairTotalRecent[pairIdx];
+  let hitsRecent = pairHitsRecent[pairIdx];
 
-  let totalAll = 0, hitsAll = 0;
-  let totalRecent = 0, hitsRecent = 0;
-
-  for (let s2 = 0; s2 < nBuckets; s2++) {
-    const idx = prev2 * nBuckets * nBuckets + prev1 * nBuckets + s2;
-    totalAll += countAll[idx];
-    totalRecent += countRecent[idx];
-    if (s2 >= targetBucket) {
-      hitsAll += countAll[idx];
-      hitsRecent += countRecent[idx];
-    }
+  if (totalAll < 8) {
+    totalAll = singleTotalAll[prev1];
+    hitsAll = singleHitsAll[prev1];
+    totalRecent = singleTotalRecent[prev1];
+    hitsRecent = singleHitsRecent[prev1];
   }
 
-  // Backoff 1: if the exact 2nd-order state is sparse, back off to 1st-order on prev1.
-  if (totalAll < 6) {
-    let backoffAll = 0;
-    let backoffHitsAll = 0;
-    let backoffRecent = 0;
-    let backoffHitsRecent = 0;
-    for (let s0 = 0; s0 < nBuckets; s0++) {
-      for (let s2 = 0; s2 < nBuckets; s2++) {
-        const idx = s0 * nBuckets * nBuckets + prev1 * nBuckets + s2;
-        backoffAll += countAll[idx];
-        backoffRecent += countRecent[idx];
-        if (s2 >= targetBucket) {
-          backoffHitsAll += countAll[idx];
-          backoffHitsRecent += countRecent[idx];
-        }
-      }
-    }
-    if (backoffAll > totalAll) {
-      totalAll = backoffAll;
-      hitsAll = backoffHitsAll;
-      totalRecent = backoffRecent;
-      hitsRecent = backoffHitsRecent;
-    }
-  }
-
-  // Backoff 2: unconditional hit rate for the target when transition states are still sparse.
   if (totalAll <= 0) {
-    const baseHits = rounds.filter((r) => r.val >= target.minVal).length;
-    const baseProb = n > 0 ? baseHits / n : 0;
+    const baseAll = unconditionalTotal > 0 ? (unconditionalHits / unconditionalTotal) : 0;
+    const baseRecent = unconditionalRecentTotal > 0 ? (unconditionalRecentHits / unconditionalRecentTotal) : baseAll;
+    const prob = unconditionalRecentTotal >= 12
+      ? (CFG.markovRecentWeight * baseRecent + (1 - CFG.markovRecentWeight) * baseAll)
+      : baseAll;
     return {
-      prob: clamp(baseProb, 0, 1),
-      reliability: clamp(n / 800, 0, 0.45),
+      prob: clamp(prob, 0, 1),
+      reliability: clamp(unconditionalTotal / 200, 0, 0.45),
     };
   }
 
-  const pAll = totalAll > 0 ? hitsAll / totalAll : 0;
-  const pRecent = totalRecent > 0 ? hitsRecent / totalRecent : pAll;
-  const w = CFG.markovRecentWeight;
-  const prob = totalRecent >= 10 ? (w * pRecent + (1 - w) * pAll) : pAll;
-  const sampleSize = totalAll + totalRecent;
-  const reliability = clamp(Math.min(sampleSize / 100, 1), 0, 1);
-
+  const pAll = hitsAll / totalAll;
+  const pRecent = totalRecent > 0 ? (hitsRecent / totalRecent) : pAll;
+  const prob = totalRecent >= 8
+    ? (CFG.markovRecentWeight * pRecent + (1 - CFG.markovRecentWeight) * pAll)
+    : pAll;
+  const reliability = clamp((totalAll + totalRecent) / 80, 0, 1);
   return { prob: clamp(prob, 0, 1), reliability };
 }
 
@@ -280,37 +301,30 @@ function kmProb(table, roundsSince, k) {
   return clamp((1 - table[to] / sFrom) * 100, 0, 100);
 }
 
-function buildKMLayer(allGaps, recentGaps, roundsSince, winSize, regimeLabel) {
+function buildKMLayer(allGaps, recentGaps, roundsSince, winSize, regime) {
   if (allGaps.length < CFG.kmMinGaps) return { pHitWindow: 0, pHit1: 0, pHit5: 0, reliability: 0 };
 
   const allSorted = sortedCopy(allGaps);
   const recentSorted = sortedCopy(recentGaps);
 
-  // In white/clustered regimes, lean heavier on recent gaps
-  const useRecent = regimeLabel === 'CLUSTERED_LOW' || regimeLabel === 'TRENDING_DOWN';
-  let blendedGaps;
-  if (useRecent && recentSorted.length >= 15) {
-    // Weighted merge: more recent bias
-    const w = CFG.kmRegimeBlendRecent;
-    const mergedLen = Math.max(allSorted.length, recentSorted.length);
-    blendedGaps = [];
-    for (let i = 0; i < mergedLen; i++) {
-      const fromAll = i < allSorted.length ? allSorted[i] : allSorted[allSorted.length - 1];
-      const fromRecent = i < recentSorted.length ? recentSorted[i % recentSorted.length] : recentSorted[recentSorted.length - 1];
-      blendedGaps.push(Math.round(w * fromRecent + (1 - w) * fromAll));
-    }
-    blendedGaps.sort((a, b) => a - b);
-  } else {
-    blendedGaps = allSorted;
-  }
+  const regimeLabel = regime?.label || 'RANDOM';
+  const regimeReliable = Number(regime?.reliability || 0) >= 0.35;
+  const useRecent =
+    regimeReliable &&
+    recentSorted.length >= CFG.kmMinGaps &&
+    ['TRENDING_UP', 'TRENDING_DOWN', 'CLUSTERED_LOW', 'VOLATILE', 'DISPERSED'].includes(regimeLabel);
 
-  const table = buildKMTable(blendedGaps);
+  const selectedGaps = useRecent
+    ? trimSortedRange(recentSorted, 8, 92)
+    : trimSortedRange(allSorted, 4, 96);
+
+  const table = buildKMTable(selectedGaps);
 
   const pHit1 = kmProb(table, roundsSince, 1);
   const pHit5 = kmProb(table, roundsSince, 5);
   const pHitWindow = kmProb(table, roundsSince, winSize);
 
-  const reliability = clamp(allGaps.length / (CFG.kmMinGaps * 3), 0, 1);
+  const reliability = clamp(selectedGaps.length / (CFG.kmMinGaps * 2.5), 0, 1);
 
   return { pHitWindow, pHit1, pHit5, reliability, table };
 }
@@ -435,10 +449,10 @@ function computeWhitePhase(rounds, target) {
   // White pressure should reflect true low-multiplier clusters, not scale linearly with high targets.
   // Capped target-relative thresholds reduce false "always-white" behavior on high X.
   const softThreshold = target.minVal <= 10 ? 1.9
-    : target.minVal <= 30 ? 2.1
-    : target.minVal <= 100 ? 2.2
-    : target.minVal <= 500 ? 2.3
-    : 2.35;
+    : target.minVal <= 30 ? 2.05
+    : target.minVal <= 100 ? 2.15
+    : target.minVal <= 500 ? 2.22
+    : 2.28;
 
   const recent24 = rounds.slice(-24).map(r => r.val);
   const recent12 = rounds.slice(-12).map(r => r.val);
@@ -512,6 +526,12 @@ function computeWhitePhase(rounds, target) {
     return count;
   })();
   const tailRecovery = recent4.filter(v => v >= medianAll).length >= CFG.whiteEndingTailRecovery;
+  const recoveryReady =
+    reboundSpike ||
+    tailRecovery ||
+    ewmaReversalCount >= CFG.whiteEndingEwmaReversal ||
+    trend6 > 6 ||
+    recent4.filter(v => v > softThreshold).length >= 2;
 
   // ── Phase classification ──
   let phase = 'NORMAL';
@@ -528,19 +548,19 @@ function computeWhitePhase(rounds, target) {
   );
 
   // WHITE_ENDING: in cluster but recovery signals firing
-  const whiteEnding = whiteActive && (
-    reboundSpike ||
-    ewmaReversalCount >= CFG.whiteEndingEwmaReversal ||
-    (tailRecovery && trend6 > 3)
-  );
+  const whiteEnding = whiteActive && recoveryReady;
 
   // PRE_WHITE: not yet in cluster but signals approaching
-  const preWhite = !whiteActive && (
-    (trend12 < -3 && softWhiteRate12 >= 0.48) ||
-    (trend6 < -2 && softWhiteRate8 >= 0.60) ||
-    (hardWhiteRate8 >= 0.25 && volCompression >= 0.15) ||
-    (whiteStreak >= 3 && trend6 < -1) ||
-    (softWhiteRate12 >= CFG.whitePreEntryLowConcentration && volCompression >= CFG.whitePreEntryVolCompression)
+  const preWhite = !whiteActive && !recoveryReady && (
+    (trend12 < -6 && softWhiteRate12 >= 0.62) ||
+    (trend6 < -4 && softWhiteRate8 >= 0.625) ||
+    (hardWhiteRate8 >= 0.25 && volCompression >= 0.12 && trend6 <= 0) ||
+    (whiteStreak >= 2 && softWhiteRate12 >= 0.55 && trend6 < -1.5) ||
+    (
+      hardWhiteRate12 >= 0.18 &&
+      softWhiteRate24 >= Math.max(CFG.whitePreEntryLowConcentration, 0.62) &&
+      volCompression >= (CFG.whitePreEntryVolCompression * 0.6)
+    )
   );
 
   if (whiteEnding) phase = 'WHITE_ENDING';
@@ -563,6 +583,7 @@ function computeWhitePhase(rounds, target) {
     reboundSpike,
     ewmaReversalCount,
     tailRecovery,
+    recoveryReady,
     maxRecent4: Number(maxRecent4.toFixed(2)),
   };
 
@@ -683,6 +704,8 @@ function buildRegimeLayer(rounds, target) {
   const prevHitRate = prevVals.filter(v => v >= target.minVal).length / prevVals.length;
   const baseline = 1 / target.minVal;
   const drift = Math.abs(recentHitRate - baseline);
+  const absoluteHitDrift = recentHitRate - prevHitRate;
+  const relativeHitDrift = baseline > 0 ? absoluteHitDrift / baseline : 0;
 
   // Lag-1 correlation
   const recentHits = recentVals.map(v => v >= target.minVal ? 1 : 0);
@@ -707,11 +730,19 @@ function buildRegimeLayer(rounds, target) {
 
   // Classify
   let label = 'RANDOM';
-  if (lowRateRecent >= 0.50 && lowRateRecent > lowRatePrev + 0.1) {
+  const strongerLowPressure = lowRateRecent >= 0.54 && lowRateRecent > lowRatePrev + 0.08;
+  const trendUpSignal =
+    absoluteHitDrift >= Math.max(0.01, baseline * 0.45) ||
+    relativeHitDrift >= 0.7;
+  const trendDownSignal =
+    absoluteHitDrift <= -Math.max(0.01, baseline * 0.45) ||
+    relativeHitDrift <= -0.7;
+
+  if (strongerLowPressure) {
     label = 'CLUSTERED_LOW';
-  } else if (js > CFG.regimeJsThreshold * 2 && recentHitRate > prevHitRate + 0.03) {
+  } else if ((js > CFG.regimeJsThreshold * 1.35 || Math.abs(relativeHitDrift) >= 0.7) && trendUpSignal) {
     label = 'TRENDING_UP';
-  } else if (js > CFG.regimeJsThreshold * 2 && recentHitRate < prevHitRate - 0.03) {
+  } else if ((js > CFG.regimeJsThreshold * 1.35 || Math.abs(relativeHitDrift) >= 0.7) && trendDownSignal) {
     label = 'TRENDING_DOWN';
   } else if (js > CFG.regimeJsThreshold && stddev(recentVals) > stddev(prevVals) * 1.3) {
     label = 'VOLATILE';
@@ -730,6 +761,7 @@ function buildRegimeLayer(rounds, target) {
     lagCorr: Number(lagCorr.toFixed(4)),
     lowRateRecent: Number((lowRateRecent * 100).toFixed(1)),
     hitRateDrift: Number(((recentHitRate - prevHitRate) * 100).toFixed(2)),
+    relativeHitDrift: Number((relativeHitDrift * 100).toFixed(2)),
     reliability: clamp(n / (w * 2), 0, 1),
   };
 }
@@ -752,7 +784,7 @@ function computeEnsembleConfidence({
 }) {
   // Collect layer probabilities and weights
   const layers = [];
-  const baselineP = 1 / target.minVal;
+  const baselineP = getWindowBaselineProbability(target.minVal, target.window);
 
   if (markov.prob !== null && markov.reliability > 0.1) {
     layers.push({ name: 'markov', prob: markov.prob, weight: 1.5, reliability: markov.reliability });
@@ -787,27 +819,27 @@ function computeEnsembleConfidence({
 
   // B2B layer
   if (b2b.b2bScore > 30 && b2b.reliability > 0.3) {
-    const b2bProb = clamp(baselineP * (1 + b2b.b2bScore / 100), 0, 1);
+    const b2bProb = clamp(baselineP + (baselineP * (b2b.b2bScore / 100) * 0.45), 0, 1);
     layers.push({ name: 'b2b', prob: b2bProb, weight: 1.3 * (b2b.b2bScore / 100), reliability: b2b.reliability });
   }
 
   if (layers.length < 1) {
     const kmP = clamp((km?.pHitWindow || 0) / 100, 0, 1);
     const b2bBoost = clamp((b2b?.b2bScore || 0) / 100, 0, 1) * baselineP * 0.6;
-    const patternBoost = clamp((pattern?.lift || 0) / 120, -0.08, 0.12);
+    const patternBoost = clamp((pattern?.lift || 0) / 140, -0.04, 0.08);
     const fallbackP = clamp(
-      baselineP + (kmP - baselineP) * 0.35 + b2bBoost + patternBoost,
+      baselineP + (kmP - baselineP) * 0.45 + b2bBoost + patternBoost,
       0,
       1
     );
 
     let fallbackRaw = clamp(
-      (fallbackP * 100 * 0.9) +
-      ((km?.pHitWindow || 0) * 0.25) +
-      ((b2b?.b2bScore || 0) * 0.18) +
+      (fallbackP * 100 * 0.72) +
+      ((km?.pHitWindow || 0) * 0.16) +
+      ((b2b?.b2bScore || 0) * 0.14) +
       ((regime?.label === 'TRENDING_UP') ? 5 : 0) -
       ((regime?.label === 'TRENDING_DOWN') ? 6 : 0),
-      8,
+      10,
       68
     );
 
@@ -858,7 +890,7 @@ function computeEnsembleConfidence({
 
   // Edge over baseline
   const edge = ensembleP - baselineP;
-  const edgeScore = clamp(edge / Math.max(0.01, baselineP), -1, 3);
+  const edgeScore = clamp(edge / Math.max(0.03, baselineP), -1.1, 2.2);
 
 
   // EV
@@ -873,22 +905,22 @@ function computeEnsembleConfidence({
 
 
   let rawConfidence = clamp(
-    (edgeScore * 25) +
-    (clamp(ensembleP * 100, 0, 100) * 0.3) +
-    (km.pHitWindow * 0.25) +
-    (clamp(pattern.lift, -10, 20) * 0.4) +
-    (b2b.b2bScore * 0.1) +
-    (ev > 0 ? 10 : 0),
+    (clamp(ensembleP * 100, 0, 100) * 0.62) +
+    (edgeScore * 14) +
+    (km.pHitWindow * 0.14) +
+    (clamp(pattern.lift, -8, 18) * 0.22) +
+    (b2b.b2bScore * 0.12) +
+    (ev > 0 ? 5 : 0),
     0,
     100
   );
 
   // Regime adjustments
-  if (regime.label === 'TRENDING_UP') rawConfidence += 5;
-  if (regime.label === 'TRENDING_DOWN') rawConfidence -= 8;
-  if (regime.label === 'CLUSTERED_LOW') rawConfidence -= 12;
+  if (regime.label === 'TRENDING_UP') rawConfidence += 6;
+  if (regime.label === 'TRENDING_DOWN') rawConfidence -= 7;
+  if (regime.label === 'CLUSTERED_LOW') rawConfidence -= 10;
   if (regime.label === 'VOLATILE') rawConfidence -= 4;
-  if (regime.label === 'RANDOM') rawConfidence -= 3;
+  if (regime.label === 'RANDOM') rawConfidence -= 1;
 
   // White phase hard blocks
   const wp = whitePhase.phase;
@@ -915,7 +947,7 @@ function computeEnsembleConfidence({
   if (resolved.length >= 24) {
 
     const globalWinRate = resolved.filter(r => r.outcome === 'win').length / resolved.length * 100;
-    confidence = Math.round(rawConfidence * 0.78 + globalWinRate * 0.22);
+    confidence = Math.round(rawConfidence * 0.86 + globalWinRate * 0.14);
   }
   confidence = clamp(Math.round(confidence), 0, 100);
 
@@ -977,7 +1009,7 @@ function computeOracleForecast(rounds, target, options = {}) {
       b2bScore: 0,
       regimeLabel: 'RANDOM',
       layerBreakdown: [],
-      engineVersion: 'oracle_v3',
+      engineVersion: 'oracle_v4',
     };
   }
 
@@ -1001,7 +1033,7 @@ function computeOracleForecast(rounds, target, options = {}) {
       issuePrediction: false, activePrediction: false,
       issueMode: 'observe', avoidReason: 'insufficient_gaps',
       whitePhase: 'NORMAL', b2bScore: 0, regimeLabel: 'RANDOM',
-      layerBreakdown: [], engineVersion: 'oracle_v3',
+      layerBreakdown: [], engineVersion: 'oracle_v4',
     };
   }
 
@@ -1036,10 +1068,10 @@ function computeOracleForecast(rounds, target, options = {}) {
   const regime = buildRegimeLayer(cleanRounds, target);
 
   // Layer 1: Markov
-  const markov = buildMarkovLayer(cleanRounds, target);
+  const markov = buildMarkovLayer(cleanRounds, target, winSize);
 
   // Layer 2: KM
-  const km = buildKMLayer(allGapsRaw, recentGaps, roundsSince, winSize, regime.label);
+  const km = buildKMLayer(allGapsRaw, recentGaps, roundsSince, winSize, regime);
 
   // Layer 3: EWMA
   const ewma = buildEWMALayer(cleanRounds, target);
@@ -1311,7 +1343,7 @@ function computeOracleForecast(rounds, target, options = {}) {
     layerBreakdown: ensemble.layerBreakdown,
 
     // Engine version
-    engineVersion: 'oracle_v3',
+    engineVersion: 'oracle_v4',
   };
 }
 
