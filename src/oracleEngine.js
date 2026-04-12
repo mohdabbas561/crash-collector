@@ -432,14 +432,17 @@ function computeWhitePhase(rounds, target) {
 
 
 
+  // White pressure should reflect true low-multiplier clusters, not scale linearly with high targets.
+  // Capped target-relative thresholds reduce false "always-white" behavior on high X.
   const softThreshold = target.minVal <= 10 ? 1.9
-    : target.minVal <= 30 ? 2.3
-    : target.minVal <= 100 ? 2.8
-    : target.minVal <= 500 ? 3.5
-    : 4.0;
+    : target.minVal <= 30 ? 2.1
+    : target.minVal <= 100 ? 2.2
+    : target.minVal <= 500 ? 2.3
+    : 2.35;
 
   const recent24 = rounds.slice(-24).map(r => r.val);
   const recent12 = rounds.slice(-12).map(r => r.val);
+  const recent8 = rounds.slice(-8).map(r => r.val);
   const recent6 = rounds.slice(-6).map(r => r.val);
   const recent4 = rounds.slice(-4).map(r => r.val);
 
@@ -450,6 +453,8 @@ function computeWhitePhase(rounds, target) {
   // Soft white rate (below target-dependent threshold)
   const softWhiteRate24 = recent24.filter(v => v <= softThreshold).length / recent24.length;
   const softWhiteRate12 = recent12.filter(v => v <= softThreshold).length / recent12.length;
+  const softWhiteRate8 = recent8.filter(v => v <= softThreshold).length / Math.max(1, recent8.length);
+  const hardWhiteRate8 = recent8.filter(v => v <= CFG.whiteHardCap).length / Math.max(1, recent8.length);
 
   // Trend (log-multiplier slope)
   const logRecent = recent12.map(v => Math.log(Math.max(1.0001, v)));
@@ -517,6 +522,8 @@ function computeWhitePhase(rounds, target) {
   const whiteActive = (
     hardWhiteRate24 >= CFG.whiteActiveHardRate ||
     softWhiteRate24 >= CFG.whiteActiveSoftRate ||
+    hardWhiteRate12 >= 0.34 ||
+    softWhiteRate12 >= 0.78 ||
     whiteStreak >= CFG.whiteActiveStreak
   );
 
@@ -529,9 +536,11 @@ function computeWhitePhase(rounds, target) {
 
   // PRE_WHITE: not yet in cluster but signals approaching
   const preWhite = !whiteActive && (
-    (trend12 < -4 && softWhiteRate12 >= CFG.whitePreEntryLowConcentration) ||
-    (softWhiteRate12 >= 0.5 && volCompression >= CFG.whitePreEntryVolCompression) ||
-    (trend12 < -6 && hardWhiteRate12 >= 0.18)
+    (trend12 < -3 && softWhiteRate12 >= 0.48) ||
+    (trend6 < -2 && softWhiteRate8 >= 0.60) ||
+    (hardWhiteRate8 >= 0.25 && volCompression >= 0.15) ||
+    (whiteStreak >= 3 && trend6 < -1) ||
+    (softWhiteRate12 >= CFG.whitePreEntryLowConcentration && volCompression >= CFG.whitePreEntryVolCompression)
   );
 
   if (whiteEnding) phase = 'WHITE_ENDING';
@@ -544,6 +553,8 @@ function computeWhitePhase(rounds, target) {
     softWhiteRate24: Number((softWhiteRate24 * 100).toFixed(1)),
     hardWhiteRate12: Number((hardWhiteRate12 * 100).toFixed(1)),
     softWhiteRate12: Number((softWhiteRate12 * 100).toFixed(1)),
+    softWhiteRate8: Number((softWhiteRate8 * 100).toFixed(1)),
+    hardWhiteRate8: Number((hardWhiteRate8 * 100).toFixed(1)),
     trend12: Number(trend12.toFixed(2)),
     trend6: Number(trend6.toFixed(2)),
     volCompression: Number(volCompression.toFixed(3)),
