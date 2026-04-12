@@ -90,10 +90,10 @@ const CFG = Object.freeze({
   b2bScoreThreshold: 60,
 
   // Issue thresholds per target range
-  issueThresholdLow: 32,     // ≤15x
-  issueThresholdMid: 35,     // ≤50x
-  issueThresholdHigh: 38,    // ≤200x
-  issueThresholdMoon: 40,    // >200x
+  issueThresholdLow: 30,     // ≤15x
+  issueThresholdMid: 33,     // ≤50x
+  issueThresholdHigh: 36,    // ≤200x
+  issueThresholdMoon: 38,    // >200x
 });
 
 
@@ -198,6 +198,41 @@ function buildMarkovLayer(rounds, target) {
       hitsAll += countAll[idx];
       hitsRecent += countRecent[idx];
     }
+  }
+
+  // Backoff 1: if the exact 2nd-order state is sparse, back off to 1st-order on prev1.
+  if (totalAll < 6) {
+    let backoffAll = 0;
+    let backoffHitsAll = 0;
+    let backoffRecent = 0;
+    let backoffHitsRecent = 0;
+    for (let s0 = 0; s0 < nBuckets; s0++) {
+      for (let s2 = 0; s2 < nBuckets; s2++) {
+        const idx = s0 * nBuckets * nBuckets + prev1 * nBuckets + s2;
+        backoffAll += countAll[idx];
+        backoffRecent += countRecent[idx];
+        if (s2 >= targetBucket) {
+          backoffHitsAll += countAll[idx];
+          backoffHitsRecent += countRecent[idx];
+        }
+      }
+    }
+    if (backoffAll > totalAll) {
+      totalAll = backoffAll;
+      hitsAll = backoffHitsAll;
+      totalRecent = backoffRecent;
+      hitsRecent = backoffHitsRecent;
+    }
+  }
+
+  // Backoff 2: unconditional hit rate for the target when transition states are still sparse.
+  if (totalAll <= 0) {
+    const baseHits = rounds.filter((r) => r.val >= target.minVal).length;
+    const baseProb = n > 0 ? baseHits / n : 0;
+    return {
+      prob: clamp(baseProb, 0, 1),
+      reliability: clamp(n / 800, 0, 0.45),
+    };
   }
 
   const pAll = totalAll > 0 ? hitsAll / totalAll : 0;
@@ -746,7 +781,40 @@ function computeEnsembleConfidence({
   }
 
   if (layers.length < 1) {
-    return { confidence: 0, rawConfidence: 0, ensembleP: baselineP, predMethod: 'baseline', layerBreakdown: [] };
+    const kmP = clamp((km?.pHitWindow || 0) / 100, 0, 1);
+    const b2bBoost = clamp((b2b?.b2bScore || 0) / 100, 0, 1) * baselineP * 0.6;
+    const patternBoost = clamp((pattern?.lift || 0) / 120, -0.08, 0.12);
+    const fallbackP = clamp(
+      baselineP + (kmP - baselineP) * 0.35 + b2bBoost + patternBoost,
+      0,
+      1
+    );
+
+    let fallbackRaw = clamp(
+      (fallbackP * 100 * 0.9) +
+      ((km?.pHitWindow || 0) * 0.25) +
+      ((b2b?.b2bScore || 0) * 0.18) +
+      ((regime?.label === 'TRENDING_UP') ? 5 : 0) -
+      ((regime?.label === 'TRENDING_DOWN') ? 6 : 0),
+      8,
+      68
+    );
+
+    if (whitePhase?.phase === 'WHITE_ACTIVE') fallbackRaw = Math.min(fallbackRaw, CFG.whiteActiveConfidenceCap);
+    else if (whitePhase?.phase === 'PRE_WHITE') fallbackRaw = Math.min(fallbackRaw, CFG.preWhiteConfidenceCap);
+    else if (whitePhase?.phase === 'WHITE_ENDING') fallbackRaw = Math.min(78, fallbackRaw + CFG.whiteEndingBoost * 0.5);
+
+    const fallbackConfidence = Math.round(clamp(fallbackRaw, 0, 100));
+    return {
+      confidence: fallbackConfidence,
+      rawConfidence: Number(fallbackRaw.toFixed(1)),
+      ensembleP: Number(fallbackP.toFixed(6)),
+      baselineP: Number(baselineP.toFixed(6)),
+      edge: Number((fallbackP - baselineP).toFixed(6)),
+      ev: Number((fallbackP * target.minVal - 1).toFixed(4)),
+      predMethod: 'fallback_baseline',
+      layerBreakdown: [],
+    };
   }
 
   // Inverse-error weighted blend
@@ -836,7 +904,7 @@ function computeEnsembleConfidence({
   if (resolved.length >= 24) {
 
     const globalWinRate = resolved.filter(r => r.outcome === 'win').length / resolved.length * 100;
-    confidence = Math.round(rawConfidence * 0.62 + globalWinRate * 0.38);
+    confidence = Math.round(rawConfidence * 0.78 + globalWinRate * 0.22);
   }
   confidence = clamp(Math.round(confidence), 0, 100);
 
@@ -1045,22 +1113,56 @@ function computeOracleForecast(rounds, target, options = {}) {
   // ── Issue decision ──
   const confidence = ensemble.confidence;
   const threshold = getIssueThreshold(minVal);
+  const thresholdFloor = minVal <= 15 ? 22 : minVal <= 50 ? 24 : minVal <= 200 ? 26 : 28;
+  const patternStrong = pattern.ready && pattern.lift >= 4;
+  const kmStrong = km.pHitWindow >= Math.max(10, Math.round(threshold * 0.9));
+  const b2bStrong = b2b.b2bScore >= 50;
+  let thresholdEase = 0;
+  if (b2bStrong) thresholdEase += 6;
+  if (patternStrong) thresholdEase += 4;
+  if (regime.label === 'TRENDING_UP') thresholdEase += 4;
+  if (regime.label === 'DISPERSED') thresholdEase += 2;
+  if (kmStrong) thresholdEase += 3;
+  if (roundsSince >= gapStats.p25) thresholdEase += 2;
+  if (roundsSince >= gapStats.med) thresholdEase += 3;
+  if (minVal >= 100 && whitePhase.phase !== 'WHITE_ACTIVE') thresholdEase += 2;
+  const effectiveThreshold = clamp(threshold - thresholdEase, thresholdFloor, threshold);
 
   // Hard blocks — WHITE_ACTIVE blocks only, but WHITE_ENDING ALWAYS passes through
   const whiteBlock = whitePhase.phase === 'WHITE_ACTIVE';
-  const preWhiteBlock = whitePhase.phase === 'PRE_WHITE' && confidence < threshold - 8;
-  const downtrendBlock = regime.label === 'TRENDING_DOWN' && confidence < threshold - 5;
-  const randomBlock = regime.label === 'RANDOM' && confidence < threshold - 5 && !b2b.immediateB2B;
+  const preWhiteBlock =
+    whitePhase.phase === 'PRE_WHITE' &&
+    confidence < effectiveThreshold - 4 &&
+    !b2bStrong &&
+    !patternStrong;
+  const downtrendBlock =
+    regime.label === 'TRENDING_DOWN' &&
+    confidence < effectiveThreshold - 4 &&
+    !b2bStrong;
+  const randomWeakStructure =
+    !b2b.immediateB2B &&
+    !b2bStrong &&
+    !patternStrong &&
+    km.pHitWindow < Math.max(6, Math.round(effectiveThreshold * 0.55));
+  const randomBlock =
+    regime.label === 'RANDOM' &&
+    confidence < effectiveThreshold - 8 &&
+    randomWeakStructure &&
+    !inWindow;
   const hardBlock = whiteBlock || preWhiteBlock || downtrendBlock || randomBlock;
 
   // Strong transition signals that override blocks
-  const strongB2B = b2b.b2bScore >= CFG.b2bScoreThreshold;
+  const strongB2BThreshold = minVal <= 15 ? 50 : minVal <= 50 ? 54 : 58;
+  const strongB2B = b2b.b2bScore >= strongB2BThreshold;
   const strongWhiteRecovery = whitePhase.phase === 'WHITE_ENDING';
   const strongOverdue = droughtPct >= 85;
-  const strongTransition = strongB2B || strongWhiteRecovery || strongOverdue;
+  const strongPattern = pattern.ready && pattern.lift >= 6;
+  const strongTrendUp = regime.label === 'TRENDING_UP' && confidence >= effectiveThreshold - 8;
+  const strongTransition = strongB2B || strongWhiteRecovery || strongOverdue || strongPattern || strongTrendUp;
 
-  const issuePrediction = !hardBlock && confidence >= threshold ||
-    (strongTransition && confidence >= threshold - 12 && !whiteBlock);
+  const issuePrediction =
+    (!hardBlock && confidence >= effectiveThreshold) ||
+    (strongTransition && confidence >= effectiveThreshold - 10 && !whiteBlock);
 
 
 
@@ -1075,6 +1177,7 @@ function computeOracleForecast(rounds, target, options = {}) {
     else if (preWhiteBlock) avoidReason = 'pre_white_cluster';
     else if (downtrendBlock) avoidReason = 'downtrend';
     else if (randomBlock) avoidReason = 'random_like';
+    else if (confidence >= effectiveThreshold - 4) avoidReason = 'near_threshold';
     else if (isTooEarly) avoidReason = 'too_early';
     else avoidReason = 'weak_probability';
   }
@@ -1086,6 +1189,11 @@ function computeOracleForecast(rounds, target, options = {}) {
     else if (pattern.ready && pattern.lift >= 4) issueMode = 'pattern_support';
     else if (regime.label === 'TRENDING_UP') issueMode = 'trend_support';
     else issueMode = 'strict';
+  } else {
+    if (whiteBlock || preWhiteBlock) issueMode = 'cluster_guard';
+    else if (downtrendBlock) issueMode = 'trend_guard';
+    else if (confidence >= effectiveThreshold - 4 || kmStrong || patternStrong || b2bStrong) issueMode = 'watch';
+    else if (isTooEarly) issueMode = 'prep';
   }
 
   // Chase signal
@@ -1132,6 +1240,8 @@ function computeOracleForecast(rounds, target, options = {}) {
 
     // Confluence
     confidence,
+    threshold,
+    effectiveThreshold,
     rawConfidence: ensemble.rawConfidence,
     ensembleP: ensemble.ensembleP,
     baselineP: ensemble.baselineP,
