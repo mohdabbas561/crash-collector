@@ -918,6 +918,19 @@ function computeOracleForecast(rounds, target, options = {}) {
     highTargetMomentum ||
     (recentPattern.b2bSupportScore >= 65);
   const strongEdge = (pHitWindow >= (threshold - 6)) || (predictiveLift >= 3.5) || (patternSupport.ready && patternSupport.lift >= 4);
+  const highXAnticipation = (
+    minVal >= 15 &&
+    !recentPattern.whiteCluster &&
+    !recentPattern.preWhiteCluster &&
+    !recentPattern.downtrend &&
+    roundsUntilWindowLo <= Math.max(6, Math.round(winSize * 0.9)) &&
+    pHitNearWindow >= Math.max(24, threshold - 12) &&
+    confidence >= Math.max(18, threshold - 12) &&
+    (
+      predictiveLift >= -0.5 ||
+      (patternSupport.ready && patternSupport.lift >= 0.5)
+    )
+  );
 
   const whiteEscapeScore = minVal >= 100 ? 56 : 68;
   const preWhiteEscapeScore = whiteEscapeScore + 6;
@@ -956,13 +969,15 @@ function computeOracleForecast(rounds, target, options = {}) {
 
   const issuePrediction = !hardBlock && (
     confidence >= threshold ||
-    (strongTransition && confidence >= (threshold - 7) && strongEdge)
+    (strongTransition && confidence >= (threshold - 7) && strongEdge) ||
+    highXAnticipation
   );
 
   const issueMode = issuePrediction
     ? (
       recentPattern.b2bSupportScore >= 66 && roundsSince <= 2 ? 'b2b_support'
         : (recentPattern.whiteEndingSignal || recentPattern.lowRegimeEndingSignal) ? 'white_rebound'
+          : highXAnticipation ? 'highx_anticipation'
           : patternSupport.ready && patternSupport.lift >= 4 ? 'pattern_support'
             : strongTransition ? 'transition_support'
               : 'strict'
@@ -1047,6 +1062,10 @@ function computeOracleForecast(rounds, target, options = {}) {
     riskOverride: !issuePrediction,
     softDowntrendBlock: hardDowntrendBlock,
     softWhiteBlock: hardWhiteBlock,
+    b2bMomentum: Number(recentPattern.b2bSupportScore.toFixed(1)),
+    b2bMomentumPct: Number(recentPattern.b2bSupportScore.toFixed(1)),
+    b2bMomentumRatio: Number((recentPattern.b2bSupportScore / 100).toFixed(4)),
+    transitionSupport: Boolean(strongTransition || highXAnticipation),
     windowReady,
     windowReadyThreshold,
     pHit1: Number(pHit1.toFixed(1)),
