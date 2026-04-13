@@ -717,6 +717,25 @@ function computeOracleForecast(rounds, target, options = {}) {
       avoidReason: 'weak_probability',
       lockDriftAlert: false,
       lockDriftReason: null,
+      b2bMomentum: 0,
+      b2bMomentumPct: 0,
+      b2bMomentumRatio: 0,
+      b2bScore: 0,
+      b2bDetails: {
+        momentum: 0,
+        momentumPct: 0,
+        momentumRatio: 0,
+        level: 'low',
+        nearRate: 0,
+        longRate: 0,
+        immRate: 0,
+      },
+      recentPattern: {
+        b2bSupportScore: 0,
+        b2bMomentum: 0,
+        b2bMomentumPct: 0,
+        b2bMomentumRatio: 0,
+      },
     };
   }
 
@@ -747,6 +766,25 @@ function computeOracleForecast(rounds, target, options = {}) {
       avoidReason: 'weak_probability',
       lockDriftAlert: false,
       lockDriftReason: null,
+      b2bMomentum: 0,
+      b2bMomentumPct: 0,
+      b2bMomentumRatio: 0,
+      b2bScore: 0,
+      b2bDetails: {
+        momentum: 0,
+        momentumPct: 0,
+        momentumRatio: 0,
+        level: 'low',
+        nearRate: 0,
+        longRate: 0,
+        immRate: 0,
+      },
+      recentPattern: {
+        b2bSupportScore: 0,
+        b2bMomentum: 0,
+        b2bMomentumPct: 0,
+        b2bMomentumRatio: 0,
+      },
     };
   }
 
@@ -1011,6 +1049,15 @@ function computeOracleForecast(rounds, target, options = {}) {
   if (recentPattern.downtrend) reliabilityFlags.push('downtrend');
   if (randomLiftWeak || recentPattern.randomLike) reliabilityFlags.push('random_like');
   if (!patternSupport.ready) reliabilityFlags.push('pattern_low_sample');
+  const b2bMomentumPct = Number(recentPattern.b2bSupportScore.toFixed(1));
+  const b2bMomentumRatio = Number((b2bMomentumPct / 100).toFixed(4));
+  const b2bLevel = b2bMomentumPct >= 66
+    ? 'strong'
+    : b2bMomentumPct >= 40
+      ? 'medium'
+      : b2bMomentumPct >= 20
+        ? 'soft'
+        : 'low';
 
   return {
     ...target,
@@ -1062,9 +1109,20 @@ function computeOracleForecast(rounds, target, options = {}) {
     riskOverride: !issuePrediction,
     softDowntrendBlock: hardDowntrendBlock,
     softWhiteBlock: hardWhiteBlock,
-    b2bMomentum: Number(recentPattern.b2bSupportScore.toFixed(1)),
-    b2bMomentumPct: Number(recentPattern.b2bSupportScore.toFixed(1)),
-    b2bMomentumRatio: Number((recentPattern.b2bSupportScore / 100).toFixed(4)),
+    b2bMomentum: b2bMomentumPct,
+    b2bMomentumPct,
+    b2bMomentumRatio,
+    b2bScore: b2bMomentumRatio,
+    b2bSupportScore: b2bMomentumPct,
+    b2bDetails: {
+      momentum: b2bMomentumPct,
+      momentumPct: b2bMomentumPct,
+      momentumRatio: b2bMomentumRatio,
+      level: b2bLevel,
+      nearRate: Number(recentPattern.shortGapRate.toFixed(1)),
+      longRate: Number(recentPattern.nearHitRate.toFixed(1)),
+      immRate: Number(recentPattern.immediateGapRate.toFixed(1)),
+    },
     transitionSupport: Boolean(strongTransition || highXAnticipation),
     windowReady,
     windowReadyThreshold,
@@ -1087,6 +1145,9 @@ function computeOracleForecast(rounds, target, options = {}) {
     reliabilityFlags,
     recentPattern: {
       ...recentPattern,
+      b2bMomentum: b2bMomentumPct,
+      b2bMomentumPct,
+      b2bMomentumRatio,
       patternSupportPct: Number(patternSupport.supportPct.toFixed(1)),
       patternRandomPct: Number(patternSupport.randomPct.toFixed(1)),
       patternLift: Number(patternSupport.lift.toFixed(1)),
