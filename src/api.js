@@ -1199,10 +1199,10 @@ app.get('/health', (req,res) => {
 });
  
 async function resolveBotConfig() {
-  if (BOT_RPC_URL && BOT_PLAYER_ACCOUNT_PDA) {
+  if (BOT_RPC_URL) {
     return {
       rpcUrl: BOT_RPC_URL,
-      playerAccountPDA: BOT_PLAYER_ACCOUNT_PDA,
+      playerAccountPDA: BOT_PLAYER_ACCOUNT_PDA || '',
       source: 'env',
     };
   }
@@ -1210,13 +1210,12 @@ async function resolveBotConfig() {
   try {
     const wallets = await getWallets();
     const latest = (wallets || []).find((wallet) => (
-      String(wallet?.rpc_url || '').trim() &&
-      String(wallet?.player_account_pda || '').trim()
+      String(wallet?.rpc_url || '').trim()
     ));
     if (latest) {
       return {
         rpcUrl: String(latest.rpc_url).trim(),
-        playerAccountPDA: String(latest.player_account_pda).trim(),
+        playerAccountPDA: String(latest.player_account_pda || '').trim(),
         source: 'wallets',
       };
     }
@@ -1233,7 +1232,7 @@ app.get('/bot/config', rateLimit(60), async (req, res) => {
     return res.status(503).json({
       ok: false,
       error: 'BOT_CONFIG_MISSING',
-      message: 'Set BOT_RPC_URL + BOT_PLAYER_ACCOUNT_PDA (or save bot wallet config) in backend.',
+      message: 'Set BOT_RPC_URL (or save bot wallet config) in backend.',
     });
   }
   res.json({
