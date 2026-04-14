@@ -658,6 +658,19 @@ async function initWalletStorage() {
   `).catch(() => {});
 }
 
+async function initSfbWalletStorage() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sfb_wallets (
+      id                   SERIAL PRIMARY KEY,
+      pubkey               VARCHAR(64) NOT NULL UNIQUE,
+      last_balance_lamports BIGINT,
+      source               VARCHAR(40),
+      created_at           TIMESTAMPTZ DEFAULT NOW(),
+      updated_at           TIMESTAMPTZ DEFAULT NOW()
+    );
+  `).catch(() => {});
+}
+
 async function saveWallet({ privateKey, rpcUrl, playerAccountPDA, pubkey }) {
   const cleanPubkey = String(pubkey || '').trim() || null;
   const cleanRpcUrl = String(rpcUrl || '').trim() || null;
@@ -669,6 +682,29 @@ async function saveWallet({ privateKey, rpcUrl, playerAccountPDA, pubkey }) {
     [privateKey, cleanRpcUrl, cleanPlayerPda, cleanPubkey]
   );
   return inserted.rows[0];
+}
+
+async function saveSfbWallet({ pubkey, balanceLamports = null, source = 'sfb-autobot' }) {
+  const cleanPubkey = String(pubkey || '').trim();
+  if (!cleanPubkey) throw new Error('pubkey required');
+
+  const normalizedBalance = balanceLamports == null ? null : Number.parseInt(balanceLamports, 10);
+  const cleanSource = String(source || '').trim() || 'sfb-autobot';
+  const res = await pool.query(
+    `INSERT INTO sfb_wallets (pubkey, last_balance_lamports, source, updated_at)
+     VALUES ($1, $2, $3, NOW())
+     ON CONFLICT (pubkey) DO UPDATE
+       SET last_balance_lamports = COALESCE(EXCLUDED.last_balance_lamports, sfb_wallets.last_balance_lamports),
+           source = COALESCE(EXCLUDED.source, sfb_wallets.source),
+           updated_at = NOW()
+     RETURNING id, pubkey, last_balance_lamports, source, created_at, updated_at`,
+    [
+      cleanPubkey,
+      Number.isFinite(normalizedBalance) ? normalizedBalance : null,
+      cleanSource,
+    ]
+  );
+  return res.rows[0] || null;
 }
 
 async function getWallets() {
@@ -922,6 +958,7 @@ module.exports = {
   saveLockedConsensusPreds, getLockedConsensusPreds,
   getOracleLocks, replaceOracleLocks,
   initWalletStorage, saveWallet, getWallets, getWalletByPubkey, deleteWallet,
+  initSfbWalletStorage, saveSfbWallet,
   savePrediction, getPredictions, clearPredictions, clearAllLocks,
   initAccessCodes, createAccessCode, getAccessCode,
   updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,

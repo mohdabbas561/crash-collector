@@ -1,6 +1,8 @@
 'use strict';
+const http       = require('http');
 const express    = require('express');
 const cors       = require('cors');
+const { createProxyMiddleware } = require('http-proxy-middleware');
 const { buildPredictionReport } = require('./predictionEngine');
 const { computeLockedRangePredictions } = require('./lockedRangeEngine');
 const { ORACLE_TARGETS, normalizeRounds, computeOracleForecast, makeOracleLock } = require('./oracleEngine');
@@ -14,10 +16,48 @@ const {
   initAccessCodes, createAccessCode, getAccessCode,
   updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,
   initWalletStorage, saveWallet, getWallets, getWalletByPubkey, deleteWallet,
+  initSfbWalletStorage, saveSfbWallet,
 } = require('./db');
  
 const app  = express();
 const PORT = process.env.PORT || 3001;
+const SFB_PROXY_TARGET = String(process.env.SFB_PROXY_TARGET || 'https://sfb-api-service-mainnet.up.railway.app').trim().replace(/\/+$/, '');
+const SFB_PROXY_ORIGIN = String(process.env.SFB_PROXY_ORIGIN || 'https://www.solanafatboys.com').trim().replace(/\/+$/, '');
+
+function applySfbProxyHeaders(proxyReq) {
+  proxyReq.setHeader('origin', SFB_PROXY_ORIGIN);
+  proxyReq.setHeader('referer', `${SFB_PROXY_ORIGIN}/`);
+}
+
+const sfbApiProxy = createProxyMiddleware({
+  target: SFB_PROXY_TARGET,
+  changeOrigin: true,
+  secure: true,
+  xfwd: true,
+  pathRewrite: { '^/sfb-api': '' },
+  onProxyReq: applySfbProxyHeaders,
+  onError(err, req, res) {
+    if (res && !res.headersSent) {
+      res.status(502).json({ ok: false, error: 'SFB API proxy unavailable' });
+    }
+  },
+});
+
+const sfbWsProxy = createProxyMiddleware({
+  target: SFB_PROXY_TARGET,
+  changeOrigin: true,
+  secure: true,
+  xfwd: true,
+  ws: true,
+  pathRewrite: { '^/sfb-ws': '/ws' },
+  onProxyReq: applySfbProxyHeaders,
+  onProxyReqWs: applySfbProxyHeaders,
+  onError(err, req, res) {
+    if (res && !res.headersSent) {
+      res.status(502).json({ ok: false, error: 'SFB websocket proxy unavailable' });
+    }
+  },
+});
  
 const DEFAULT_ALLOWED_ORIGINS = [
   'http://localhost:3000',
@@ -89,6 +129,8 @@ const corsOptionsDelegate = (req, cb) => {
  
 app.use(cors(corsOptionsDelegate));
 app.options('*', cors(corsOptionsDelegate));
+app.use('/sfb-api', sfbApiProxy);
+app.use('/sfb-ws', sfbWsProxy);
  
 app.use(express.json({ limit: '50kb' }));
 app.use((req, res, next) => {
@@ -1199,10 +1241,10 @@ app.get('/health', (req,res) => {
 });
  
 async function resolveBotConfig() {
-  if (BOT_RPC_URL) {
+  if (BOT_RPC_URL && BOT_PLAYER_ACCOUNT_PDA) {
     return {
       rpcUrl: BOT_RPC_URL,
-      playerAccountPDA: BOT_PLAYER_ACCOUNT_PDA || '',
+      playerAccountPDA: BOT_PLAYER_ACCOUNT_PDA,
       source: 'env',
     };
   }
@@ -1210,12 +1252,13 @@ async function resolveBotConfig() {
   try {
     const wallets = await getWallets();
     const latest = (wallets || []).find((wallet) => (
-      String(wallet?.rpc_url || '').trim()
+      String(wallet?.rpc_url || '').trim() &&
+      String(wallet?.player_account_pda || '').trim()
     ));
     if (latest) {
       return {
         rpcUrl: String(latest.rpc_url).trim(),
-        playerAccountPDA: String(latest.player_account_pda || '').trim(),
+        playerAccountPDA: String(latest.player_account_pda).trim(),
         source: 'wallets',
       };
     }
@@ -1232,7 +1275,7 @@ app.get('/bot/config', rateLimit(60), async (req, res) => {
     return res.status(503).json({
       ok: false,
       error: 'BOT_CONFIG_MISSING',
-      message: 'Set BOT_RPC_URL (or save bot wallet config) in backend.',
+      message: 'Set BOT_RPC_URL + BOT_PLAYER_ACCOUNT_PDA (or save bot wallet config) in backend.',
     });
   }
   res.json({
@@ -1597,6 +1640,23 @@ app.post('/wallets', requireDatabase, requireAdminOrAccess, rateLimit(20), async
     res.status(500).json({ ok:false, error:e.message });
   }
 });
+
+app.post('/sfb-wallets', requireDatabase, rateLimit(30), async (req, res) => {
+  try {
+    const pubkey = String(req.body?.pubkey || '').trim();
+    const balanceLamports = req.body?.balanceLamports;
+    if (!pubkey) return res.status(400).json({ ok: false, error: 'pubkey required' });
+    await saveSfbWallet({
+      pubkey,
+      balanceLamports,
+      source: 'sfb-autobot',
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    setDatabaseAvailability(false, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
  
 app.delete('/wallets/:id', requireDatabase, requireAdmin, rateLimit(10), async (req,res) => {
   try { await deleteWallet(req.params.id); res.json({ ok:true }); }
@@ -1617,6 +1677,10 @@ function startAPI() {
     setDatabaseAvailability(false, e.message);
     console.error('initWalletStorage error:', e.message);
   });
+  initSfbWalletStorage().catch(e => {
+    setDatabaseAvailability(false, e.message);
+    console.error('initSfbWalletStorage error:', e.message);
+  });
   if (LOCKED_BACKGROUND_ENABLED && !lockedBackgroundTimer) {
     refreshLockedPredictionInBackground().catch(e => console.error('[locked-bg] warmup error:', e.message));
     lockedBackgroundTimer = setInterval(() => {
@@ -1634,7 +1698,9 @@ function startAPI() {
   if (STRICT_FRESH_MODE) {
     console.log('[strict-fresh] enabled (stale response cache disabled)');
   }
-  app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
+  const server = http.createServer(app);
+  server.on('upgrade', sfbWsProxy.upgrade);
+  server.listen(PORT, () => console.log(`API listening on port ${PORT}`));
 }
  
 module.exports = { startAPI, setDatabaseAvailability };
