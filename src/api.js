@@ -29,6 +29,16 @@ const SFB_PROXY_HEADERS = {
   referer: `${SFB_PROXY_ORIGIN}/`,
 };
 
+function reflectBrowserCors(proxyRes, req) {
+  const requestOrigin = req.headers?.origin;
+  if (!requestOrigin || !isOriginAllowed(requestOrigin)) return;
+  proxyRes.headers['access-control-allow-origin'] = requestOrigin;
+  proxyRes.headers['access-control-allow-credentials'] = 'true';
+  proxyRes.headers.vary = proxyRes.headers.vary
+    ? `${proxyRes.headers.vary}, Origin`
+    : 'Origin';
+}
+
 const sfbApiProxy = createProxyMiddleware({
   target: SFB_PROXY_TARGET,
   changeOrigin: true,
@@ -40,6 +50,9 @@ const sfbApiProxy = createProxyMiddleware({
     proxyReq(proxyReq) {
       proxyReq.setHeader('origin', SFB_PROXY_ORIGIN);
       proxyReq.setHeader('referer', `${SFB_PROXY_ORIGIN}/`);
+    },
+    proxyRes(proxyRes, req) {
+      reflectBrowserCors(proxyRes, req);
     },
   },
   onError(err, req, res) {
@@ -65,6 +78,9 @@ const sfbWsProxy = createProxyMiddleware({
     proxyReqWs(proxyReq) {
       proxyReq.setHeader('origin', SFB_PROXY_ORIGIN);
       proxyReq.setHeader('referer', `${SFB_PROXY_ORIGIN}/`);
+    },
+    proxyRes(proxyRes, req) {
+      reflectBrowserCors(proxyRes, req);
     },
   },
   onError(err, req, res) {
