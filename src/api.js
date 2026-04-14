@@ -24,19 +24,24 @@ const PORT = process.env.PORT || 3001;
 const SFB_PROXY_TARGET = String(process.env.SFB_PROXY_TARGET || 'https://sfb-api-service-mainnet.up.railway.app').trim().replace(/\/+$/, '');
 const SFB_PROXY_ORIGIN = String(process.env.SFB_PROXY_ORIGIN || 'https://www.solanafatboys.com').trim().replace(/\/+$/, '');
 const rewriteSfbWsPath = (path) => (path === '/' ? '/ws' : `/ws${path}`);
-
-function applySfbProxyHeaders(proxyReq) {
-  proxyReq.setHeader('origin', SFB_PROXY_ORIGIN);
-  proxyReq.setHeader('referer', `${SFB_PROXY_ORIGIN}/`);
-}
+const SFB_PROXY_HEADERS = {
+  origin: SFB_PROXY_ORIGIN,
+  referer: `${SFB_PROXY_ORIGIN}/`,
+};
 
 const sfbApiProxy = createProxyMiddleware({
   target: SFB_PROXY_TARGET,
   changeOrigin: true,
   secure: true,
   xfwd: true,
+  headers: SFB_PROXY_HEADERS,
   pathRewrite: { '^/sfb-api': '' },
-  onProxyReq: applySfbProxyHeaders,
+  on: {
+    proxyReq(proxyReq) {
+      proxyReq.setHeader('origin', SFB_PROXY_ORIGIN);
+      proxyReq.setHeader('referer', `${SFB_PROXY_ORIGIN}/`);
+    },
+  },
   onError(err, req, res) {
     if (res && !res.headersSent) {
       res.status(502).json({ ok: false, error: 'SFB API proxy unavailable' });
@@ -50,9 +55,18 @@ const sfbWsProxy = createProxyMiddleware({
   secure: true,
   xfwd: true,
   ws: true,
+  headers: SFB_PROXY_HEADERS,
   pathRewrite: rewriteSfbWsPath,
-  onProxyReq: applySfbProxyHeaders,
-  onProxyReqWs: applySfbProxyHeaders,
+  on: {
+    proxyReq(proxyReq) {
+      proxyReq.setHeader('origin', SFB_PROXY_ORIGIN);
+      proxyReq.setHeader('referer', `${SFB_PROXY_ORIGIN}/`);
+    },
+    proxyReqWs(proxyReq) {
+      proxyReq.setHeader('origin', SFB_PROXY_ORIGIN);
+      proxyReq.setHeader('referer', `${SFB_PROXY_ORIGIN}/`);
+    },
+  },
   onError(err, req, res) {
     if (res && !res.headersSent) {
       res.status(502).json({ ok: false, error: 'SFB websocket proxy unavailable' });
