@@ -23,6 +23,7 @@ const app  = express();
 const PORT = process.env.PORT || 3001;
 const SFB_PROXY_TARGET = String(process.env.SFB_PROXY_TARGET || 'https://sfb-api-service-mainnet.up.railway.app').trim().replace(/\/+$/, '');
 const SFB_PROXY_ORIGIN = String(process.env.SFB_PROXY_ORIGIN || 'https://www.solanafatboys.com').trim().replace(/\/+$/, '');
+const rewriteSfbWsPath = (path) => (path === '/' ? '/ws' : `/ws${path}`);
 
 function applySfbProxyHeaders(proxyReq) {
   proxyReq.setHeader('origin', SFB_PROXY_ORIGIN);
@@ -49,7 +50,7 @@ const sfbWsProxy = createProxyMiddleware({
   secure: true,
   xfwd: true,
   ws: true,
-  pathRewrite: { '^/sfb-ws': '/ws' },
+  pathRewrite: rewriteSfbWsPath,
   onProxyReq: applySfbProxyHeaders,
   onProxyReqWs: applySfbProxyHeaders,
   onError(err, req, res) {
@@ -64,6 +65,8 @@ const DEFAULT_ALLOWED_ORIGINS = [
   'http://127.0.0.1:3000',
   'http://localhost:5173',
   'http://127.0.0.1:5173',
+  'https://sfb-bks5.onrender.com',
+  'https://crash-collector-production-3672.up.railway.app',
 ];
 const EXPLICIT_ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
