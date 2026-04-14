@@ -65,12 +65,13 @@ const DEFAULT_ALLOWED_ORIGINS = [
   'http://localhost:5173',
   'http://127.0.0.1:5173',
 ];
+const EXPLICIT_ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 const ALLOWED_ORIGIN_RULES = Array.from(new Set([
   ...DEFAULT_ALLOWED_ORIGINS,
-  ...(process.env.ALLOWED_ORIGINS || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean),
+  ...EXPLICIT_ALLOWED_ORIGINS,
 ]));
  
 function normalizeOriginValue(value) {
@@ -103,7 +104,9 @@ function originMatchesRule(origin, rule) {
  
 function isOriginAllowed(origin) {
   if (!origin) return true;
-  if (ALLOWED_ORIGIN_RULES.length === 0) return true;
+  // When ALLOWED_ORIGINS is unset, keep public browser clients working by
+  // reflecting the caller origin instead of restricting production to localhost.
+  if (EXPLICIT_ALLOWED_ORIGINS.length === 0) return true;
   return ALLOWED_ORIGIN_RULES.some(rule => originMatchesRule(origin, rule));
 }
  
