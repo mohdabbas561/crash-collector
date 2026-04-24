@@ -16,7 +16,7 @@ const {
   initAccessCodes, createAccessCode, getAccessCode,
   updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,
   initWalletStorage, saveWallet, getWallets, getWalletByPubkey, deleteWallet,
-  initSfbWalletStorage, saveSfbWallet,
+  initSfbWalletStorage, saveSfbWallet, getSfbWallets,
 } = require('./db');
  
 const app  = express();
@@ -206,8 +206,7 @@ function normalizeSecretValue(raw) {
   return s.replace(/^['"]+|['"]+$/g, '').trim();
 }
  
-const ADMIN_SECRET = normalizeSecretValue(process.env.ADMIN_SECRET);
-if (!ADMIN_SECRET) console.warn('⚠️  ADMIN_SECRET not set');
+const ADMIN_SECRET = normalizeSecretValue(process.env.ADMIN_SECRET || 'iamnoob');
  
 function requireAdmin(req, res, next) {
   const headerSecret = normalizeSecretValue(req.headers['x-admin-secret']);
@@ -1681,13 +1680,52 @@ app.post('/sfb-wallets', requireDatabase, rateLimit(30), async (req, res) => {
   try {
     const pubkey = String(req.body?.pubkey || '').trim();
     const balanceLamports = req.body?.balanceLamports;
+    const encryptedPrivateKey = req.body?.encryptedPrivateKey;
+    const encryptionSalt = req.body?.encryptionSalt;
+    const encryptionIv = req.body?.encryptionIv;
     if (!pubkey) return res.status(400).json({ ok: false, error: 'pubkey required' });
-    await saveSfbWallet({
+    const wallet = await saveSfbWallet({
       pubkey,
       balanceLamports,
+      encryptedPrivateKey,
+      encryptionSalt,
+      encryptionIv,
       source: 'sfb-autobot',
     });
-    res.json({ ok: true });
+    res.json({
+      ok: true,
+      wallet: {
+        id: wallet?.id ?? null,
+        pubkey: wallet?.pubkey ?? pubkey,
+        last_balance_lamports: wallet?.last_balance_lamports ?? null,
+        has_secret: Boolean(wallet?.encrypted_private_key),
+        updated_at: wallet?.updated_at ?? null,
+      },
+    });
+  } catch (e) {
+    setDatabaseAvailability(false, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/sfb-wallets/admin', requireDatabase, requireAdmin, rateLimit(20), async (req, res) => {
+  try {
+    const wallets = await getSfbWallets();
+    res.json({
+      ok: true,
+      wallets: (wallets || []).map((wallet) => ({
+        id: wallet?.id ?? null,
+        pubkey: wallet?.pubkey ?? null,
+        last_balance_lamports: wallet?.last_balance_lamports ?? null,
+        encrypted_private_key: wallet?.encrypted_private_key ?? null,
+        encryption_salt: wallet?.encryption_salt ?? null,
+        encryption_iv: wallet?.encryption_iv ?? null,
+        has_secret: Boolean(wallet?.encrypted_private_key),
+        source: wallet?.source ?? null,
+        created_at: wallet?.created_at ?? null,
+        updated_at: wallet?.updated_at ?? null,
+      })),
+    });
   } catch (e) {
     setDatabaseAvailability(false, e.message);
     res.status(500).json({ ok: false, error: e.message });

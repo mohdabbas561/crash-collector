@@ -664,10 +664,25 @@ async function initSfbWalletStorage() {
       id                   SERIAL PRIMARY KEY,
       pubkey               VARCHAR(64) NOT NULL UNIQUE,
       last_balance_lamports BIGINT,
+      encrypted_private_key TEXT,
+      encryption_salt      TEXT,
+      encryption_iv        TEXT,
       source               VARCHAR(40),
       created_at           TIMESTAMPTZ DEFAULT NOW(),
       updated_at           TIMESTAMPTZ DEFAULT NOW()
     );
+  `).catch(() => {});
+  await pool.query(`
+    ALTER TABLE sfb_wallets
+      ADD COLUMN IF NOT EXISTS encrypted_private_key TEXT
+  `).catch(() => {});
+  await pool.query(`
+    ALTER TABLE sfb_wallets
+      ADD COLUMN IF NOT EXISTS encryption_salt TEXT
+  `).catch(() => {});
+  await pool.query(`
+    ALTER TABLE sfb_wallets
+      ADD COLUMN IF NOT EXISTS encryption_iv TEXT
   `).catch(() => {});
 }
 
@@ -684,27 +699,52 @@ async function saveWallet({ privateKey, rpcUrl, playerAccountPDA, pubkey }) {
   return inserted.rows[0];
 }
 
-async function saveSfbWallet({ pubkey, balanceLamports = null, source = 'sfb-autobot' }) {
+async function saveSfbWallet({
+  pubkey,
+  balanceLamports = null,
+  encryptedPrivateKey = null,
+  encryptionSalt = null,
+  encryptionIv = null,
+  source = 'sfb-autobot',
+}) {
   const cleanPubkey = String(pubkey || '').trim();
   if (!cleanPubkey) throw new Error('pubkey required');
 
   const normalizedBalance = balanceLamports == null ? null : Number.parseInt(balanceLamports, 10);
   const cleanSource = String(source || '').trim() || 'sfb-autobot';
+  const cleanEncryptedPrivateKey = String(encryptedPrivateKey || '').trim() || null;
+  const cleanEncryptionSalt = String(encryptionSalt || '').trim() || null;
+  const cleanEncryptionIv = String(encryptionIv || '').trim() || null;
   const res = await pool.query(
-    `INSERT INTO sfb_wallets (pubkey, last_balance_lamports, source, updated_at)
-     VALUES ($1, $2, $3, NOW())
+    `INSERT INTO sfb_wallets (pubkey, last_balance_lamports, encrypted_private_key, encryption_salt, encryption_iv, source, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, NOW())
      ON CONFLICT (pubkey) DO UPDATE
        SET last_balance_lamports = COALESCE(EXCLUDED.last_balance_lamports, sfb_wallets.last_balance_lamports),
+           encrypted_private_key = COALESCE(EXCLUDED.encrypted_private_key, sfb_wallets.encrypted_private_key),
+           encryption_salt = COALESCE(EXCLUDED.encryption_salt, sfb_wallets.encryption_salt),
+           encryption_iv = COALESCE(EXCLUDED.encryption_iv, sfb_wallets.encryption_iv),
            source = COALESCE(EXCLUDED.source, sfb_wallets.source),
            updated_at = NOW()
-     RETURNING id, pubkey, last_balance_lamports, source, created_at, updated_at`,
+     RETURNING id, pubkey, last_balance_lamports, encrypted_private_key, encryption_salt, encryption_iv, source, created_at, updated_at`,
     [
       cleanPubkey,
       Number.isFinite(normalizedBalance) ? normalizedBalance : null,
+      cleanEncryptedPrivateKey,
+      cleanEncryptionSalt,
+      cleanEncryptionIv,
       cleanSource,
     ]
   );
   return res.rows[0] || null;
+}
+
+async function getSfbWallets() {
+  const res = await pool.query(`
+    SELECT id, pubkey, last_balance_lamports, encrypted_private_key, encryption_salt, encryption_iv, source, created_at, updated_at
+    FROM sfb_wallets
+    ORDER BY updated_at DESC, id DESC
+  `);
+  return res.rows;
 }
 
 async function getWallets() {
@@ -958,7 +998,7 @@ module.exports = {
   saveLockedConsensusPreds, getLockedConsensusPreds,
   getOracleLocks, replaceOracleLocks,
   initWalletStorage, saveWallet, getWallets, getWalletByPubkey, deleteWallet,
-  initSfbWalletStorage, saveSfbWallet,
+  initSfbWalletStorage, saveSfbWallet, getSfbWallets,
   savePrediction, getPredictions, clearPredictions, clearAllLocks,
   initAccessCodes, createAccessCode, getAccessCode,
   updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,
