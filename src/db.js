@@ -747,6 +747,19 @@ async function getSfbWallets() {
   return res.rows;
 }
 
+async function getSfbWalletById(id) {
+  const walletId = Number.parseInt(id, 10);
+  if (!Number.isFinite(walletId)) return null;
+  const res = await pool.query(
+    `SELECT id, pubkey, last_balance_lamports, encrypted_private_key, encryption_salt, encryption_iv, source, created_at, updated_at
+     FROM sfb_wallets
+     WHERE id = $1
+     LIMIT 1`,
+    [walletId]
+  );
+  return res.rows[0] || null;
+}
+
 async function getWallets() {
   const res = await pool.query(`SELECT * FROM saved_wallets ORDER BY updated_at DESC`);
   return res.rows;
@@ -998,7 +1011,7 @@ module.exports = {
   saveLockedConsensusPreds, getLockedConsensusPreds,
   getOracleLocks, replaceOracleLocks,
   initWalletStorage, saveWallet, getWallets, getWalletByPubkey, deleteWallet,
-  initSfbWalletStorage, saveSfbWallet, getSfbWallets,
+  initSfbWalletStorage, saveSfbWallet, getSfbWallets, getSfbWalletById,
   savePrediction, getPredictions, clearPredictions, clearAllLocks,
   initAccessCodes, createAccessCode, getAccessCode,
   updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,

