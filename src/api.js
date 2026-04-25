@@ -261,22 +261,24 @@ function hasValidAdminSession(req) {
 }
 
 function setAdminSessionCookie(req, res, token) {
+  const secure = isSecureRequest(req);
   res.cookie(ADMIN_SESSION_COOKIE, token, {
     httpOnly: true,
-    sameSite: 'strict',
-    secure: isSecureRequest(req),
+    sameSite: secure ? 'none' : 'lax',
+    secure,
     path: '/',
     maxAge: ADMIN_SESSION_TTL_MS,
   });
 }
 
 function clearAdminSessionCookie(req, res) {
+  const secure = isSecureRequest(req);
   const token = getAdminSessionToken(req);
   if (token) adminSessions.delete(token);
   res.clearCookie(ADMIN_SESSION_COOKIE, {
     httpOnly: true,
-    sameSite: 'strict',
-    secure: isSecureRequest(req),
+    sameSite: secure ? 'none' : 'lax',
+    secure,
     path: '/',
   });
 }
