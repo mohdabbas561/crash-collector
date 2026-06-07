@@ -547,17 +547,17 @@ async function getStats() {
         FROM rounds
       )
       SELECT
-        l.round_id - COALESCE(lh.h2,    0) AS g2,
-        l.round_id - COALESCE(lh.h5,    0) AS g5,
-        l.round_id - COALESCE(lh.h10,   0) AS g10,
-        l.round_id - COALESCE(lh.h20,   0) AS g20,
-        l.round_id - COALESCE(lh.h25,   0) AS g25,
-        l.round_id - COALESCE(lh.h30,   0) AS g30,
-        l.round_id - COALESCE(lh.h50,   0) AS g50,
-        l.round_id - COALESCE(lh.h100,  0) AS g100,
-        l.round_id - COALESCE(lh.h200,  0) AS g200,
-        l.round_id - COALESCE(lh.h500,  0) AS g500,
-        l.round_id - COALESCE(lh.h1000, 0) AS g1000
+        CASE WHEN lh.h2    IS NULL THEN NULL ELSE l.round_id - lh.h2    END AS g2,
+        CASE WHEN lh.h5    IS NULL THEN NULL ELSE l.round_id - lh.h5    END AS g5,
+        CASE WHEN lh.h10   IS NULL THEN NULL ELSE l.round_id - lh.h10   END AS g10,
+        CASE WHEN lh.h20   IS NULL THEN NULL ELSE l.round_id - lh.h20   END AS g20,
+        CASE WHEN lh.h25   IS NULL THEN NULL ELSE l.round_id - lh.h25   END AS g25,
+        CASE WHEN lh.h30   IS NULL THEN NULL ELSE l.round_id - lh.h30   END AS g30,
+        CASE WHEN lh.h50   IS NULL THEN NULL ELSE l.round_id - lh.h50   END AS g50,
+        CASE WHEN lh.h100  IS NULL THEN NULL ELSE l.round_id - lh.h100  END AS g100,
+        CASE WHEN lh.h200  IS NULL THEN NULL ELSE l.round_id - lh.h200  END AS g200,
+        CASE WHEN lh.h500  IS NULL THEN NULL ELSE l.round_id - lh.h500  END AS g500,
+        CASE WHEN lh.h1000 IS NULL THEN NULL ELSE l.round_id - lh.h1000 END AS g1000
       FROM latest l, last_hits lh
     `)
   ]);
@@ -569,10 +569,17 @@ async function getStats() {
     highest     : row.highest,
     currentRound: Number(row.current_round) || null,
     gaps: {
-      2: Number(g.g2)||0, 5: Number(g.g5)||0, 10: Number(g.g10)||0,
-      20: Number(g.g20)||0, 25: Number(g.g25)||0, 30: Number(g.g30)||0,
-      50: Number(g.g50)||0, 100: Number(g.g100)||0,
-      200: Number(g.g200)||0, 500: Number(g.g500)||0, 1000: Number(g.g1000)||0,
+      2: g.g2 == null ? null : Number(g.g2),
+      5: g.g5 == null ? null : Number(g.g5),
+      10: g.g10 == null ? null : Number(g.g10),
+      20: g.g20 == null ? null : Number(g.g20),
+      25: g.g25 == null ? null : Number(g.g25),
+      30: g.g30 == null ? null : Number(g.g30),
+      50: g.g50 == null ? null : Number(g.g50),
+      100: g.g100 == null ? null : Number(g.g100),
+      200: g.g200 == null ? null : Number(g.g200),
+      500: g.g500 == null ? null : Number(g.g500),
+      1000: g.g1000 == null ? null : Number(g.g1000),
     },
     distribution: {
       lt2    : Number(row.lt2),
