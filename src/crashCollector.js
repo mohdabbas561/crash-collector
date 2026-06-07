@@ -19,27 +19,17 @@ const DEFAULT_CRASH_SOURCES = [
     roundsPath: '?limit=100',
   },
   {
-    sourceKey: 'stake-crash',
-    label: 'Stake Crash',
-    gameUrl: 'https://stake.bet/casino/games/crash',
-    adapter: 'auto',
+    sourceKey: 'solanafatboys-bustonaut',
+    label: 'Solana Fat Boys Bustonaut',
+    gameUrl: 'https://www.solanafatboys.com/bustonaut/',
+    adapter: 'sfb',
+    apiUrl: 'https://sfb-api-service-mainnet.up.railway.app/api/games/bustonaut/latest?page=0&limit=100',
+    roundsPath: '?page=0&limit=100',
   },
   {
     sourceKey: 'bcgame-crash',
     label: 'BC.Game Crash',
     gameUrl: 'https://bcgame52.com/game/crash',
-    adapter: 'auto',
-  },
-  {
-    sourceKey: 'solanafatboys-bustonaut',
-    label: 'Solana Fat Boys Bustonaut',
-    gameUrl: 'https://www.solanafatboys.com/bustonaut/',
-    adapter: 'auto',
-  },
-  {
-    sourceKey: 'solcrash-play',
-    label: 'SolCrash',
-    gameUrl: 'https://solcrash.io/play',
     adapter: 'auto',
   },
 ];
@@ -74,6 +64,16 @@ function normalizeUrl(raw) {
   return value.replace(/\/+$/, '');
 }
 
+function normalizeGameKey(raw) {
+  const value = normalizeUrl(raw);
+  if (!value) return '';
+  try {
+    return new URL(value).origin.toLowerCase() + new URL(value).pathname.toLowerCase();
+  } catch {
+    return value.toLowerCase();
+  }
+}
+
 function resolveUrl(baseUrl, maybeRelative) {
   try {
     return new URL(maybeRelative, baseUrl).href;
@@ -102,8 +102,12 @@ function extractRoundArray(payload) {
   if (Array.isArray(payload.history)) return payload.history;
   if (Array.isArray(payload.items)) return payload.items;
   if (Array.isArray(payload.data)) return payload.data;
+  if (Array.isArray(payload.entries)) return payload.entries;
+  if (Array.isArray(payload.list)) return payload.list;
   if (payload.data && Array.isArray(payload.data.rounds)) return payload.data.rounds;
   if (payload.data && Array.isArray(payload.data.history)) return payload.data.history;
+  if (payload.data && Array.isArray(payload.data.entries)) return payload.data.entries;
+  if (payload.data && Array.isArray(payload.data.list)) return payload.data.list;
   return [];
 }
 
@@ -113,6 +117,7 @@ function normalizeRoundRow(row) {
     row.roundId ??
     row.round_id ??
     row.id ??
+    row.gameId ??
     row.gameRoundId ??
     row.round ??
     row.sequence ??
@@ -121,6 +126,8 @@ function normalizeRoundRow(row) {
   );
   const multiplier = parseFloatish(
     row.multiplier ??
+    row.bustMultiplier ??
+    row.crashMultiplier ??
     row.gameResult ??
     row.crashPoint ??
     row.crash_point ??
@@ -284,7 +291,32 @@ async function parseRoundsFromApi(apiUrl) {
 async function ensureSeedData() {
   const existingSites = await getCrashSites();
   const existingKeys = new Set(existingSites.map((site) => site.sourceKey));
+  const existingGameKeys = new Map(
+    existingSites.map((site) => [normalizeGameKey(site.gameUrl), site])
+  );
   for (const site of DEFAULT_CRASH_SOURCES) {
+    const gameKey = normalizeGameKey(site.gameUrl);
+    const existingByGame = existingGameKeys.get(gameKey);
+    if (existingByGame) {
+      const needsFix = (
+        (site.apiUrl && !existingByGame.apiUrl) ||
+        (site.roundsPath && !existingByGame.roundsPath) ||
+        (site.adapter && existingByGame.adapter !== site.adapter)
+      );
+      if (needsFix) {
+        await upsertCrashSite({
+          sourceKey: existingByGame.sourceKey,
+          label: existingByGame.label || site.label,
+          gameUrl: existingByGame.gameUrl || site.gameUrl,
+          adapter: site.adapter || existingByGame.adapter,
+          apiUrl: existingByGame.apiUrl || site.apiUrl || null,
+          roundsPath: existingByGame.roundsPath || site.roundsPath || null,
+          enabled: existingByGame.enabled,
+          pollIntervalMs: existingByGame.pollIntervalMs || site.pollIntervalMs || 30000,
+        });
+      }
+      continue;
+    }
     if (existingKeys.has(site.sourceKey)) continue;
     await upsertCrashSite({
       sourceKey: site.sourceKey,
@@ -309,6 +341,19 @@ async function refreshSiteConfig(site) {
       adapter: site.adapter,
       apiUrl: 'https://api.dealer.degencoinflip.com/v1/game/2/room/1/rounds?limit=100',
       roundsPath: '?limit=100',
+      enabled: site.enabled,
+      pollIntervalMs: site.pollIntervalMs,
+    });
+  }
+
+  if (site.adapter === 'sfb' && !site.apiUrl) {
+    return upsertCrashSite({
+      sourceKey: site.sourceKey,
+      label: site.label,
+      gameUrl: site.gameUrl,
+      adapter: site.adapter,
+      apiUrl: 'https://sfb-api-service-mainnet.up.railway.app/api/games/bustonaut/latest?page=0&limit=100',
+      roundsPath: '?page=0&limit=100',
       enabled: site.enabled,
       pollIntervalMs: site.pollIntervalMs,
     });

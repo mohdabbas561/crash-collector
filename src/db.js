@@ -1006,9 +1006,81 @@ async function getCrashDashboard({ limitPerSite = 40 } = {}) {
       },
     });
   }
-  const overallSummary = await getCrashSummary();
+
+  const normalizedKey = (value) => {
+    const raw = String(value || '').trim().replace(/\/+$/, '');
+    if (!raw) return '';
+    try {
+      const url = new URL(raw);
+      return `${url.origin.toLowerCase()}${url.pathname.toLowerCase()}`;
+    } catch {
+      return raw.toLowerCase();
+    }
+  };
+
+  const pickPreferredSite = (current, candidate) => {
+    if (!current) return candidate;
+    const currentScore = [
+      Number(current?.summary?.total || 0) > 0 ? 4 : 0,
+      String(current?.apiUrl || '').trim() ? 2 : 0,
+      String(current?.lastSuccessAt || '').trim() ? 1 : 0,
+      Number(current?.id || 0) / 1000000,
+    ].reduce((sum, value) => sum + value, 0);
+    const candidateScore = [
+      Number(candidate?.summary?.total || 0) > 0 ? 4 : 0,
+      String(candidate?.apiUrl || '').trim() ? 2 : 0,
+      String(candidate?.lastSuccessAt || '').trim() ? 1 : 0,
+      Number(candidate?.id || 0) / 1000000,
+    ].reduce((sum, value) => sum + value, 0);
+    return candidateScore > currentScore ? candidate : current;
+  };
+
+  const uniqueSitesByGame = new Map();
+  for (const site of enriched) {
+    const key = normalizedKey(site.gameUrl || site.sourceKey || site.label);
+    const next = pickPreferredSite(uniqueSitesByGame.get(key), site);
+    uniqueSitesByGame.set(key, next);
+  }
+
+  const uniqueSites = [...uniqueSitesByGame.values()];
+  const overallSummary = uniqueSites.reduce((acc, site) => {
+    const summary = site.summary || {};
+    const total = Number(summary.total || 0);
+    const avg = Number(summary.avg || 0);
+    acc.total += total;
+    acc.counts.gte3 += Number(summary?.counts?.gte3 || 0);
+    acc.counts.gte4 += Number(summary?.counts?.gte4 || 0);
+    acc.counts.gte5 += Number(summary?.counts?.gte5 || 0);
+    if (Number.isFinite(summary.latestRoundId)) {
+      acc.latestRoundId = acc.latestRoundId == null
+        ? Number(summary.latestRoundId)
+        : Math.max(acc.latestRoundId, Number(summary.latestRoundId));
+    }
+    if (Number.isFinite(summary.highest)) {
+      acc.highest = acc.highest == null ? Number(summary.highest) : Math.max(acc.highest, Number(summary.highest));
+    }
+    if (total > 0 && Number.isFinite(avg)) {
+      acc.weightedAvg += avg * total;
+      acc.weightedTotal += total;
+    }
+    return acc;
+  }, {
+    total: 0,
+    latestRoundId: null,
+    highest: null,
+    weightedAvg: 0,
+    weightedTotal: 0,
+    counts: { gte3: 0, gte4: 0, gte5: 0 },
+  });
+
+  overallSummary.avg = overallSummary.weightedTotal > 0
+    ? Number((overallSummary.weightedAvg / overallSummary.weightedTotal).toFixed(4))
+    : null;
+  delete overallSummary.weightedAvg;
+  delete overallSummary.weightedTotal;
+
   return {
-    sites: enriched,
+    sites: uniqueSites,
     overall: overallSummary,
     generatedAt: new Date().toISOString(),
   };

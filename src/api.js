@@ -1426,15 +1426,35 @@ app.post('/crash-sites', rateLimit(20), async (req, res) => {
     if (!gameUrl) return res.status(400).json({ ok: false, error: 'gameUrl required' });
     const label = String(req.body?.label || '').trim() || inferCrashLabel(gameUrl);
     const sourceKey = String(req.body?.sourceKey || '').trim() || slugifyCrashKey(gameUrl);
+    const existingSites = await getCrashSites();
+    const normalizeGameKey = (value) => {
+      const raw = String(value || '').trim().replace(/\/+$/, '');
+      if (!raw) return '';
+      try {
+        const url = new URL(raw);
+        return `${url.origin.toLowerCase()}${url.pathname.toLowerCase()}`;
+      } catch {
+        return raw.toLowerCase();
+      }
+    };
+    const existingSite = existingSites.find((site) => normalizeGameKey(site.gameUrl) === normalizeGameKey(gameUrl));
     const site = await upsertCrashSite({
-      sourceKey,
+      sourceKey: existingSite?.sourceKey || sourceKey,
       label,
       gameUrl,
-      adapter: String(req.body?.adapter || 'auto').trim() || 'auto',
-      apiUrl: req.body?.apiUrl || null,
-      roundsPath: req.body?.roundsPath || null,
-      enabled: req.body?.enabled != null ? Boolean(req.body.enabled) : true,
-      pollIntervalMs: req.body?.pollIntervalMs || 30000,
+      adapter: String(req.body?.adapter || existingSite?.adapter || 'auto').trim() || 'auto',
+      apiUrl: Object.prototype.hasOwnProperty.call(req.body || {}, 'apiUrl')
+        ? (req.body.apiUrl || null)
+        : (existingSite?.apiUrl || null),
+      roundsPath: Object.prototype.hasOwnProperty.call(req.body || {}, 'roundsPath')
+        ? (req.body.roundsPath || null)
+        : (existingSite?.roundsPath || null),
+      enabled: Object.prototype.hasOwnProperty.call(req.body || {}, 'enabled')
+        ? Boolean(req.body.enabled)
+        : (existingSite?.enabled != null ? existingSite.enabled : true),
+      pollIntervalMs: Object.prototype.hasOwnProperty.call(req.body || {}, 'pollIntervalMs')
+        ? req.body.pollIntervalMs
+        : (existingSite?.pollIntervalMs || 30000),
     });
     res.json({ ok: true, site });
   } catch (error) {
