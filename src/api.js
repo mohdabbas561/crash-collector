@@ -97,7 +97,7 @@ const DEFAULT_ALLOWED_ORIGINS = [
   'http://localhost:5173',
   'http://127.0.0.1:5173',
   'https://sfb-bks5.onrender.com',
-  'https://crash-collector-production-3672.up.railway.app',
+  'https://crash-collector-production-9663.up.railway.app/',
 ];
 const EXPLICIT_ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
