@@ -608,6 +608,412 @@ async function pingDB() {
   return true;
 }
 
+function summarizeCrashRoundStats(rows = []) {
+  const stats = {
+    total: rows.length,
+    gte3: 0,
+    gte4: 0,
+    gte5: 0,
+  };
+  for (const row of rows) {
+    const multiplier = Number(row?.multiplier ?? 0);
+    if (!Number.isFinite(multiplier)) continue;
+    if (multiplier >= 3) stats.gte3 += 1;
+    if (multiplier >= 4) stats.gte4 += 1;
+    if (multiplier >= 5) stats.gte5 += 1;
+  }
+  return stats;
+}
+
+async function initCrashWatchStorage() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS crash_sites (
+      id               SERIAL PRIMARY KEY,
+      source_key       VARCHAR(80) UNIQUE NOT NULL,
+      label            VARCHAR(120) NOT NULL,
+      game_url         TEXT NOT NULL,
+      adapter          VARCHAR(40) NOT NULL DEFAULT 'manual',
+      api_url          TEXT,
+      rounds_path      TEXT,
+      enabled          BOOLEAN NOT NULL DEFAULT TRUE,
+      poll_interval_ms INT NOT NULL DEFAULT 30000,
+      last_polled_at   TIMESTAMPTZ,
+      last_success_at  TIMESTAMPTZ,
+      last_error       TEXT,
+      last_round_id    BIGINT,
+      created_at       TIMESTAMPTZ DEFAULT NOW(),
+      updated_at       TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_crash_sites_enabled ON crash_sites(enabled, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_crash_sites_label ON crash_sites(label);
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS crash_rounds (
+      id          BIGSERIAL PRIMARY KEY,
+      site_id     INT NOT NULL REFERENCES crash_sites(id) ON DELETE CASCADE,
+      source_key  VARCHAR(80) NOT NULL,
+      round_id    BIGINT NOT NULL,
+      multiplier  NUMERIC(12,4) NOT NULL,
+      timestamp   BIGINT,
+      raw_payload JSONB,
+      created_at  TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(site_id, round_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_crash_rounds_site_round ON crash_rounds(site_id, round_id DESC);
+    CREATE INDEX IF NOT EXISTS idx_crash_rounds_source_key ON crash_rounds(source_key, round_id DESC);
+    CREATE INDEX IF NOT EXISTS idx_crash_rounds_created_at ON crash_rounds(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_crash_rounds_multiplier ON crash_rounds(multiplier);
+  `);
+}
+
+async function upsertCrashSite({
+  sourceKey,
+  label,
+  gameUrl,
+  adapter = 'manual',
+  apiUrl = null,
+  roundsPath = null,
+  enabled = true,
+  pollIntervalMs = 30000,
+}) {
+  const cleanSourceKey = String(sourceKey || '').trim();
+  const cleanLabel = String(label || '').trim();
+  const cleanGameUrl = String(gameUrl || '').trim();
+  if (!cleanSourceKey) throw new Error('sourceKey required');
+  if (!cleanLabel) throw new Error('label required');
+  if (!cleanGameUrl) throw new Error('gameUrl required');
+
+  const res = await pool.query(
+    `INSERT INTO crash_sites (
+      source_key, label, game_url, adapter, api_url, rounds_path, enabled, poll_interval_ms, updated_at
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+    ON CONFLICT (source_key) DO UPDATE SET
+      label = EXCLUDED.label,
+      game_url = EXCLUDED.game_url,
+      adapter = EXCLUDED.adapter,
+      api_url = EXCLUDED.api_url,
+      rounds_path = EXCLUDED.rounds_path,
+      enabled = EXCLUDED.enabled,
+      poll_interval_ms = EXCLUDED.poll_interval_ms,
+      updated_at = NOW()
+    RETURNING *`,
+    [
+      cleanSourceKey,
+      cleanLabel,
+      cleanGameUrl,
+      String(adapter || 'manual').trim() || 'manual',
+      apiUrl ? String(apiUrl).trim() : null,
+      roundsPath ? String(roundsPath).trim() : null,
+      Boolean(enabled),
+      Number.isFinite(Number(pollIntervalMs)) ? Number(pollIntervalMs) : 30000,
+    ]
+  );
+  const row = res.rows[0];
+  if (!row) return null;
+  return {
+    id: Number(row.id),
+    sourceKey: row.source_key,
+    label: row.label,
+    gameUrl: row.game_url,
+    adapter: row.adapter,
+    apiUrl: row.api_url,
+    roundsPath: row.rounds_path,
+    enabled: Boolean(row.enabled),
+    pollIntervalMs: Number(row.poll_interval_ms || 30000),
+    lastPolledAt: row.last_polled_at ? new Date(row.last_polled_at).toISOString() : null,
+    lastSuccessAt: row.last_success_at ? new Date(row.last_success_at).toISOString() : null,
+    lastError: row.last_error || null,
+    lastRoundId: row.last_round_id != null ? Number(row.last_round_id) : null,
+    createdAt: row.created_at ? new Date(row.created_at).toISOString() : null,
+    updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : null,
+  };
+}
+
+async function getCrashSites() {
+  const res = await pool.query(`
+    SELECT
+      id, source_key, label, game_url, adapter, api_url, rounds_path, enabled,
+      poll_interval_ms, last_polled_at, last_success_at, last_error, last_round_id,
+      created_at, updated_at
+    FROM crash_sites
+    ORDER BY enabled DESC, updated_at DESC, id DESC
+  `);
+  return res.rows.map((row) => ({
+    id: Number(row.id),
+    sourceKey: row.source_key,
+    label: row.label,
+    gameUrl: row.game_url,
+    adapter: row.adapter,
+    apiUrl: row.api_url,
+    roundsPath: row.rounds_path,
+    enabled: Boolean(row.enabled),
+    pollIntervalMs: Number(row.poll_interval_ms || 30000),
+    lastPolledAt: row.last_polled_at ? new Date(row.last_polled_at).toISOString() : null,
+    lastSuccessAt: row.last_success_at ? new Date(row.last_success_at).toISOString() : null,
+    lastError: row.last_error || null,
+    lastRoundId: row.last_round_id != null ? Number(row.last_round_id) : null,
+    createdAt: row.created_at ? new Date(row.created_at).toISOString() : null,
+    updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : null,
+  }));
+}
+
+async function getCrashSiteById(id) {
+  const siteId = Number.parseInt(id, 10);
+  if (!Number.isFinite(siteId)) return null;
+  const res = await pool.query(`
+    SELECT
+      id, source_key, label, game_url, adapter, api_url, rounds_path, enabled,
+      poll_interval_ms, last_polled_at, last_success_at, last_error, last_round_id,
+      created_at, updated_at
+    FROM crash_sites
+    WHERE id = $1
+    LIMIT 1
+  `, [siteId]);
+  const row = res.rows[0];
+  if (!row) return null;
+  return {
+    id: Number(row.id),
+    sourceKey: row.source_key,
+    label: row.label,
+    gameUrl: row.game_url,
+    adapter: row.adapter,
+    apiUrl: row.api_url,
+    roundsPath: row.rounds_path,
+    enabled: Boolean(row.enabled),
+    pollIntervalMs: Number(row.poll_interval_ms || 30000),
+    lastPolledAt: row.last_polled_at ? new Date(row.last_polled_at).toISOString() : null,
+    lastSuccessAt: row.last_success_at ? new Date(row.last_success_at).toISOString() : null,
+    lastError: row.last_error || null,
+    lastRoundId: row.last_round_id != null ? Number(row.last_round_id) : null,
+    createdAt: row.created_at ? new Date(row.created_at).toISOString() : null,
+    updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : null,
+  };
+}
+
+async function getCrashSiteBySourceKey(sourceKey) {
+  const cleanSourceKey = String(sourceKey || '').trim();
+  if (!cleanSourceKey) return null;
+  const res = await pool.query(`
+    SELECT
+      id, source_key, label, game_url, adapter, api_url, rounds_path, enabled,
+      poll_interval_ms, last_polled_at, last_success_at, last_error, last_round_id,
+      created_at, updated_at
+    FROM crash_sites
+    WHERE source_key = $1
+    LIMIT 1
+  `, [cleanSourceKey]);
+  const row = res.rows[0];
+  if (!row) return null;
+  return {
+    id: Number(row.id),
+    sourceKey: row.source_key,
+    label: row.label,
+    gameUrl: row.game_url,
+    adapter: row.adapter,
+    apiUrl: row.api_url,
+    roundsPath: row.rounds_path,
+    enabled: Boolean(row.enabled),
+    pollIntervalMs: Number(row.poll_interval_ms || 30000),
+    lastPolledAt: row.last_polled_at ? new Date(row.last_polled_at).toISOString() : null,
+    lastSuccessAt: row.last_success_at ? new Date(row.last_success_at).toISOString() : null,
+    lastError: row.last_error || null,
+    lastRoundId: row.last_round_id != null ? Number(row.last_round_id) : null,
+    createdAt: row.created_at ? new Date(row.created_at).toISOString() : null,
+    updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : null,
+  };
+}
+
+async function touchCrashSite(id, patch = {}) {
+  const siteId = Number.parseInt(id, 10);
+  if (!Number.isFinite(siteId)) throw new Error('site id required');
+  const fields = [];
+  const params = [];
+  let idx = 1;
+  if (Object.prototype.hasOwnProperty.call(patch, 'lastPolledAt')) {
+    fields.push(`last_polled_at = $${idx++}`);
+    params.push(patch.lastPolledAt ? new Date(patch.lastPolledAt) : null);
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, 'lastSuccessAt')) {
+    fields.push(`last_success_at = $${idx++}`);
+    params.push(patch.lastSuccessAt ? new Date(patch.lastSuccessAt) : null);
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, 'lastError')) {
+    fields.push(`last_error = $${idx++}`);
+    params.push(patch.lastError ? String(patch.lastError) : null);
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, 'lastRoundId')) {
+    fields.push(`last_round_id = $${idx++}`);
+    params.push(patch.lastRoundId == null ? null : Number(patch.lastRoundId));
+  }
+  if (!fields.length) return null;
+  fields.push('updated_at = NOW()');
+  params.push(siteId);
+  await pool.query(`UPDATE crash_sites SET ${fields.join(', ')} WHERE id = $${idx}`, params);
+  return true;
+}
+
+async function saveCrashRounds(site, rounds = []) {
+  if (!site || !rounds.length) return 0;
+  const siteRow = typeof site === 'object' && site.id
+    ? site
+    : await getCrashSiteById(site);
+  if (!siteRow) throw new Error('Crash site not found');
+  let totalSaved = 0;
+  const CHUNK_SIZE = 500;
+  for (let offset = 0; offset < rounds.length; offset += CHUNK_SIZE) {
+    const chunk = rounds.slice(offset, offset + CHUNK_SIZE);
+    const params = [];
+    const values = [];
+    let idx = 1;
+    for (const round of chunk) {
+      const roundId = Number(round?.roundId ?? round?.id);
+      const multiplier = Number(round?.multiplier ?? round?.gameResult ?? round?.crashPoint ?? round?.result);
+      if (!Number.isFinite(roundId) || !Number.isFinite(multiplier)) continue;
+      values.push(`($${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++})`);
+      params.push(
+        siteRow.id,
+        siteRow.sourceKey,
+        roundId,
+        multiplier,
+        round?.timestamp ?? null
+      );
+    }
+    if (!values.length) continue;
+    const res = await pool.query(
+      `INSERT INTO crash_rounds (site_id, source_key, round_id, multiplier, timestamp)
+       VALUES ${values.join(', ')}
+       ON CONFLICT (site_id, round_id) DO NOTHING`,
+      params
+    );
+    totalSaved += res.rowCount;
+  }
+  if (rounds.length) {
+    const latest = [...rounds]
+      .map((round) => Number(round?.roundId ?? round?.id))
+      .filter((n) => Number.isFinite(n))
+      .sort((a, b) => b - a)[0];
+    await touchCrashSite(siteRow.id, {
+      lastPolledAt: new Date(),
+      lastSuccessAt: new Date(),
+      lastError: null,
+      lastRoundId: latest ?? siteRow.lastRoundId ?? null,
+    });
+  }
+  return totalSaved;
+}
+
+async function getCrashRounds({
+  siteId = null,
+  sourceKey = null,
+  limit = 100,
+  offset = 0,
+  sinceRoundId = null,
+} = {}) {
+  const conditions = [];
+  const params = [];
+  let idx = 1;
+  if (siteId != null) {
+    conditions.push(`site_id = $${idx++}`);
+    params.push(siteId);
+  }
+  if (sourceKey) {
+    conditions.push(`source_key = $${idx++}`);
+    params.push(String(sourceKey));
+  }
+  if (sinceRoundId != null) {
+    conditions.push(`round_id > $${idx++}`);
+    params.push(Number(sinceRoundId));
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  params.push(limit, offset);
+  const limitParam = `$${idx++}`;
+  const offsetParam = `$${idx++}`;
+  const res = await pool.query(
+    `SELECT site_id, source_key, round_id, multiplier, timestamp, created_at
+     FROM crash_rounds
+     ${where}
+     ORDER BY round_id DESC
+     LIMIT ${limitParam} OFFSET ${offsetParam}`,
+    params
+  );
+  return res.rows.map((row) => ({
+    siteId: Number(row.site_id),
+    sourceKey: row.source_key,
+    roundId: Number(row.round_id),
+    multiplier: Number.parseFloat(row.multiplier),
+    timestamp: row.timestamp != null ? Number(row.timestamp) : Number(new Date(row.created_at)),
+    createdAt: row.created_at ? new Date(row.created_at).toISOString() : null,
+  })).sort((a, b) => a.roundId - b.roundId);
+}
+
+async function getCrashSummary({ siteId = null, sourceKey = null } = {}) {
+  const conditions = [];
+  const params = [];
+  let idx = 1;
+  if (siteId != null) {
+    conditions.push(`site_id = $${idx++}`);
+    params.push(siteId);
+  }
+  if (sourceKey) {
+    conditions.push(`source_key = $${idx++}`);
+    params.push(String(sourceKey));
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const res = await pool.query(`
+    SELECT
+      COUNT(*)::BIGINT AS total,
+      MAX(round_id) AS latest_round_id,
+      MAX(multiplier)::NUMERIC(12,4) AS highest,
+      AVG(multiplier)::NUMERIC(12,4) AS avg,
+      SUM(CASE WHEN multiplier >= 3 THEN 1 ELSE 0 END)::BIGINT AS gte3,
+      SUM(CASE WHEN multiplier >= 4 THEN 1 ELSE 0 END)::BIGINT AS gte4,
+      SUM(CASE WHEN multiplier >= 5 THEN 1 ELSE 0 END)::BIGINT AS gte5
+    FROM crash_rounds
+    ${where}
+  `, params);
+  const row = res.rows[0] || {};
+  return {
+    total: Number(row.total || 0),
+    latestRoundId: row.latest_round_id != null ? Number(row.latest_round_id) : null,
+    highest: row.highest != null ? Number(row.highest) : null,
+    avg: row.avg != null ? Number(row.avg) : null,
+    counts: {
+      gte3: Number(row.gte3 || 0),
+      gte4: Number(row.gte4 || 0),
+      gte5: Number(row.gte5 || 0),
+    },
+  };
+}
+
+async function getCrashDashboard({ limitPerSite = 40 } = {}) {
+  const sites = await getCrashSites();
+  const enriched = [];
+  for (const site of sites) {
+    const [summary, rounds] = await Promise.all([
+      getCrashSummary({ siteId: site.id }),
+      getCrashRounds({ siteId: site.id, limit: limitPerSite }),
+    ]);
+    enriched.push({
+      ...site,
+      summary,
+      rounds,
+      health: {
+        status: site.enabled
+          ? (site.lastError ? 'degraded' : 'live')
+          : 'disabled',
+        lastSeenAt: site.lastSuccessAt || site.lastPolledAt || null,
+      },
+    });
+  }
+  const overallSummary = await getCrashSummary();
+  return {
+    sites: enriched,
+    overall: overallSummary,
+    generatedAt: new Date().toISOString(),
+  };
+}
+
 async function clearPredictions() {
   const client = await pool.connect();
   try {
@@ -1013,6 +1419,8 @@ module.exports = {
   pool,
   initDB, saveRounds, getRounds, getStorageStats, getStats,
   getLatestRoundId, getRoundCount, pingDB,
+  initCrashWatchStorage, upsertCrashSite, getCrashSites, getCrashSiteById, getCrashSiteBySourceKey,
+  saveCrashRounds, getCrashRounds, getCrashSummary, getCrashDashboard, touchCrashSite,
   saveLockedPreds, getLockedPreds,
   saveLockedAdvPreds, getLockedAdvPreds,
   saveLockedConsensusPreds, getLockedConsensusPreds,

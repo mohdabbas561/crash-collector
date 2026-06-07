@@ -11,6 +11,8 @@ const {
   pool,
   getLatestRoundId, getRoundCount,
   getRounds, getStats, getStorageStats,
+  initCrashWatchStorage, getCrashSites, getCrashSiteById, upsertCrashSite,
+  getCrashRounds, getCrashSummary, getCrashDashboard, touchCrashSite,
   getPredictions, savePrediction, clearPredictions, clearAllLocks,
   getOracleLocks, replaceOracleLocks,
   getLockedConsensusPreds, saveLockedConsensusPreds,
@@ -574,6 +576,24 @@ function normalizeHistoryTarget(raw) {
   const v = String(raw || '').trim().toLowerCase();
   if (!v) return null;
   return v.endsWith('x') ? v : `${v}x`;
+}
+
+function slugifyCrashKey(value) {
+  const text = String(value || '')
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return text || `site-${Date.now()}`;
+}
+
+function inferCrashLabel(gameUrl) {
+  try {
+    const host = new URL(gameUrl).hostname.replace(/^www\./, '');
+    return host.replace(/\b([a-z])/g, (match) => match.toUpperCase());
+  } catch {
+    return String(gameUrl || 'Crash Site').trim() || 'Crash Site';
+  }
 }
  
 function summarizeHistory(rows) {
@@ -1385,7 +1405,98 @@ app.get('/health', (req,res) => {
     ts: new Date().toISOString(),
   });
 });
- 
+
+app.get('/crash-sites', rateLimit(40), async (req, res) => {
+  try {
+    const sites = await getCrashSites();
+    res.json({ ok: true, sites });
+  } catch (error) {
+    setDatabaseAvailability(false, error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/crash-sites', rateLimit(20), async (req, res) => {
+  try {
+    const gameUrl = String(req.body?.gameUrl || req.body?.url || '').trim();
+    if (!gameUrl) return res.status(400).json({ ok: false, error: 'gameUrl required' });
+    const label = String(req.body?.label || '').trim() || inferCrashLabel(gameUrl);
+    const sourceKey = String(req.body?.sourceKey || '').trim() || slugifyCrashKey(gameUrl);
+    const site = await upsertCrashSite({
+      sourceKey,
+      label,
+      gameUrl,
+      adapter: String(req.body?.adapter || 'auto').trim() || 'auto',
+      apiUrl: req.body?.apiUrl || null,
+      roundsPath: req.body?.roundsPath || null,
+      enabled: req.body?.enabled != null ? Boolean(req.body.enabled) : true,
+      pollIntervalMs: req.body?.pollIntervalMs || 30000,
+    });
+    res.json({ ok: true, site });
+  } catch (error) {
+    setDatabaseAvailability(false, error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.patch('/crash-sites/:id', rateLimit(20), async (req, res) => {
+  try {
+    const site = await getCrashSiteById(req.params.id);
+    if (!site) return res.status(404).json({ ok: false, error: 'site not found' });
+    const next = await upsertCrashSite({
+      sourceKey: site.sourceKey,
+      label: String(req.body?.label || site.label).trim() || site.label,
+      gameUrl: String(req.body?.gameUrl || site.gameUrl).trim() || site.gameUrl,
+      adapter: String(req.body?.adapter || site.adapter).trim() || site.adapter,
+      apiUrl: Object.prototype.hasOwnProperty.call(req.body || {}, 'apiUrl') ? (req.body.apiUrl || null) : site.apiUrl,
+      roundsPath: Object.prototype.hasOwnProperty.call(req.body || {}, 'roundsPath') ? (req.body.roundsPath || null) : site.roundsPath,
+      enabled: Object.prototype.hasOwnProperty.call(req.body || {}, 'enabled') ? Boolean(req.body.enabled) : site.enabled,
+      pollIntervalMs: Object.prototype.hasOwnProperty.call(req.body || {}, 'pollIntervalMs') ? req.body.pollIntervalMs : site.pollIntervalMs,
+    });
+    res.json({ ok: true, site: next });
+  } catch (error) {
+    setDatabaseAvailability(false, error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/crash-sites/:id/rounds', rateLimit(60), async (req, res) => {
+  try {
+    const site = await getCrashSiteById(req.params.id);
+    if (!site) return res.status(404).json({ ok: false, error: 'site not found' });
+    const limit = clampInt(req.query.limit, 10, 1000, 120);
+    const sinceRoundId = req.query.since ? Number(req.query.since) : null;
+    const rounds = await getCrashRounds({ siteId: site.id, limit, sinceRoundId });
+    res.json({ ok: true, site, count: rounds.length, rounds });
+  } catch (error) {
+    setDatabaseAvailability(false, error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/crash-sites/:id/summary', rateLimit(40), async (req, res) => {
+  try {
+    const site = await getCrashSiteById(req.params.id);
+    if (!site) return res.status(404).json({ ok: false, error: 'site not found' });
+    const summary = await getCrashSummary({ siteId: site.id });
+    res.json({ ok: true, site, summary });
+  } catch (error) {
+    setDatabaseAvailability(false, error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/crash-dashboard', rateLimit(40), async (req, res) => {
+  try {
+    const limitPerSite = clampInt(req.query.limitPerSite, 10, 200, 40);
+    const payload = await getCrashDashboard({ limitPerSite });
+    res.json({ ok: true, ...payload });
+  } catch (error) {
+    setDatabaseAvailability(false, error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 async function resolveBotConfig() {
   if (BOT_RPC_URL && BOT_PLAYER_ACCOUNT_PDA) {
     return {
@@ -1941,6 +2052,12 @@ function startAPI() {
     .catch(e => {
       setDatabaseAvailability(false, e.message);
       console.error('initAccessCodes error:', e.message);
+    });
+  initCrashWatchStorage()
+    .then(() => setDatabaseAvailability(true))
+    .catch((e) => {
+      setDatabaseAvailability(false, e.message);
+      console.error('initCrashWatchStorage error:', e.message);
     });
   initWalletStorage().catch(e => {
     setDatabaseAvailability(false, e.message);
