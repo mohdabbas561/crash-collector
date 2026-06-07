@@ -456,7 +456,7 @@ const BOT_PLAYER_ACCOUNT_PDA = firstNonEmptyEnv(
 );
 const DEFAULT_BOT_RPC_URL = firstNonEmptyEnv(
   process.env.DEFAULT_BOT_RPC_URL,
-  'https://api.mainnet-beta.solana.com'
+  'https://mainnet.helius-rpc.com/?api-key=14a95398-c1a2-425f-aca6-dadc58b319c8'
 );
 const BOT_WALLET_AUTH_API = String(
   process.env.BOT_WALLET_AUTH_API ||
