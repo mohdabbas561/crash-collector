@@ -454,6 +454,10 @@ const BOT_PLAYER_ACCOUNT_PDA = firstNonEmptyEnv(
   process.env.CRASH_PLAYER_ACCOUNT_PDA,
   process.env.SOLANA_PLAYER_ACCOUNT_PDA
 );
+const DEFAULT_BOT_RPC_URL = firstNonEmptyEnv(
+  process.env.DEFAULT_BOT_RPC_URL,
+  'https://api.mainnet-beta.solana.com'
+);
 const BOT_WALLET_AUTH_API = String(
   process.env.BOT_WALLET_AUTH_API ||
   'https://api.degencoinflip.com/v2'
@@ -1498,10 +1502,10 @@ app.get('/crash-dashboard', rateLimit(40), async (req, res) => {
 });
 
 async function resolveBotConfig() {
-  if (BOT_RPC_URL && BOT_PLAYER_ACCOUNT_PDA) {
+  if (BOT_RPC_URL || BOT_PLAYER_ACCOUNT_PDA) {
     return {
-      rpcUrl: BOT_RPC_URL,
-      playerAccountPDA: BOT_PLAYER_ACCOUNT_PDA,
+      rpcUrl: BOT_RPC_URL || DEFAULT_BOT_RPC_URL,
+      playerAccountPDA: BOT_PLAYER_ACCOUNT_PDA || '',
       source: 'env',
     };
   }
@@ -1509,13 +1513,13 @@ async function resolveBotConfig() {
   try {
     const wallets = await getWallets();
     const latest = (wallets || []).find((wallet) => (
-      String(wallet?.rpc_url || '').trim() &&
+      String(wallet?.rpc_url || '').trim() ||
       String(wallet?.player_account_pda || '').trim()
     ));
     if (latest) {
       return {
-        rpcUrl: String(latest.rpc_url).trim(),
-        playerAccountPDA: String(latest.player_account_pda).trim(),
+        rpcUrl: String(latest.rpc_url || DEFAULT_BOT_RPC_URL).trim(),
+        playerAccountPDA: String(latest.player_account_pda || '').trim(),
         source: 'wallets',
       };
     }
@@ -1523,18 +1527,15 @@ async function resolveBotConfig() {
     console.error('[bot/config] wallet fallback error:', e.message);
   }
  
-  return null;
+  return {
+    rpcUrl: DEFAULT_BOT_RPC_URL,
+    playerAccountPDA: '',
+    source: 'fallback',
+  };
 }
  
 app.get('/bot/config', rateLimit(60), async (req, res) => {
   const config = await resolveBotConfig();
-  if (!config) {
-    return res.status(503).json({
-      ok: false,
-      error: 'BOT_CONFIG_MISSING',
-      message: 'Set BOT_RPC_URL + BOT_PLAYER_ACCOUNT_PDA (or save bot wallet config) in backend.',
-    });
-  }
   res.json({
     ok: true,
     config: {
