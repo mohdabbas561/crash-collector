@@ -108,6 +108,31 @@ function parseFloatish(raw) {
   return match ? Number.parseFloat(match[0]) : Number.parseFloat(text);
 }
 
+function makeSyntheticRoundId(row, multiplier, timestamp) {
+  const ts = Number.isFinite(timestamp) ? Math.floor(timestamp) : Date.now();
+  const mult = Number.isFinite(multiplier) ? Math.round(multiplier * 1000) : 0;
+  const seedSource = String(
+    row?.roundId ??
+    row?.round_id ??
+    row?.id ??
+    row?.gameId ??
+    row?.gameRoundId ??
+    row?.uuid ??
+    row?.hash ??
+    row?.createdAt ??
+    row?.created_at ??
+    row?.time ??
+    row?.date ??
+    ''
+  );
+  let hash = 0;
+  for (let i = 0; i < seedSource.length; i += 1) {
+    hash = ((hash << 5) - hash + seedSource.charCodeAt(i)) | 0;
+  }
+  const suffix = Math.abs(hash % 1000);
+  return Number(`${ts}${String(mult).padStart(4, '0')}${String(suffix).padStart(3, '0')}`.slice(0, 15));
+}
+
 function extractRoundArray(payload) {
   if (!payload) return [];
   if (Array.isArray(payload)) return payload;
@@ -136,10 +161,12 @@ function extractRoundArray(payload) {
 function normalizeRoundRow(row) {
   if (Array.isArray(row)) {
     const [roundIdRaw, multiplierRaw, timestampRaw] = row;
-    const roundId = Number(roundIdRaw);
     const multiplier = parseFloatish(multiplierRaw);
-    if (!Number.isFinite(roundId) || !Number.isFinite(multiplier)) return null;
     const timestamp = timestampRaw != null ? Number(timestampRaw) : Date.now();
+    const roundId = Number.isFinite(Number(roundIdRaw))
+      ? Number(roundIdRaw)
+      : makeSyntheticRoundId(row, multiplier, timestamp);
+    if (!Number.isFinite(multiplier)) return null;
     return {
       roundId,
       multiplier,
@@ -177,7 +204,6 @@ function normalizeRoundRow(row) {
     row.score ??
     row.finalMultiplier
   );
-  if (!Number.isFinite(roundId) || !Number.isFinite(multiplier)) return null;
   const timestamp = row.timestamp != null
     ? Number(row.timestamp)
     : row.createdAt
@@ -188,9 +214,13 @@ function normalizeRoundRow(row) {
           ? Number(new Date(row.time))
           : row.date
             ? Number(new Date(row.date))
-        : Date.now();
+            : Date.now();
+  const resolvedRoundId = Number.isFinite(roundId)
+    ? roundId
+    : makeSyntheticRoundId(row, multiplier, timestamp);
+  if (!Number.isFinite(resolvedRoundId) || !Number.isFinite(multiplier)) return null;
   return {
-    roundId,
+    roundId: resolvedRoundId,
     multiplier,
     timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(),
     raw: row,
