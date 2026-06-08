@@ -7,6 +7,7 @@ const { createProxyMiddleware } = require('http-proxy-middleware');
 const { buildPredictionReport } = require('./predictionEngine');
 const { computeLockedRangePredictions } = require('./lockedRangeEngine');
 const { ORACLE_TARGETS, normalizeRounds, computeOracleForecast, makeOracleLock } = require('./oracleEngine');
+const { pollAllSites } = require('./crashCollector');
 const {
   pool,
   getLatestRoundId, getRoundCount,
@@ -1524,6 +1525,7 @@ app.get('/crash-sites/:id/summary', rateLimit(40), async (req, res) => {
 
 app.get('/crash-dashboard', rateLimit(40), async (req, res) => {
   try {
+    await Promise.allSettled([pollAllSites()]);
     const limitPerSite = clampInt(req.query.limitPerSite, 10, 200, 40);
     const payload = await getCrashDashboard({ limitPerSite });
     res.json({ ok: true, ...payload });

@@ -23,7 +23,7 @@ const DEFAULT_CRASH_SOURCES = [
     label: 'Solana Fat Boys Bustonaut',
     gameUrl: 'https://www.solanafatboys.com/bustonaut/',
     adapter: 'sfb',
-    apiUrl: 'https://api.solanafatboys.com/api/games/bustonaut/latest?page=0&limit=100',
+    apiUrl: 'https://sfb-api-service-mainnet.up.railway.app/api/games/bustonaut/latest?page=0&limit=100',
     roundsPath: '?page=0&limit=100',
   },
   {
@@ -459,7 +459,7 @@ async function refreshSiteConfig(site) {
       label: site.label,
       gameUrl: site.gameUrl,
       adapter: site.adapter,
-      apiUrl: 'https://api.solanafatboys.com/api/games/bustonaut/latest?page=0&limit=100',
+      apiUrl: 'https://sfb-api-service-mainnet.up.railway.app/api/games/bustonaut/latest?page=0&limit=100',
       roundsPath: '?page=0&limit=100',
       enabled: site.enabled,
       pollIntervalMs: site.pollIntervalMs,
@@ -568,6 +568,7 @@ async function startCrashWatchCollector() {
 module.exports = {
   DEFAULT_CRASH_SOURCES,
   startCrashWatchCollector,
+  pollAllSites,
   discoverApiUrl,
   parseRoundsFromApi,
 };
