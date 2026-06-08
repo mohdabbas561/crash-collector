@@ -10,6 +10,10 @@ const {
   touchCrashSite,
 } = require('./db');
 
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
 const DEFAULT_CRASH_SOURCES = [
   {
     sourceKey: 'degencoinflip-crash',
