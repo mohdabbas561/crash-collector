@@ -6,6 +6,7 @@ const {
   getCrashSiteById,
   upsertCrashSite,
   saveCrashRounds,
+  saveTowerPredictionHistory,
   touchCrashSite,
 } = require('./db');
 
@@ -111,9 +112,9 @@ function parseFloatish(raw) {
 }
 
 const TOWER_RESULT_MAP = {
-  3: 'A',
+  3: 'C',
   5: 'B',
-  6: 'C',
+  6: 'A',
 };
 
 function parseTowerGameResult(raw) {
@@ -269,6 +270,111 @@ function normalizeRoundRow(row) {
       : row,
     raw: row,
   };
+}
+
+function extractTowerSequenceFromRound(round) {
+  const raw = round?.rawPayload || round?.raw || round || null;
+  if (!raw) return '';
+  if (typeof raw.towerSequenceText === 'string' && raw.towerSequenceText.trim()) {
+    return raw.towerSequenceText.trim();
+  }
+  if (Array.isArray(raw.towerSequence) && raw.towerSequence.length) {
+    return raw.towerSequence.map((entry) => entry?.letter).filter(Boolean).join('');
+  }
+  const parsed = parseTowerGameResult(raw.gameResult || raw.game_result || raw.sequence || null);
+  return parsed.map((entry) => entry.letter).join('');
+}
+
+function buildTowerForecast(rounds) {
+  const usableRounds = rounds.filter((round) => round.sequence && round.sequence.length >= 4);
+  if (!usableRounds.length) return '';
+
+  const depth = 10;
+  const decay = 0.92;
+  const positionStats = Array.from({ length: depth }, () => ({ A: 0, B: 0, C: 0 }));
+  const transitionStats = Array.from({ length: depth }, () => ({
+    A: { A: 0, B: 0, C: 0 },
+    B: { A: 0, B: 0, C: 0 },
+    C: { A: 0, B: 0, C: 0 },
+  }));
+  const recentBias = { A: 0, B: 0, C: 0 };
+
+  [...usableRounds].slice(-60).forEach((round, indexFromEnd) => {
+    const weight = Math.pow(decay, indexFromEnd);
+    const sequence = round.sequence;
+    for (let i = 0; i < Math.min(sequence.length, depth); i += 1) {
+      const letter = sequence[i];
+      positionStats[i][letter] += weight;
+      recentBias[letter] += weight;
+      if (i > 0) {
+        const prev = sequence[i - 1];
+        transitionStats[i][prev][letter] += weight;
+      }
+    }
+  });
+
+  const forecast = [];
+  for (let i = 0; i < depth; i += 1) {
+    const scores = {
+      A: positionStats[i].A,
+      B: positionStats[i].B,
+      C: positionStats[i].C,
+    };
+
+    if (i === 0) {
+      scores.A += recentBias.A * 0.12;
+      scores.B += recentBias.B * 0.12;
+      scores.C += recentBias.C * 0.12;
+    } else {
+      const prev = forecast[i - 1];
+      scores.A += transitionStats[i][prev].A * 0.45;
+      scores.B += transitionStats[i][prev].B * 0.45;
+      scores.C += transitionStats[i][prev].C * 0.45;
+    }
+
+    if (i > 1) {
+      const prev1 = forecast[i - 1];
+      const prev2 = forecast[i - 2];
+      if (prev1 === prev2) {
+        scores[prev1] *= 0.84;
+      }
+      if (i > 2 && forecast[i - 1] === forecast[i - 2] && forecast[i - 2] === forecast[i - 3]) {
+        scores[forecast[i - 1]] *= 0.78;
+      }
+    }
+
+    const ordered = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+    forecast.push(ordered[0]?.[0] || 'A');
+  }
+
+  return forecast.join('');
+}
+
+function buildTowerPredictionHistory(rounds) {
+  const usableRounds = rounds
+    .map((round) => ({
+      ...round,
+      sequence: extractTowerSequenceFromRound(round),
+    }))
+    .filter((round) => round.sequence && round.sequence.length >= 4)
+    .sort((a, b) => Number(a.roundId) - Number(b.roundId));
+
+  const rows = [];
+  for (let i = 5; i < usableRounds.length; i += 1) {
+    const trainingRounds = usableRounds.slice(0, i);
+    const forecast = buildTowerForecast(trainingRounds).slice(0, 4);
+    const actual = usableRounds[i].sequence.slice(0, 4);
+    const matches = forecast.split('').reduce((count, letter, idx) => count + (letter === actual[idx] ? 1 : 0), 0);
+    rows.push({
+      roundId: usableRounds[i].roundId,
+      forecast,
+      actual,
+      matches,
+      accuracy: Math.round((matches / 4) * 100),
+      outcome: matches === 4 ? 'WIN' : 'LOSS',
+    });
+  }
+  return rows;
 }
 
 function scoreCandidate(url, baseOrigin) {
@@ -552,6 +658,12 @@ async function pollSite(site) {
   try {
     const rounds = await parseRoundsFromApi(currentSite.apiUrl);
     const saved = await saveCrashRounds(currentSite, rounds);
+    if (String(currentSite.gameUrl || '').toLowerCase().includes('/towers')) {
+      const historyRows = buildTowerPredictionHistory(rounds);
+      if (historyRows.length) {
+        await saveTowerPredictionHistory(currentSite, historyRows);
+      }
+    }
     await touchCrashSite(currentSite.id, {
       lastPolledAt: new Date(),
       lastSuccessAt: new Date(),

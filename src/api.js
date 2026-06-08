@@ -14,6 +14,7 @@ const {
   getRounds, getStats, getStorageStats,
   initCrashWatchStorage, getCrashSites, getCrashSiteById, upsertCrashSite,
   getCrashRounds, clearCrashRounds, clearAllCrashRounds, getCrashSummary, getCrashDashboard, touchCrashSite,
+  getTowerPredictionHistory,
   getPredictions, savePrediction, clearPredictions, clearAllLocks,
   getOracleLocks, replaceOracleLocks,
   getLockedConsensusPreds, saveLockedConsensusPreds,
@@ -1517,6 +1518,20 @@ app.get('/crash-sites/:id/summary', rateLimit(40), async (req, res) => {
     if (!site) return res.status(404).json({ ok: false, error: 'site not found' });
     const summary = await getCrashSummary({ siteId: site.id });
     res.json({ ok: true, site, summary });
+  } catch (error) {
+    setDatabaseAvailability(false, error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/crash-sites/:id/tower-history', rateLimit(60), async (req, res) => {
+  try {
+    const site = await getCrashSiteById(req.params.id);
+    if (!site) return res.status(404).json({ ok: false, error: 'site not found' });
+    const limit = clampInt(req.query.limit, 10, 500, 50);
+    const offset = clampInt(req.query.offset, 0, 5000, 0);
+    const history = await getTowerPredictionHistory({ siteId: site.id, limit, offset });
+    res.json({ ok: true, site, count: history.length, history });
   } catch (error) {
     setDatabaseAvailability(false, error.message);
     res.status(500).json({ ok: false, error: error.message });

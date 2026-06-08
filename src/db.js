@@ -73,9 +73,9 @@ function canonicalizePredictionOutcome({ lo, hi, hitRound }) {
 }
 
 const TOWER_RESULT_MAP = {
-  3: 'A',
+  3: 'C',
   5: 'B',
-  6: 'C',
+  6: 'A',
 };
 
 function parseTowerSequence(rawPayload) {
@@ -710,6 +710,26 @@ async function initCrashWatchStorage() {
     CREATE INDEX IF NOT EXISTS idx_crash_rounds_created_at ON crash_rounds(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_crash_rounds_multiplier ON crash_rounds(multiplier);
   `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tower_prediction_history (
+      id          BIGSERIAL PRIMARY KEY,
+      site_id     INT NOT NULL REFERENCES crash_sites(id) ON DELETE CASCADE,
+      source_key  VARCHAR(80) NOT NULL,
+      round_id    BIGINT NOT NULL,
+      forecast    TEXT NOT NULL,
+      actual      TEXT NOT NULL,
+      matches     SMALLINT NOT NULL DEFAULT 0,
+      accuracy    SMALLINT NOT NULL DEFAULT 0,
+      outcome     VARCHAR(10) NOT NULL,
+      created_at  TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(site_id, round_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_tower_prediction_history_site_round ON tower_prediction_history(site_id, round_id DESC);
+    CREATE INDEX IF NOT EXISTS idx_tower_prediction_history_source_key ON tower_prediction_history(source_key, round_id DESC);
+    CREATE INDEX IF NOT EXISTS idx_tower_prediction_history_created_at ON tower_prediction_history(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_tower_prediction_history_outcome ON tower_prediction_history(outcome);
+  `);
 }
 
 async function upsertCrashSite({
@@ -968,11 +988,13 @@ async function clearCrashRounds({ siteId = null, sourceKey = null } = {}) {
     `DELETE FROM crash_rounds WHERE ${conditions.join(' AND ')}`,
     params
   );
+  await clearTowerPredictionHistory({ siteId, sourceKey }).catch(() => {});
   return Number(res.rowCount || 0);
 }
 
 async function clearAllCrashRounds() {
   const res = await pool.query('DELETE FROM crash_rounds');
+  await pool.query('DELETE FROM tower_prediction_history').catch(() => {});
   return Number(res.rowCount || 0);
 }
 
@@ -1028,6 +1050,122 @@ async function getCrashRounds({
     rawPayload: row.raw_payload || null,
     towerSequence: parseTowerSequence(row.raw_payload),
     towerSequenceText: parseTowerSequence(row.raw_payload).map((entry) => entry.letter).join(''),
+  })).sort((a, b) => a.roundId - b.roundId);
+}
+
+async function saveTowerPredictionHistory(site, rows = []) {
+  if (!site || !rows.length) return 0;
+  const siteRow = typeof site === 'object' && site.id
+    ? site
+    : await getCrashSiteById(site);
+  if (!siteRow) throw new Error('Crash site not found');
+
+  let totalSaved = 0;
+  const CHUNK_SIZE = 250;
+  for (let offset = 0; offset < rows.length; offset += CHUNK_SIZE) {
+    const chunk = rows.slice(offset, offset + CHUNK_SIZE);
+    const values = [];
+    const params = [];
+    let idx = 1;
+    for (const row of chunk) {
+      const roundId = Number(row?.roundId);
+      const forecast = String(row?.forecast || '').trim();
+      const actual = String(row?.actual || '').trim();
+      const matches = Number(row?.matches || 0);
+      const accuracy = Number(row?.accuracy || 0);
+      const outcome = String(row?.outcome || '').trim().toUpperCase();
+      if (!Number.isFinite(roundId) || !forecast || !actual || !outcome) continue;
+      values.push(`($${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++})`);
+      params.push(
+        siteRow.id,
+        siteRow.sourceKey,
+        roundId,
+        forecast,
+        actual,
+        Number.isFinite(matches) ? matches : 0,
+        Number.isFinite(accuracy) ? accuracy : 0,
+        outcome === 'WIN' ? 'WIN' : 'LOSS'
+      );
+    }
+    if (!values.length) continue;
+    const res = await pool.query(
+      `INSERT INTO tower_prediction_history (site_id, source_key, round_id, forecast, actual, matches, accuracy, outcome)
+       VALUES ${values.join(', ')}
+       ON CONFLICT (site_id, round_id) DO UPDATE
+         SET forecast = EXCLUDED.forecast,
+             actual = EXCLUDED.actual,
+             matches = EXCLUDED.matches,
+             accuracy = EXCLUDED.accuracy,
+             outcome = EXCLUDED.outcome`,
+      params
+    );
+    totalSaved += res.rowCount;
+  }
+
+  return totalSaved;
+}
+
+async function clearTowerPredictionHistory({ siteId = null, sourceKey = null } = {}) {
+  const conditions = [];
+  const params = [];
+  let idx = 1;
+  if (siteId != null) {
+    conditions.push(`site_id = $${idx++}`);
+    params.push(Number(siteId));
+  }
+  if (sourceKey) {
+    conditions.push(`source_key = $${idx++}`);
+    params.push(String(sourceKey));
+  }
+  if (!conditions.length) {
+    throw new Error('siteId or sourceKey required');
+  }
+  const res = await pool.query(
+    `DELETE FROM tower_prediction_history WHERE ${conditions.join(' AND ')}`,
+    params
+  );
+  return Number(res.rowCount || 0);
+}
+
+async function getTowerPredictionHistory({
+  siteId = null,
+  sourceKey = null,
+  limit = 50,
+  offset = 0,
+} = {}) {
+  const conditions = [];
+  const params = [];
+  let idx = 1;
+  if (siteId != null) {
+    conditions.push(`site_id = $${idx++}`);
+    params.push(Number(siteId));
+  }
+  if (sourceKey) {
+    conditions.push(`source_key = $${idx++}`);
+    params.push(String(sourceKey));
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  params.push(limit, offset);
+  const limitParam = `$${idx++}`;
+  const offsetParam = `$${idx++}`;
+  const res = await pool.query(
+    `SELECT site_id, source_key, round_id, forecast, actual, matches, accuracy, outcome, created_at
+     FROM tower_prediction_history
+     ${where}
+     ORDER BY round_id DESC
+     LIMIT ${limitParam} OFFSET ${offsetParam}`,
+    params
+  );
+  return res.rows.map((row) => ({
+    siteId: Number(row.site_id),
+    sourceKey: row.source_key,
+    roundId: Number(row.round_id),
+    forecast: String(row.forecast || ''),
+    actual: String(row.actual || ''),
+    matches: Number(row.matches || 0),
+    accuracy: Number(row.accuracy || 0),
+    outcome: String(row.outcome || 'LOSS').toUpperCase(),
+    createdAt: row.created_at ? new Date(row.created_at).toISOString() : null,
   })).sort((a, b) => a.roundId - b.roundId);
 }
 
@@ -1577,7 +1715,8 @@ module.exports = {
   getLatestRoundId, getRoundCount, pingDB,
   initCrashWatchStorage, upsertCrashSite, getCrashSites, getCrashSiteById, getCrashSiteBySourceKey,
   saveCrashRounds, clearCrashRounds, clearAllCrashRounds, deleteCrashSite,
-  getCrashRounds, getCrashSummary, getCrashDashboard, touchCrashSite,
+  getCrashRounds, saveTowerPredictionHistory, getTowerPredictionHistory, clearTowerPredictionHistory,
+  getCrashSummary, getCrashDashboard, touchCrashSite,
   saveLockedPreds, getLockedPreds,
   saveLockedAdvPreds, getLockedAdvPreds,
   saveLockedConsensusPreds, getLockedConsensusPreds,
