@@ -73,21 +73,14 @@ function canonicalizePredictionOutcome({ lo, hi, hitRound }) {
 }
 
 const TOWER_RESULT_MAP = {
-  3: 'C',
+  3: 'A',
   5: 'B',
-  6: 'A',
+  6: 'C',
 };
 
 function parseTowerSequence(rawPayload) {
   if (!rawPayload) return [];
-  if (typeof rawPayload.towerSequenceText === 'string' && rawPayload.towerSequenceText.trim()) {
-    return rawPayload.towerSequenceText.trim().split('').map((letter, index) => ({
-      level: index,
-      result: null,
-      letter,
-    }));
-  }
-  const source = rawPayload.towerSequence || rawPayload.gameResult || rawPayload.game_result || rawPayload.sequence || null;
+  const source = rawPayload.gameResult || rawPayload.game_result || rawPayload.towerSequence || rawPayload.sequence || null;
   let value = source;
   if (typeof value === 'string') {
     try {
@@ -95,6 +88,13 @@ function parseTowerSequence(rawPayload) {
     } catch {
       return [];
     }
+  }
+  if (!Array.isArray(value) && typeof rawPayload.towerSequenceText === 'string' && rawPayload.towerSequenceText.trim()) {
+    return rawPayload.towerSequenceText.trim().split('').map((letter, index) => ({
+      level: index,
+      result: null,
+      letter,
+    }));
   }
   if (!Array.isArray(value)) return [];
   return value
@@ -949,7 +949,11 @@ async function saveCrashRounds(site, rounds = []) {
     const res = await pool.query(
       `INSERT INTO crash_rounds (site_id, source_key, round_id, multiplier, timestamp, raw_payload)
        VALUES ${values.join(', ')}
-       ON CONFLICT (site_id, round_id) DO NOTHING`,
+       ON CONFLICT (site_id, round_id) DO UPDATE
+         SET source_key = EXCLUDED.source_key,
+             multiplier = EXCLUDED.multiplier,
+             timestamp = EXCLUDED.timestamp,
+             raw_payload = EXCLUDED.raw_payload`,
       params
     );
     totalSaved += res.rowCount;

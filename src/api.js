@@ -7,13 +7,13 @@ const { createProxyMiddleware } = require('http-proxy-middleware');
 const { buildPredictionReport } = require('./predictionEngine');
 const { computeLockedRangePredictions } = require('./lockedRangeEngine');
 const { ORACLE_TARGETS, normalizeRounds, computeOracleForecast, makeOracleLock } = require('./oracleEngine');
-const { pollAllSites } = require('./crashCollector');
+const { pollAllSites, buildTowerPredictionHistory, parseRoundsFromApi } = require('./crashCollector');
 const {
   pool,
   getLatestRoundId, getRoundCount,
   getRounds, getStats, getStorageStats,
   initCrashWatchStorage, getCrashSites, getCrashSiteById, upsertCrashSite,
-  getCrashRounds, clearCrashRounds, clearAllCrashRounds, getCrashSummary, getCrashDashboard, touchCrashSite,
+  getCrashRounds, saveTowerPredictionHistory, clearCrashRounds, clearAllCrashRounds, getCrashSummary, getCrashDashboard, touchCrashSite,
   getTowerPredictionHistory,
   getPredictions, savePrediction, clearPredictions, clearAllLocks,
   getOracleLocks, replaceOracleLocks,
@@ -1492,6 +1492,15 @@ app.get('/crash-sites/:id/rounds', rateLimit(60), async (req, res) => {
     if (!site) return res.status(404).json({ ok: false, error: 'site not found' });
     const limit = clampInt(req.query.limit, 10, 1000, 120);
     const sinceRoundId = req.query.since ? Number(req.query.since) : null;
+    const refreshLive = String(req.query.refresh || '').trim() === '1';
+    if (refreshLive && String(site.gameUrl || '').toLowerCase().includes('/towers') && site.apiUrl) {
+      try {
+        const liveRounds = await parseRoundsFromApi(site.apiUrl);
+        await saveCrashRounds(site, liveRounds);
+      } catch (refreshError) {
+        console.warn('[towers] live refresh failed, falling back to stored rounds:', refreshError.message);
+      }
+    }
     const rounds = await getCrashRounds({ siteId: site.id, limit, sinceRoundId });
     res.json({ ok: true, site, count: rounds.length, rounds });
   } catch (error) {
@@ -1530,6 +1539,20 @@ app.get('/crash-sites/:id/tower-history', rateLimit(60), async (req, res) => {
     if (!site) return res.status(404).json({ ok: false, error: 'site not found' });
     const limit = clampInt(req.query.limit, 10, 500, 50);
     const offset = clampInt(req.query.offset, 0, 5000, 0);
+    const refreshLive = String(req.query.refresh || '').trim() === '1';
+    if (refreshLive && String(site.gameUrl || '').toLowerCase().includes('/towers') && site.apiUrl) {
+      try {
+        const liveRounds = await parseRoundsFromApi(site.apiUrl);
+        await saveCrashRounds(site, liveRounds);
+      } catch (refreshError) {
+        console.warn('[towers] history refresh failed, using stored rounds:', refreshError.message);
+      }
+    }
+    const rawRounds = await getCrashRounds({ siteId: site.id, limit: 1000, order: 'ASC' });
+    const rebuiltHistory = buildTowerPredictionHistory(rawRounds);
+    if (rebuiltHistory.length) {
+      await saveTowerPredictionHistory(site, rebuiltHistory);
+    }
     const history = await getTowerPredictionHistory({ siteId: site.id, limit, offset });
     res.json({ ok: true, site, count: history.length, history });
   } catch (error) {

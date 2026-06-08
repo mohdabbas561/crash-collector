@@ -112,9 +112,9 @@ function parseFloatish(raw) {
 }
 
 const TOWER_RESULT_MAP = {
-  3: 'C',
+  3: 'A',
   5: 'B',
-  6: 'A',
+  6: 'C',
 };
 
 function parseTowerGameResult(raw) {
@@ -275,88 +275,234 @@ function normalizeRoundRow(row) {
 function extractTowerSequenceFromRound(round) {
   const raw = round?.rawPayload || round?.raw || round || null;
   if (!raw) return '';
-  if (typeof raw.towerSequenceText === 'string' && raw.towerSequenceText.trim()) {
-    return raw.towerSequenceText.trim();
+  const parsed = parseTowerGameResult(raw.gameResult || raw.game_result || null);
+  if (parsed.length) {
+    return parsed.map((entry) => entry.letter).join('');
   }
   if (Array.isArray(raw.towerSequence) && raw.towerSequence.length) {
     return raw.towerSequence.map((entry) => entry?.letter).filter(Boolean).join('');
   }
-  const parsed = parseTowerGameResult(raw.gameResult || raw.game_result || raw.sequence || null);
-  return parsed.map((entry) => entry.letter).join('');
-}
-
-function buildTowerForecast(rounds) {
-  const usableRounds = rounds.filter((round) => round.sequence && round.sequence.length >= 4);
-  if (!usableRounds.length) return '';
-
-  const depth = 10;
-  const decay = 0.92;
-  const positionStats = Array.from({ length: depth }, () => ({ A: 0, B: 0, C: 0 }));
-  const transitionStats = Array.from({ length: depth }, () => ({
-    A: { A: 0, B: 0, C: 0 },
-    B: { A: 0, B: 0, C: 0 },
-    C: { A: 0, B: 0, C: 0 },
-  }));
-  const recentBias = { A: 0, B: 0, C: 0 };
-
-  [...usableRounds].slice(-60).forEach((round, indexFromEnd) => {
-    const weight = Math.pow(decay, indexFromEnd);
-    const sequence = round.sequence;
-    for (let i = 0; i < Math.min(sequence.length, depth); i += 1) {
-      const letter = sequence[i];
-      positionStats[i][letter] += weight;
-      recentBias[letter] += weight;
-      if (i > 0) {
-        const prev = sequence[i - 1];
-        transitionStats[i][prev][letter] += weight;
-      }
-    }
-  });
-
-  const forecast = [];
-  for (let i = 0; i < depth; i += 1) {
-    const scores = {
-      A: positionStats[i].A,
-      B: positionStats[i].B,
-      C: positionStats[i].C,
-    };
-
-    if (i === 0) {
-      scores.A += recentBias.A * 0.12;
-      scores.B += recentBias.B * 0.12;
-      scores.C += recentBias.C * 0.12;
-    } else {
-      const prev = forecast[i - 1];
-      scores.A += transitionStats[i][prev].A * 0.45;
-      scores.B += transitionStats[i][prev].B * 0.45;
-      scores.C += transitionStats[i][prev].C * 0.45;
-    }
-
-    if (i > 1) {
-      const prev1 = forecast[i - 1];
-      const prev2 = forecast[i - 2];
-      if (prev1 === prev2) {
-        scores[prev1] *= 0.84;
-      }
-      if (i > 2 && forecast[i - 1] === forecast[i - 2] && forecast[i - 2] === forecast[i - 3]) {
-        scores[forecast[i - 1]] *= 0.78;
-      }
-    }
-
-    const ordered = Object.entries(scores).sort((a, b) => b[1] - a[1]);
-    forecast.push(ordered[0]?.[0] || 'A');
+  if (typeof raw.towerSequenceText === 'string' && raw.towerSequenceText.trim()) {
+    return raw.towerSequenceText.trim();
   }
-
-  return forecast.join('');
+  const fallback = parseTowerGameResult(raw.sequence || null);
+  return fallback.map((entry) => entry.letter).join('');
 }
 
-function buildTowerPredictionHistory(rounds) {
-  const usableRounds = rounds
+function normalizeTowerRounds(rounds = []) {
+  return rounds
     .map((round) => ({
       ...round,
       sequence: extractTowerSequenceFromRound(round),
     }))
-    .filter((round) => round.sequence && round.sequence.length >= 4)
+    .filter((round) => round.sequence && round.sequence.length >= 4);
+}
+
+function createTowerScoreBucket() {
+  return { A: 0, B: 0, C: 0 };
+}
+
+function createTowerTransitionBucket() {
+  return { A: createTowerScoreBucket(), B: createTowerScoreBucket(), C: createTowerScoreBucket() };
+}
+
+function getTowerMapBucket(map, key) {
+  if (!map.has(key)) map.set(key, createTowerScoreBucket());
+  return map.get(key);
+}
+
+function trainTowerModel(rounds) {
+  const depth = 10;
+  const positionStats = Array.from({ length: depth }, () => createTowerScoreBucket());
+  const transition1 = Array.from({ length: depth }, () => createTowerTransitionBucket());
+  const transition2 = Array.from({ length: depth }, () => new Map());
+  const transition3 = Array.from({ length: depth }, () => new Map());
+  const totals = createTowerScoreBucket();
+  const recentBias = createTowerScoreBucket();
+
+  rounds.slice(-60).forEach((round, reverseIndex) => {
+    const weight = Math.pow(0.93, reverseIndex);
+    const letters = String(round.sequence || '')
+      .split('')
+      .filter((letter) => letter === 'A' || letter === 'B' || letter === 'C');
+
+    for (let i = 0; i < Math.min(letters.length, depth); i += 1) {
+      const letter = letters[i];
+      positionStats[i][letter] += weight;
+      totals[letter] += weight;
+      recentBias[letter] += weight;
+
+      if (i >= 1) {
+        const prev1 = letters[i - 1];
+        transition1[i][prev1][letter] += weight;
+      }
+      if (i >= 2) {
+        const key2 = `${letters[i - 2]}${letters[i - 1]}`;
+        getTowerMapBucket(transition2[i], key2)[letter] += weight;
+      }
+      if (i >= 3) {
+        const key3 = `${letters[i - 3]}${letters[i - 2]}${letters[i - 1]}`;
+        getTowerMapBucket(transition3[i], key3)[letter] += weight;
+      }
+    }
+  });
+
+  return { positionStats, transition1, transition2, transition3, totals, recentBias };
+}
+
+function applyTowerPatternPenalty(scores, prefix) {
+  const tail = prefix.slice(-4);
+  if (tail.length < 4) return;
+  const [a, b, c, d] = tail;
+  if (a === b && b === c) scores[a] *= 0.74;
+  if (b === c && c === d) scores[b] *= 0.74;
+  if (a === c && b === d && a !== b) {
+    scores[a] *= 0.9;
+    scores[b] *= 0.9;
+  }
+  if (a === b && c === d && a !== c) {
+    scores[a] *= 0.92;
+    scores[c] *= 0.92;
+  }
+}
+
+function scoreTowerPosition(model, prefix, position) {
+  const scores = createTowerScoreBucket();
+  const positionWeight = position < 3 ? 1.08 : position < 7 ? 1 : 0.92;
+
+  for (const letter of ['A', 'B', 'C']) {
+    scores[letter] += (model.positionStats[position]?.[letter] || 0) * positionWeight;
+    scores[letter] += (model.totals[letter] || 0) * (position === 0 ? 0.06 : 0.02);
+    scores[letter] += (model.recentBias[letter] || 0) * (position === 0 ? 0.18 : 0.04);
+  }
+
+  if (prefix.length >= 1) {
+    const prev1 = prefix[prefix.length - 1];
+    for (const letter of ['A', 'B', 'C']) {
+      scores[letter] += (model.transition1[position]?.[prev1]?.[letter] || 0) * 0.58;
+    }
+  }
+
+  if (prefix.length >= 2) {
+    const key2 = prefix.slice(-2);
+    const bucket2 = model.transition2[position]?.get(key2);
+    if (bucket2) {
+      for (const letter of ['A', 'B', 'C']) {
+        scores[letter] += (bucket2[letter] || 0) * 0.47;
+      }
+    }
+  }
+
+  if (prefix.length >= 3) {
+    const key3 = prefix.slice(-3);
+    const bucket3 = model.transition3[position]?.get(key3);
+    if (bucket3) {
+      for (const letter of ['A', 'B', 'C']) {
+        scores[letter] += (bucket3[letter] || 0) * 0.38;
+      }
+    }
+  }
+
+  applyTowerPatternPenalty(scores, prefix);
+
+  const ordered = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+  const [bestLetter, bestScore] = ordered[0];
+  const secondScore = ordered[1]?.[1] || 0;
+  const confidence = bestScore > 0 ? clamp(((bestScore - secondScore) / bestScore) * 100, 0, 100) : 0;
+
+  return { letter: bestLetter || 'A', confidence };
+}
+
+function predictTowerSequence(rounds, horizon = 10) {
+  if (!rounds.length) {
+    return { forecast: '', confidence: 0 };
+  }
+
+  const model = trainTowerModel(rounds);
+  const forecast = [];
+  const stepConfidence = [];
+
+  for (let i = 0; i < horizon; i += 1) {
+    const { letter, confidence } = scoreTowerPosition(model, forecast, i);
+    forecast.push(letter);
+    stepConfidence.push(confidence);
+  }
+
+  const avgConfidence = stepConfidence.length
+    ? stepConfidence.reduce((sum, value) => sum + value, 0) / stepConfidence.length
+    : 0;
+
+  return {
+    forecast: forecast.join(''),
+    confidence: clamp(avgConfidence, 0, 100),
+  };
+}
+
+function evaluateTowerWindow(rounds, windowSize) {
+  const usable = normalizeTowerRounds(rounds);
+  if (usable.length < 8) {
+    return { score: 0, exactRate: 0, partialRate: 0, samples: 0 };
+  }
+
+  const start = Math.max(5, usable.length - 18);
+  let exactWins = 0;
+  let partialMatches = 0;
+  let samples = 0;
+
+  for (let i = start; i < usable.length; i += 1) {
+    const training = usable.slice(Math.max(0, i - windowSize), i);
+    if (training.length < 5) continue;
+
+    const predicted = predictTowerSequence(training, 4).forecast.slice(0, 4);
+    const actual = usable[i].sequence.slice(0, 4);
+    const matches = predicted.split('').reduce((count, letter, idx) => count + (letter === actual[idx] ? 1 : 0), 0);
+
+    exactWins += matches === 4 ? 1 : 0;
+    partialMatches += matches / 4;
+    samples += 1;
+  }
+
+  if (!samples) {
+    return { score: 0, exactRate: 0, partialRate: 0, samples: 0 };
+  }
+
+  const exactRate = exactWins / samples;
+  const partialRate = partialMatches / samples;
+  return {
+    score: (partialRate * 0.7) + (exactRate * 0.3),
+    exactRate,
+    partialRate,
+    samples,
+  };
+}
+
+function buildTowerForecast(rounds) {
+  const usableRounds = normalizeTowerRounds(rounds);
+  if (!usableRounds.length) return '';
+
+  const candidates = [18, 24, 36, 48, 60, 80].map((windowSize) => {
+    const training = usableRounds.slice(-windowSize);
+    const forecastInfo = predictTowerSequence(training, 10);
+    const scoreInfo = evaluateTowerWindow(usableRounds, windowSize);
+    return {
+      windowSize,
+      ...forecastInfo,
+      ...scoreInfo,
+      combinedScore: (scoreInfo.score * 100) + (forecastInfo.confidence * 0.35),
+    };
+  });
+
+  const best = candidates.sort((a, b) => {
+    if (b.combinedScore !== a.combinedScore) return b.combinedScore - a.combinedScore;
+    if (b.samples !== a.samples) return b.samples - a.samples;
+    return b.windowSize - a.windowSize;
+  })[0];
+
+  return best?.forecast || '';
+}
+
+function buildTowerPredictionHistory(rounds) {
+  const usableRounds = normalizeTowerRounds(rounds)
     .sort((a, b) => Number(a.roundId) - Number(b.roundId));
 
   const rows = [];
@@ -720,4 +866,5 @@ module.exports = {
   pollAllSites,
   discoverApiUrl,
   parseRoundsFromApi,
+  buildTowerPredictionHistory,
 };
