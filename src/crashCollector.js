@@ -27,12 +27,12 @@ const DEFAULT_CRASH_SOURCES = [
     roundsPath: '?page=0&limit=100',
   },
   {
-    sourceKey: 'solpump-crash',
-    label: 'SolPump Crash',
-    gameUrl: 'https://solpump.io/fairness/crash',
-    adapter: 'solpump',
-    apiUrl: 'https://solpump.io/api/v1/crash/live/history',
-    roundsPath: '/api/v1/crash/live/history',
+    sourceKey: 'degencoinflip-towers',
+    label: 'Degen Coin Flip Towers',
+    gameUrl: 'https://app.degencoinflip.com/towers',
+    adapter: 'degencoinflip',
+    apiUrl: 'https://api.dealer.degencoinflip.com/v1/game/3/room/1/rounds?limit=100',
+    roundsPath: '?limit=100',
   },
 ];
 
@@ -40,12 +40,14 @@ const DEPRECATED_CRASH_SOURCE_KEYS = new Set([
   'bcgame-crash',
   'stake-crash',
   'solcrash-crash',
+  'solpump-crash',
 ]);
 
 const DEPRECATED_CRASH_URL_PATTERNS = [
   'bcgame52.com/game/crash',
   'stake.bet/casino/games/crash',
   'solcrash.io/play',
+  'solpump.io/fairness/crash',
 ];
 
 const POLL_LOOP_MS = Number.parseInt(process.env.CRASH_WATCH_POLL_MS || '30000', 10);
@@ -106,6 +108,37 @@ function parseFloatish(raw) {
   const text = String(raw).replace(/x$/i, '').replace(/,/g, '').trim();
   const match = text.match(/-?\d+(?:\.\d+)?/);
   return match ? Number.parseFloat(match[0]) : Number.parseFloat(text);
+}
+
+const TOWER_RESULT_MAP = {
+  3: 'A',
+  5: 'B',
+  6: 'C',
+};
+
+function parseTowerGameResult(raw) {
+  if (raw == null) return [];
+  let value = raw;
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((entry) => {
+      const level = Number(entry?.level);
+      const result = String(entry?.result ?? entry?.choice ?? entry?.value ?? '').trim();
+      const letter = TOWER_RESULT_MAP[Number(result)] || TOWER_RESULT_MAP[result] || null;
+      return {
+        level: Number.isFinite(level) ? level : null,
+        result,
+        letter,
+      };
+    })
+    .filter((entry) => entry.letter);
 }
 
 function makeSyntheticRoundId(row, multiplier, timestamp) {
@@ -176,6 +209,7 @@ function normalizeRoundRow(row) {
   }
 
   if (!row || typeof row !== 'object') return null;
+  const towerSequence = parseTowerGameResult(row.gameResult);
   const roundId = Number(
     row.roundId ??
     row.round_id ??
@@ -204,6 +238,9 @@ function normalizeRoundRow(row) {
     row.score ??
     row.finalMultiplier
   );
+  const resolvedMultiplier = Number.isFinite(multiplier)
+    ? multiplier
+    : (towerSequence.length ? towerSequence.length : NaN);
   const timestamp = row.timestamp != null
     ? Number(row.timestamp)
     : row.createdAt
@@ -217,12 +254,19 @@ function normalizeRoundRow(row) {
             : Date.now();
   const resolvedRoundId = Number.isFinite(roundId)
     ? roundId
-    : makeSyntheticRoundId(row, multiplier, timestamp);
-  if (!Number.isFinite(resolvedRoundId) || !Number.isFinite(multiplier)) return null;
+    : makeSyntheticRoundId(row, resolvedMultiplier, timestamp);
+  if (!Number.isFinite(resolvedRoundId) || !Number.isFinite(resolvedMultiplier)) return null;
   return {
     roundId: resolvedRoundId,
-    multiplier,
+    multiplier: resolvedMultiplier,
     timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(),
+    rawPayload: towerSequence.length
+      ? {
+          ...row,
+          towerSequence,
+          towerSequenceText: towerSequence.map((entry) => entry.letter).join(''),
+        }
+      : row,
     raw: row,
   };
 }
@@ -286,13 +330,6 @@ async function fetchJson(url, timeoutMs = POLL_TIMEOUT_MS, headers = {}) {
 
 function getFetchHeadersForUrl(url) {
   const lower = String(url || '').toLowerCase();
-  if (lower.includes('solpump.io')) {
-    return {
-      origin: 'https://solpump.io',
-      referer: 'https://solpump.io/fairness/crash',
-      'x-requested-with': 'XMLHttpRequest',
-    };
-  }
   if (lower.includes('degencoinflip.com')) {
     return {
       origin: 'https://app.degencoinflip.com',
@@ -466,14 +503,14 @@ async function refreshSiteConfig(site) {
     });
   }
 
-  if (site.adapter === 'solpump' && !site.apiUrl) {
+  if (site.adapter === 'degencoinflip' && String(site.gameUrl || '').toLowerCase().includes('/towers') && !site.apiUrl) {
     return upsertCrashSite({
       sourceKey: site.sourceKey,
       label: site.label,
       gameUrl: site.gameUrl,
       adapter: site.adapter,
-      apiUrl: 'https://solpump.io/api/v1/crash/live/history',
-      roundsPath: '/api/v1/crash/live/history',
+      apiUrl: 'https://api.dealer.degencoinflip.com/v1/game/3/room/1/rounds?limit=100',
+      roundsPath: '?limit=100',
       enabled: site.enabled,
       pollIntervalMs: site.pollIntervalMs,
     });

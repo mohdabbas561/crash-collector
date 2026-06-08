@@ -72,6 +72,51 @@ function canonicalizePredictionOutcome({ lo, hi, hitRound }) {
   return { outcome: 'loss', hitRound: hitN };
 }
 
+const TOWER_RESULT_MAP = {
+  3: 'A',
+  5: 'B',
+  6: 'C',
+};
+
+function parseTowerSequence(rawPayload) {
+  if (!rawPayload) return [];
+  if (typeof rawPayload.towerSequenceText === 'string' && rawPayload.towerSequenceText.trim()) {
+    return rawPayload.towerSequenceText.trim().split('').map((letter, index) => ({
+      level: index,
+      result: null,
+      letter,
+    }));
+  }
+  const source = rawPayload.towerSequence || rawPayload.gameResult || rawPayload.game_result || rawPayload.sequence || null;
+  let value = source;
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((entry) => {
+      if (entry?.letter) {
+        return {
+          level: Number.isFinite(Number(entry?.level)) ? Number(entry.level) : null,
+          result: String(entry?.result ?? '').trim(),
+          letter: String(entry.letter).trim().toUpperCase(),
+        };
+      }
+      const result = String(entry?.result ?? entry?.choice ?? entry?.value ?? '').trim();
+      const letter = TOWER_RESULT_MAP[Number(result)] || TOWER_RESULT_MAP[result] || null;
+      return {
+        level: Number.isFinite(Number(entry?.level)) ? Number(entry.level) : null,
+        result,
+        letter,
+      };
+    })
+    .filter((entry) => entry.letter);
+}
+
 async function initDB() {
   if (!DATABASE_URL) {
     throw new Error(
@@ -870,18 +915,19 @@ async function saveCrashRounds(site, rounds = []) {
       const roundId = Number(round?.roundId ?? round?.id);
       const multiplier = Number(round?.multiplier ?? round?.gameResult ?? round?.crashPoint ?? round?.result);
       if (!Number.isFinite(roundId) || !Number.isFinite(multiplier)) continue;
-      values.push(`($${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++})`);
+      values.push(`($${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++})`);
       params.push(
         siteRow.id,
         siteRow.sourceKey,
         roundId,
         multiplier,
-        round?.timestamp ?? null
+        round?.timestamp ?? null,
+        round?.rawPayload ?? round?.raw ?? null
       );
     }
     if (!values.length) continue;
     const res = await pool.query(
-      `INSERT INTO crash_rounds (site_id, source_key, round_id, multiplier, timestamp)
+      `INSERT INTO crash_rounds (site_id, source_key, round_id, multiplier, timestamp, raw_payload)
        VALUES ${values.join(', ')}
        ON CONFLICT (site_id, round_id) DO NOTHING`,
       params
@@ -965,7 +1011,7 @@ async function getCrashRounds({
   const limitParam = `$${idx++}`;
   const offsetParam = `$${idx++}`;
   const res = await pool.query(
-    `SELECT site_id, source_key, round_id, multiplier, timestamp, created_at
+    `SELECT site_id, source_key, round_id, multiplier, timestamp, raw_payload, created_at
      FROM crash_rounds
      ${where}
      ORDER BY round_id DESC
@@ -979,6 +1025,9 @@ async function getCrashRounds({
     multiplier: Number.parseFloat(row.multiplier),
     timestamp: row.timestamp != null ? Number(row.timestamp) : Number(new Date(row.created_at)),
     createdAt: row.created_at ? new Date(row.created_at).toISOString() : null,
+    rawPayload: row.raw_payload || null,
+    towerSequence: parseTowerSequence(row.raw_payload),
+    towerSequenceText: parseTowerSequence(row.raw_payload).map((entry) => entry.letter).join(''),
   })).sort((a, b) => a.roundId - b.roundId);
 }
 
