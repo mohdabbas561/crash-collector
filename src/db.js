@@ -903,6 +903,41 @@ async function saveCrashRounds(site, rounds = []) {
   return totalSaved;
 }
 
+async function clearCrashRounds({ siteId = null, sourceKey = null } = {}) {
+  const conditions = [];
+  const params = [];
+  let idx = 1;
+  if (siteId != null) {
+    conditions.push(`site_id = $${idx++}`);
+    params.push(Number(siteId));
+  }
+  if (sourceKey) {
+    conditions.push(`source_key = $${idx++}`);
+    params.push(String(sourceKey));
+  }
+  if (!conditions.length) {
+    throw new Error('siteId or sourceKey required');
+  }
+  const res = await pool.query(
+    `DELETE FROM crash_rounds WHERE ${conditions.join(' AND ')}`,
+    params
+  );
+  return Number(res.rowCount || 0);
+}
+
+async function clearAllCrashRounds() {
+  const res = await pool.query('DELETE FROM crash_rounds');
+  return Number(res.rowCount || 0);
+}
+
+async function deleteCrashSite(siteId) {
+  const id = Number.parseInt(siteId, 10);
+  if (!Number.isFinite(id)) throw new Error('site id required');
+  await pool.query('DELETE FROM crash_rounds WHERE site_id = $1', [id]);
+  const res = await pool.query('DELETE FROM crash_sites WHERE id = $1 RETURNING id', [id]);
+  return res.rowCount > 0;
+}
+
 async function getCrashRounds({
   siteId = null,
   sourceKey = null,
@@ -1492,7 +1527,8 @@ module.exports = {
   initDB, saveRounds, getRounds, getStorageStats, getStats,
   getLatestRoundId, getRoundCount, pingDB,
   initCrashWatchStorage, upsertCrashSite, getCrashSites, getCrashSiteById, getCrashSiteBySourceKey,
-  saveCrashRounds, getCrashRounds, getCrashSummary, getCrashDashboard, touchCrashSite,
+  saveCrashRounds, clearCrashRounds, clearAllCrashRounds, deleteCrashSite,
+  getCrashRounds, getCrashSummary, getCrashDashboard, touchCrashSite,
   saveLockedPreds, getLockedPreds,
   saveLockedAdvPreds, getLockedAdvPreds,
   saveLockedConsensusPreds, getLockedConsensusPreds,

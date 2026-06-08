@@ -23,15 +23,29 @@ const DEFAULT_CRASH_SOURCES = [
     label: 'Solana Fat Boys Bustonaut',
     gameUrl: 'https://www.solanafatboys.com/bustonaut/',
     adapter: 'sfb',
-    apiUrl: 'https://sfb-api-service-mainnet.up.railway.app/api/games/bustonaut/latest?page=0&limit=100',
+    apiUrl: 'https://api.solanafatboys.com/api/games/bustonaut/latest?page=0&limit=100',
     roundsPath: '?page=0&limit=100',
   },
   {
-    sourceKey: 'bcgame-crash',
-    label: 'BC.Game Crash',
-    gameUrl: 'https://bcgame52.com/game/crash',
-    adapter: 'auto',
+    sourceKey: 'solpump-crash',
+    label: 'SolPump Crash',
+    gameUrl: 'https://solpump.io/fairness/crash',
+    adapter: 'solpump',
+    apiUrl: 'https://solpump.io/api/v1/crash/live/history',
+    roundsPath: '/api/v1/crash/live/history',
   },
+];
+
+const DEPRECATED_CRASH_SOURCE_KEYS = new Set([
+  'bcgame-crash',
+  'stake-crash',
+  'solcrash-crash',
+]);
+
+const DEPRECATED_CRASH_URL_PATTERNS = [
+  'bcgame52.com/game/crash',
+  'stake.bet/casino/games/crash',
+  'solcrash.io/play',
 ];
 
 const POLL_LOOP_MS = Number.parseInt(process.env.CRASH_WATCH_POLL_MS || '30000', 10);
@@ -294,13 +308,21 @@ async function ensureSeedData() {
   const existingGameKeys = new Map(
     existingSites.map((site) => [normalizeGameKey(site.gameUrl), site])
   );
+  for (const site of existingSites) {
+    const gameUrl = String(site.gameUrl || '').toLowerCase();
+    const shouldDelete = DEPRECATED_CRASH_SOURCE_KEYS.has(site.sourceKey)
+      || DEPRECATED_CRASH_URL_PATTERNS.some((pattern) => gameUrl.includes(pattern));
+    if (shouldDelete) {
+      await deleteCrashSite(site.id);
+    }
+  }
   for (const site of DEFAULT_CRASH_SOURCES) {
     const gameKey = normalizeGameKey(site.gameUrl);
     const existingByGame = existingGameKeys.get(gameKey);
     if (existingByGame) {
       const needsFix = (
-        (site.apiUrl && !existingByGame.apiUrl) ||
-        (site.roundsPath && !existingByGame.roundsPath) ||
+        (site.apiUrl && normalizeUrl(existingByGame.apiUrl) !== normalizeUrl(site.apiUrl)) ||
+        (site.roundsPath && String(existingByGame.roundsPath || '') !== String(site.roundsPath || '')) ||
         (site.adapter && existingByGame.adapter !== site.adapter)
       );
       if (needsFix) {
@@ -352,8 +374,21 @@ async function refreshSiteConfig(site) {
       label: site.label,
       gameUrl: site.gameUrl,
       adapter: site.adapter,
-      apiUrl: 'https://sfb-api-service-mainnet.up.railway.app/api/games/bustonaut/latest?page=0&limit=100',
+      apiUrl: 'https://api.solanafatboys.com/api/games/bustonaut/latest?page=0&limit=100',
       roundsPath: '?page=0&limit=100',
+      enabled: site.enabled,
+      pollIntervalMs: site.pollIntervalMs,
+    });
+  }
+
+  if (site.adapter === 'solpump' && !site.apiUrl) {
+    return upsertCrashSite({
+      sourceKey: site.sourceKey,
+      label: site.label,
+      gameUrl: site.gameUrl,
+      adapter: site.adapter,
+      apiUrl: 'https://solpump.io/api/v1/crash/live/history',
+      roundsPath: '/api/v1/crash/live/history',
       enabled: site.enabled,
       pollIntervalMs: site.pollIntervalMs,
     });

@@ -12,7 +12,7 @@ const {
   getLatestRoundId, getRoundCount,
   getRounds, getStats, getStorageStats,
   initCrashWatchStorage, getCrashSites, getCrashSiteById, upsertCrashSite,
-  getCrashRounds, getCrashSummary, getCrashDashboard, touchCrashSite,
+  getCrashRounds, clearCrashRounds, clearAllCrashRounds, getCrashSummary, getCrashDashboard, touchCrashSite,
   getPredictions, savePrediction, clearPredictions, clearAllLocks,
   getOracleLocks, replaceOracleLocks,
   getLockedConsensusPreds, saveLockedConsensusPreds,
@@ -1498,6 +1498,18 @@ app.get('/crash-sites/:id/rounds', rateLimit(60), async (req, res) => {
   }
 });
 
+app.delete('/crash-sites/:id/rounds', rateLimit(20), async (req, res) => {
+  try {
+    const site = await getCrashSiteById(req.params.id);
+    if (!site) return res.status(404).json({ ok: false, error: 'site not found' });
+    const deleted = await clearCrashRounds({ siteId: site.id });
+    res.json({ ok: true, deleted, siteId: site.id });
+  } catch (error) {
+    setDatabaseAvailability(false, error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 app.get('/crash-sites/:id/summary', rateLimit(40), async (req, res) => {
   try {
     const site = await getCrashSiteById(req.params.id);
@@ -1515,6 +1527,16 @@ app.get('/crash-dashboard', rateLimit(40), async (req, res) => {
     const limitPerSite = clampInt(req.query.limitPerSite, 10, 200, 40);
     const payload = await getCrashDashboard({ limitPerSite });
     res.json({ ok: true, ...payload });
+  } catch (error) {
+    setDatabaseAvailability(false, error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.delete('/crash-rounds', rateLimit(20), async (req, res) => {
+  try {
+    const deleted = await clearAllCrashRounds();
+    res.json({ ok: true, deleted });
   } catch (error) {
     setDatabaseAvailability(false, error.message);
     res.status(500).json({ ok: false, error: error.message });
