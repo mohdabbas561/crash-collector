@@ -1537,8 +1537,7 @@ app.get('/crash-sites/:id/tower-history', rateLimit(60), async (req, res) => {
   try {
     const site = await getCrashSiteById(req.params.id);
     if (!site) return res.status(404).json({ ok: false, error: 'site not found' });
-    const limit = clampInt(req.query.limit, 10, 500, 50);
-    const offset = clampInt(req.query.offset, 0, 5000, 0);
+    const limit = clampInt(req.query.limit, 10, 500, 200);
     const refreshLive = String(req.query.refresh || '').trim() === '1';
     if (refreshLive && String(site.gameUrl || '').toLowerCase().includes('/towers') && site.apiUrl) {
       try {
@@ -1549,14 +1548,10 @@ app.get('/crash-sites/:id/tower-history', rateLimit(60), async (req, res) => {
       }
     }
     const rawRounds = await getCrashRounds({ siteId: site.id, limit: 1000, order: 'ASC' });
-    const rebuiltHistory = buildTowerPredictionHistory(rawRounds);
-    if (rebuiltHistory.length) {
-      await saveTowerPredictionHistory(site, rebuiltHistory);
-    }
-    const history = await getTowerPredictionHistory({ siteId: site.id, limit, offset });
+    const history = buildTowerPredictionHistory(rawRounds).slice(-limit);
     res.json({ ok: true, site, count: history.length, history });
   } catch (error) {
-    setDatabaseAvailability(false, error.message);
+    console.error('[tower-history] error:', error.message);
     res.status(500).json({ ok: false, error: error.message });
   }
 });
