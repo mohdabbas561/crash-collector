@@ -116,9 +116,9 @@ function parseFloatish(raw) {
 }
 
 const TOWER_RESULT_MAP = {
-  3: 'A',
+  3: 'C',
   5: 'B',
-  6: 'C',
+  6: 'A',
 };
 
 function parseTowerGameResult(raw) {
