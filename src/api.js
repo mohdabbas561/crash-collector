@@ -1523,8 +1523,9 @@ app.delete('/crash-sites/:id/rounds', rateLimit(20), async (req, res) => {
   try {
     const site = await getCrashSiteById(req.params.id);
     if (!site) return res.status(404).json({ ok: false, error: 'site not found' });
+    const summary = await getCrashSummary({ siteId: site.id });
     const deleted = await clearCrashRounds({ siteId: site.id });
-    res.json({ ok: true, deleted, siteId: site.id });
+    res.json({ ok: true, deleted, siteId: site.id, maxRoundId: summary.latestRoundId });
   } catch (error) {
     setDatabaseAvailability(false, error.message);
     res.status(500).json({ ok: false, error: error.message });
@@ -1580,8 +1581,9 @@ app.get('/crash-dashboard', rateLimit(40), async (req, res) => {
 
 app.delete('/crash-rounds', rateLimit(20), async (req, res) => {
   try {
+    const summary = await getCrashSummary();
     const deleted = await clearAllCrashRounds();
-    res.json({ ok: true, deleted });
+    res.json({ ok: true, deleted, maxRoundId: summary.latestRoundId });
   } catch (error) {
     setDatabaseAvailability(false, error.message);
     res.status(500).json({ ok: false, error: error.message });
