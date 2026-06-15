@@ -44,6 +44,16 @@ function reflectBrowserCors(proxyRes, req) {
     : 'Origin';
 }
 
+function clamp(val, min, max) {
+  return Math.max(min, Math.min(max, val));
+}
+
+function clampInt(val, min, max, def) {
+  const n = parseInt(val, 10);
+  if (isNaN(n)) return def;
+  return Math.max(min, Math.min(max, n));
+}
+
 const sfbApiProxy = createProxyMiddleware({
   target: SFB_PROXY_TARGET,
   changeOrigin: true,

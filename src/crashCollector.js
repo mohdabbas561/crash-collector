@@ -65,6 +65,10 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function clamp(val, min, max) {
+  return Math.max(min, Math.min(max, val));
+}
+
 function withTimeout(promise, ms, label) {
   let timer = null;
   const timeout = new Promise((_, reject) => {
