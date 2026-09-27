@@ -1,4 +1,9 @@
 /node_modules
 .env
 .env.*
+<<<<<<< HEAD
 !.env.example
+=======
+*.pem
+*.key
+>>>>>>> c44efd6e4aef3f0b23fa06aae4308724306f9a41
